@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-KIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+KIT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 REQUESTED_DIR="${1:-$PWD}"
 
 if [ ! -d "$REQUESTED_DIR" ]; then
