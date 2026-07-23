@@ -9,6 +9,13 @@ Reusable configuration for Claude Code with:
 - Automatic task routing from ordinary natural-language requests.
 - Conservative Git, dependency, and release safeguards.
 
+## Automatic fallback
+
+If Codex is unavailable because of authentication, subscription, entitlement,
+quota, or billing, Fable continues the task as the sole implementation agent.
+Transient Codex failures receive one retry. High-risk tasks pause for user
+input when the absence of independent cross-model review leaves material risk.
+
 ## Installed locations
 
 - Global policy: `~/.claude/CLAUDE.md`

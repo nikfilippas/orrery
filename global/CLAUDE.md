@@ -157,6 +157,90 @@ When delegating:
 Do not automatically run unlimited review cycles. After two cycles, reassess
 whether further iteration is materially useful.
 
+## Codex Availability and Automatic Fallback
+
+Codex is optional supporting infrastructure. Its failure must not leave an
+ordinary development task incomplete.
+
+For every Codex invocation:
+
+- Inspect the exit status and returned output.
+- Do not treat missing, malformed, or incomplete output as success.
+- Preserve the task plan, constraints, and acceptance criteria if fallback is
+  required.
+
+Apply the following policy automatically.
+
+### Authentication, subscription, quota, or billing failure
+
+Examples include:
+
+- Codex is not authenticated.
+- The account does not have Codex access.
+- The Codex usage limit or rate limit has been exhausted.
+- Billing or entitlement prevents the selected Codex request.
+
+In these cases:
+
+1. Do not retry the same request.
+2. Do not cycle through Luna, Terra, and Sol, because an account-level failure
+   is unlikely to be solved by model switching.
+3. Continue the task using Fable as the sole implementation and review agent.
+4. Apply the same acceptance criteria and verification requirements.
+5. State in the completion report that independent Codex work was unavailable.
+
+### Model-specific unavailability
+
+If Codex is available but the selected model is unavailable:
+
+- Try at most one appropriate alternative Codex model when doing so preserves
+  the required quality and independence.
+- Otherwise, fall back to Fable.
+- Do not enter a model-selection loop.
+
+### Transient failure
+
+For a temporary process, network, or service failure:
+
+1. Retry once.
+2. If the retry fails, continue using Fable.
+3. Do not retry again during the same task unless the user explicitly asks.
+
+### Failed or partial implementation
+
+If Codex fails before changing files, Fable continues the implementation.
+
+If Codex changed files before failing:
+
+1. Inspect `git status` and the complete diff.
+2. Retain only changes that are understood, relevant, and verifiable.
+3. Revert or correct incomplete and unsafe changes.
+4. Continue the implementation with Fable.
+5. Run the full relevant verification suite.
+
+### Unavailable independent review
+
+If Codex review is unavailable:
+
+- Fable performs a deliberate self-review against the request, acceptance
+  criteria, complete diff, and relevant tests.
+- Testing and direct inspection remain mandatory.
+- The result must not be described as independently cross-model reviewed.
+- Report the missing independent review as a residual limitation.
+
+### Complex or high-risk work
+
+For security-sensitive, architectural, migration, concurrency, authentication,
+or production-critical work:
+
+- Continue without Codex only when Fable can verify the result adequately.
+- If the missing independent review creates material unresolved risk, pause and
+  ask the user before completing or releasing the change.
+
+If the user explicitly requires Codex participation, do not silently replace it
+with Claude-only work. Report the failure and ask whether to continue without
+Codex.
+
 ## Verification
 
 Before reporting substantial work complete:

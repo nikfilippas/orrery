@@ -333,6 +333,75 @@ Do not allow the implementation session to review its own work.
 Use `--ephemeral` for one-off independent reviews when no follow-up context is
 needed.
 
+## Codex Failure and Claude-Only Fallback
+
+Every Codex call must be checked for a successful exit status and usable output.
+
+Codex failure must not trigger repeated retries, uncontrolled model switching,
+or abandonment of an ordinary task.
+
+### Account-level unavailability
+
+Treat authentication, subscription, entitlement, billing, quota, and usage
+limit errors as account-level failures.
+
+On an account-level failure:
+
+1. Do not retry.
+2. Do not try another Codex model.
+3. Preserve the current plan and acceptance criteria.
+4. Continue implementation with Fable.
+5. Perform direct diff inspection and all relevant verification.
+6. Record that Codex implementation or independent review was unavailable.
+
+### Model-specific failure
+
+If only the selected model is unavailable, one appropriate alternative Codex
+model may be attempted.
+
+Do not try more than one alternative.
+
+Use Fable if the alternative would materially reduce implementation quality,
+review independence, or safety.
+
+### Transient failure
+
+Retry a transient process, network, or service failure once.
+
+After the second failure, use Fable and do not call Codex again for that task
+unless the user explicitly requests another attempt.
+
+### Partial Codex changes
+
+When Codex fails after modifying the working tree:
+
+1. Inspect `git status`.
+2. Inspect the complete diff.
+3. Determine which changes are complete, relevant, and correct.
+4. Revert or repair incomplete changes.
+5. Continue with Fable.
+6. Rerun the relevant verification suite.
+
+Never assume that partial Codex output represents a valid implementation.
+
+### Review fallback
+
+When Sol or another independent Codex reviewer is unavailable:
+
+- Fable must review the complete diff against the approved plan and acceptance
+  criteria.
+- Fable must actively search for regressions, boundary failures, missing tests,
+  security issues, and unrelated changes.
+- Tests and direct inspection remain mandatory.
+- The completion report must state that no independent cross-model review was
+  completed.
+
+For high-risk work, pause and ask the user when proceeding without independent
+review would leave material unresolved risk.
+
+If the user explicitly asked for Codex participation, report the failure before
+substituting Claude-only work.
+
 ## Review policy
 
 Codex review findings are advisory, not authoritative.
