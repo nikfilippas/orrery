@@ -149,6 +149,16 @@ else
     fail "claude-codex-doctor is not correctly installed"
 fi
 
+printf "\n=== Claude default model ===\n"
+if [ -r "$HOME/.claude/settings.json" ] &&
+   jq -e '.model == "opus"' "$HOME/.claude/settings.json" \
+       >/dev/null 2>&1
+then
+    pass "Claude default model uses the moving opus alias"
+else
+    fail "Claude default model is not set to opus"
+fi
+
 printf "\n=== Kit repository ===\n"
 if [ -z "$(git -C "$KIT_DIR" status --porcelain)" ]; then
     pass "Kit repository is clean"

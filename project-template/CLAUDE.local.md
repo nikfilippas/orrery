@@ -17,7 +17,7 @@ Treat the shared project `CLAUDE.md` as authoritative for:
 
 For personal workflow and delegation:
 
-- Claude Fable remains the principal orchestrator.
+- The active Claude model remains the principal orchestrator.
 - Use Luna, Terra, and Sol adaptively under the global policy.
 - Do not require manual workflow-skill invocation.
 - Do not commit, push, release, or deploy without an explicit request.

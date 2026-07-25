@@ -45,6 +45,8 @@ link_file \
     "$KIT_DIR/global/codex/sol.config.toml" \
     "$HOME/.codex/sol.config.toml"
 
+"$KIT_DIR/scripts/set-claude-model.sh"
+
 printf "\nInstallation complete.\n"
 
 if [ -d "$BACKUP_DIR" ]; then

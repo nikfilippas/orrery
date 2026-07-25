@@ -2,7 +2,7 @@
 
 Reusable configuration for Claude Code with:
 
-- Claude Fable as the principal orchestrator.
+- The active Claude model as the principal orchestrator.
 - GPT-5.6 Terra as the default substantial implementation worker.
 - GPT-5.6 Sol for difficult reasoning and independent review.
 - GPT-5.6 Luna for narrow and mechanical work.
@@ -12,7 +12,7 @@ Reusable configuration for Claude Code with:
 ## Automatic fallback
 
 If Codex is unavailable because of authentication, subscription, entitlement,
-quota, or billing, Fable continues the task as the sole implementation agent.
+quota, or billing, the principal orchestrator continues the task as the sole implementation agent.
 Transient Codex failures receive one retry. High-risk tasks pause for user
 input when the absence of independent cross-model review leaves material risk.
 

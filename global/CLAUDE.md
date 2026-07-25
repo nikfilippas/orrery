@@ -66,7 +66,7 @@ The user should describe the desired result in ordinary language.
 
 Do not require the user to remember or manually invoke workflow skills.
 
-Claude Fable is the principal orchestrator. For each development request,
+The active Claude model is the principal orchestrator. For each development request,
 classify the work internally as trivial, standard, complex or high-risk, or
 investigation only.
 
@@ -120,7 +120,7 @@ major architecture changes, large refactors, and multi-system changes.
 
 Delegation does not transfer responsibility.
 
-Fable remains responsible for:
+The principal orchestrator remains responsible for:
 
 - understanding the user's objective,
 - inspecting repository context,
@@ -185,7 +185,7 @@ In these cases:
 1. Do not retry the same request.
 2. Do not cycle through Luna, Terra, and Sol, because an account-level failure
    is unlikely to be solved by model switching.
-3. Continue the task using Fable as the sole implementation and review agent.
+3. Continue the task using the principal orchestrator as the sole implementation and review agent.
 4. Apply the same acceptance criteria and verification requirements.
 5. State in the completion report that independent Codex work was unavailable.
 
@@ -195,7 +195,7 @@ If Codex is available but the selected model is unavailable:
 
 - Try at most one appropriate alternative Codex model when doing so preserves
   the required quality and independence.
-- Otherwise, fall back to Fable.
+- Otherwise, fall back to the principal orchestrator.
 - Do not enter a model-selection loop.
 
 ### Transient failure
@@ -203,26 +203,26 @@ If Codex is available but the selected model is unavailable:
 For a temporary process, network, or service failure:
 
 1. Retry once.
-2. If the retry fails, continue using Fable.
+2. If the retry fails, continue using the principal orchestrator.
 3. Do not retry again during the same task unless the user explicitly asks.
 
 ### Failed or partial implementation
 
-If Codex fails before changing files, Fable continues the implementation.
+If Codex fails before changing files, the principal orchestrator continues the implementation.
 
 If Codex changed files before failing:
 
 1. Inspect `git status` and the complete diff.
 2. Retain only changes that are understood, relevant, and verifiable.
 3. Revert or correct incomplete and unsafe changes.
-4. Continue the implementation with Fable.
+4. Continue the implementation with the principal orchestrator.
 5. Run the full relevant verification suite.
 
 ### Unavailable independent review
 
 If Codex review is unavailable:
 
-- Fable performs a deliberate self-review against the request, acceptance
+- The principal orchestrator performs a deliberate self-review against the request, acceptance
   criteria, complete diff, and relevant tests.
 - Testing and direct inspection remain mandatory.
 - The result must not be described as independently cross-model reviewed.
@@ -233,7 +233,7 @@ If Codex review is unavailable:
 For security-sensitive, architectural, migration, concurrency, authentication,
 or production-critical work:
 
-- Continue without Codex only when Fable can verify the result adequately.
+- Continue without Codex only when the principal orchestrator can verify the result adequately.
 - If the missing independent review creates material unresolved risk, pause and
   ask the user before completing or releasing the change.
 

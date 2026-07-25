@@ -2,7 +2,7 @@
 name: development-orchestrator
 description: >
   Automatically orchestrate software implementation, debugging, refactoring,
-  testing, and substantial code review using Claude Fable as the principal
+  testing, and substantial code review using the active Claude model as the principal
   decision-maker and Codex as a specialist worker. Use when the user asks to
   add, implement, fix, debug, refactor, optimize, test, or materially review
   code. Select Luna, Terra, or Sol according to task complexity without
@@ -18,7 +18,7 @@ work.
 The user should describe the desired outcome normally. Do not require them to
 remember or invoke workflow skills.
 
-Claude Fable remains the principal orchestrator. It is responsible for
+The active Claude model remains the principal orchestrator. It is responsible for
 understanding the request, inspecting the repository, selecting the workflow,
 delegating bounded work, evaluating Codex output, inspecting all changes,
 running verification, and deciding whether the result is complete.
@@ -41,7 +41,27 @@ Optimize decisions in this order:
 
 Do not invoke Codex merely because it is available.
 
-Do not make Fable and Codex duplicate the same work without a clear benefit.
+Do not make the principal orchestrator and Codex duplicate the same work without a clear benefit.
+
+## Model role configuration
+
+The orchestration system is role-based.
+
+- Principal orchestrator: the active Claude model selected in Claude Code.
+- Mechanical worker: the Codex `luna` profile.
+- Implementation worker: the Codex `terra` profile.
+- Independent reviewer: the Codex `sol` profile.
+
+Do not depend on concrete model names in workflow logic.
+
+The current Codex models and reasoning levels are defined only in:
+
+- `~/.codex/luna.config.toml`
+- `~/.codex/terra.config.toml`
+- `~/.codex/sol.config.toml`
+
+Changing a worker model should require updating its profile file, not rewriting
+the orchestration workflow.
 
 ## Task classification
 
@@ -58,7 +78,7 @@ Examples:
 
 Workflow:
 
-1. Fable implements directly.
+1. The principal orchestrator implements directly.
 2. Inspect the diff.
 3. Run the smallest relevant verification.
 4. Do not invoke Codex unless uncertainty materially justifies it.
@@ -72,7 +92,7 @@ Examples:
 - Narrow test generation.
 - Straightforward edits with explicit acceptance criteria.
 
-Use GPT-5.6 Luna with low reasoning when delegation is worthwhile.
+Use the `luna` Codex profile when delegation is worthwhile.
 
 ### Standard implementation
 
@@ -84,7 +104,7 @@ Examples:
 - Multi-file changes with clear architecture.
 - New tests around meaningful application logic.
 
-Use GPT-5.6 Terra with medium reasoning as the default implementation worker.
+Use the `terra` Codex profile as the default implementation worker.
 
 Do not require a separate plan-review cycle for routine, low-risk work.
 
@@ -104,16 +124,16 @@ Examples:
 
 Workflow:
 
-1. Fable investigates the repository.
-2. Fable produces an explicit plan with acceptance criteria.
-3. A fresh GPT-5.6 Sol run challenges the plan in read-only mode.
-4. Fable evaluates the criticism and revises the plan where justified.
-5. GPT-5.6 Terra implements the approved plan unless Sol is materially
-   justified as the implementer.
-6. Fable inspects all changed files and the complete diff.
+1. The principal orchestrator investigates the repository.
+2. The principal orchestrator produces an explicit plan with acceptance criteria.
+3. A fresh `sol` profile run challenges the plan in read-only mode.
+4. The principal orchestrator evaluates the criticism and revises the plan where justified.
+5. The `terra` profile implements the approved plan unless the review
+   profile is materially justified as the implementer.
+6. The principal orchestrator inspects all changed files and the complete diff.
 7. Run the complete relevant verification suite.
 8. A fresh GPT-5.6 Sol run reviews the completed uncommitted changes.
-9. Fable verifies each finding and corrects legitimate problems.
+9. The principal orchestrator verifies each finding and corrects legitimate problems.
 10. Rerun affected verification.
 
 ### Investigation only
@@ -129,7 +149,7 @@ changes:
 
 ## Model routing
 
-### GPT-5.6 Luna
+### Mechanical worker: `luna` profile
 
 Use Luna for:
 
@@ -143,14 +163,12 @@ Default reasoning effort: low.
 
 Example invocation:
 
-    codex exec \
-      --model gpt-5.6-luna \
+    codex --profile luna exec \
       --sandbox workspace-write \
-      -c model_reasoning_effort=low \
       --color never \
       "<PROMPT>"
 
-### GPT-5.6 Terra
+### Implementation worker: `terra` profile
 
 Use Terra for:
 
@@ -165,14 +183,12 @@ Default reasoning effort: medium.
 
 Example invocation:
 
-    codex exec \
-      --model gpt-5.6-terra \
+    codex --profile terra exec \
       --sandbox workspace-write \
-      -c model_reasoning_effort=medium \
       --color never \
       "<PROMPT>"
 
-### GPT-5.6 Sol
+### Independent reviewer: `sol` profile
 
 Use Sol for:
 
@@ -187,15 +203,13 @@ Default reasoning effort: high.
 
 Example invocation:
 
-    codex exec \
-      --model gpt-5.6-sol \
+    codex --profile sol exec \
       --sandbox read-only \
       --ephemeral \
-      -c model_reasoning_effort=high \
       --color never \
       "<PROMPT>"
 
-Do not use Sol for routine work merely because it is the strongest model.
+Do not use the independent-review profile for routine work merely because its current model is the strongest Codex option.
 
 Do not use maximum reasoning effort by default.
 
@@ -260,7 +274,7 @@ the prompt.
 
 Do not send unrelated conversation history.
 
-Do not ask Codex to make architectural decisions that Fable has not framed.
+Do not ask Codex to make architectural decisions that the principal orchestrator has not framed.
 
 ## Standard workflow
 
@@ -350,7 +364,7 @@ On an account-level failure:
 1. Do not retry.
 2. Do not try another Codex model.
 3. Preserve the current plan and acceptance criteria.
-4. Continue implementation with Fable.
+4. Continue implementation with the principal orchestrator.
 5. Perform direct diff inspection and all relevant verification.
 6. Record that Codex implementation or independent review was unavailable.
 
@@ -361,14 +375,14 @@ model may be attempted.
 
 Do not try more than one alternative.
 
-Use Fable if the alternative would materially reduce implementation quality,
+Use the principal orchestrator if the alternative would materially reduce implementation quality,
 review independence, or safety.
 
 ### Transient failure
 
 Retry a transient process, network, or service failure once.
 
-After the second failure, use Fable and do not call Codex again for that task
+After the second failure, use the principal orchestrator and do not call Codex again for that task
 unless the user explicitly requests another attempt.
 
 ### Partial Codex changes
@@ -379,7 +393,7 @@ When Codex fails after modifying the working tree:
 2. Inspect the complete diff.
 3. Determine which changes are complete, relevant, and correct.
 4. Revert or repair incomplete changes.
-5. Continue with Fable.
+5. Continue with the principal orchestrator.
 6. Rerun the relevant verification suite.
 
 Never assume that partial Codex output represents a valid implementation.
@@ -388,9 +402,9 @@ Never assume that partial Codex output represents a valid implementation.
 
 When Sol or another independent Codex reviewer is unavailable:
 
-- Fable must review the complete diff against the approved plan and acceptance
+- The principal orchestrator must review the complete diff against the approved plan and acceptance
   criteria.
-- Fable must actively search for regressions, boundary failures, missing tests,
+- The principal orchestrator must actively search for regressions, boundary failures, missing tests,
   security issues, and unrelated changes.
 - Tests and direct inspection remain mandatory.
 - The completion report must state that no independent cross-model review was
@@ -406,7 +420,7 @@ substituting Claude-only work.
 
 Codex review findings are advisory, not authoritative.
 
-Fable must:
+The principal orchestrator must:
 
 - Verify each material finding against the repository.
 - Reject unsupported, irrelevant, or speculative findings.
@@ -458,7 +472,7 @@ why.
 
 ## Safety and scope
 
-Codex and Fable must not independently:
+Codex and the principal orchestrator must not independently:
 
 - Commit or push changes.
 - Create, delete, or merge branches.
