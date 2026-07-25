@@ -138,4 +138,4 @@ fi
 printf "\n=== Migration result ===\n"
 printf "Shared instructions: %s\n" "$SHARED_TARGET"
 printf "Private workflow:    %s\n" "$LOCAL_TARGET"
-printf "\nRun /memory in a fresh Claude Code session to confirm both files load.\n"
+printf "\nRun /context in a fresh Claude Code session to confirm both files load.\n"

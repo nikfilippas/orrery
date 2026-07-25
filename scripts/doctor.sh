@@ -78,32 +78,44 @@ fi
 
 printf "\n=== Codex profiles ===\n"
 
-if grep -Fxq "model = \"gpt-5.6-luna\"" \
-    "$HOME/.codex/luna.config.toml" &&
-   grep -Fxq "model_reasoning_effort = \"low\"" \
-    "$HOME/.codex/luna.config.toml"; then
-    pass "Luna profile is valid"
-else
-    fail "Luna profile is invalid"
-fi
+validate_codex_profile() {
+    local profile_name="$1"
+    local expected_effort="$2"
+    local profile_path="$HOME/.codex/${profile_name}.config.toml"
 
-if grep -Fxq "model = \"gpt-5.6-terra\"" \
-    "$HOME/.codex/terra.config.toml" &&
-   grep -Fxq "model_reasoning_effort = \"medium\"" \
-    "$HOME/.codex/terra.config.toml"; then
-    pass "Terra profile is valid"
-else
-    fail "Terra profile is invalid"
-fi
+    if python3 - "$profile_path" "$expected_effort" <<'PYPROFILE'
+from pathlib import Path
+import sys
+import tomllib
 
-if grep -Fxq "model = \"gpt-5.6-sol\"" \
-    "$HOME/.codex/sol.config.toml" &&
-   grep -Fxq "model_reasoning_effort = \"high\"" \
-    "$HOME/.codex/sol.config.toml"; then
-    pass "Sol profile is valid"
-else
-    fail "Sol profile is invalid"
-fi
+path = Path(sys.argv[1])
+expected_effort = sys.argv[2]
+
+try:
+    with path.open("rb") as handle:
+        config = tomllib.load(handle)
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(1)
+
+model = config.get("model")
+effort = config.get("model_reasoning_effort")
+
+if not isinstance(model, str) or not model.strip():
+    raise SystemExit(1)
+
+if effort != expected_effort:
+    raise SystemExit(1)
+PYPROFILE
+    then
+        pass "${profile_name^} profile is valid"
+    else
+        fail "${profile_name^} profile is invalid"
+    fi
+}
+
+validate_codex_profile "luna" "low"
+validate_codex_profile "terra" "medium"
+validate_codex_profile "sol" "high"
 
 printf "\n=== Authentication ===\n"
 if codex login status 2>&1 | grep -q "Logged in"; then
