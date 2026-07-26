@@ -46,6 +46,7 @@ link_file \
     "$HOME/.codex/sol.config.toml"
 
 "$KIT_DIR/scripts/set-claude-model.sh"
+"$KIT_DIR/scripts/install-lnt-hooks.sh"
 
 printf "\nInstallation complete.\n"
 

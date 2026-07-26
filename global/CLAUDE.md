@@ -243,6 +243,8 @@ Codex.
 
 ## Verification
 
+- Apply the mandatory environment inspection and cleanup in `## Leave No Trace` before reporting completion.
+
 Before reporting substantial work complete:
 
 - review the complete diff,
@@ -295,6 +297,53 @@ These actions require an explicit user request.
 
 Never expose credentials, tokens, private keys, .env contents, or other secrets
 in prompts, reports, logs, commits, or generated documentation.
+
+## Leave No Trace
+
+- Revert every process, socket, file, setting, database row, and Git side effect that the session creates or changes outside the repository working tree. Do not transfer cleanup to the user or defer it until later.
+- Register cleanup at launch. Sessions get interrupted, context gets compacted, and turns get abandoned; end-of-task checklists fail in exactly the cases that leak.
+- Prefer, in order: do not start a long-lived process; bound its lifetime at launch with an explicit timeout, `--virtual-time-budget`, a context manager, or `try/finally`; clean it in the same tool call that created it.
+- Use `claude-lnt-start --ttl <seconds> -- <command>` for any process that must span tool calls. Register arbitrary rollback before mutation with `claude-lnt-register -- <command> [args...]` or `claude-lnt-register --shell '<command>'`.
+- Treat end-of-turn verification as the backstop, not the primary cleanup mechanism.
+- Revert background and detached processes, including headless browsers, model servers, watchers, and anything started with `nohup`, `&`, `disown`, `setsid`, or `run_in_background`.
+- Revert listening sockets, especially debug, CDP, and inspector ports.
+- Remove temporary and profile directories, including `/tmp/tmp.*`, browser `--user-data-dir` paths, and scratch directories created outside the designated scratchpad.
+- Release GPU memory held by abandoned model processes.
+- Revert toggled settings, kill switches, feature flags, and environment variables written to configuration.
+- Remove rows written to a real database for testing.
+- Apply `## Git and External Actions` to stray branches, worktrees, stashes, and staged changes.
+- Before every completion response, run these commands and inspect their output:
+
+```bash
+pgrep -af "headless|playwright|chromedriver|--remote-debugging"
+ss -ltnp 2>/dev/null | grep -vE ':(22|80|443|8600|8601)\b'
+ls -d /tmp/tmp.* /tmp/mh_* 2>/dev/null | head
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+git status --short   # in every checkout AND worktree
+```
+
+- If any command shows something created by the session, clean it before reporting completion. If cleanup fails, state that explicitly and provide the exact command the user must run.
+- Snap Chromium detaches into its own systemd user scope (`snap.chromium.chromium-<uuid>.scope`). Killing the launching shell, or letting `timeout` expire, does NOT kill the browser: it is reparented to systemd (ppid 1/2282) and survives indefinitely. Verify the browser is gone; do not assume the launcher's death took it with it.
+- `kill` from a Claude-Code-in-VS-Code shell is DENIED by AppArmor even at the same uid and even with sandboxing disabled, because the shell's label is `vscode`:
+
+```text
+apparmor="DENIED" operation="signal" profile="snap.chromium.chromium"
+denied_mask="receive" signal=kill peer="vscode"
+```
+
+- Stop the systemd scope so systemd sends the signal:
+
+```bash
+for p in $(ps -eo pid,args | grep "headless=new" | grep -v -- "--type=" \
+           | grep -v grep | awk '{print $1}'); do
+  sc=$(sed 's/^0:://' /proc/$p/cgroup \
+       | grep -oE 'snap\.chromium\.chromium-[^/]+\.scope')
+  [ -n "$sc" ] && systemctl --user stop "$sc"
+done
+```
+
+- Exclude `chrome_crashpad_handler` when classifying scopes: its path contains `chromium-browser/chrome` but it has neither `--type=` nor `--headless=new`, so a naive filter classifies every scope as mixed and stops nothing.
+- Never stop a scope whose root process lacks `--headless=new`; that is the user's interactive browser.
 
 ## Completion Report
 

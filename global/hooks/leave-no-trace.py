@@ -1,0 +1,812 @@
+#!/usr/bin/env python3
+"""Claude Code Leave No Trace lifecycle hook and helper command."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from typing import Any
+
+POLL_SECONDS = 3
+TERM_GRACE_SECONDS = 2.0
+MAX_WATCH_SECONDS = 24 * 60 * 60
+LNT_MARKER = "claude-lnt"
+
+
+def runtime_root() -> Path:
+    candidates = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg:
+        candidates.append(Path(xdg) / "claude-lnt")
+    candidates.append(Path(f"/run/user/{os.getuid()}") / "claude-lnt")
+    candidates.append(Path.home() / ".cache" / "claude-lnt" / "runtime")
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(path, 0o700)
+            return path
+        except OSError:
+            continue
+    raise RuntimeError("Cannot create a writable Leave No Trace runtime directory")
+
+
+def log_root() -> Path:
+    path = Path.home() / ".cache" / "claude-lnt" / "logs"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
+
+
+def safe_key(session_id: str) -> str:
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
+
+
+def state_dir(session_id: str) -> Path:
+    return runtime_root() / safe_key(session_id)
+
+
+def unit_name(session_id: str) -> str:
+    return f"claude-lnt-watch-{safe_key(session_id)[:16]}"
+
+
+def read_json_stdin() -> dict[str, Any]:
+    raw = sys.stdin.read()
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def current_session(data: dict[str, Any] | None = None) -> str:
+    if data:
+        value = data.get("session_id")
+        if isinstance(value, str) and value:
+            return value
+    value = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not value:
+        raise RuntimeError("CLAUDE_CODE_SESSION_ID is unavailable")
+    return value
+
+
+def proc_stat(pid: int) -> tuple[int, int] | None:
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+        rest = text[text.rfind(")") + 2 :].split()
+        return int(rest[1]), int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_start(pid: int) -> int | None:
+    value = proc_stat(pid)
+    return value[1] if value else None
+
+
+def proc_ppid(pid: int) -> int | None:
+    value = proc_stat(pid)
+    return value[0] if value else None
+
+
+def proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
+def proc_env(pid: int) -> dict[str, str]:
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    result: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, value = item.split(b"=", 1)
+        result[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return result
+
+
+def ancestors(pid: int) -> set[int]:
+    result: set[int] = set()
+    current = pid
+    while current > 1 and current not in result:
+        result.add(current)
+        parent = proc_ppid(current)
+        if parent is None or parent == current:
+            break
+        current = parent
+    return result
+
+
+def process_matches(pid: int, session_id: str) -> tuple[bool, dict[str, str]]:
+    env = proc_env(pid)
+    matched = (
+        env.get("CLAUDE_CODE_SESSION_ID") == session_id
+        and env.get("CLAUDE_CODE_CHILD_SESSION") == "1"
+        and env.get("CLAUDE_LNT_INTERNAL") != "1"
+    )
+    return matched, env
+
+
+def load_json(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def save_json(path: Path, value: Any) -> None:
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.chmod(temp, 0o600)
+    temp.replace(path)
+
+
+def append_log(session_id: str, message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    with (log_root() / f"{safe_key(session_id)}.log").open("a") as handle:
+        handle.write(f"{timestamp} {message}\n")
+
+
+def metadata(session_id: str) -> dict[str, Any]:
+    return load_json(state_dir(session_id) / "meta.json", {})
+
+
+def live_same_process(pid: int, expected_start: int | None) -> bool:
+    if pid <= 1 or not Path(f"/proc/{pid}").exists():
+        return False
+    if expected_start is None:
+        return True
+    return proc_start(pid) == expected_start
+
+
+def lease_records(session_id: str) -> dict[str, Any]:
+    value = load_json(state_dir(session_id) / "leases.json", {})
+    return value if isinstance(value, dict) else {}
+
+
+def active_lease_ids(session_id: str) -> set[str]:
+    now = time.time()
+    records = lease_records(session_id)
+    return {
+        lease_id
+        for lease_id, item in records.items()
+        if isinstance(item, dict) and float(item.get("expires", 0)) > now
+    }
+
+
+def process_is_leased(env: dict[str, str], active_ids: set[str]) -> bool:
+    lease_id = env.get("CLAUDE_LNT_LEASE_ID")
+    return bool(lease_id and lease_id in active_ids)
+
+
+def find_owned_processes(
+    session_id: str,
+    *,
+    detached_only: bool,
+    ignore_leases: bool,
+) -> list[tuple[int, str, dict[str, str]]]:
+    meta = metadata(session_id)
+    claude_pid = int(meta.get("claude_pid", 0) or 0)
+    protected = ancestors(os.getpid())
+    protected.add(claude_pid)
+    active_ids = set() if ignore_leases else active_lease_ids(session_id)
+    found: list[tuple[int, str, dict[str, str]]] = []
+
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in protected:
+            continue
+        matched, env = process_matches(pid, session_id)
+        if not matched or process_is_leased(env, active_ids):
+            continue
+        if detached_only and claude_pid in ancestors(pid):
+            continue
+        command = proc_cmdline(pid)
+        if not command or LNT_MARKER in command:
+            continue
+        found.append((pid, command, env))
+    return found
+
+
+def profile_dirs_from_commands(commands: list[str]) -> set[Path]:
+    result: set[Path] = set()
+    for command in commands:
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            parts = command.split()
+        index = 0
+        while index < len(parts):
+            token = parts[index]
+            value = ""
+            if token.startswith("--user-data-dir="):
+                value = token.split("=", 1)[1]
+            elif token == "--user-data-dir" and index + 1 < len(parts):
+                index += 1
+                value = parts[index]
+            if value:
+                path = Path(os.path.expandvars(os.path.expanduser(value)))
+                if path.is_absolute():
+                    result.add(path)
+            index += 1
+    return result
+
+
+def scope_for_pid(pid: int) -> str:
+    try:
+        text = Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return ""
+    match = re.search(r"snap\.chromium\.chromium-[^/\n]+\.scope", text)
+    return match.group(0) if match else ""
+
+
+def stop_snap_scopes(processes: list[tuple[int, str, dict[str, str]]], session_id: str) -> None:
+    if not shutil.which("systemctl"):
+        return
+    scopes: set[str] = set()
+    for pid, command, _ in processes:
+        if "--headless=new" not in command or "--type=" in command:
+            continue
+        if "chrome_crashpad_handler" in command:
+            continue
+        scope = scope_for_pid(pid)
+        if scope:
+            scopes.add(scope)
+    for scope in sorted(scopes):
+        result = subprocess.run(
+            ["systemctl", "--user", "stop", scope],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        append_log(session_id, f"stop scope {scope}: rc={result.returncode} {result.stderr.strip()}")
+
+
+def terminate_processes(processes: list[tuple[int, str, dict[str, str]]], session_id: str) -> None:
+    pids = {pid for pid, _, _ in processes}
+    ordered = sorted(pids, key=lambda pid: len(ancestors(pid)), reverse=True)
+    for pid in ordered:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError) as exc:
+            append_log(session_id, f"SIGTERM {pid}: {exc}")
+    deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while time.monotonic() < deadline and any(Path(f"/proc/{pid}").exists() for pid in pids):
+        time.sleep(0.1)
+    for pid in ordered:
+        if not Path(f"/proc/{pid}").exists():
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError) as exc:
+            append_log(session_id, f"SIGKILL {pid}: {exc}")
+
+
+def safe_remove_profile(path: Path, session_id: str) -> bool:
+    try:
+        resolved = path.resolve()
+        info = resolved.stat()
+    except OSError:
+        return True
+    meta = metadata(session_id)
+    start_epoch = float(meta.get("start_epoch", 0) or 0)
+    cwd = Path(str(meta.get("cwd", "/"))).resolve()
+    home = Path.home().resolve()
+    tmp_root = (state_dir(session_id) / "tmp").resolve()
+    if resolved in {Path("/"), home, cwd} or info.st_uid != os.getuid():
+        return False
+    recent = max(info.st_ctime, info.st_mtime) >= start_epoch - 2
+    in_tmp = resolved == tmp_root or tmp_root in resolved.parents
+    if not in_tmp and not recent:
+        return False
+    try:
+        if resolved.is_dir():
+            shutil.rmtree(resolved)
+        else:
+            resolved.unlink()
+        append_log(session_id, f"removed profile {resolved}")
+        return True
+    except OSError as exc:
+        append_log(session_id, f"remove profile {resolved}: {exc}")
+        return False
+
+
+def run_registered_cleanup(session_id: str) -> list[str]:
+    directory = state_dir(session_id) / "cleanup.d"
+    failures: list[str] = []
+    if not directory.exists():
+        return failures
+    for path in sorted(directory.glob("*.json"), reverse=True):
+        item = load_json(path, {})
+        cwd = str(metadata(session_id).get("cwd", Path.home()))
+        env = os.environ.copy()
+        env.pop("CLAUDE_CODE_CHILD_SESSION", None)
+        env["CLAUDE_LNT_INTERNAL"] = "1"
+        try:
+            if isinstance(item.get("argv"), list):
+                result = subprocess.run(
+                    [str(value) for value in item["argv"]],
+                    cwd=cwd if Path(cwd).is_dir() else None,
+                    env=env,
+                    timeout=30,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            elif isinstance(item.get("shell"), str):
+                result = subprocess.run(
+                    ["bash", "-lc", item["shell"]],
+                    cwd=cwd if Path(cwd).is_dir() else None,
+                    env=env,
+                    timeout=30,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            else:
+                failures.append(f"invalid cleanup entry {path.name}")
+                continue
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            failures.append(f"{path.name}: {exc}")
+            continue
+        append_log(session_id, f"cleanup {path.name}: rc={result.returncode} {result.stdout.strip()}")
+        if result.returncode == 0:
+            path.unlink(missing_ok=True)
+        else:
+            failures.append(f"{path.name}: exit {result.returncode}")
+    return failures
+
+
+def cleanup(
+    session_id: str,
+    *,
+    detached_only: bool,
+    ignore_leases: bool,
+    run_registry: bool,
+) -> list[str]:
+    processes = find_owned_processes(
+        session_id,
+        detached_only=detached_only,
+        ignore_leases=ignore_leases,
+    )
+    commands = [command for _, command, _ in processes]
+    profile_dirs = profile_dirs_from_commands(commands)
+    if processes:
+        append_log(session_id, f"cleanup found {len(processes)} owned process(es)")
+        stop_snap_scopes(processes, session_id)
+        processes = find_owned_processes(
+            session_id,
+            detached_only=detached_only,
+            ignore_leases=ignore_leases,
+        )
+        terminate_processes(processes, session_id)
+
+    failures = run_registered_cleanup(session_id) if run_registry else []
+    for path in profile_dirs:
+        if not safe_remove_profile(path, session_id):
+            failures.append(f"profile not removed safely: {path}")
+
+    if not detached_only:
+        tmp_root = state_dir(session_id) / "tmp"
+        try:
+            shutil.rmtree(tmp_root)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            failures.append(f"temporary directory {tmp_root}: {exc}")
+
+    residual = find_owned_processes(
+        session_id,
+        detached_only=detached_only,
+        ignore_leases=ignore_leases,
+    )
+    failures.extend(f"process {pid}: {command}" for pid, command, _ in residual)
+    return failures
+
+
+def stop_watchdog(session_id: str) -> None:
+    state = state_dir(session_id)
+    if shutil.which("systemctl"):
+        subprocess.run(
+            ["systemctl", "--user", "stop", unit_name(session_id)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    watcher_pid = load_json(state / "watcher.json", {}).get("pid")
+    if isinstance(watcher_pid, int) and watcher_pid != os.getpid():
+        try:
+            os.kill(watcher_pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def start_watchdog(session_id: str, claude_pid: int, claude_start: int | None) -> None:
+    if os.environ.get("CLAUDE_LNT_DISABLE_WATCHDOG") == "1" or claude_pid <= 1:
+        return
+    if shutil.which("systemctl"):
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit_name(session_id)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if active.returncode == 0:
+            return
+    script = str(Path(__file__).resolve())
+    args = [sys.executable, script, "watch", session_id, str(claude_pid), str(claude_start or 0)]
+    env = os.environ.copy()
+    for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_PID"):
+        env.pop(key, None)
+    env["CLAUDE_LNT_INTERNAL"] = "1"
+    if shutil.which("systemd-run") and shutil.which("systemctl"):
+        result = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--collect",
+                f"--unit={unit_name(session_id)}",
+                "--property=Type=exec",
+                "--property=TimeoutStopSec=10s",
+                "/usr/bin/env",
+                "-u",
+                "CLAUDE_CODE_SESSION_ID",
+                "-u",
+                "CLAUDE_CODE_CHILD_SESSION",
+                "-u",
+                "CLAUDE_PID",
+                "CLAUDE_LNT_INTERNAL=1",
+                *args,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+    process = subprocess.Popen(
+        args,
+        env=env,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    save_json(state_dir(session_id) / "watcher.json", {"pid": process.pid})
+
+
+def sweep_stale_states() -> None:
+    for path in runtime_root().iterdir():
+        if not path.is_dir():
+            continue
+        meta = load_json(path / "meta.json", {})
+        session_id = meta.get("session_id")
+        pid = int(meta.get("claude_pid", 0) or 0)
+        start = meta.get("claude_start")
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        if live_same_process(pid, int(start) if isinstance(start, int) else None):
+            continue
+        failures = cleanup(
+            session_id,
+            detached_only=False,
+            ignore_leases=True,
+            run_registry=True,
+        )
+        if not failures:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def hook_start() -> int:
+    data = read_json_stdin()
+    session_id = current_session(data)
+    sweep_stale_states()
+    state = state_dir(session_id)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state / "cleanup.d").mkdir(exist_ok=True, mode=0o700)
+    (state / "tmp").mkdir(exist_ok=True, mode=0o700)
+    claude_pid = int(os.environ.get("CLAUDE_PID", "0") or 0)
+    claude_start = proc_start(claude_pid)
+    existing = metadata(session_id)
+    same_process = (
+        int(existing.get("claude_pid", 0) or 0) == claude_pid
+        and existing.get("claude_start") == claude_start
+        and live_same_process(claude_pid, claude_start)
+    )
+    meta = {
+        "session_id": session_id,
+        "cwd": str(data.get("cwd") or os.getcwd()),
+        "start_epoch": existing.get("start_epoch", time.time()) if same_process else time.time(),
+        "claude_pid": claude_pid,
+        "claude_start": claude_start,
+    }
+    save_json(state / "meta.json", meta)
+    env_file = os.environ.get("CLAUDE_ENV_FILE")
+    if env_file:
+        with Path(env_file).open("a") as handle:
+            handle.write(f"\n# claude-lnt:{safe_key(session_id)}\n")
+            handle.write(f"export CLAUDE_LNT_STATE={shlex.quote(str(state))}\n")
+            handle.write(f"export TMPDIR={shlex.quote(str(state / 'tmp'))}\n")
+    if not same_process:
+        start_watchdog(session_id, claude_pid, meta["claude_start"])
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": (
+                        "Leave No Trace automation is active. Use claude-lnt-start for any "
+                        "process that must span tool calls and claude-lnt-register before "
+                        "an external mutation that needs a custom rollback."
+                    ),
+                }
+            }
+        )
+    )
+    return 0
+
+
+def hook_guard() -> int:
+    data = read_json_stdin()
+    if data.get("tool_name") != "Bash":
+        return 0
+    tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return 0
+    command = str(tool_input.get("command", ""))
+    background = bool(tool_input.get("run_in_background"))
+    safe_wrapper = "claude-lnt-start" in command
+    self_cleaning = bool(
+        re.search(r"\btrap\b.*\b(EXIT|INT|TERM)\b", command, re.S)
+        and re.search(r"\bwait\b", command)
+    )
+    raw_detach = bool(
+        background
+        or re.search(r"(^|[;&|]\s*)nohup\b", command)
+        or re.search(r"\bdisown\b", command)
+        or re.search(r"(^|[;&|]\s*)setsid\b", command)
+        or re.search(r"(?<![>&])&\s*(?:$|[;\n])", command)
+    )
+    if raw_detach and not safe_wrapper and not self_cleaning:
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Unregistered detached process blocked by Leave No Trace. "
+                            "Use claude-lnt-start --ttl <seconds> -- <command>, or keep the "
+                            "process in this tool call with trap-based cleanup and wait."
+                        ),
+                    }
+                }
+            )
+        )
+    return 0
+
+
+def hook_cleanup(action: str) -> int:
+    data = read_json_stdin()
+    session_id = current_session(data)
+    detached_only = action == "sweep"
+    failures = cleanup(
+        session_id,
+        detached_only=detached_only,
+        ignore_leases=not detached_only,
+        run_registry=not detached_only,
+    )
+    event = str(data.get("hook_event_name", ""))
+    if event == "SessionEnd":
+        stop_watchdog(session_id)
+        if not failures:
+            shutil.rmtree(state_dir(session_id), ignore_errors=True)
+    if failures:
+        message = "; ".join(failures[:8])
+        append_log(session_id, f"residual: {message}")
+        if event == "Stop" and not bool(data.get("stop_hook_active")):
+            print(
+                json.dumps(
+                    {
+                        "decision": "block",
+                        "reason": (
+                            "Leave No Trace cleanup found residual session-owned resources: "
+                            f"{message}. Clean them and rerun claude-lnt-status before completing."
+                        ),
+                    }
+                )
+            )
+    return 0
+
+
+def watch(session_id: str, claude_pid: int, claude_start: int | None) -> int:
+    deadline = time.monotonic() + MAX_WATCH_SECONDS
+    while time.monotonic() < deadline and live_same_process(claude_pid, claude_start):
+        cleanup(
+            session_id,
+            detached_only=True,
+            ignore_leases=False,
+            run_registry=False,
+        )
+        time.sleep(POLL_SECONDS)
+    failures = cleanup(
+        session_id,
+        detached_only=False,
+        ignore_leases=True,
+        run_registry=True,
+    )
+    if not failures:
+        shutil.rmtree(state_dir(session_id), ignore_errors=True)
+    return 0
+
+
+def register_cleanup(args: argparse.Namespace) -> int:
+    session_id = current_session()
+    directory = state_dir(session_id) / "cleanup.d"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.shell is not None:
+        item: dict[str, Any] = {"shell": args.shell}
+    elif args.command:
+        item = {"argv": args.command}
+    else:
+        raise RuntimeError("Provide a cleanup command after -- or use --shell")
+    name = f"{time.time_ns():020d}-{uuid.uuid4().hex[:8]}.json"
+    save_json(directory / name, item)
+    print(f"Registered cleanup: {name}")
+    return 0
+
+
+def start_process(args: argparse.Namespace) -> int:
+    session_id = current_session()
+    if not args.command:
+        raise RuntimeError("Provide a command after --")
+    state = state_dir(session_id)
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    (state / "tmp").mkdir(exist_ok=True, mode=0o700)
+    lease_id = uuid.uuid4().hex
+    env = os.environ.copy()
+    env["CLAUDE_CODE_SESSION_ID"] = session_id
+    env["CLAUDE_CODE_CHILD_SESSION"] = "1"
+    env["CLAUDE_LNT_LEASE_ID"] = lease_id
+    env["TMPDIR"] = str(state / "tmp")
+    log_path = state / f"process-{lease_id[:12]}.log"
+    log_handle = log_path.open("ab", buffering=0)
+    process = subprocess.Popen(
+        args.command,
+        env=env,
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    records = lease_records(session_id)
+    records[lease_id] = {
+        "pid": process.pid,
+        "start": proc_start(process.pid),
+        "expires": time.time() + args.ttl,
+        "command": args.command,
+        "log": str(log_path),
+    }
+    save_json(state / "leases.json", records)
+    print(f"PID={process.pid} TTL={args.ttl}s LOG={log_path}")
+    return 0
+
+
+def manual_cleanup(args: argparse.Namespace) -> int:
+    session_id = args.session or current_session()
+    failures = cleanup(
+        session_id,
+        detached_only=False,
+        ignore_leases=True,
+        run_registry=True,
+    )
+    if failures:
+        print("Residual resources:")
+        for item in failures:
+            print(f"- {item}")
+        return 1
+    print(f"Clean: {session_id}")
+    return 0
+
+
+def status(args: argparse.Namespace) -> int:
+    session_id = args.session or current_session()
+    processes = find_owned_processes(
+        session_id,
+        detached_only=False,
+        ignore_leases=False,
+    )
+    state = state_dir(session_id)
+    entries = list((state / "cleanup.d").glob("*.json")) if (state / "cleanup.d").exists() else []
+    print(f"Session: {session_id}")
+    print(f"State: {state}")
+    print(f"Owned unleased processes: {len(processes)}")
+    for pid, command, _ in processes:
+        print(f"  {pid} {command}")
+    print(f"Registered cleanups: {len(entries)}")
+    return 1 if processes else 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser()
+    sub = result.add_subparsers(dest="action", required=True)
+    for name in ("hook-start", "hook-guard", "hook-sweep", "hook-cleanup"):
+        sub.add_parser(name)
+    watch_parser = sub.add_parser("watch")
+    watch_parser.add_argument("session")
+    watch_parser.add_argument("claude_pid", type=int)
+    watch_parser.add_argument("claude_start", type=int)
+    register_parser = sub.add_parser("register")
+    register_parser.add_argument("--shell")
+    register_parser.add_argument("command", nargs=argparse.REMAINDER)
+    start_parser = sub.add_parser("start")
+    start_parser.add_argument("--ttl", type=int, default=300)
+    start_parser.add_argument("command", nargs=argparse.REMAINDER)
+    cleanup_parser = sub.add_parser("cleanup")
+    cleanup_parser.add_argument("session", nargs="?")
+    status_parser = sub.add_parser("status")
+    status_parser.add_argument("session", nargs="?")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.action == "hook-start":
+            return hook_start()
+        if args.action == "hook-guard":
+            return hook_guard()
+        if args.action == "hook-sweep":
+            return hook_cleanup("sweep")
+        if args.action == "hook-cleanup":
+            return hook_cleanup("cleanup")
+        if args.action == "watch":
+            return watch(args.session, args.claude_pid, args.claude_start or None)
+        if args.action == "register":
+            if args.command and args.command[0] == "--":
+                args.command = args.command[1:]
+            return register_cleanup(args)
+        if args.action == "start":
+            if args.command and args.command[0] == "--":
+                args.command = args.command[1:]
+            if args.ttl < 1 or args.ttl > 86400:
+                raise RuntimeError("--ttl must be between 1 and 86400 seconds")
+            return start_process(args)
+        if args.action == "cleanup":
+            return manual_cleanup(args)
+        if args.action == "status":
+            return status(args)
+    except RuntimeError as exc:
+        print(f"claude-lnt: {exc}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
