@@ -15,12 +15,14 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from pathlib import Path
@@ -2524,6 +2526,795 @@ def test_service_umask() -> None:
         assert_no_review_residue(f"claude-codex-review-{process.pid}-")
 
 
+@test("an unexpired lease survives a turn boundary but not the session end")
+def test_lease_survives_stop() -> None:
+    """claude-lnt-start exists for work that spans tool calls."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_leases",
+    )
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-lease"
+    state = hook.private_dir(hook.state_dir(session))
+    hook.private_dir(state / "tmp")
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+
+    # Working data the leased process depends on. Surviving the turn without
+    # it would not be a meaningful promise.
+    sentinel = state / "tmp" / "sentinel"
+    sentinel.write_text("working data")
+
+    lease = "test-lease-identifier"
+    environment = os.environ.copy()
+    environment["CLAUDE_CODE_SESSION_ID"] = session
+    environment["CLAUDE_CODE_CHILD_SESSION"] = "1"
+    environment["CLAUDE_LNT_LEASE_ID"] = lease
+    environment.pop("CLAUDE_LNT_INTERNAL", None)
+
+    leased = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        env=environment,
+        start_new_session=True,
+    )
+
+    def run_cleanup(event: str) -> None:
+        payload = json.dumps({"session_id": session, "hook_event_name": event})
+        subprocess.run(
+            [
+                sys.executable,
+                str(KIT_DIR / "global" / "hooks" / "leave-no-trace.py"),
+                "hook-cleanup",
+            ],
+            input=payload,
+            env={
+                **os.environ,
+                "CLAUDE_LNT_DISABLE_WATCHDOG": "1",
+                # The hook runs in a fresh interpreter, so an in-process
+                # stub cannot reach it. Without this the real sweep would
+                # delete real profiles from the real /tmp.
+                "CLAUDE_LNT_SKIP_PROFILE_SWEEP": "1",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    try:
+        hook.save_json(
+            state / "leases.json",
+            {
+                lease: {
+                    "pid": leased.pid,
+                    "start": hook.proc_start(leased.pid),
+                    "expires": time.time() + 600,
+                    "command": ["sleep"],
+                }
+            },
+        )
+
+        run_cleanup("Stop")
+        time.sleep(0.5)
+        require(
+            leased.poll() is None,
+            "a leased process was killed at the end of a turn, which is "
+            "exactly what claude-lnt-start promises will not happen",
+        )
+        require(
+            sentinel.exists(),
+            "the leased process survived but its temporary directory was "
+            "cleared underneath it, so it lost its sockets and working data",
+        )
+
+        run_cleanup("SessionEnd")
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and leased.poll() is None:
+            time.sleep(0.1)
+        require(
+            leased.poll() is not None,
+            "a leased process survived the end of the session",
+        )
+        require(
+            not sentinel.exists(),
+            "session temporary data outlived the session",
+        )
+    finally:
+        if leased.poll() is None:
+            leased.kill()
+        leased.wait(timeout=30)
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("a lease expiring mid-cleanup never strands a live process without data")
+def test_lease_expiry_during_cleanup() -> None:
+    """The process and its working directory must be decided together.
+
+    Sampling the leases twice let an expiry between the two spare the
+    process on the first check and delete its directory on the second,
+    leaving it alive and broken.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_expiry",
+    )
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-expiry"
+    state = hook.private_dir(hook.state_dir(session))
+    hook.private_dir(state / "tmp")
+    hook.private_dir(state / "cleanup.d")
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+
+    sentinel = state / "tmp" / "sentinel"
+    sentinel.write_text("working data")
+
+    lease = "expiring-lease"
+    environment = os.environ.copy()
+    environment["CLAUDE_CODE_SESSION_ID"] = session
+    environment["CLAUDE_CODE_CHILD_SESSION"] = "1"
+    environment["CLAUDE_LNT_LEASE_ID"] = lease
+    environment.pop("CLAUDE_LNT_INTERNAL", None)
+
+    leased = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)"],
+        env=environment,
+        start_new_session=True,
+    )
+
+    try:
+        # Expires while the registered cleanup below is still running.
+        hook.save_json(
+            state / "leases.json",
+            {
+                lease: {
+                    "pid": leased.pid,
+                    "start": hook.proc_start(leased.pid),
+                    "expires": time.time() + 0.5,
+                    "command": ["sleep"],
+                }
+            },
+        )
+        # A rollback that destroys exactly what the leased process depends
+        # on. It must not run while that process is still alive.
+        hook.save_json(
+            state / "cleanup.d" / "00000000000000000001-slow.json",
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    f"import os, time; time.sleep(2); os.unlink({str(sentinel)!r})",
+                ]
+            },
+        )
+
+        subprocess.run(
+            [
+                sys.executable,
+                str(KIT_DIR / "global" / "hooks" / "leave-no-trace.py"),
+                "hook-cleanup",
+            ],
+            input=json.dumps(
+                {"session_id": session, "hook_event_name": "Stop"}
+            ),
+            env={
+                **os.environ,
+                "CLAUDE_LNT_DISABLE_WATCHDOG": "1",
+                # The hook runs in a fresh interpreter, so an in-process
+                # stub cannot reach it. Without this the real sweep would
+                # delete real profiles from the real /tmp.
+                "CLAUDE_LNT_SKIP_PROFILE_SWEEP": "1",
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        time.sleep(0.5)
+
+        alive = leased.poll() is None
+        kept = sentinel.exists()
+        require(
+            alive == kept,
+            "the process and its working directory disagreed: alive="
+            f"{alive} data_kept={kept}. A process must never be left running "
+            "without the directory it depends on.",
+        )
+    finally:
+        if leased.poll() is None:
+            leased.kill()
+        leased.wait(timeout=30)
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("a lease follows the work when its launcher daemonises")
+def test_lease_survives_daemonising_launcher() -> None:
+    """The lease belongs to the work, not to one process.
+
+    Requiring the recorded process to be alive would kill a descendant that
+    outlived the launcher which started it, well before its term expired.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_daemon",
+    )
+
+    session = f"kit-tests-{os.getpid()}-daemon"
+    state = hook.private_dir(hook.state_dir(session))
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+
+    environment = os.environ.copy()
+    environment["CLAUDE_CODE_SESSION_ID"] = session
+    environment["CLAUDE_CODE_CHILD_SESSION"] = "1"
+    environment["CLAUDE_LNT_LEASE_ID"] = "daemon-lease"
+    environment.pop("CLAUDE_LNT_INTERNAL", None)
+
+    launcher = subprocess.Popen(
+        ["sh", "-c", "sleep 120 & echo $!"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    child = int(launcher.stdout.readline().strip())
+    launcher.wait(timeout=30)
+
+    children = [child]
+    try:
+        hook.save_json(
+            state / "leases.json",
+            {
+                "daemon-lease": {
+                    "pid": launcher.pid,
+                    "start": 1,
+                    "expires": time.time() + 300,
+                    "command": ["sh"],
+                }
+            },
+        )
+
+        require(
+            Path(f"/proc/{child}").exists(), "the fixture child did not survive"
+        )
+        require(
+            "daemon-lease" in hook.active_lease_ids(session),
+            "the lease lapsed when its launcher exited, so a descendant "
+            "still doing the work would be killed before its term",
+        )
+
+        owned = hook.find_owned_processes(
+            session, detached_only=False, ignore_leases=False
+        )
+        require(
+            not any(pid == child for pid, _, _ in owned),
+            "the surviving descendant was selected for termination",
+        )
+
+        # Repeated with no settling delay, which is the window in which a
+        # child part way through exec has an unreadable environment. Reading
+        # /proc twice would classify it as unleased and then as owned.
+        #
+        # Each iteration gets its own session and its own lease, so the only
+        # thing that can make the raced child look leased is observing that
+        # child. Sharing a session with an already-visible holder would make
+        # the test pass under the old two-scan behaviour.
+        for index in range(8):
+            racing_session = f"{session}-race-{index}"
+            racing_state = hook.private_dir(hook.state_dir(racing_session))
+            hook.save_json(
+                racing_state / "meta.json",
+                {
+                    "session_id": racing_session,
+                    "cwd": str(KIT_DIR),
+                    "claude_pid": os.getpid(),
+                },
+            )
+
+            racing_environment = os.environ.copy()
+            racing_environment["CLAUDE_CODE_SESSION_ID"] = racing_session
+            racing_environment["CLAUDE_CODE_CHILD_SESSION"] = "1"
+            racing_environment["CLAUDE_LNT_LEASE_ID"] = "raced-lease"
+            racing_environment.pop("CLAUDE_LNT_INTERNAL", None)
+
+            racing = subprocess.Popen(
+                ["sh", "-c", "sleep 60 & echo $!"],
+                env=racing_environment,
+                stdout=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            raced = int(racing.stdout.readline().strip())
+            racing.wait(timeout=30)
+            children.append(raced)
+
+            hook.save_json(
+                racing_state / "leases.json",
+                {
+                    "raced-lease": {
+                        "pid": racing.pid,
+                        "start": 1,
+                        "expires": time.time() + 300,
+                        "command": ["sh"],
+                    }
+                },
+            )
+
+            try:
+                active = hook.active_lease_ids(racing_session)
+                owned = hook.find_owned_processes(
+                    racing_session,
+                    detached_only=False,
+                    ignore_leases=False,
+                    active_ids=active,
+                )
+                require(
+                    not any(pid == raced for pid, _, _ in owned),
+                    f"iteration {index}: a leased descendant was selected "
+                    "for termination while its exec was still in flight",
+                )
+            finally:
+                shutil.rmtree(
+                    hook.state_dir(racing_session), ignore_errors=True
+                )
+    finally:
+        for pid in children:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("cleanup of an unknown session is a no-op, not an error")
+def test_cleanup_absent_session() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(KIT_DIR / "global" / "hooks" / "leave-no-trace.py"),
+            "cleanup",
+            f"absent-{os.getpid()}",
+        ],
+        env={**os.environ, "CLAUDE_LNT_SKIP_PROFILE_SWEEP": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    require(
+        result.returncode == 0,
+        f"cleanup of an absent session failed: {result.stderr.strip()}",
+    )
+    require(
+        "Clean" in result.stdout,
+        f"unexpected output: {result.stdout.strip()!r}",
+    )
+
+
+@test("lock files are reclaimed rather than accumulating per session")
+def test_lock_files_reclaimed() -> None:
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_lockgc",
+    )
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-lockgc"
+    lock = hook.session_lock_path(session)
+
+    try:
+        with hook.session_lock(session):
+            pass
+        require(lock.exists(), "the fixture did not create a lock")
+
+        # A crashed session leaves its lock behind; nothing holds it now.
+        hook.sweep_orphan_locks()
+        require(
+            not lock.exists(),
+            "an unheld lock for a session with no state was not reclaimed",
+        )
+
+        # A lock somebody is holding must survive the sweep.
+        held = f"{session}-held"
+        with hook.session_lock(held):
+            hook.sweep_orphan_locks()
+            require(
+                hook.session_lock_path(held).exists(),
+                "the sweep reclaimed a lock that was actively held",
+            )
+        hook.sweep_orphan_locks()
+
+        # A normal end of session takes its own lock with it.
+        ending = f"{session}-ending"
+        hook.private_dir(hook.state_dir(ending))
+        hook.save_json(
+            hook.state_dir(ending) / "meta.json",
+            {"session_id": ending, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+        )
+        hook.scan_session_processes = lambda session_id: []
+        hook.cleanup(
+            ending,
+            detached_only=False,
+            ignore_leases=True,
+            run_registry=False,
+            remove_state=True,
+        )
+        require(
+            not hook.session_lock_path(ending).exists(),
+            "a completed session left its lock behind",
+        )
+    finally:
+        for name in (session, f"{session}-held", f"{session}-ending"):
+            hook.session_lock_path(name).unlink(missing_ok=True)
+            shutil.rmtree(hook.state_dir(name), ignore_errors=True)
+
+
+@test("the session lock outlives the directory it protects")
+def test_lock_outside_session_state() -> None:
+    """A lock inside the session directory cannot serialise its own removal.
+
+    Two cases it has to survive: a first launch racing a cleanup before the
+    directory exists at all, and a launch racing the removal at SessionEnd.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_lockfile",
+    )
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    class Arguments:
+        command = ["sleep", "60"]
+        ttl = 300
+
+    saved_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    launched: list[int] = []
+    sessions: list[str] = []
+
+    try:
+        # The lock file must not live under the session directory.
+        probe = f"kit-tests-{os.getpid()}-lockfile"
+        sessions.append(probe)
+        with hook.session_lock(probe):
+            pass
+        require(
+            not (hook.state_dir(probe) / ".lock").exists(),
+            "the lock is inside the directory whose removal it serialises",
+        )
+
+        # A first launch, with no session directory yet, racing a cleanup.
+        fresh = f"kit-tests-{os.getpid()}-firstlaunch"
+        sessions.append(fresh)
+        started = threading.Event()
+        original_records = hook.lease_records
+
+        def slow_records(session_id: str) -> Any:
+            started.set()
+            time.sleep(1.0)
+            return original_records(session_id)
+
+        def launch() -> None:
+            hook.lease_records = slow_records
+            os.environ["CLAUDE_CODE_SESSION_ID"] = fresh
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    hook.start_process(Arguments())
+            finally:
+                hook.lease_records = original_records
+
+        thread = threading.Thread(target=launch)
+        thread.start()
+        require(started.wait(timeout=30), "the launch never reached its lease")
+        hook.cleanup(
+            fresh,
+            detached_only=False,
+            ignore_leases=False,
+            run_registry=False,
+        )
+        thread.join(timeout=60)
+
+        records = hook.lease_records(fresh)
+        require(records, "the first launch recorded no lease")
+        pid = next(iter(records.values()))["pid"]
+        launched.append(pid)
+        require(
+            Path(f"/proc/{pid}").exists(),
+            "a cleanup ran unlocked because the session directory did not "
+            "exist yet, and killed the launch it raced",
+        )
+    finally:
+        if saved_session is None:
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        else:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = saved_session
+        for pid in launched:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+        for name in sessions:
+            shutil.rmtree(hook.state_dir(name), ignore_errors=True)
+
+
+@test("a launch in flight is not killed by a concurrent cleanup")
+def test_launch_survives_concurrent_cleanup() -> None:
+    """The window between Popen and recording the lease must be covered."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_launch",
+    )
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-launch"
+    state = hook.private_dir(hook.state_dir(session))
+    hook.private_dir(state / "tmp")
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+    hook.save_json(state / "leases.json", {})
+
+    class Arguments:
+        command = ["sleep", "60"]
+        ttl = 300
+
+    started = threading.Event()
+    original_records = hook.lease_records
+
+    def slow_records(session_id: str) -> Any:
+        started.set()
+        time.sleep(1.0)
+        return original_records(session_id)
+
+    def launch() -> None:
+        hook.lease_records = slow_records
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                hook.start_process(Arguments())
+        finally:
+            hook.lease_records = original_records
+
+    saved_session = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    os.environ["CLAUDE_CODE_SESSION_ID"] = session
+    thread = threading.Thread(target=launch)
+    launched: int | None = None
+
+    try:
+        thread.start()
+        require(started.wait(timeout=30), "the launch never reached its lease")
+
+        # Concurrent with the launch, in the window before it is recorded.
+        hook.cleanup(
+            session,
+            detached_only=False,
+            ignore_leases=False,
+            run_registry=False,
+        )
+        thread.join(timeout=60)
+
+        records = hook.lease_records(session)
+        require(records, "the launch recorded no lease")
+        launched = next(iter(records.values()))["pid"]
+        require(
+            Path(f"/proc/{launched}").exists(),
+            "a process was terminated between being launched and having its "
+            "lease recorded, which is the window the lock has to cover",
+        )
+    finally:
+        if saved_session is None:
+            os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+        else:
+            os.environ["CLAUDE_CODE_SESSION_ID"] = saved_session
+        if launched:
+            try:
+                os.kill(launched, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("a lease cannot be granted inside the teardown window")
+def test_lease_creation_serialises_with_teardown() -> None:
+    """Otherwise a new holder is left with the directory just removed."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_lock",
+    )
+    hook.run_registered_cleanup = lambda session: []
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+    hook.scan_session_processes = lambda session: []
+
+    session = f"kit-tests-{os.getpid()}-lock"
+    state = hook.private_dir(hook.state_dir(session))
+    hook.private_dir(state / "tmp")
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+    hook.save_json(state / "leases.json", {})
+
+    def record_lease() -> None:
+        with hook.session_lock(session):
+            records = hook.lease_records(session)
+            records["new"] = {
+                "pid": 4242,
+                "start": 1,
+                "expires": time.time() + 300,
+                "command": ["worker"],
+            }
+            hook.save_json(state / "leases.json", records)
+
+    writer = threading.Thread(target=record_lease)
+    original_save = hook.save_json
+
+    def save_and_race(path: Path, value: Any) -> None:
+        original_save(path, value)
+        # Start the competing writer exactly inside the teardown window.
+        if path.name == "leases.json" and value == {}:
+            writer.start()
+            time.sleep(0.3)
+
+    hook.save_json = save_and_race
+    try:
+        hook.cleanup(
+            session,
+            detached_only=False,
+            ignore_leases=False,
+            run_registry=True,
+        )
+    finally:
+        hook.save_json = original_save
+        writer.join(timeout=30)
+
+    try:
+        require(
+            "new" in hook.lease_records(session),
+            "the competing lease was lost entirely",
+        )
+        require(
+            (state / "tmp").is_dir(),
+            "a lease was granted whose temporary directory had already been "
+            "removed, so its holder would run with no state",
+        )
+    finally:
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("teardown revokes the leases it invalidates")
+def test_teardown_revokes_leases() -> None:
+    """A lease protects state. Once that state is gone, so is the lease.
+
+    A holder that only becomes visible after its directory was removed must
+    not be spared on every later cleanup, which would leave it running
+    without the state it depends on until its term expired.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_revoke",
+    )
+    hook.run_registered_cleanup = lambda session: []
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-revoke"
+    state = hook.private_dir(hook.state_dir(session))
+    tmp = hook.private_dir(state / "tmp")
+    (tmp / "sentinel").write_text("working data")
+    hook.save_json(
+        state / "meta.json",
+        {"session_id": session, "cwd": str(KIT_DIR), "claude_pid": os.getpid()},
+    )
+    hook.save_json(
+        state / "leases.json",
+        {
+            "late": {
+                "pid": 999999,
+                "start": 1,
+                "expires": time.time() + 600,
+                "command": ["worker"],
+            }
+        },
+    )
+
+    holder = [
+        (
+            4242,
+            "worker",
+            {
+                "CLAUDE_CODE_SESSION_ID": session,
+                "CLAUDE_CODE_CHILD_SESSION": "1",
+                "CLAUDE_LNT_LEASE_ID": "late",
+            },
+        )
+    ]
+
+    def sequence(scans: list[list[Any]]) -> Any:
+        calls = {"n": 0}
+
+        def scan(_session: str) -> list[Any]:
+            index = min(calls["n"], len(scans) - 1)
+            calls["n"] += 1
+            return scans[index]
+
+        return scan
+
+    try:
+        # The holder is invisible until after teardown has happened.
+        hook.scan_session_processes = sequence([[], [], holder])
+        first = hook.cleanup(
+            session,
+            detached_only=False,
+            ignore_leases=False,
+            run_registry=True,
+        )
+        require(
+            not (tmp / "sentinel").exists(),
+            "nothing was torn down, so this does not test revocation",
+        )
+        require(first, "the late holder was not reported after teardown")
+
+        # Now it is visible from the start. Its lease must not come back.
+        hook.scan_session_processes = sequence([holder])
+        second = hook.cleanup(
+            session,
+            detached_only=False,
+            ignore_leases=False,
+            run_registry=True,
+        )
+        require(
+            second,
+            "a holder whose state was already removed was spared again, so "
+            "it would survive untouched for the rest of its term",
+        )
+    finally:
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
+@test("a finished process's lease stops protecting the session directory")
+def test_dead_lease_releases_state() -> None:
+    """Lease records outlive their processes, so expiry alone is not enough."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_dead_lease",
+    )
+
+    session = f"kit-tests-{os.getpid()}-dead-lease"
+    state = hook.private_dir(hook.state_dir(session))
+
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait(timeout=30)
+
+    try:
+        hook.save_json(
+            state / "leases.json",
+            {
+                "long-ttl": {
+                    "pid": finished.pid,
+                    "start": 1,
+                    # An hour of term remaining, but the process is gone.
+                    "expires": time.time() + 3600,
+                    "command": ["true"],
+                }
+            },
+        )
+        require(
+            not hook.active_lease_ids(session),
+            "a lease whose process has exited still counted as active, so it "
+            "would protect the session directory for the rest of its term",
+        )
+    finally:
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+
 @test("orphaned browser profiles are swept but live ones are spared")
 def test_orphan_browser_profiles() -> None:
     hook = load_script(
@@ -2702,6 +3493,98 @@ def test_installer_refuses_self_source() -> None:
                 "model" in path.read_text(),
                 f"the canonical {profile} profile was emptied",
             )
+
+
+@test("the setup guide documents every file in the kit")
+def test_setup_guide_current() -> None:
+    """The previous guide drifted because it duplicated file contents.
+
+    It now references files instead, so this only has to hold the inventory
+    honest: a script nobody documented is a script nobody will find.
+    """
+    guide_path = KIT_DIR / "docs" / "setup-guide.md"
+    require(guide_path.exists(), "docs/setup-guide.md is missing")
+    guide = guide_path.read_text()
+
+    # Whole path tokens, not substrings: "scripts/install" must not be
+    # satisfied by the documented "scripts/install.sh".
+    mentioned = set(re.findall(r"[A-Za-z0-9_.@/-]+", guide))
+
+    # Git's tracked set, not the filesystem: ignored bytecode is not part of
+    # the kit and must not make this fail.
+    tracked = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(KIT_DIR),
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout.split()
+
+    documented: list[str] = []
+    undocumented: list[str] = []
+
+    for relative in sorted(tracked):
+        if Path(relative).name in (".gitignore", "README.md"):
+            continue
+        if KIT_DIR / relative == guide_path:
+            continue
+
+        (documented if relative in mentioned else undocumented).append(relative)
+
+    require(
+        not undocumented,
+        f"not mentioned in docs/setup-guide.md: {undocumented}",
+    )
+    require(len(documented) > 15, f"the guide covers too little: {documented}")
+
+    # Anything the guide names must still exist.
+    for claim in ("scripts/claude-codex-review", "tests/run-tests.py"):
+        require((KIT_DIR / claim).exists(), f"the guide names a missing {claim}")
+
+
+@test("every command the policy names is pre-approved")
+def test_policy_commands_allowed() -> None:
+    """A documented command that stops for approval cannot be used headlessly."""
+    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+    allow = canonical.get("permissions", {}).get("allow", [])
+    prefixes = [
+        rule[len("Bash(") : -len(":*)")]
+        for rule in allow
+        if rule.startswith("Bash(") and rule.endswith(":*)")
+    ]
+
+    policy = (KIT_DIR / "global" / "CLAUDE.md").read_text()
+
+    commands = re.findall(r"`((?:npx|codex|claude-codex-review)[^`]*)`", policy)
+
+    # Fenced blocks too. The screenshot command lives in one, and shell line
+    # continuations have to be folded before it can be matched.
+    for block in re.findall(r"```(?:bash|sh)?\n(.*?)```", policy, re.S):
+        for line in re.sub(r"\\\n\s*", " ", block).splitlines():
+            line = line.strip()
+            if line.startswith(("npx ", "codex ", "claude-codex-review ")):
+                commands.append(line)
+
+    gaps = []
+    for command in commands:
+        command = " ".join(command.split())
+        if not any(command.startswith(prefix) for prefix in prefixes):
+            gaps.append(command)
+
+    require(
+        any(command.startswith("npx ") for command in commands),
+        "the extraction found no npx command, so it is not testing anything",
+    )
+
+    require(not gaps, f"named in the policy but not pre-approved: {gaps}")
 
 
 @test("no call site pins a system browser")

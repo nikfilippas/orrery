@@ -55,6 +55,11 @@ of the wrapper still stops the whole Codex control group.
   companion state, and hooks in one locked, atomic transaction while
   preserving unrelated live settings.
 
+## Documentation
+
+`docs/setup-guide.md` covers installation, routine use, changing models,
+validation, browsers, troubleshooting and maintenance.
+
 ## Tests
 
 ```bash

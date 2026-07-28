@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -249,14 +251,113 @@ def lease_records(session_id: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def active_lease_ids(session_id: str) -> set[str]:
-    now = time.time()
-    records = lease_records(session_id)
+def session_lock_path(session_id: str) -> Path:
+    # Deliberately outside the session directory: a lock inside it would be
+    # destroyed by the very teardown it is meant to serialise, and would not
+    # exist yet when a first launch races a cleanup.
+    return runtime_root() / f".{safe_key(session_id)}.lock"
+
+
+@contextlib.contextmanager
+def session_lock(session_id: str) -> Any:
+    """Serialise lease creation against teardown.
+
+    Without it a lease can be recorded in the window between revoking the
+    old leases and removing the directory the new one would protect, which
+    leaves the new holder running with no state. Both sides take this lock,
+    so teardown completes before a lease is granted, or the other way round.
+    """
+    path = session_lock_path(session_id)
+    with path.open("a+b") as handle:
+        private_file(path)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def scan_session_processes(
+    session_id: str,
+) -> list[tuple[int, str, dict[str, str]]]:
+    """One pass over /proc: this session's processes and their environments.
+
+    Ownership and lease holding have to be decided from the same
+    observation. Reading /proc twice lets a process part way through `exec`,
+    whose environment is briefly unreadable, look unleased to the first read
+    and owned by the second, which is enough to kill work holding a valid
+    lease. Read once, and such a process is simply invisible to both.
+    """
+    found: list[tuple[int, str, dict[str, str]]] = []
+
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+
+        pid = int(entry.name)
+        env = proc_env(pid)
+        if env.get("CLAUDE_CODE_SESSION_ID") != session_id:
+            continue
+
+        found.append((pid, proc_cmdline(pid), env))
+
+    return found
+
+
+def held_lease_ids(
+    snapshot: list[tuple[int, str, dict[str, str]]],
+) -> set[str]:
+    """Lease identifiers carried by a live process in this snapshot."""
     return {
-        lease_id
-        for lease_id, item in records.items()
-        if isinstance(item, dict) and float(item.get("expires", 0)) > now
+        env["CLAUDE_LNT_LEASE_ID"]
+        for _pid, _command, env in snapshot
+        if env.get("CLAUDE_LNT_LEASE_ID")
     }
+
+
+def active_lease_ids(
+    session_id: str,
+    snapshot: list[tuple[int, str, dict[str, str]]] | None = None,
+) -> set[str]:
+    """Leases whose process is still running and whose term has not expired.
+
+    A record is not removed when its process exits, so expiry alone would
+    keep a finished lease protecting the session temporary directory for the
+    rest of its term. The recorded start time distinguishes the process from
+    a later one that reused its identifier.
+    """
+    now = time.time()
+    active: set[str] = set()
+    held: set[str] | None = None
+
+    for lease_id, item in lease_records(session_id).items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            if float(item.get("expires", 0)) <= now:
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        pid = item.get("pid")
+        start = item.get("start")
+        if isinstance(pid, int) and live_same_process(
+            pid, start if isinstance(start, int) else None
+        ):
+            active.add(lease_id)
+            continue
+
+        # The launcher may have daemonised, so the work outlives the process
+        # that was recorded. Its descendants inherit the lease identifier,
+        # and the lease belongs to the work rather than to one process.
+        if held is None:
+            if snapshot is None:
+                snapshot = scan_session_processes(session_id)
+            held = held_lease_ids(snapshot)
+        if lease_id in held:
+            active.add(lease_id)
+
+    return active
 
 
 def process_is_leased(env: dict[str, str], active_ids: set[str]) -> bool:
@@ -269,26 +370,33 @@ def find_owned_processes(
     *,
     detached_only: bool,
     ignore_leases: bool,
+    active_ids: set[str] | None = None,
+    snapshot: list[tuple[int, str, dict[str, str]]] | None = None,
 ) -> list[tuple[int, str, dict[str, str]]]:
     meta = metadata(session_id)
     claude_pid = int(meta.get("claude_pid", 0) or 0)
     protected = ancestors(os.getpid())
     protected.add(claude_pid)
-    active_ids = set() if ignore_leases else active_lease_ids(session_id)
+    if snapshot is None:
+        snapshot = scan_session_processes(session_id)
+    if active_ids is None:
+        active_ids = (
+            set() if ignore_leases else active_lease_ids(session_id, snapshot)
+        )
+
     found: list[tuple[int, str, dict[str, str]]] = []
 
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
+    for pid, command, env in snapshot:
         if pid in protected:
             continue
-        matched, env = process_matches(pid, session_id)
-        if not matched or process_is_leased(env, active_ids):
+        if env.get("CLAUDE_CODE_CHILD_SESSION") != "1":
+            continue
+        if env.get("CLAUDE_LNT_INTERNAL") == "1":
+            continue
+        if process_is_leased(env, active_ids):
             continue
         if detached_only and claude_pid in ancestors(pid):
             continue
-        command = proc_cmdline(pid)
         if not command or LNT_MARKER in command:
             continue
         found.append((pid, command, env))
@@ -348,6 +456,13 @@ def sweep_orphan_browser_profiles(
     session cannot quietly accumulate profiles run after run.
     """
     if roots is None:
+        # This is the one part of cleanup that reaches outside the session's
+        # own state, so it has to be switchable off. A test that drives the
+        # hook in a subprocess cannot patch it, and neither can anyone who
+        # would rather manage the system temporary directory themselves.
+        if os.environ.get("CLAUDE_LNT_SKIP_PROFILE_SWEEP") == "1":
+            return
+
         # The redirected TMPDIR and the real system temporary directory,
         # because a browser that did not inherit the redirection leaks into
         # the latter.
@@ -522,25 +637,96 @@ def cleanup(
     detached_only: bool,
     ignore_leases: bool,
     run_registry: bool,
+    remove_state: bool = False,
 ) -> list[str]:
-    processes = find_owned_processes(
-        session_id,
-        detached_only=detached_only,
-        ignore_leases=ignore_leases,
-    )
+    """Reclaim what a session owns, serialised against lease creation.
+
+    The lock covers the whole of cleanup, not just teardown. Scanning and
+    terminating outside it would let a process launched under the lock be
+    killed before its lease was recorded, and a launch completing between
+    the last scan and the lock would have its brand new lease revoked.
+    """
+    with session_lock(session_id):
+        failures = cleanup_locked(
+            session_id,
+            detached_only=detached_only,
+            ignore_leases=ignore_leases,
+            run_registry=run_registry,
+        )
+
+        # Removing the session directory belongs inside the lock too.
+        # Outside it, a launch could record a lease and start a process
+        # between cleanup finishing and the directory being deleted.
+        if remove_state and not failures:
+            shutil.rmtree(state_dir(session_id), ignore_errors=True)
+            # The lock is reclaimed with the session it belonged to. Held
+            # here, and the session is over, so nothing legitimate is
+            # waiting on it.
+            session_lock_path(session_id).unlink(missing_ok=True)
+
+        return failures
+
+
+def cleanup_locked(
+    session_id: str,
+    *,
+    detached_only: bool,
+    ignore_leases: bool,
+    run_registry: bool,
+) -> list[str]:
+    # Lease protection only ever grows within one cleanup run. Each pass
+    # reads /proc once and derives ownership and lease holding from that same
+    # observation, then adds what it found to the set. A lease that expires
+    # part way through therefore keeps protecting the process it spared and
+    # the directory that process depends on, and a holder that only becomes
+    # visible on a later pass is still honoured. The next cleanup starts
+    # afresh and terminates whatever has genuinely finished.
+    active_ids: set[str] = set()
+    granting = True
+
+    def owned(detached: bool) -> list[tuple[int, str, dict[str, str]]]:
+        snapshot = scan_session_processes(session_id)
+        if not ignore_leases and granting:
+            active_ids.update(active_lease_ids(session_id, snapshot))
+        return find_owned_processes(
+            session_id,
+            detached_only=detached,
+            ignore_leases=ignore_leases,
+            active_ids=active_ids,
+            snapshot=snapshot,
+        )
+
+    processes = owned(detached_only)
     commands = [command for _, command, _ in processes]
     profile_dirs = profile_dirs_from_commands(commands)
     if processes:
         append_log(session_id, f"cleanup found {len(processes)} owned process(es)")
         stop_snap_scopes(processes, session_id)
-        processes = find_owned_processes(
-            session_id,
-            detached_only=detached_only,
-            ignore_leases=ignore_leases,
-        )
+        processes = owned(detached_only)
         terminate_processes(processes, session_id)
 
-    failures = run_registered_cleanup(session_id) if run_registry else []
+    # One more reading before anything is torn down, purely to complete the
+    # lease picture. A holder that only becomes visible now must protect its
+    # own state, so the decision cannot be frozen before this point.
+    owned(detached_only)
+    leased_work_in_progress = bool(active_ids)
+
+    # Lease protection stops being granted here. Once the state a lease
+    # protects has been torn down, sparing a holder that only becomes
+    # visible afterwards would leave it running without the directory it
+    # depends on. It is reported as residual instead, which is the honest
+    # outcome, and the next cleanup terminates it.
+    granting = False
+
+    # While leased work is in progress the session defers teardown as a
+    # whole. Running a registered rollback now could remove exactly what the
+    # surviving process depends on, which is the same mistake as clearing its
+    # temporary directory. Both run once the lease ends or the session does.
+    failures = (
+        run_registered_cleanup(session_id)
+        if run_registry and not leased_work_in_progress
+        else []
+    )
     for path in profile_dirs:
         if not safe_remove_profile(path, session_id):
             failures.append(f"profile not removed safely: {path}")
@@ -548,7 +734,23 @@ def cleanup(
     if not detached_only:
         sweep_orphan_browser_profiles(session_id)
 
+    # A leased process is still using the session temporary directory, so
+    # clearing it would leave that process alive without its sockets,
+    # profiles and working data. Surviving the turn has to mean surviving
+    # intact. The end of the session overrides leases and clears it.
+    if (
+        not detached_only
+        and not leased_work_in_progress
+        and state_dir(session_id).is_dir()
+    ):
+        # Teardown and lease revocation happen together, under the lock that
+        # claude-lnt-start also takes. A lease whose holder was not
+        # observable when its directory was removed is void: nothing is left
+        # for it to protect, so honouring it on a later cleanup would spare a
+        # process whose state is already gone, permanently.
         tmp_root = state_dir(session_id) / "tmp"
+        save_json(state_dir(session_id) / "leases.json", {})
+
         try:
             shutil.rmtree(tmp_root)
         except FileNotFoundError:
@@ -556,20 +758,17 @@ def cleanup(
         except OSError as exc:
             failures.append(f"temporary directory {tmp_root}: {exc}")
 
-        # TMPDIR was exported to this value for the whole session, so the
-        # directory has to outlive its contents. Removing it outright makes
-        # every later mktemp and tempfile call in the session fail. The
-        # state directory as a whole is removed at SessionEnd.
+        # TMPDIR was exported to this value for the whole session, so
+        # the directory has to outlive its contents. Removing it
+        # outright makes every later mktemp and tempfile call in the
+        # session fail. The state directory as a whole goes at
+        # SessionEnd.
         try:
             private_dir(tmp_root)
         except OSError as exc:
             failures.append(f"temporary directory {tmp_root}: {exc}")
 
-    residual = find_owned_processes(
-        session_id,
-        detached_only=detached_only,
-        ignore_leases=ignore_leases,
-    )
+    residual = owned(detached_only)
     failures.extend(f"process {pid}: {command}" for pid, command, _ in residual)
     return failures
 
@@ -611,6 +810,12 @@ def start_watchdog(session_id: str, claude_pid: int, claude_start: int | None) -
         env.pop(key, None)
     env["CLAUDE_LNT_INTERNAL"] = "1"
     if shutil.which("systemd-run") and shutil.which("systemctl"):
+        # A transient unit inherits nothing from this process, so anything
+        # the watchdog must honour has to be passed through explicitly.
+        assignments = ["CLAUDE_LNT_INTERNAL=1"]
+        if os.environ.get("CLAUDE_LNT_SKIP_PROFILE_SWEEP") == "1":
+            assignments.append("CLAUDE_LNT_SKIP_PROFILE_SWEEP=1")
+
         result = subprocess.run(
             [
                 "systemd-run",
@@ -627,7 +832,7 @@ def start_watchdog(session_id: str, claude_pid: int, claude_start: int | None) -
                 "CLAUDE_CODE_CHILD_SESSION",
                 "-u",
                 "CLAUDE_PID",
-                "CLAUDE_LNT_INTERNAL=1",
+                *assignments,
                 *args,
             ],
             stdout=subprocess.DEVNULL,
@@ -647,7 +852,31 @@ def start_watchdog(session_id: str, claude_pid: int, claude_start: int | None) -
     save_json(state_dir(session_id) / "watcher.json", {"pid": process.pid})
 
 
+def sweep_orphan_locks() -> None:
+    """Remove lock files whose session state is gone and which are unheld.
+
+    A crashed session cannot reclaim its own lock. Acquiring it without
+    blocking is what proves nobody is using it.
+    """
+    for path in runtime_root().glob(".*.lock"):
+        key = path.name[1:-len(".lock")]
+        if (runtime_root() / key).is_dir():
+            continue
+
+        try:
+            with path.open("a+b") as handle:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue
+                path.unlink(missing_ok=True)
+        except OSError:
+            continue
+
+
 def sweep_stale_states() -> None:
+    sweep_orphan_locks()
+
     for path in runtime_root().iterdir():
         if not path.is_dir():
             continue
@@ -659,14 +888,13 @@ def sweep_stale_states() -> None:
             continue
         if live_same_process(pid, int(start) if isinstance(start, int) else None):
             continue
-        failures = cleanup(
+        cleanup(
             session_id,
             detached_only=False,
             ignore_leases=True,
             run_registry=True,
+            remove_state=True,
         )
-        if not failures:
-            shutil.rmtree(path, ignore_errors=True)
 
 
 def hook_start() -> int:
@@ -761,18 +989,29 @@ def hook_guard() -> int:
 def hook_cleanup(action: str) -> int:
     data = read_json_stdin()
     session_id = current_session(data)
+    event = str(data.get("hook_event_name", ""))
     detached_only = action == "sweep"
+
+    # A lease is a promise that a process may outlive the tool call that
+    # started it. Overriding leases at the end of every turn made
+    # claude-lnt-start useless for the very thing it exists for, so a lease
+    # that has not expired now survives Stop and PreCompact. Only the end of
+    # the session overrides it, and the watchdog still overrides leases when
+    # Claude itself dies.
+    session_ending = event == "SessionEnd"
+
+    if session_ending:
+        # Stopped first so it cannot recreate state behind the cleanup.
+        stop_watchdog(session_id)
+
     failures = cleanup(
         session_id,
         detached_only=detached_only,
-        ignore_leases=not detached_only,
+        ignore_leases=session_ending,
         run_registry=not detached_only,
+        remove_state=session_ending,
     )
-    event = str(data.get("hook_event_name", ""))
-    if event == "SessionEnd":
-        stop_watchdog(session_id)
-        if not failures:
-            shutil.rmtree(state_dir(session_id), ignore_errors=True)
+
     if failures:
         message = "; ".join(failures[:8])
         append_log(session_id, f"residual: {message}")
@@ -801,14 +1040,13 @@ def watch(session_id: str, claude_pid: int, claude_start: int | None) -> int:
             run_registry=False,
         )
         time.sleep(POLL_SECONDS)
-    failures = cleanup(
+    cleanup(
         session_id,
         detached_only=False,
         ignore_leases=True,
         run_registry=True,
+        remove_state=True,
     )
-    if not failures:
-        shutil.rmtree(state_dir(session_id), ignore_errors=True)
     return 0
 
 
@@ -831,35 +1069,46 @@ def start_process(args: argparse.Namespace) -> int:
     session_id = current_session()
     if not args.command:
         raise RuntimeError("Provide a command after --")
-    state = private_dir(state_dir(session_id))
-    private_dir(state / "tmp")
     lease_id = uuid.uuid4().hex
-    env = os.environ.copy()
-    env["CLAUDE_CODE_SESSION_ID"] = session_id
-    env["CLAUDE_CODE_CHILD_SESSION"] = "1"
-    env["CLAUDE_LNT_LEASE_ID"] = lease_id
-    env["TMPDIR"] = str(state / "tmp")
-    log_path = state / f"process-{lease_id[:12]}.log"
-    private_file(log_path)
-    log_handle = log_path.open("ab", buffering=0)
-    private_file(log_path)
-    process = subprocess.Popen(
-        args.command,
-        env=env,
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    records = lease_records(session_id)
-    records[lease_id] = {
-        "pid": process.pid,
-        "start": proc_start(process.pid),
-        "expires": time.time() + args.ttl,
-        "command": args.command,
-        "log": str(log_path),
-    }
-    save_json(state / "leases.json", records)
+
+    # Creating the state, launching and recording the lease all happen under
+    # the lock that teardown also takes. Creating it outside would let a
+    # concurrent SessionEnd delete the directory between the mkdir and the
+    # acquisition, and launching outside would leave a window in which the
+    # process holds no recorded lease and is treated as unowned work.
+    with session_lock(session_id):
+        state = private_dir(state_dir(session_id))
+        private_dir(state / "tmp")
+
+        env = os.environ.copy()
+        env["CLAUDE_CODE_SESSION_ID"] = session_id
+        env["CLAUDE_CODE_CHILD_SESSION"] = "1"
+        env["CLAUDE_LNT_LEASE_ID"] = lease_id
+        env["TMPDIR"] = str(state / "tmp")
+
+        log_path = state / f"process-{lease_id[:12]}.log"
+        private_file(log_path)
+        log_handle = log_path.open("ab", buffering=0)
+        private_file(log_path)
+
+        process = subprocess.Popen(
+            args.command,
+            env=env,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        records = lease_records(session_id)
+        records[lease_id] = {
+            "pid": process.pid,
+            "start": proc_start(process.pid),
+            "expires": time.time() + args.ttl,
+            "command": args.command,
+            "log": str(log_path),
+        }
+        save_json(state / "leases.json", records)
+
     print(f"PID={process.pid} TTL={args.ttl}s LOG={log_path}")
     return 0
 

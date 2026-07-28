@@ -106,7 +106,9 @@
       "Bash(codex:*)",
       "Bash(claude-codex-review:*)",
       "Bash(claude-codex-doctor:*)",
-      "Bash(claude-lnt-status:*)"
+      "Bash(claude-lnt-status:*)",
+      "Bash(npx --yes playwright@1.62.0 screenshot:*)",
+      "Bash(npx --yes playwright@1.62.0 install chromium:*)"
     ]
   }
 }

@@ -282,6 +282,8 @@ why.
 
 ## Efficiency
 
+- Match reasoning effort to the shape of the work, not to its importance. Maximum effort suits a single hard judgement; it does not suit an agentic loop, where the cost is paid again on every turn. Measured on this toolkit, the same delegated task at `xhigh` spent eight minutes deliberating and never reached the delegation step at all, while at `medium` it delegated, verified and reported in under three minutes.
+- Run non-interactive sessions at moderate effort: `claude -p --effort medium`. Reserve the highest effort for interactive work, where the deliberation is visible and can be interrupted.
 - Do not invoke Codex for trivial tasks.
 - Do not require plan review for straightforward, low-risk work.
 - Keep plans and agent reports concise.
@@ -346,9 +348,9 @@ git status --short   # in every checkout AND worktree
 
 ## Browser Automation
 
-- Use the Playwright-bundled Chromium only. Drive it through `npx playwright@1.62.0`, with no `executablePath` and no `channel`.
+- Use the Playwright-bundled Chromium only. Drive it through the pinned Playwright CLI, version 1.62.0, with no `executablePath` and no `channel`.
 - Pin the Playwright version at every call site. Each Playwright release requires its exact bundled browser build, and version drift produces the "executable doesn't exist" failure that motivates falling back to a system browser.
-- If the bundled executable is reported missing, run `npx playwright@1.62.0 install chromium` and retry.
+- If the bundled executable is reported missing, run `npx --yes playwright@1.62.0 install chromium` and retry.
 - Never fall back to a system browser. Do not use `/snap/bin/chromium`, bare `chromium` or `chromium-browser` on `PATH`, `channel: "chrome"`, or any `executablePath` pointing outside `~/.cache/ms-playwright/`.
 - Run headless. On this machine headless and headed render identically, because both are Chrome for Testing, but headed costs about 2.1 times the memory and 2.7 times the wall clock, and it needs a display, so it cannot run over SSH or from a scheduled job. Use headed only when the task genuinely needs a real window, such as window-manager or extension behaviour.
 - Measured for one 1440x900 screenshot: headless about 190 ms and about 430 MiB peak resident; headed about 505 ms and about 923 MiB. The `chromium-headless-shell` channel measures the same as headless, so prefer plain `headless: true` and do not pin a second browser build.
@@ -359,6 +361,15 @@ git status --short   # in every checkout AND worktree
 
 Screenshots are the way to check what a change actually looks like, rather than inferring it from the markup.
 
+- Prefer the driver's own command, which needs no script and closes its browser itself:
+
+```bash
+npx --yes playwright@1.62.0 screenshot \
+    --viewport-size 1280,720 \
+    "file://$PWD/page.html" shot.png
+```
+
+- This exact form is pre-approved, so it runs without stopping for permission. An ad hoc Node script is not, and it also has to close the browser itself. Reach for one only when the capture genuinely needs scripting, such as interacting with the page first.
 - Render the page headless, write a PNG, then read that file back and assess it. Reading the image is what makes this an assessment rather than a claim.
 - Capture at the viewports the work targets, not just one. A desktop and a narrow mobile width catch different faults.
 - Say what the screenshot shows, including what is wrong or unresolved. A screenshot that was taken but not described is not evidence.
