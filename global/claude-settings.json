@@ -97,5 +97,16 @@
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "codex@openai-codex": false
+  },
+  "permissions": {
+    "allow": [
+      "Bash(codex:*)",
+      "Bash(claude-codex-review:*)",
+      "Bash(claude-codex-doctor:*)",
+      "Bash(claude-lnt-status:*)"
+    ]
   }
 }

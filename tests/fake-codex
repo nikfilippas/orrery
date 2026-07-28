@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Stand-in for the Codex CLI used by the kit regression tests.
+
+Behaviour is selected with CODEX_FAKE_MODE so that the review wrapper can be
+exercised without spending Codex credits or reaching the network.
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def output_path(argv: list[str]) -> Path | None:
+    for index, argument in enumerate(argv):
+        if argument == "--output-last-message" and index + 1 < len(argv):
+            return Path(argv[index + 1])
+    return None
+
+
+def main() -> int:
+    mode = os.environ.get("CODEX_FAKE_MODE", "success")
+    marker = os.environ.get("CODEX_FAKE_MARKER")
+
+    if marker:
+        Path(marker).write_text(f"{os.getpid()}\n")
+
+    if mode == "detach":
+        # A descendant that ignores SIGTERM, lives in its own session, and
+        # therefore only dies when the whole control group is killed.
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal, time\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "time.sleep(3600)\n",
+            ],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(3600)
+        return 0
+
+    if mode == "sleep":
+        time.sleep(3600)
+        return 0
+
+    if mode == "empty":
+        return 0
+
+    if mode == "fail":
+        print("simulated codex failure", file=sys.stderr)
+        return 7
+
+    destination = output_path(sys.argv[1:])
+    if destination is not None:
+        destination.write_text("# PASS\nfake verdict\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

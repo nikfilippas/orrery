@@ -137,6 +137,26 @@ relevant files, diff, commands, and results directly.
 
 ## Codex Use
 
+- Use direct Codex CLI profiles for automated work. Do not invoke the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
+
+Three Codex profiles are installed, distinguished by reasoning effort:
+
+| Profile | Reasoning | Use for |
+| --- | --- | --- |
+| `luna` | low | narrow, mechanical, well-specified edits |
+| `terra` | medium | the default worker for substantial implementation |
+| `sol` | high | independent review, and difficult diagnosis |
+
+Invoke them as `codex --profile <name> exec`. An unknown profile name is not
+an error to Codex: it silently falls back to the default model and effort, so
+a mistyped profile produces work from a model you did not choose. Confirm the
+profile exists rather than assuming the run used it.
+
+For an independent review, prefer the `claude-codex-review` wrapper over a
+bare `codex --profile sol exec`. It runs Sol read-only inside a transient
+systemd user service, so a timeout or an interruption stops the whole control
+group, and it refuses to run at all if the `sol` profile is missing.
+
 Use Codex primarily as:
 
 - the implementation worker for substantial coding,
@@ -317,12 +337,34 @@ in prompts, reports, logs, commits, or generated documentation.
 ```bash
 pgrep -af "headless|playwright|chromedriver|--remote-debugging"
 ss -ltnp 2>/dev/null | grep -vE ':(22|80|443|8600|8601)\b'
-ls -d /tmp/tmp.* /tmp/mh_* 2>/dev/null | head
+ls -d /tmp/tmp.* /tmp/mh_* /tmp/playwright_* 2>/dev/null | head
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
 git status --short   # in every checkout AND worktree
 ```
 
 - If any command shows something created by the session, clean it before reporting completion. If cleanup fails, state that explicitly and provide the exact command the user must run.
+
+## Browser Automation
+
+- Use the Playwright-bundled Chromium only. Drive it through `npx playwright@1.62.0`, with no `executablePath` and no `channel`.
+- Pin the Playwright version at every call site. Each Playwright release requires its exact bundled browser build, and version drift produces the "executable doesn't exist" failure that motivates falling back to a system browser.
+- If the bundled executable is reported missing, run `npx playwright@1.62.0 install chromium` and retry.
+- Never fall back to a system browser. Do not use `/snap/bin/chromium`, bare `chromium` or `chromium-browser` on `PATH`, `channel: "chrome"`, or any `executablePath` pointing outside `~/.cache/ms-playwright/`.
+- Run headless. On this machine headless and headed render identically, because both are Chrome for Testing, but headed costs about 2.1 times the memory and 2.7 times the wall clock, and it needs a display, so it cannot run over SSH or from a scheduled job. Use headed only when the task genuinely needs a real window, such as window-manager or extension behaviour.
+- Measured for one 1440x900 screenshot: headless about 190 ms and about 430 MiB peak resident; headed about 505 ms and about 923 MiB. The `chromium-headless-shell` channel measures the same as headless, so prefer plain `headless: true` and do not pin a second browser build.
+- Close the context and the browser before reporting completion, then verify the process is actually gone. Do not trust the launcher's exit status.
+- Bundled-browser profiles are created under `$TMPDIR`, so a session that inherits the redirected `TMPDIR` keeps them inside its own state and they are removed with it. A browser that does not inherit it leaks into the real `/tmp` as `/tmp/playwright_*`, where nothing ages them out. Leave No Trace sweeps abandoned ones, but closing the browser properly is still the primary mechanism.
+
+### Visual assessment
+
+Screenshots are the way to check what a change actually looks like, rather than inferring it from the markup.
+
+- Render the page headless, write a PNG, then read that file back and assess it. Reading the image is what makes this an assessment rather than a claim.
+- Capture at the viewports the work targets, not just one. A desktop and a narrow mobile width catch different faults.
+- Say what the screenshot shows, including what is wrong or unresolved. A screenshot that was taken but not described is not evidence.
+- Codex accepts images, so a screenshot can be attached to an independent review with `codex --profile sol exec -i shot.png`.
+- Do not leave screenshots in the repository. Write them under the session's temporary directory unless the user asked for a file.
+- The snap Chromium is the failure mode this policy exists to prevent. It runs in a private mount namespace, so its profiles accumulate under `/tmp/snap-private-tmp/snap.chromium/tmp/`, which is invisible to ordinary `du`, excluded from systemd tmpfiles ageing, and backed by RAM. The rules below apply only to cleaning up a snap browser that is already running.
 - Snap Chromium detaches into its own systemd user scope (`snap.chromium.chromium-<uuid>.scope`). Killing the launching shell, or letting `timeout` expire, does NOT kill the browser: it is reparented to systemd (ppid 1/2282) and survives indefinitely. Verify the browser is gone; do not assume the launcher's death took it with it.
 - `kill` from a Claude-Code-in-VS-Code shell is DENIED by AppArmor even at the same uid and even with sandboxing disabled, because the shell's label is `vscode`:
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -12,8 +13,10 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -22,6 +25,68 @@ POLL_SECONDS = 3
 TERM_GRACE_SECONDS = 2.0
 MAX_WATCH_SECONDS = 24 * 60 * 60
 LNT_MARKER = "claude-lnt"
+
+# Ephemeral profile directories created by browser automation. These are the
+# exact prefixes the drivers use, not a wildcard over the tool name: a glob
+# such as `playwright_*` would also match a user's own `playwright_test-results`
+# and this sweep deletes permanently.
+BROWSER_PROFILE_PATTERNS = (
+    "playwright_chromiumdev_profile-*",
+    "playwright_firefoxdev_profile-*",
+    "playwright_webkitdev_profile-*",
+    # Puppeteer builds this as puppeteer_dev_<browser>_profile-, so both
+    # browsers it supports need naming.
+    "puppeteer_dev_chrome_profile-*",
+    "puppeteer_dev_firefox_profile-*",
+)
+
+# How old an unreferenced profile must be before it counts as abandoned.
+ORPHAN_PROFILE_GRACE_SECONDS = 300
+
+
+def private_file(path: Path) -> None:
+    """Make a file private, tolerating one that is absent or not ours."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def private_dir(path: Path) -> Path:
+    """Create a directory, and any missing parent, private to this user.
+
+    mkdir's mode argument is masked by the umask, so a restrictive umask
+    would otherwise produce a directory nothing can be written into. Each
+    missing level is created and secured in turn, because mkdir(parents=True)
+    applies the mode only to the final component. Directories that already
+    exist above the missing ones are left alone.
+    """
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+
+    if not path.is_dir():
+        # Something that is not a directory already occupies the path.
+        # Raising an OSError lets runtime_root fall through to its next
+        # candidate rather than returning an unusable root.
+        raise NotADirectoryError(
+            errno.ENOTDIR,
+            os.strerror(errno.ENOTDIR),
+            str(path),
+        )
+
+    if not missing:
+        os.chmod(path, 0o700)
+
+    return path
 
 
 def runtime_root() -> Path:
@@ -33,18 +98,14 @@ def runtime_root() -> Path:
     candidates.append(Path.home() / ".cache" / "claude-lnt" / "runtime")
     for path in candidates:
         try:
-            path.mkdir(parents=True, exist_ok=True, mode=0o700)
-            os.chmod(path, 0o700)
-            return path
+            return private_dir(path)
         except OSError:
             continue
     raise RuntimeError("Cannot create a writable Leave No Trace runtime directory")
 
 
 def log_root() -> Path:
-    path = Path.home() / ".cache" / "claude-lnt" / "logs"
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    return path
+    return private_dir(Path.home() / ".cache" / "claude-lnt" / "logs")
 
 
 def safe_key(session_id: str) -> str:
@@ -160,7 +221,14 @@ def save_json(path: Path, value: Any) -> None:
 
 def append_log(session_id: str, message: str) -> None:
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    with (log_root() / f"{safe_key(session_id)}.log").open("a") as handle:
+    path = log_root() / f"{safe_key(session_id)}.log"
+
+    # Repaired before the open, not after: a log left unreadable by a
+    # restrictive umask cannot be opened at all, so a corrective chmod
+    # afterwards would never be reached.
+    private_file(path)
+    with path.open("a") as handle:
+        private_file(path)
         handle.write(f"{timestamp} {message}\n")
 
 
@@ -249,6 +317,73 @@ def profile_dirs_from_commands(commands: list[str]) -> set[Path]:
                     result.add(path)
             index += 1
     return result
+
+
+def live_command_lines() -> list[str]:
+    lines: list[str] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        command = proc_cmdline(int(entry.name))
+        if command:
+            lines.append(command)
+    return lines
+
+
+def sweep_orphan_browser_profiles(
+    session_id: str,
+    roots: set[Path] | None = None,
+) -> None:
+    """Remove automation browser profiles that no live process is using.
+
+    Playwright and Puppeteer put the profile under the system temporary
+    directory and remove it on a clean close. A browser that is killed
+    rather than closed, which is what an interrupted session or a torn down
+    control group produces, leaves the directory behind for good: nothing
+    ages `/tmp` entries out on this system, and a snap browser's profiles
+    are not even visible there.
+
+    Redirecting TMPDIR into the session state directory covers the browsers
+    that inherit it. This is the backstop for the ones that do not, so a
+    session cannot quietly accumulate profiles run after run.
+    """
+    if roots is None:
+        # The redirected TMPDIR and the real system temporary directory,
+        # because a browser that did not inherit the redirection leaks into
+        # the latter.
+        roots = {Path(tempfile.gettempdir()), Path("/tmp")}
+
+    in_use = "\n".join(live_command_lines())
+    cutoff = time.time() - ORPHAN_PROFILE_GRACE_SECONDS
+
+    for root in roots:
+        for pattern in BROWSER_PROFILE_PATTERNS:
+            for path in sorted(root.glob(pattern)):
+                try:
+                    info = path.lstat()
+                except OSError:
+                    continue
+
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                    continue
+
+                # A profile a live browser is still using names itself on
+                # that browser's command line.
+                if str(path) in in_use:
+                    continue
+
+                # Never race a browser between creating its profile and
+                # becoming visible in /proc with its arguments. A running
+                # browser keeps writing into its profile, so an old
+                # modification time means nothing is using it.
+                if info.st_mtime > cutoff:
+                    continue
+
+                try:
+                    shutil.rmtree(path)
+                    append_log(session_id, f"removed orphan profile {path}")
+                except OSError as exc:
+                    append_log(session_id, f"orphan profile {path}: {exc}")
 
 
 def scope_for_pid(pid: int) -> str:
@@ -411,11 +546,22 @@ def cleanup(
             failures.append(f"profile not removed safely: {path}")
 
     if not detached_only:
+        sweep_orphan_browser_profiles(session_id)
+
         tmp_root = state_dir(session_id) / "tmp"
         try:
             shutil.rmtree(tmp_root)
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            failures.append(f"temporary directory {tmp_root}: {exc}")
+
+        # TMPDIR was exported to this value for the whole session, so the
+        # directory has to outlive its contents. Removing it outright makes
+        # every later mktemp and tempfile call in the session fail. The
+        # state directory as a whole is removed at SessionEnd.
+        try:
+            private_dir(tmp_root)
         except OSError as exc:
             failures.append(f"temporary directory {tmp_root}: {exc}")
 
@@ -528,9 +674,9 @@ def hook_start() -> int:
     session_id = current_session(data)
     sweep_stale_states()
     state = state_dir(session_id)
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (state / "cleanup.d").mkdir(exist_ok=True, mode=0o700)
-    (state / "tmp").mkdir(exist_ok=True, mode=0o700)
+    private_dir(state)
+    private_dir(state / "cleanup.d")
+    private_dir(state / "tmp")
     claude_pid = int(os.environ.get("CLAUDE_PID", "0") or 0)
     claude_start = proc_start(claude_pid)
     existing = metadata(session_id)
@@ -668,8 +814,7 @@ def watch(session_id: str, claude_pid: int, claude_start: int | None) -> int:
 
 def register_cleanup(args: argparse.Namespace) -> int:
     session_id = current_session()
-    directory = state_dir(session_id) / "cleanup.d"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory = private_dir(state_dir(session_id) / "cleanup.d")
     if args.shell is not None:
         item: dict[str, Any] = {"shell": args.shell}
     elif args.command:
@@ -686,9 +831,8 @@ def start_process(args: argparse.Namespace) -> int:
     session_id = current_session()
     if not args.command:
         raise RuntimeError("Provide a command after --")
-    state = state_dir(session_id)
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (state / "tmp").mkdir(exist_ok=True, mode=0o700)
+    state = private_dir(state_dir(session_id))
+    private_dir(state / "tmp")
     lease_id = uuid.uuid4().hex
     env = os.environ.copy()
     env["CLAUDE_CODE_SESSION_ID"] = session_id
@@ -696,7 +840,9 @@ def start_process(args: argparse.Namespace) -> int:
     env["CLAUDE_LNT_LEASE_ID"] = lease_id
     env["TMPDIR"] = str(state / "tmp")
     log_path = state / f"process-{lease_id[:12]}.log"
+    private_file(log_path)
     log_handle = log_path.open("ab", buffering=0)
+    private_file(log_path)
     process = subprocess.Popen(
         args.command,
         env=env,

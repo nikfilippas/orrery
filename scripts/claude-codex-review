@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import uuid
+from pathlib import Path
+
+
+TERMINAL_STATES = frozenset({"inactive", "failed"})
+
+# How long a transient unit is allowed to reach a terminal state after a stop
+# and again after an escalation to SIGKILL.
+STOP_SETTLE_SECONDS = 10.0
+
+
+class UsageError(Exception):
+    pass
+
+
+class CleanupError(Exception):
+    pass
+
+
+class ReviewInterrupted(Exception):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+def interrupting_signals() -> set[int]:
+    """Every catchable asynchronous signal whose default action terminates.
+
+    Any of these would otherwise kill the wrapper without running the
+    cleanup in `finally`, leaving the transient unit and the Codex control
+    group behind. The set is derived from the platform rather than listed
+    by hand so that signals such as SIGIO, SIGSTKFLT and the real-time
+    signals are covered too.
+    """
+    excluded_names = (
+        # Cannot be caught.
+        "SIGKILL",
+        "SIGSTOP",
+        # Default action is ignore, stop, or continue, so the wrapper
+        # survives and its own cleanup still runs.
+        "SIGCHLD",
+        "SIGCLD",
+        "SIGCONT",
+        "SIGTSTP",
+        "SIGTTIN",
+        "SIGTTOU",
+        "SIGURG",
+        "SIGWINCH",
+        # Synchronous faults. Raising a Python exception from these
+        # handlers is not safe, and they indicate a broken process rather
+        # than a request to stop.
+        "SIGABRT",
+        "SIGBUS",
+        "SIGFPE",
+        "SIGILL",
+        "SIGIOT",
+        "SIGSEGV",
+        "SIGSYS",
+        "SIGTRAP",
+    )
+
+    excluded = {
+        int(member)
+        for member in (getattr(signal, name, None) for name in excluded_names)
+        if isinstance(member, signal.Signals)
+    }
+
+    return {
+        int(number)
+        for number in signal.valid_signals()
+        if int(number) not in excluded
+    }
+
+
+def usage() -> str:
+    return (
+        "Usage:\n"
+        "  claude-codex-review [--timeout SECONDS] [--output PATH] -- PROMPT...\n"
+        "  printf '%s\\n' \"PROMPT\" | claude-codex-review "
+        "[--timeout SECONDS] [--output PATH]\n\n"
+        "Runs a synchronous independent review through the Codex `sol` profile. "
+        "The run is placed in a transient systemd user service so timeout and "
+        "interruption stop its complete control group.\n"
+    )
+
+
+def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
+    try:
+        timeout_seconds = int(
+            os.environ.get("CODEX_REVIEW_TIMEOUT_SECONDS", "600")
+        )
+    except ValueError as exc:
+        raise UsageError(
+            "CODEX_REVIEW_TIMEOUT_SECONDS must be a positive integer"
+        ) from exc
+
+    output_path: Path | None = None
+    prompt_parts: list[str] | None = None
+
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+
+        if argument in ("--help", "-h"):
+            print(usage(), end="")
+            raise SystemExit(0)
+
+        if argument == "--":
+            prompt_parts = argv[index + 1 :]
+            break
+
+        if argument == "--timeout":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --timeout")
+            index += 1
+            try:
+                timeout_seconds = int(argv[index])
+            except ValueError as exc:
+                raise UsageError(
+                    "--timeout must be a positive integer"
+                ) from exc
+        elif argument.startswith("--timeout="):
+            try:
+                timeout_seconds = int(argument.split("=", 1)[1])
+            except ValueError as exc:
+                raise UsageError(
+                    "--timeout must be a positive integer"
+                ) from exc
+        elif argument == "--output":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --output")
+            index += 1
+            output_path = Path(argv[index])
+        elif argument.startswith("--output="):
+            output_path = Path(argument.split("=", 1)[1])
+        elif argument.startswith("-"):
+            raise UsageError(f"unknown wrapper option: {argument}")
+        else:
+            prompt_parts = argv[index:]
+            break
+
+        index += 1
+
+    if timeout_seconds <= 0:
+        raise UsageError("--timeout must be a positive integer")
+
+    if prompt_parts is not None and prompt_parts:
+        prompt = " ".join(prompt_parts)
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        raise UsageError("a review prompt is required")
+
+    if not prompt.strip():
+        raise UsageError("the review prompt is empty")
+
+    return timeout_seconds, output_path, prompt
+
+
+def codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+
+    if raw is None:
+        raw = str(Path.home() / ".codex")
+
+    if not raw.strip():
+        print(
+            "claude-codex-review: CODEX_HOME cannot be empty",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def profile_model(profile: str) -> str:
+    """The model configured for a Codex profile, or a fatal error.
+
+    Codex does not fail when `--profile` names a profile it cannot find: it
+    silently falls back to the default model and reasoning effort. A missing
+    or unreadable profile would therefore produce a review by some other
+    model while this wrapper announced the configured one, which would make
+    the independence of the review a claim rather than a fact.
+    """
+    path = codex_home() / f"{profile}.config.toml"
+
+    try:
+        with path.open("rb") as handle:
+            configuration = tomllib.load(handle)
+    except OSError as exc:
+        raise UsageError(
+            f"the Codex {profile} profile is not readable at {path}: {exc}"
+        ) from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise UsageError(
+            f"the Codex {profile} profile at {path} is not valid TOML: {exc}"
+        ) from exc
+
+    value = configuration.get("model")
+    if not isinstance(value, str) or not value.strip():
+        raise UsageError(
+            f"the Codex {profile} profile at {path} does not set a model"
+        )
+
+    return value.strip()
+
+
+def tail_text(path: Path, lines: int = 80) -> str:
+    if not path.exists():
+        return ""
+    content = path.read_text(errors="replace").splitlines()
+    return "\n".join(content[-lines:])
+
+
+def run_systemctl(
+    *arguments: str,
+    timeout: float = 20.0,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"systemctl timed out: {' '.join(arguments)}"
+        ) from exc
+
+
+def systemctl_error(
+    action: str,
+    result: subprocess.CompletedProcess[str],
+) -> RuntimeError:
+    detail = result.stderr.strip() or result.stdout.strip()
+    if not detail:
+        detail = f"exit status {result.returncode}"
+    return RuntimeError(f"systemctl {action} failed: {detail}")
+
+
+def unit_status(unit: str) -> tuple[bool, str]:
+    # Named properties are parsed rather than positional `--value` output.
+    # systemctl emits `--value` lines in its own canonical property order, not
+    # the requested order, and omits nothing for empty values, so positional
+    # reading silently misattributes states.
+    result = run_systemctl(
+        "show",
+        unit,
+        "--property=LoadState",
+        "--property=ActiveState",
+        timeout=3.0,
+    )
+
+    properties: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            properties[key.strip()] = value.strip()
+
+    load_state = properties.get("LoadState", "")
+    active_state = properties.get("ActiveState", "")
+
+    absent_messages = (
+        "could not be found",
+        "not found",
+        "not loaded",
+    )
+    stderr_lower = result.stderr.lower()
+
+    if load_state == "not-found" or (
+        result.returncode != 0
+        and any(message in stderr_lower for message in absent_messages)
+    ):
+        return False, "not-found"
+
+    if result.returncode != 0:
+        raise systemctl_error("show", result)
+
+    if not load_state:
+        raise RuntimeError(
+            f"systemctl show returned no LoadState for {unit}"
+        )
+
+    return True, active_state
+
+
+def unit_is_loaded(unit: str) -> bool:
+    loaded, _active_state = unit_status(unit)
+    return loaded
+
+
+def wait_for_unit_registration(
+    process: subprocess.Popen[bytes],
+    unit: str,
+    timeout: float = 15.0,
+) -> bool:
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        if unit_is_loaded(unit):
+            return True
+        if process.poll() is not None:
+            return False
+        time.sleep(0.05)
+
+    raise RuntimeError(
+        f"transient review unit was not registered: {unit}"
+    )
+
+
+def unit_is_settled(unit: str) -> bool:
+    """True when the unit is gone or has reached a known terminal state.
+
+    Only `inactive` and `failed` count as terminal. Every other loaded state,
+    including states this version of the toolkit does not know about, is
+    treated as still needing cleanup, and blank state reporting is an error
+    rather than an implicit success.
+    """
+    loaded, active_state = unit_status(unit)
+    if not loaded:
+        return True
+
+    if not active_state:
+        raise RuntimeError(
+            f"systemctl returned an empty ActiveState for {unit}"
+        )
+
+    return active_state in TERMINAL_STATES
+
+
+def wait_until_settled(unit: str, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        if unit_is_settled(unit):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+def stop_unit(unit: str) -> None:
+    problems: list[str] = []
+
+    def attempt(*arguments: str) -> None:
+        # A failure here is recorded rather than raised so that a stop that
+        # fails, or times out on a wedged user bus, still reaches the
+        # SIGKILL escalation below instead of leaving Codex running.
+        try:
+            result = run_systemctl(*arguments, timeout=20.0)
+        except RuntimeError as exc:
+            problems.append(str(exc))
+            return
+
+        if result.returncode != 0:
+            problems.append(str(systemctl_error(arguments[0], result)))
+
+    def settled(seconds: float = STOP_SETTLE_SECONDS) -> bool:
+        try:
+            return wait_until_settled(unit, seconds)
+        except RuntimeError as exc:
+            problems.append(str(exc))
+            return False
+
+    # A failure to read the state is not treated as an absent unit. The stop
+    # and the escalation below are attempted anyway, because they are
+    # harmless when the unit really is gone and essential when it is not.
+    if settled(0.0):
+        return
+
+    attempt("stop", unit)
+    if settled():
+        return
+
+    # `systemctl stop` can fail, time out, or report success while the
+    # control group is still alive.
+    attempt("kill", "--kill-whom=all", "--signal=KILL", unit)
+    if settled():
+        return
+
+    problems.append(f"transient review unit did not stop: {unit}")
+    raise RuntimeError("; ".join(problems))
+
+
+def terminate_client(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    try:
+        process.wait(timeout=5.0)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def codex_environment(tmp_dir: Path) -> dict[str, str]:
+    environment = {
+        "HOME": str(Path.home()),
+        "PATH": os.environ.get("PATH", ""),
+        "TMPDIR": str(tmp_dir),
+    }
+
+    exact_names = {
+        "ALL_PROXY",
+        "CURL_CA_BUNDLE",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GIT_ASKPASS",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LANG",
+        "LOGNAME",
+        "NO_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_DIR",
+        "SHELL",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSL_CERT_FILE",
+        "TERM",
+        "USER",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+    allowed_prefixes = (
+        "AZURE_OPENAI_",
+        "CODEX_",
+        "LC_",
+        "OPENAI_",
+    )
+
+    for name, value in os.environ.items():
+        if name in exact_names or name.startswith(allowed_prefixes):
+            environment[name] = value
+
+    environment["CODEX_HOME"] = str(codex_home())
+    return environment
+
+
+def write_service_launcher(run_dir: Path, tmp_dir: Path) -> tuple[Path, Path]:
+    environment_path = run_dir / "service-environment.json"
+    environment_fd = os.open(
+        environment_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+    )
+    with os.fdopen(environment_fd, "w", encoding="utf-8") as handle:
+        json.dump(
+            codex_environment(tmp_dir),
+            handle,
+            ensure_ascii=False,
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    launcher_path = run_dir / "service-launcher.py"
+    launcher_path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "environment_path = Path(sys.argv[1])\n"
+        "environment = json.loads(environment_path.read_text())\n"
+        "environment_path.unlink(missing_ok=True)\n"
+        "os.execvpe(sys.argv[2], sys.argv[2:], environment)\n"
+    )
+    launcher_path.chmod(0o700)
+    return launcher_path, environment_path
+
+
+def process_start_time(pid: int) -> int | None:
+    """Start time of a live process, or None if it cannot do any more work.
+
+    A zombie counts as gone: it has already exited, so it will never run
+    cleanup, even though /proc still lists it.
+    """
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+
+    fields = text[text.rfind(")") + 2 :].split()
+    try:
+        if fields[0] == "Z":
+            return None
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def record_runtime_owner(run_dir: Path, unit: str = "") -> None:
+    # No numeric sentinel for an unknown start time. It has to read back as
+    # unattributable rather than as a match for any owner.
+    start = process_start_time(os.getpid())
+    (run_dir / "owner").write_text(
+        f"{os.getpid()} {start if start is not None else 'unknown'} {unit}\n"
+    )
+
+
+def read_runtime_owner(run_dir: Path) -> tuple[int | None, str]:
+    """The recorded start time and unit name, parsed independently.
+
+    An unparseable start time must not also discard the unit name, or an
+    orphaned unit would be left running while its state was reclaimed.
+    """
+    try:
+        fields = (run_dir / "owner").read_text().split()
+    except OSError:
+        return None, ""
+
+    start: int | None = None
+    if len(fields) > 1:
+        try:
+            start = int(fields[1])
+        except ValueError:
+            start = None
+
+    return start, fields[2] if len(fields) > 2 else ""
+
+
+def force_remove(path: Path) -> bool:
+    """Remove a tree, clearing permissions that would block the removal.
+
+    Codex or one of its descendants can leave an unreadable directory in
+    the run directory. Without restoring access first, every later sweep
+    would silently skip it and the state would never be reclaimed.
+    """
+    if path.is_symlink():
+        # rmtree refuses to remove a symlink, so it is unlinked directly.
+        # Its referent is left entirely alone.
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return not os.path.lexists(path)
+
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+    for directory, names, _files in os.walk(
+        path,
+        topdown=True,
+        onerror=lambda _error: None,
+    ):
+        for name in names:
+            entry = os.path.join(directory, name)
+
+            # os.walk lists directory symlinks without descending into them,
+            # and os.chmod follows symlinks by default. Changing the mode of
+            # whatever a reviewed process linked to would reach outside the
+            # runtime tree entirely.
+            if os.path.islink(entry):
+                continue
+
+            try:
+                os.chmod(entry, 0o700)
+            except OSError:
+                continue
+
+    shutil.rmtree(path, ignore_errors=True)
+    return not os.path.lexists(path)
+
+
+def sweep_stale_runtime(root: Path) -> None:
+    """Reclaim run directories owned by wrappers that no longer exist.
+
+    An uncatchable death cannot run this wrapper's own cleanup, so the next
+    run reclaims what was left behind. The directory can hold the prompt,
+    the Codex log, the verdict, and, if the wrapper died before the service
+    started, the serialised environment. The recorded start time also makes
+    a reused process identifier fail to protect a dead owner's directory.
+
+    The orphaned unit is stopped before its state is removed, and the state
+    is kept if the stop cannot be confirmed, so files are never pulled out
+    from under a Codex run that may still be going. A later sweep retries,
+    and the unit's own RuntimeMaxSec bounds it regardless.
+    """
+    for entry in root.glob("run.*"):
+        parts = entry.name.split(".")
+        if len(parts) < 3 or not parts[1].isdigit():
+            continue
+
+        owner = int(parts[1])
+        recorded, unit = read_runtime_owner(entry)
+        live_start = process_start_time(owner)
+
+        if live_start is not None:
+            # Only a recorded start time that matches proves the directory
+            # belongs to the process that is currently alive. Matching on
+            # the identifier alone would let a reused identifier, including
+            # one reused by this very process, protect a dead owner's state.
+            if recorded == live_start:
+                continue
+
+            if recorded is None and owner != os.getpid():
+                # Alive but unattributable, so not safely abandoned. A
+                # directory naming this process cannot be its own, because
+                # this sweep runs before this process creates one.
+                continue
+
+        if unit:
+            try:
+                stop_unit(unit)
+            except RuntimeError:
+                # The unit could not be confirmed stopped, so its files stay.
+                continue
+
+        if not force_remove(entry):
+            print(
+                f"claude-codex-review: could not reclaim {entry}",
+                file=sys.stderr,
+            )
+
+
+def bounded_prefix(destination: Path, reserve: int = 8) -> str:
+    """A same-directory temporary prefix that leaves room within NAME_MAX.
+
+    `tempfile` appends random characters to the prefix, so a destination
+    whose own name is near the limit would otherwise make publication fail
+    after the review has already succeeded. NAME_MAX bounds bytes, and
+    whole characters are dropped so a multi-byte sequence is never split.
+    """
+    try:
+        limit = int(os.pathconf(destination.parent, "PC_NAME_MAX"))
+    except (OSError, ValueError, AttributeError):
+        limit = 255
+
+    # Two more bytes for the leading and trailing dot.
+    available = max(1, limit - reserve - 2)
+    stem = destination.name
+    while len(stem) > 1 and len(os.fsencode(stem)) > available:
+        stem = stem[:-1]
+
+    return f".{stem}."
+
+
+def publish_atomically(source: Path, destination: Path) -> None:
+    destination = destination.expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=destination.parent,
+            prefix=bounded_prefix(destination),
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            with source.open("rb") as source_handle:
+                shutil.copyfileobj(source_handle, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+        temporary = None
+
+        directory_fd = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def main() -> int:
+    # Everything this wrapper creates is private session state that it also
+    # reads back. A umask can only remove bits, so setting it here makes
+    # that private without a restrictive inherited umask being able to make
+    # the log, the verdict, or the service environment unreadable. The
+    # Codex service inherits it too.
+    os.umask(0o077)
+
+    try:
+        timeout_seconds, output_path, prompt = parse_args(sys.argv[1:])
+    except UsageError as exc:
+        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        print(usage(), file=sys.stderr, end="")
+        return 2
+
+    for command in ("codex", "systemd-run", "systemctl"):
+        if shutil.which(command) is None:
+            print(
+                f"claude-codex-review: required command unavailable: {command}",
+                file=sys.stderr,
+            )
+            return 127
+
+    codex_path = shutil.which("codex")
+    assert codex_path is not None
+
+    profile = "sol"
+    try:
+        model = profile_model(profile)
+    except UsageError as exc:
+        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"↳ Codex Sol · {model} · independent review",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    runtime_base = Path(
+        os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache"))
+    )
+    runtime_root = runtime_base / "claude-codex-review"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.chmod(0o700)
+
+    unit_base = (
+        f"claude-codex-review-{os.getpid()}-"
+        f"{uuid.uuid4().hex[:10]}"
+    )
+    unit = f"{unit_base}.service"
+    process: subprocess.Popen[bytes] | None = None
+    unit_may_exist = False
+    control_returned = False
+
+    def return_control() -> None:
+        nonlocal control_returned
+        if not control_returned:
+            print(
+                "↳ Principal orchestrator · control resumed",
+                file=sys.stderr,
+                flush=True,
+            )
+            control_returned = True
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        raise ReviewInterrupted(signum)
+
+    # Deliberately not a TemporaryDirectory: its finaliser would remove the
+    # state at garbage collection even when the unit could not be confirmed
+    # stopped, which is exactly the case where the state has to survive.
+    run_dir: Path | None = None
+    unit_stopped = True
+    handled_signals: set[signal.Signals] = set()
+
+    try:
+        for signal_number in sorted(interrupting_signals()):
+            # An inherited SIG_IGN means the caller deliberately made this
+            # signal harmless. Overriding it would introduce an interruption
+            # that would not otherwise occur.
+            try:
+                if signal.getsignal(signal_number) is signal.SIG_IGN:
+                    continue
+                signal.signal(signal_number, handle_signal)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            handled_signals.add(signal_number)
+
+        sweep_stale_runtime(runtime_root)
+        run_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"run.{os.getpid()}.",
+                dir=runtime_root,
+            )
+        )
+        # mkdtemp's mode is masked by the umask, so it is set explicitly.
+        run_dir.chmod(0o700)
+        record_runtime_owner(run_dir, unit)
+        tmp_dir = run_dir / "tmp"
+        tmp_dir.mkdir()
+        tmp_dir.chmod(0o700)
+        verdict_path = run_dir / "verdict.txt"
+        log_path = run_dir / "codex.log"
+        launcher_path, environment_path = write_service_launcher(
+            run_dir,
+            tmp_dir,
+        )
+
+        command = [
+            "systemd-run",
+            "--user",
+            "--quiet",
+            "--wait",
+            "--collect",
+            "--pipe",
+            f"--unit={unit_base}",
+            "--property=Type=exec",
+            "--property=KillMode=control-group",
+            "--property=TimeoutStopSec=10s",
+            # The service is started by the user manager, not forked from
+            # this process, so it does not inherit the umask set in main().
+            "--property=UMask=0077",
+            # Backstop owned by systemd rather than by this process, so an
+            # uncatchable death of the wrapper (SIGKILL, power loss of the
+            # controlling terminal) still cannot leave Codex running forever.
+            # The wrapper's own timeout fires first and reports diagnostics.
+            f"--property=RuntimeMaxSec={timeout_seconds + 60}s",
+            f"--working-directory={Path.cwd()}",
+            sys.executable,
+            str(launcher_path),
+            str(environment_path),
+            codex_path,
+            "--profile",
+            profile,
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            str(verdict_path),
+            "--",
+            prompt,
+        ]
+
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+
+        with log_path.open("wb") as log_handle:
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                handled_signals,
+            )
+            try:
+                unit_may_exist = True
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                wait_for_unit_registration(process, unit)
+            finally:
+                signal.pthread_sigmask(
+                    signal.SIG_SETMASK,
+                    previous_mask,
+                )
+
+            timed_out = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+
+                try:
+                    return_code = process.wait(
+                        timeout=min(30.0, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    elapsed = int(time.monotonic() - started)
+                    print(
+                        f"  still running · {elapsed}s elapsed",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            if timed_out:
+                stop_unit(unit)
+                terminate_client(process)
+
+                print(
+                    f"Codex review timed out after {timeout_seconds}s.",
+                    file=sys.stderr,
+                )
+                diagnostics = tail_text(log_path)
+                if diagnostics:
+                    print(
+                        "--- Codex diagnostic output ---",
+                        file=sys.stderr,
+                    )
+                    print(diagnostics, file=sys.stderr)
+                return 124
+
+        if return_code != 0:
+            print(
+                f"Codex review failed with exit status {return_code}.",
+                file=sys.stderr,
+            )
+            diagnostics = tail_text(log_path)
+            if diagnostics:
+                print(
+                    "--- Codex diagnostic output ---",
+                    file=sys.stderr,
+                )
+                print(diagnostics, file=sys.stderr)
+            return return_code
+
+        if (
+            not verdict_path.exists()
+            or verdict_path.stat().st_size == 0
+        ):
+            print(
+                "Codex exited successfully but produced no final verdict.",
+                file=sys.stderr,
+            )
+            diagnostics = tail_text(log_path)
+            if diagnostics:
+                print(
+                    "--- Codex diagnostic output ---",
+                    file=sys.stderr,
+                )
+                print(diagnostics, file=sys.stderr)
+            return 1
+
+        verdict = verdict_path.read_text(errors="replace")
+
+        if output_path is not None:
+            publish_atomically(verdict_path, output_path)
+
+        sys.stdout.write(verdict)
+        if not verdict.endswith("\n"):
+            sys.stdout.write("\n")
+        return 0
+    except ReviewInterrupted as exc:
+        print(
+            f"Codex review interrupted by signal {exc.signum}.",
+            file=sys.stderr,
+        )
+        return 128 + exc.signum
+    except RuntimeError as exc:
+        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+        cleanup_errors: list[str] = []
+
+        if unit_may_exist:
+            try:
+                stop_unit(unit)
+            except RuntimeError as exc:
+                unit_stopped = False
+                cleanup_errors.append(str(exc))
+
+        if process is not None:
+            terminate_client(process)
+
+        if run_dir is not None:
+            if unit_stopped:
+                if not force_remove(run_dir):
+                    cleanup_errors.append(
+                        f"Could not remove review runtime state: {run_dir}"
+                    )
+            else:
+                # The service is detached under systemd, so the client
+                # exiting does not prove the unit stopped. Removing its
+                # temporary directory, log, and verdict path now could pull
+                # them out from under a Codex run that is still going. A
+                # later sweep retries the stop and reclaims the state.
+                cleanup_errors.append(
+                    f"Review runtime state kept for a later sweep: {run_dir}"
+                )
+
+        return_control()
+
+        if cleanup_errors:
+            raise CleanupError("; ".join(cleanup_errors))
+
+
+def entrypoint() -> int:
+    try:
+        return main()
+    except CleanupError as exc:
+        print(
+            f"claude-codex-review cleanup failed: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(entrypoint())

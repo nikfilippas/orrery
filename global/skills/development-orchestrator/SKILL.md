@@ -45,6 +45,8 @@ Do not make the principal orchestrator and Codex duplicate the same work without
 
 ## Model role configuration
 
+Automated reviews must use direct Codex CLI execution, preferably `claude-codex-review`. Do not use the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
+
 The orchestration system is role-based.
 
 - Principal orchestrator: the active Claude model selected in Claude Code.
