@@ -1063,6 +1063,65 @@ def test_exhaustion_restores() -> None:
         )
 
 
+@test("a writer landing during the restore stays live")
+def test_restore_converges() -> None:
+    """The restore is a compare-and-swap too, so it can lose and must retry.
+
+    Losing means an even newer version was displaced, and that is what
+    should end up live. Installing the older one anyway silently regresses
+    the settings while reporting failure.
+    """
+    for extra in (1, 3):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            target = root / "settings.json"
+            write_json(source, {"model": "opus"})
+            write_json(target, {"model": "sonnet", "foreign": 0})
+
+            original_write = settings_module.write_temporary
+            rounds: list[int] = []
+
+            def inject(target_path: Path, payload: bytes, mode: int) -> Path:
+                temporary = original_write(target_path, payload, mode)
+                rounds.append(1)
+                # Keeps writing past exhaustion, into the restore itself.
+                if len(rounds) <= settings_module.ATTEMPTS + extra:
+                    foreign = target_path.with_name("foreign.json")
+                    write_json(
+                        foreign,
+                        {"model": "sonnet", "foreign": len(rounds)},
+                    )
+                    os.replace(foreign, target_path)
+                return temporary
+
+            settings_module.write_temporary = inject
+            try:
+                sys.argv = [
+                    "apply-claude-settings.py",
+                    "--model",
+                    "--source",
+                    str(source),
+                    "--target",
+                    str(target),
+                ]
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        settings_module.main()
+                except SystemExit:
+                    pass
+            finally:
+                settings_module.write_temporary = original_write
+
+            newest = settings_module.ATTEMPTS + extra
+            live = read_json(target).get("foreign")
+            require(
+                live == newest,
+                f"{extra} writer(s) during the restore: live version is "
+                f"{live}, but {newest} is newer and exists only in a backup",
+            )
+
+
 @test("a failed flush still leaves a backup of the displaced version")
 def test_backup_precedes_flush() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -1175,6 +1234,76 @@ def test_long_target_name_backup() -> None:
                 not sidecar_residue(root, target.name),
                 "the displaced version was left under a temporary name",
             )
+
+
+@test("continuous contention destroys no version of the settings")
+def test_unbounded_contention_preserves_every_version() -> None:
+    """The guarantee a bounded compare-and-swap can actually make.
+
+    If a writer lands in the window on every single attempt, the loop stops
+    with an older version live and a newer one only in a backup. No bounded
+    algorithm avoids that. What must hold regardless is that no version is
+    ever destroyed, so the state is recoverable by hand.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source.json"
+        target = root / "settings.json"
+        write_json(source, {"model": "opus"})
+        write_json(target, {"model": "sonnet", "foreign": 0})
+
+        original_write = settings_module.write_temporary
+        rounds: list[int] = []
+
+        def inject(target_path: Path, payload: bytes, mode: int) -> Path:
+            temporary = original_write(target_path, payload, mode)
+            rounds.append(1)
+            # Never relents, including through every restore attempt.
+            foreign = target_path.with_name("foreign.json")
+            write_json(foreign, {"model": "sonnet", "foreign": len(rounds)})
+            os.replace(foreign, target_path)
+            return temporary
+
+        settings_module.write_temporary = inject
+        try:
+            sys.argv = [
+                "apply-claude-settings.py",
+                "--model",
+                "--source",
+                str(source),
+                "--target",
+                str(target),
+            ]
+            reported = ""
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    settings_module.main()
+            except SystemExit as exc:
+                reported = str(exc.code)
+        finally:
+            settings_module.write_temporary = original_write
+
+        backups = sorted(
+            root.glob("settings.json.backup-claude-codex-*"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        preserved = {read_json(path).get("foreign") for path in backups}
+        preserved.add(read_json(target).get("foreign"))
+
+        require(reported, "continuous contention was not reported as failure")
+        require(
+            preserved >= set(range(1, len(rounds) + 1)),
+            f"a version was destroyed: saw {sorted(preserved)} of "
+            f"{len(rounds)} written",
+        )
+        require(
+            "preserved" in reported and "Rerun" in reported,
+            f"the report does not say how to recover: {reported!r}",
+        )
+        require(
+            not sidecar_residue(root, target.name),
+            "contention left temporary files behind",
+        )
 
 
 @test("an update is refused when RENAME_EXCHANGE is unsupported")
@@ -2900,6 +3029,60 @@ def test_cleanup_absent_session() -> None:
         "Clean" in result.stdout,
         f"unexpected output: {result.stdout.strip()!r}",
     )
+
+
+@test("unlinking a lock cannot split mutual exclusion")
+def test_lock_survives_unlink() -> None:
+    """A lock held on an unlinked inode excludes nobody.
+
+    Reclamation unlinks the pathname, so a waiter that was already blocked
+    on the old inode must notice and start again on the file that replaced
+    it, rather than believing it holds the lock.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_leave_no_trace_unlink",
+    )
+
+    session = f"kit-tests-{os.getpid()}-unlink"
+    path = hook.session_lock_path(session)
+    overlapped: list[bool] = []
+    inside = threading.Event()
+
+    def waiter() -> None:
+        inside.wait(timeout=30)
+        with hook.session_lock(session):
+            # If exclusion had split, a second holder could enter here.
+            entered: list[bool] = []
+
+            def contender() -> None:
+                with hook.session_lock(session):
+                    entered.append(True)
+
+            other = threading.Thread(target=contender)
+            other.start()
+            other.join(timeout=2.0)
+            overlapped.append(bool(entered))
+
+    thread = threading.Thread(target=waiter)
+    try:
+        thread.start()
+        with hook.session_lock(session):
+            inside.set()
+            time.sleep(0.3)
+            # Reclamation, exactly as cleanup performs it.
+            path.unlink(missing_ok=True)
+        thread.join(timeout=60)
+
+        require(overlapped, "the waiter never acquired the lock")
+        require(
+            not overlapped[0],
+            "two holders were inside the lock at once, so unlinking split "
+            "mutual exclusion across two inodes",
+        )
+    finally:
+        thread.join(timeout=30)
+        path.unlink(missing_ok=True)
 
 
 @test("lock files are reclaimed rather than accumulating per session")

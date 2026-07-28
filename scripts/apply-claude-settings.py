@@ -671,16 +671,37 @@ def main() -> int:
         # Every attempt collided. Put the version displaced by the last one
         # back, so the settings end as they were found instead of holding a
         # merge that omits it, and only then report that nothing was applied.
-        try:
-            restored, _bytes, _displaced, _installed = install(
-                target_path,
-                base_bytes,
-                mode,
-                identity,
-                expected_bytes,
-            )
-        except FileNotFoundError:
-            restored = False
+        #
+        # The restore is a compare-and-swap like any other, so it can lose
+        # to a writer that lands during it. Losing means an even newer
+        # version was displaced, which is then what should be live, so the
+        # restore follows the same convergence as the main loop rather than
+        # leaving an older version installed.
+        payload = base_bytes
+        restored = False
+
+        for _restore_attempt in range(ATTEMPTS):
+            try:
+                restored, displaced_bytes, displaced, installed = install(
+                    target_path,
+                    payload,
+                    mode,
+                    identity,
+                    expected_bytes,
+                )
+            except FileNotFoundError:
+                restored = False
+                break
+
+            if restored:
+                break
+
+            # Order matters: the target now holds the payload this attempt
+            # installed, and the next attempt installs what was displaced.
+            expected_bytes = payload
+            payload = displaced_bytes
+            mode = displaced.st_mode & 0o777
+            identity = installed
 
         if restored:
             raise SystemExit(
@@ -689,11 +710,21 @@ def main() -> int:
                 "as they were found."
             )
 
+    # Every bounded compare-and-swap has this end: if a writer lands in the
+    # window on every attempt, the loop stops with the version it last
+    # installed live and a newer one only in a backup. Under sustained
+    # contention no bounded algorithm avoids that, so the guarantee this
+    # code does make is the one that matters: no version is ever destroyed.
+    # Each is preserved as a backup, and the newest is the most recent of
+    # them, so the state is always recoverable by hand.
     raise SystemExit(
         f"Claude settings changed during each of {ATTEMPTS} attempts and "
-        "again while restoring them. No update was applied. Every displaced "
-        f"version was preserved as a {target_path.name}"
-        ".backup-claude-codex-* file."
+        f"again during {ATTEMPTS} attempts to restore them, so another "
+        "writer is updating them continuously. No update was applied. Every "
+        "version that was displaced is preserved as a "
+        f"{target_path.name}.backup-claude-codex-* file, newest last by "
+        "modification time, and one of those is more recent than what is "
+        "currently live. Rerun once the other writer has stopped."
     )
 
 

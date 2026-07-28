@@ -268,13 +268,37 @@ def session_lock(session_id: str) -> Any:
     so teardown completes before a lease is granted, or the other way round.
     """
     path = session_lock_path(session_id)
-    with path.open("a+b") as handle:
-        private_file(path)
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+    while True:
+        handle = path.open("a+b")
         try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            private_file(path)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+            # The pathname can be unlinked and recreated while this call
+            # waits, and a lock held on an unlinked inode excludes nobody.
+            # Confirm the descriptor is still the file the path names, or
+            # start again on the file that replaced it.
+            try:
+                current = path.stat()
+            except FileNotFoundError:
+                handle.close()
+                continue
+
+            held = os.fstat(handle.fileno())
+            if (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+                handle.close()
+                continue
+        except BaseException:
+            handle.close()
+            raise
+
+        break
+
+    try:
+        yield
+    finally:
+        handle.close()
 
 
 def scan_session_processes(
