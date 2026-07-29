@@ -91,6 +91,10 @@ link_file \
     "$CODEX_HOME/terra.config.toml"
 
 link_file \
+    "$KIT_DIR/global/codex/vesta.config.toml" \
+    "$CODEX_HOME/vesta.config.toml"
+
+link_file \
     "$KIT_DIR/global/codex/sol.config.toml" \
     "$CODEX_HOME/sol.config.toml"
 

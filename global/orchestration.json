@@ -8,7 +8,8 @@
       "file": "global/claude-settings.json",
       "aliases": "global/claude-models.json",
       "summary": "Classifies every request, plans, delegates bounded work, inspects each diff itself, runs verification, and owns the outcome.",
-      "selects": "The default Claude Code model for new sessions. Repositories can override it with claude-codex-init <alias>, and a running session with /model."
+      "selects": "The default Claude Code model for new sessions. Repositories can override it with claude-codex-init <alias>, and a running session with /model.",
+      "shared_note": "One continuous session runs every orchestrator step, so they necessarily share a model."
     },
     {
       "id": "luna",
@@ -31,14 +32,120 @@
       "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable."
     },
     {
+      "id": "vesta",
+      "title": "Vesta",
+      "provider": "openai",
+      "kind": "codex-profile",
+      "file": "global/codex/vesta.config.toml",
+      "expected_effort": "high",
+      "summary": "The plan reviewer: challenges a plan before any code is written, when the work is complex or high-risk.",
+      "selects": "The Codex model behind the vesta profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer."
+    },
+    {
       "id": "sol",
       "title": "Sol",
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/sol.config.toml",
       "expected_effort": "high",
-      "summary": "The independent reviewer: fresh read-only sessions that challenge plans and completed work, and difficult diagnosis.",
-      "selects": "The Codex model behind the sol profile. Its high reasoning effort defines the role and is not configurable."
+      "summary": "The final reviewer: fresh read-only sessions that review completed work, and difficult diagnosis.",
+      "selects": "The Codex model behind the sol profile, used for the review that gates completion."
     }
-  ]
+  ],
+  "flow": [
+    {
+      "id": "request",
+      "label": "An ordinary request, in your own words",
+      "role": null,
+      "note": "No model runs here."
+    },
+    {
+      "id": "classify",
+      "label": "Classify the work",
+      "role": "orchestrator",
+      "note": "Trivial, mechanical, standard, complex, or investigation."
+    },
+    {
+      "id": "trivial",
+      "label": "Trivial: implement directly",
+      "role": "orchestrator",
+      "group": "branches"
+    },
+    {
+      "id": "mechanical",
+      "label": "Mechanical: delegate the edit",
+      "role": "luna",
+      "group": "branches"
+    },
+    {
+      "id": "standard",
+      "label": "Standard: delegate the implementation",
+      "role": "terra",
+      "group": "branches"
+    },
+    {
+      "id": "investigation",
+      "label": "Investigation: diagnose, change nothing",
+      "role": "orchestrator",
+      "group": "branches",
+      "note": "Read-only sandboxes. Sol may give a second opinion when it materially helps."
+    },
+    {
+      "id": "plan",
+      "label": "Complex: write the plan",
+      "role": "orchestrator",
+      "group": "complex"
+    },
+    {
+      "id": "plan-review",
+      "label": "Complex: challenge the plan",
+      "role": "vesta",
+      "group": "complex"
+    },
+    {
+      "id": "implement",
+      "label": "Complex: implement the approved plan",
+      "role": "terra",
+      "group": "complex"
+    },
+    {
+      "id": "inspect",
+      "label": "Inspect the real diff, never the worker's summary",
+      "role": "orchestrator"
+    },
+    {
+      "id": "verify",
+      "label": "Tests, lint, type checks, build",
+      "role": null,
+      "note": "Shell commands. No model runs here."
+    },
+    {
+      "id": "review",
+      "label": "Independent review of the finished work",
+      "role": "sol",
+      "note": "Fresh session, read-only, contained. Always for complex work; for standard work when logic or regression risk warrants it; not for trivial changes."
+    },
+    {
+      "id": "correct",
+      "label": "Reproduce each finding, fix, add regression tests",
+      "role": "orchestrator",
+      "note": "Only when a review produced findings that survived verification."
+    },
+    {
+      "id": "done",
+      "label": "Done. Nothing committed without an explicit request",
+      "role": null,
+      "note": "No model runs here."
+    }
+  ],
+  "bands": {
+    "branches": {
+      "label": "exactly one of these is taken, by classification",
+      "connector": "\u2193"
+    },
+    "complex": {
+      "label": "complex or high-risk work takes this branch instead, in order",
+      "connector": "or"
+    }
+  }
 }

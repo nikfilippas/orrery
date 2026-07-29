@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -85,19 +86,27 @@ def interrupting_signals() -> set[int]:
     }
 
 
+PROFILE_ROLES = {
+    "sol": "independent review",
+    "vesta": "plan review",
+}
+
+
 def usage() -> str:
     return (
         "Usage:\n"
-        "  claude-codex-review [--timeout SECONDS] [--output PATH] -- PROMPT...\n"
+        "  claude-codex-review [--timeout SECONDS] [--output PATH]\n"
+        "                      [--profile NAME] -- PROMPT...\n"
         "  printf '%s\\n' \"PROMPT\" | claude-codex-review "
         "[--timeout SECONDS] [--output PATH]\n\n"
-        "Runs a synchronous independent review through the Codex `sol` profile. "
-        "The run is placed in a transient systemd user service so timeout and "
+        "Runs a synchronous independent review through a read-only Codex "
+        "profile, `sol` by default and `vesta` for plan review. The run is "
+        "placed in a transient systemd user service so timeout and "
         "interruption stop its complete control group.\n"
     )
 
 
-def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
+def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
     try:
         timeout_seconds = int(
             os.environ.get("CODEX_REVIEW_TIMEOUT_SECONDS", "600")
@@ -109,6 +118,7 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
 
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
+    profile = "sol"
 
     index = 0
     while index < len(argv):
@@ -151,6 +161,13 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
             if not value:
                 raise UsageError("--output requires a non-empty path")
             output_path = Path(value)
+        elif argument in ("--profile", "-p"):
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --profile")
+            index += 1
+            profile = argv[index]
+        elif argument.startswith("--profile="):
+            profile = argument.split("=", 1)[1]
         elif argument.startswith("-"):
             raise UsageError(f"unknown wrapper option: {argument}")
         else:
@@ -172,7 +189,11 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
     if not prompt.strip():
         raise UsageError("the review prompt is empty")
 
-    return timeout_seconds, output_path, prompt
+    # A profile name becomes a filename, so it may not escape CODEX_HOME.
+    if not profile or not re.fullmatch(r"[A-Za-z0-9._-]+", profile):
+        raise UsageError(f"invalid profile name: {profile!r}")
+
+    return timeout_seconds, output_path, prompt, profile
 
 
 def codex_home() -> Path:
@@ -786,7 +807,7 @@ def main() -> int:
     os.umask(0o077)
 
     try:
-        timeout_seconds, output_path, prompt = parse_args(sys.argv[1:])
+        timeout_seconds, output_path, prompt, profile = parse_args(sys.argv[1:])
     except UsageError as exc:
         print(f"claude-codex-review: {exc}", file=sys.stderr)
         print(usage(), file=sys.stderr, end="")
@@ -815,14 +836,14 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    profile = "sol"
     try:
         model = profile_model(profile)
     except UsageError as exc:
         print(f"claude-codex-review: {exc}", file=sys.stderr)
         return 2
     print(
-        f"↳ Codex Sol · {model} · independent review",
+        f"↳ Codex {profile.capitalize()} · {model} · "
+        f"{PROFILE_ROLES.get(profile, 'independent review')}",
         file=sys.stderr,
         flush=True,
     )

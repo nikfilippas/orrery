@@ -5,22 +5,22 @@
 
 # Órrery
 
-**One orchestrator, three workers, no residue.**
+**One orchestrator, four workers, no residue.**
 
 Órrery, pronounced *OR-ər-ee* with the stress the accent marks, takes its
 name from the orrery: a clockwork model of the solar system, one mechanism
 keeping every body in its proper orbit. This kit does the same for AI-assisted
 development. It makes **Claude Code the principal engineer** of every
 session and the **Codex CLI its specialist crew**, named for their orbits:
-**Luna** for mechanical work, **Terra** for implementation, **Sol** for
-independent review. Around them sits an atomic configuration system, a
+**Luna** for mechanical work, **Terra** for implementation, **Vesta** to
+challenge a plan and **Sol** to review the result. Around them sits an atomic configuration system, a
 cross-model review harness with hard cleanup guarantees, and a session
 hygiene layer that reverts everything a session creates.
 
 You describe outcomes in ordinary language. The orchestration decides who
 does what, inspects everything itself, and owns the result.
 
-| 93 | 48 | 3 | 2 |
+| 97 | 53 | 4 | 2 |
 | :---: | :---: | :---: | :---: |
 | deterministic regression tests | doctor checks, no model calls | Codex worker profiles | commands to adopt a repository |
 
@@ -32,7 +32,7 @@ flowchart TD
     C -->|trivial| K[Claude implements directly]
     C -->|mechanical| L[Luna executes<br/>workspace-write]
     C -->|standard| T[Terra implements<br/>workspace-write]
-    C -->|complex| P[Claude plans,<br/>Sol challenges the plan] --> T
+    C -->|complex| P[Claude plans,<br/>Vesta challenges the plan] --> T
     C -->|investigation| R[read-only sandboxes only]
     L --> I[Claude inspects the real diff,<br/>never the worker's summary]
     T --> I
@@ -46,11 +46,13 @@ flowchart TD
     classDef claude fill:#38617f,stroke:#2a4a62,color:#ffffff
     classDef luna fill:#98a2b8,stroke:#737d94,color:#1b2226
     classDef terra fill:#587b50,stroke:#44603e,color:#ffffff
+    classDef vesta fill:#8a6a9c,stroke:#6d5279,color:#ffffff
     classDef sol fill:#b07e28,stroke:#8c641f,color:#ffffff
     classDef quiet fill:#e8ebee,stroke:#b8c0c7,color:#1b2226
-    class U,C,K,I,P,X claude
+    class U,C,K,I,X claude
     class L luna
     class T terra
+    class P vesta
     class S sol
     class R,V,F,D quiet
 ```
@@ -62,7 +64,7 @@ What each class sounds like, and who touches it:
 | Trivial | "fix this typo", "bump the timeout" | Claude directly, smallest relevant check | diff inspection only |
 | Mechanical | "rename this across the repo" | Luna, workspace-write | diff inspection |
 | Standard | "add a `--top` flag with tests" | Terra, workspace-write, one bounded task per run | Sol, when logic or regression risk warrants it |
-| Complex | auth, migrations, concurrency | Claude plans, Sol challenges the plan, then Terra in batches | Sol, fresh session, findings verified before any fix |
+| Complex | auth, migrations, concurrency | Claude plans, Vesta challenges the plan, then Terra in batches | Sol, fresh session, findings verified before any fix |
 | Investigation | "why does this leak?" | nobody: read-only sandboxes only | Sol as a second opinion when it materially helps |
 
 Delegation never transfers responsibility. Codex failure never strands a
@@ -79,7 +81,12 @@ review is reported as a limitation rather than papered over.
 | Principal orchestrator | the active Claude Code model (default `opus`) | session setting | classification, planning, inspection, verification, ownership |
 | Luna | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
 | Terra | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| Sol | `gpt-5.6-sol` | high | independent review and difficult diagnosis |
+| Vesta | `gpt-5.6-sol` | high | challenging a plan before any code is written |
+| Sol | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
+
+Vesta and Sol ship with the same model so behaviour is unchanged out of the
+box, but they are separate profiles: reviewing foundations and reviewing
+consequences can be priced differently.
 
 The orchestrator understands the request, inspects the repository,
 classifies the task, delegates bounded work with explicit acceptance
@@ -268,7 +275,7 @@ git clone <remote> ~/src/claude-codex-kit
 cd ~/src/claude-codex-kit
 ./scripts/install.sh     # symlinks, hooks, one atomic settings merge
 codex login              # once per machine
-claude-codex-doctor      # 48 checks, no model calls
+claude-codex-doctor      # 53 checks, no model calls
 ```
 
 `~/.local/bin` must be on `PATH`; the installer warns and the doctor fails
@@ -304,7 +311,7 @@ that contradicts delegation before it can misfire.
 ## Proving it works
 
 ```bash
-./tests/run-tests.py     # 93 deterministic tests, stand-in Codex, no credits
+./tests/run-tests.py     # 97 deterministic tests, stand-in Codex, no credits
 claude-codex-doctor      # CLAUDE_CODEX_KIT_READY when everything holds
 ```
 

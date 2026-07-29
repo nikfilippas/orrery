@@ -128,7 +128,7 @@ Workflow:
 
 1. The principal orchestrator investigates the repository.
 2. The principal orchestrator produces an explicit plan with acceptance criteria.
-3. A fresh `sol` profile run challenges the plan in read-only mode.
+3. A fresh `vesta` profile run challenges the plan in read-only mode.
 4. The principal orchestrator evaluates the criticism and revises the plan where justified.
 5. The `terra` profile implements the approved plan unless the review
    profile is materially justified as the implementer.
@@ -190,11 +190,34 @@ Example invocation:
       --color never \
       "<PROMPT>"
 
+### Plan reviewer: `vesta` profile
+
+Use Vesta for:
+
+- Independent review of a plan, before any code is written.
+
+Default reasoning effort: high.
+
+Example invocation:
+
+    codex --profile vesta exec \
+      --sandbox read-only \
+      --ephemeral \
+      --color never \
+      "<PROMPT>"
+
+Or, with the same containment and cleanup as any other review:
+
+    claude-codex-review --profile vesta --timeout 600 -- "<PROMPT>"
+
+Vesta and Sol are separate profiles so that challenging a plan and
+reviewing finished work can use different models. They ship configured
+identically, so nothing changes until one of them is repointed.
+
 ### Independent reviewer: `sol` profile
 
 Use Sol for:
 
-- Independent plan review.
 - Independent final code review.
 - Difficult diagnosis.
 - Security-sensitive reasoning.
@@ -335,7 +358,7 @@ For complex or high-risk work:
 1. Inspect architecture, implementation, tests, and relevant history.
 2. Define explicit acceptance criteria and failure conditions.
 3. Write an implementation plan.
-4. Ask a fresh Sol session to challenge the plan.
+4. Ask a fresh Vesta session to challenge the plan.
 5. Evaluate the review independently.
 6. Revise the plan only where criticism is supported.
 7. Delegate implementation to Terra in one coherent run where practical.

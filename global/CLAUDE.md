@@ -139,13 +139,15 @@ relevant files, diff, commands, and results directly.
 
 - Use direct Codex CLI profiles for automated work. Do not invoke the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
 
-Three Codex profiles are installed, distinguished by reasoning effort:
+Four Codex profiles are installed, distinguished by reasoning effort and
+by the stage they serve:
 
 | Profile | Reasoning | Use for |
 | --- | --- | --- |
 | `luna` | low | narrow, mechanical, well-specified edits |
 | `terra` | medium | the default worker for substantial implementation |
-| `sol` | high | independent review, and difficult diagnosis |
+| `vesta` | high | challenging a plan before any code is written |
+| `sol` | high | reviewing finished work, and difficult diagnosis |
 
 Invoke them as `codex --profile <name> exec`. An unknown profile name is not
 an error to Codex: it silently falls back to the default model and effort, so

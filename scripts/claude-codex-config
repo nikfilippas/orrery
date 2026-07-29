@@ -389,14 +389,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   :root {
     --ground: #f3f5f6; --panel: #ffffff; --edge: #d9dfe3;
     --ink: #1b2226; --soft: #4c5a63; --accent: #38617f;
-    --luna: #737d94; --terra: #587b50; --sol: #a97a24;
+    --luna: #737d94; --terra: #587b50; --vesta: #8a6a9c; --sol: #a97a24;
     --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ground: #14181b; --panel: #1c2226; --edge: #2c353b;
       --ink: #dde3e6; --soft: #a6b2b9; --accent: #7fa8c9;
-      --luna: #98a2b8; --terra: #86a97e; --sol: #cfa04a;
+      --luna: #98a2b8; --terra: #86a97e; --vesta: #b294c4; --sol: #cfa04a;
       --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
     }
   }
@@ -408,43 +408,55 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
-  .flow { display: grid; gap: 14px; }
-  .arrow { text-align: center; color: var(--soft); font-size: 13px; }
-  .step {
+  .flow { display: grid; gap: 0; }
+  .rail { display: grid; gap: 10px; }
+  .connector {
+    justify-self: center; color: var(--soft); font-size: 18px;
+    line-height: 1; padding: 7px 0;
+  }
+  .branchband {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
+    gap: 10px;
+  }
+  .bandlabel {
+    font-size: 11.5px; letter-spacing: 0.09em; text-transform: uppercase;
+    color: var(--soft); margin: 2px 0 -2px;
+  }
+  .node {
     background: var(--panel); border: 1px solid var(--edge);
-    border-top: 3px solid var(--role, var(--accent)); padding: 14px 16px;
+    border-left: 3px solid var(--role, var(--edge)); padding: 11px 13px;
   }
-  .workers { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
-  .step h2 { font-size: 15.5px; margin: 0; display: flex; gap: 8px; align-items: baseline; }
+  .node.inert { border-left-style: dotted; opacity: 0.8; }
+  .node h2 { font-size: 14px; margin: 0 0 3px; font-weight: 600; }
   .badge {
-    font-family: ui-monospace, monospace; font-size: 10.5px;
+    font-family: ui-monospace, monospace; font-size: 10px;
     letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--role, var(--accent));
+    color: var(--role, var(--soft));
   }
-  .summary { font-size: 13px; color: var(--soft); margin: 6px 0 10px; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  label { font-size: 12.5px; color: var(--soft); }
+  .note { font-size: 12px; color: var(--soft); margin: 3px 0 0; }
+  .control { margin-top: 8px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+  label { font-size: 12px; color: var(--soft); }
   select, input[type=text] {
     background: var(--ground); color: var(--ink);
-    border: 1px solid var(--edge); padding: 5px 8px; font-size: 13.5px;
-    font-family: ui-monospace, monospace; min-width: 200px;
+    border: 1px solid var(--edge); padding: 4px 7px; font-size: 13px;
+    font-family: ui-monospace, monospace; min-width: 185px;
   }
-  .fixed { font-family: ui-monospace, monospace; font-size: 13px; }
-  .note { font-size: 12px; color: var(--soft); margin-top: 8px; }
-  .live { font-size: 12px; color: var(--soft); }
-  .actions { margin: 26px 0 12px; display: flex; gap: 10px; }
-  button {
-    background: var(--accent); color: #fff; border: none;
-    padding: 9px 18px; font-size: 14px; cursor: pointer;
+  .mirror {
+    font-family: ui-monospace, monospace; font-size: 12.5px;
+    color: var(--ink); background: var(--ground);
+    border: 1px dashed var(--edge); padding: 3px 7px;
   }
-  button:disabled { opacity: 0.45; cursor: default; }
-  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
-  pre {
-    background: var(--code); color: var(--code-ink); padding: 12px 14px;
-    overflow-x: auto; font-size: 12.5px; line-height: 1.55;
+  .mirrornote { font-size: 11.5px; color: var(--soft); }
+  .fixed { font-family: ui-monospace, monospace; font-size: 12px; color: var(--soft); }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 18px;
+    font-size: 12.5px; color: var(--soft);
   }
-  .ok { color: var(--good); } .err { color: var(--bad); }
-  #result h3 { font-size: 14px; margin: 18px 0 6px; }
+  .legend span::before {
+    content: ""; display: inline-block; width: 9px; height: 9px;
+    margin-right: 6px; background: var(--role, var(--accent));
+  }
+
   .scopenote {
     border-left: 3px solid var(--accent); padding: 8px 12px;
     font-size: 13px; color: var(--soft); margin: 20px 0;
@@ -454,7 +466,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>Órrery configuration</h1>
-  <p class="sub">Generated from the live files under __KIT_DIR__. The page holds no knowledge of its own.</p>
+  <p class="sub">The pipeline as it actually runs, generated from the live files under __KIT_DIR__.
+     Steps sharing a role share one model, and say so; steps that run no model say that too.</p>
   <div class="flow" id="flow"></div>
   <div class="scopenote">
     Saving changes the system-wide default for <strong>new sessions</strong>.
@@ -471,76 +484,138 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </div>
 <script>
 const STATE = __STATE__;
+const FLOW = __FLOW__;
+const BANDS = __BANDS__;
 const TOKEN_PATH = __TOKEN_PATH__;
-const original = {};
+const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
+const original = Object.fromEntries(STATE.map(s => [s.id, s.model]));
 const flow = document.getElementById("flow");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
-
-function roleColour(id) {
-  return { luna: "var(--luna)", terra: "var(--terra)", sol: "var(--sol)" }[id] || "var(--accent)";
-}
 
 function esc(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function stepBox(step) {
-  const box = document.createElement("div");
-  box.className = "step";
-  box.style.setProperty("--role", roleColour(step.id));
-  original[step.id] = step.model;
+function roleColour(id) {
+  return {
+    orchestrator: "var(--accent)", luna: "var(--luna)",
+    terra: "var(--terra)", vesta: "var(--vesta)", sol: "var(--sol)",
+  }[id] || "var(--edge)";
+}
+
+// The first node of each role owns the control; later nodes mirror it,
+// because those steps genuinely run the same configured model.
+const owner = {};
+FLOW.forEach(node => {
+  if (node.role && !(node.role in owner)) owner[node.role] = node.id;
+});
+
+function control(step) {
   const id = esc(step.id);
-  let picker;
   if (step.choices) {
-    const options = step.choices
-      .map(c => `<option value="${esc(c.value)}" ${c.value === step.model ? "selected" : ""}>${esc(c.alias)} → ${esc(c.value)}</option>`)
-      .join("");
+    const options = step.choices.map(c =>
+      `<option value="${esc(c.value)}" ${c.value === step.model ? "selected" : ""}>` +
+      `${esc(c.alias)} → ${esc(c.value)}</option>`).join("");
     const custom = step.choices.some(c => c.value === step.model) ? "" : "selected";
-    picker = `<select data-step="${id}" data-kind="select">${options}
-      <option value="__custom__" ${custom}>custom…</option></select>
-      <input type="text" data-step="${id}" data-kind="custom"
-        value="${custom ? esc(step.model) : ""}" style="display:${custom ? "inline-block" : "none"}"
-        placeholder="exact model identifier">`;
-  } else {
-    picker = `<input type="text" data-step="${id}" data-kind="model" value="${esc(step.model)}">`;
+    return `<select data-step="${id}" data-kind="select">${options}` +
+      `<option value="__custom__" ${custom}>custom…</option></select>` +
+      `<input type="text" data-step="${id}" data-kind="custom" ` +
+      `value="${custom ? esc(step.model) : ""}" ` +
+      `style="display:${custom ? "inline-block" : "none"}" ` +
+      `placeholder="exact model identifier">`;
   }
-  const effort = step.effort
-    ? `<span class="fixed" title="Defined by the role">effort: ${esc(step.effort)} (fixed)</span>` : "";
-  const live = step.live_model !== undefined
-    ? `<div class="live">live default now: <code>${esc(step.live_model || "unset")}</code></div>` : "";
-  box.innerHTML = `
-    <h2>${esc(step.title)} <span class="badge">${esc(step.provider)}</span></h2>
-    <p class="summary">${esc(step.summary)}</p>
-    <div class="row"><label>model</label> ${picker} ${effort}</div>
-    ${live}
-    <p class="note">${esc(step.selects)} <code>${esc(step.file)}</code></p>`;
+  return `<input type="text" data-step="${id}" data-kind="model" value="${esc(step.model)}">`;
+}
+
+function nodeBox(node) {
+  const box = document.createElement("div");
+  const step = node.role ? roles[node.role] : null;
+  box.className = step ? "node" : "node inert";
+  if (step) box.style.setProperty("--role", roleColour(step.id));
+
+  let body = "";
+  if (!step) {
+    body = `<p class="note">${esc(node.note || "No model runs here.")}</p>`;
+  } else if (owner[node.role] === node.id) {
+    const effort = step.effort
+      ? `<span class="fixed">effort ${esc(step.effort)} · fixed by the role</span>` : "";
+    body = `<div class="control"><label>model</label>${control(step)}${effort}</div>` +
+      (node.note ? `<p class="note">${esc(node.note)}</p>` : "");
+  } else {
+    body = `<div class="control"><span class="mirror" data-mirror="${esc(step.id)}">` +
+      `${esc(step.model)}</span>` +
+      `<span class="mirrornote">same ${esc(step.title)} profile as above</span></div>` +
+      (node.note ? `<p class="note">${esc(node.note)}</p>` : "");
+  }
+
+  box.innerHTML = `<h2>${esc(node.label)}</h2>` +
+    (step ? `<span class="badge">${esc(step.title)} · ${esc(step.provider)}</span>` :
+      `<span class="badge">no model</span>`) + body;
   return box;
 }
 
 function render() {
-  const byId = Object.fromEntries(STATE.map(s => [s.id, s]));
-  flow.appendChild(stepBox(byId.orchestrator));
-  flow.insertAdjacentHTML("beforeend",
-    '<div class="arrow">↓ classifies, plans, delegates bounded work ↓</div>');
-  const workers = document.createElement("div");
-  workers.className = "workers";
-  ["luna", "terra", "sol"].forEach(id => byId[id] && workers.appendChild(stepBox(byId[id])));
-  flow.appendChild(workers);
-  STATE.filter(s => !["orchestrator", "luna", "terra", "sol"].includes(s.id))
-    .forEach(s => flow.appendChild(stepBox(s)));
-  flow.insertAdjacentHTML("beforeend",
-    '<div class="arrow">↓ diff inspection · verification · independent review · nothing committed without approval ↓</div>');
+  const legend = document.createElement("div");
+  legend.className = "legend";
+  legend.innerHTML = STATE.map(s =>
+    `<span style="--role:${roleColour(s.id)}">${esc(s.title)}</span>`).join("");
+  flow.parentNode.insertBefore(legend, flow);
+
+  const rail = document.createElement("div");
+  rail.className = "rail";
+  let index = 0;
+  let first = true;
+  while (index < FLOW.length) {
+    const group = FLOW[index].group;
+    const band = [];
+    while (index < FLOW.length && FLOW[index].group === group && group) {
+      band.push(FLOW[index]); index += 1;
+    }
+    if (!band.length) { band.push(FLOW[index]); index += 1; }
+
+    if (!first) {
+      const arrow = document.createElement("div");
+      arrow.className = "connector";
+      // A band declares how it follows what came before: a step that
+      // continues the pipeline, or a branch taken instead of it.
+      arrow.textContent = (group && BANDS[group] && BANDS[group].connector) || "↓";
+      rail.appendChild(arrow);
+    }
+    first = false;
+
+    if (group) {
+      const label = document.createElement("div");
+      label.className = "bandlabel";
+      label.textContent = (BANDS[group] && BANDS[group].label) || group;
+      rail.appendChild(label);
+      const wrap = document.createElement("div");
+      wrap.className = "branchband";
+      band.forEach(node => wrap.appendChild(nodeBox(node)));
+      rail.appendChild(wrap);
+    } else {
+      band.forEach(node => rail.appendChild(nodeBox(node)));
+    }
+  }
+  flow.appendChild(rail);
 }
 
 function currentModel(id) {
   const select = document.querySelector(`select[data-step="${id}"]`);
   if (select) {
     if (select.value !== "__custom__") return select.value;
-    return document.querySelector(`input[data-step="${id}"][data-kind="custom"]`).value.trim();
+    const custom = document.querySelector(`input[data-step="${id}"][data-kind="custom"]`);
+    return custom ? custom.value.trim() : "";
   }
-  return document.querySelector(`input[data-step="${id}"]`).value.trim();
+  const field = document.querySelector(`input[data-step="${id}"]`);
+  return field ? field.value.trim() : "";
+}
+
+function syncMirrors() {
+  document.querySelectorAll("[data-mirror]").forEach(element => {
+    element.textContent = currentModel(element.dataset.mirror) || "(empty)";
+  });
 }
 
 function changes() {
@@ -561,6 +636,7 @@ async function post(endpoint, body) {
   return response.json();
 }
 
+document.addEventListener("input", () => { syncMirrors(); applyButton.disabled = true; });
 document.addEventListener("change", event => {
   if (event.target.dataset && event.target.dataset.kind === "select") {
     const custom = document.querySelector(
@@ -568,6 +644,7 @@ document.addEventListener("change", event => {
     if (custom) custom.style.display =
       event.target.value === "__custom__" ? "inline-block" : "none";
   }
+  syncMirrors();
   applyButton.disabled = true;
 });
 
@@ -602,10 +679,11 @@ applyButton.addEventListener("click", async () => {
     `<h3>Propagated to live settings</h3><pre>${esc(reply.propagated.output)}</pre>` : "";
   result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
     propagated + doctor +
-    '<p class="note">Reload the page to edit further; the kit repository now holds these values, ready to commit.</p>';
+    '<p class="note">Reload to edit further; the kit repository now holds these values, ready to commit.</p>';
 });
 
 document.getElementById("revert").addEventListener("click", () => location.reload());
+
 render();
 </script>
 </body>
@@ -643,6 +721,8 @@ def render_page(token: str) -> str:
     return (
         PAGE_TEMPLATE
         .replace("__STATE__", script_json(snapshot()))
+        .replace("__FLOW__", script_json(load_manifest().get("flow", [])))
+        .replace("__BANDS__", script_json(load_manifest().get("bands", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
         .replace("__KIT_DIR__", escape_html(str(KIT_DIR)))
     )

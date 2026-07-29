@@ -21,7 +21,8 @@ Three Codex profiles, each pinning its own model and reasoning effort:
 | --- | --- | --- | --- |
 | `luna` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
 | `terra` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| `sol` | `gpt-5.6-sol` | high | independent review, and difficult diagnosis |
+| `vesta` | `gpt-5.6-sol` | high | challenging a plan before code is written |
+| `sol` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
 
 Two rules shape everything else:
 
@@ -42,6 +43,7 @@ Two rules shape everything else:
 | `global/hooks/leave-no-trace.py` | Session lifecycle hook and `claude-lnt-*` implementation |
 | `global/codex/luna.config.toml` | Low-effort Codex profile |
 | `global/codex/terra.config.toml` | Medium-effort Codex profile |
+| `global/codex/vesta.config.toml` | High-effort Codex profile for plan review |
 | `global/codex/sol.config.toml` | High-effort Codex profile |
 | `project-template/CLAUDE.md` | Shared per-repository template |
 | `project-template/CLAUDE.local.md` | Private per-repository workflow block |

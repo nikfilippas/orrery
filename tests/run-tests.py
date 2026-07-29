@@ -4367,7 +4367,7 @@ def test_orchestration_manifest() -> None:
     manifest = read_json(KIT_DIR / "global" / "orchestration.json")
     steps = {step["id"]: step for step in manifest["steps"]}
     require(
-        {"orchestrator", "luna", "terra", "sol"} <= set(steps),
+        {"orchestrator", "luna", "terra", "vesta", "sol"} <= set(steps),
         f"manifest is missing core steps: {sorted(steps)}",
     )
     for step in steps.values():
@@ -4385,6 +4385,98 @@ def test_orchestration_manifest() -> None:
                 == step.get("expected_effort"),
                 f"manifest effort drifted from the profile for {step['id']}",
             )
+
+
+@test("the flow describes the real pipeline and binds controls to roles")
+def test_manifest_flow() -> None:
+    """Every node must map to a real role or declare that it runs none."""
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    roles = {step["id"] for step in manifest["steps"]}
+    flow = manifest["flow"]
+    require(len(flow) >= 8, f"the flow is too short to be the pipeline: {len(flow)}")
+
+    seen_roles = set()
+    for node in flow:
+        require(bool(node.get("label")), f"node {node['id']} has no label")
+        role = node.get("role")
+        if role is None:
+            require(
+                bool(node.get("note")),
+                f"node {node['id']} runs no model but does not say so",
+            )
+            continue
+        require(role in roles, f"node {node['id']} names an unknown role: {role}")
+        seen_roles.add(role)
+
+    require(
+        seen_roles == roles,
+        f"roles absent from the flow would be unreachable: {roles - seen_roles}",
+    )
+    # Shared roles are the honest case the layout exists to show.
+    orchestrator_nodes = [n for n in flow if n.get("role") == "orchestrator"]
+    require(
+        len(orchestrator_nodes) > 1,
+        "the orchestrator should appear at several steps",
+    )
+
+
+@test("the review wrapper accepts a profile and refuses an unsafe one")
+def test_review_profile_option() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / "vesta.config.toml").write_text(
+            'model = "fake-vesta"\nmodel_reasoning_effort = "high"\n'
+        )
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(home)
+
+        arguments_path = home / "argv.txt"
+        environment["CODEX_FAKE_ARGS"] = str(arguments_path)
+
+        try:
+            process = start_review(
+                environment, "--profile", "vesta", "--timeout", "60", "--", "prompt"
+            )
+            _, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 0,
+                f"a vesta review failed ({process.returncode}): {stderr}",
+            )
+            require(
+                "Codex Vesta · fake-vesta · plan review" in stderr,
+                f"the handover did not name the profile's role: {stderr!r}",
+            )
+            arguments = arguments_path.read_text().splitlines()
+            require(
+                arguments[arguments.index("--profile") + 1] == "vesta",
+                "codex was not invoked with the requested profile",
+            )
+            assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+
+            # A profile name becomes a filename and must not escape.
+            for hostile in ("../sol", "a/b", ""):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REVIEW_SCRIPT),
+                        f"--profile={hostile}",
+                        "--",
+                        "prompt",
+                    ],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+                require(
+                    result.returncode == 2
+                    and "invalid profile name" in result.stderr,
+                    f"an unsafe profile was accepted: {hostile!r}",
+                )
+        finally:
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 @test("the configuration surface previews and applies model changes")
@@ -4754,7 +4846,7 @@ def test_installer_refuses_self_source() -> None:
             result.returncode != 0,
             "the installer accepted a target inside its own source tree",
         )
-        for profile in ("luna", "terra", "sol"):
+        for profile in ("luna", "terra", "vesta", "sol"):
             path = kit / "global" / "codex" / f"{profile}.config.toml"
             require(
                 path.is_file() and not path.is_symlink(),
