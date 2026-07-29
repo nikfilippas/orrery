@@ -215,6 +215,31 @@ Do not use the independent-review profile for routine work merely because its cu
 
 Do not use maximum reasoning effort by default.
 
+## Progress visibility
+
+The transcript is the progress surface. Some clients, including the
+VS Code extension, show little beyond the conversation itself, so make the
+orchestration legible there by narrating stage boundaries discreetly:
+
+- After classifying a request, state the class in one short line before
+  acting on it.
+- Before every Codex invocation, print a handover line naming the role,
+  the model its profile configures, and the stage:
+
+      ↳ Terra · gpt-5.6-terra · implementation
+
+- When the invocation returns and its output has been collected, print:
+
+      ↳ Principal orchestrator · control resumed
+
+- Mark the other transitions in one short sentence each as they happen:
+  planning, plan review, implementation, diff inspection, verification,
+  independent review, correction.
+
+`claude-codex-review` prints its own handover and heartbeat lines; do not
+duplicate them around it. Keep the narration to single lines: it is a
+surface, not a report.
+
 ## Permissions
 
 Use `workspace-write` only when Codex is explicitly implementing or correcting
