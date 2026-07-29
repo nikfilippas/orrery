@@ -82,6 +82,67 @@ def toml_key(key: str) -> str:
     return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
 
 
+def load_catalogue() -> dict[str, list[dict[str, str]]]:
+    """Models offered in the dropdowns, per provider.
+
+    Neither CLI can enumerate its available models locally, so the choices
+    are curated here rather than invented. Anything absent can still be
+    typed in, and the current value is always offered even when the
+    catalogue does not mention it.
+    """
+    path = KIT_DIR / "global" / "model-catalogue.json"
+    try:
+        providers = json.loads(path.read_text()).get("providers", {})
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"the model catalogue is unreadable: {exc}") from exc
+
+    catalogue: dict[str, list[dict[str, str]]] = {}
+    for provider, entries in providers.items():
+        if not isinstance(entries, list):
+            continue
+        catalogue[provider] = [
+            {
+                "id": entry["id"],
+                "label": str(entry.get("label") or entry["id"]),
+            }
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        ]
+    return catalogue
+
+
+def model_choices(step: dict[str, Any], current: str) -> list[dict[str, str]]:
+    """The dropdown entries for one step, newest intent first.
+
+    Claude aliases come first where they exist, because an alias that
+    follows a provider's newest model is usually the better default than
+    any pinned identifier.
+    """
+    choices: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    aliases_file = step.get("aliases")
+    if aliases_file:
+        try:
+            aliases = json.loads((KIT_DIR / aliases_file).read_text())
+        except (OSError, json.JSONDecodeError):
+            aliases = {}
+        for alias, value in sorted(aliases.items()):
+            if isinstance(value, str) and value not in seen:
+                choices.append({"id": value, "label": f"{alias} → {value}"})
+                seen.add(value)
+
+    for entry in load_catalogue().get(step.get("provider", ""), []):
+        if entry["id"] not in seen:
+            choices.append({"id": entry["id"], "label": entry["label"]})
+            seen.add(entry["id"])
+
+    if current and current not in seen:
+        choices.append({"id": current, "label": f"{current} · currently set"})
+
+    return choices
+
+
 def step_state(step: dict[str, Any]) -> dict[str, Any]:
     path = KIT_DIR / step["file"]
     state: dict[str, Any] = {
@@ -97,14 +158,6 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
     if step["kind"] == "claude-settings":
         settings = json.loads(path.read_text())
         state["model"] = settings.get("model", "")
-        aliases_file = step.get("aliases")
-        aliases = {}
-        if aliases_file:
-            aliases = json.loads((KIT_DIR / aliases_file).read_text())
-        state["choices"] = [
-            {"alias": alias, "value": value}
-            for alias, value in sorted(aliases.items())
-        ]
         live = Path.home() / ".claude" / "settings.json"
         try:
             state["live_model"] = json.loads(live.read_text()).get("model", "")
@@ -118,6 +171,7 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
     else:
         raise ConfigError(f"unknown step kind: {step['kind']}")
 
+    state["choices"] = model_choices(step, state["model"])
     return state
 
 
@@ -405,51 +459,49 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
-  .flow { display: grid; gap: 0; }
-  .rail { display: grid; gap: 10px; }
-  .connector {
-    justify-self: center; color: var(--soft); font-size: 18px;
-    line-height: 1; padding: 7px 0;
-  }
-  .branchband {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr));
-    gap: 10px;
-  }
-  .bandlabel {
-    font-size: 11.5px; letter-spacing: 0.09em; text-transform: uppercase;
-    color: var(--soft); margin: 2px 0 -2px;
-  }
+  .graphwrap { overflow-x: auto; padding-bottom: 6px; }
+  .graph { position: relative; min-width: 1180px; margin: 0 auto; }
+  .graph svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .row { display: flex; justify-content: center; align-items: flex-start; gap: 14px; position: relative; z-index: 1; }
+  .stack { display: flex; flex-direction: column; gap: 26px; }
   .node {
     background: var(--panel); border: 1px solid var(--edge);
-    border-left: 3px solid var(--role, var(--edge)); padding: 11px 13px;
+    border-top: 3px solid var(--role, var(--edge));
+    padding: 9px 11px; width: 208px;
   }
-  .node.inert { border-left-style: dotted; opacity: 0.8; }
-  .node h2 { font-size: 14px; margin: 0 0 3px; font-weight: 600; }
+  .node.inert { border-top-style: dotted; background: transparent; }
+  .node.wide { width: 300px; }
+  .node h2 { font-size: 13px; margin: 0 0 2px; font-weight: 600; line-height: 1.35; }
   .badge {
-    font-family: ui-monospace, monospace; font-size: 10px;
-    letter-spacing: 0.08em; text-transform: uppercase;
+    font-family: ui-monospace, monospace; font-size: 9.5px;
+    letter-spacing: 0.07em; text-transform: uppercase;
     color: var(--role, var(--soft));
   }
-  .note { font-size: 12px; color: var(--soft); margin: 3px 0 0; }
-  .control { margin-top: 8px; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
-  label { font-size: 12px; color: var(--soft); }
+  .note { font-size: 11.5px; color: var(--soft); margin: 4px 0 0; line-height: 1.4; }
+  .control { margin-top: 7px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  label { font-size: 11.5px; color: var(--soft); }
   select, input[type=text] {
     background: var(--ground); color: var(--ink);
-    border: 1px solid var(--edge); padding: 4px 7px; font-size: 13px;
-    font-family: ui-monospace, monospace; min-width: 185px;
+    border: 1px solid var(--edge); padding: 3px 5px; font-size: 12px;
+    font-family: ui-monospace, monospace; max-width: 100%;
   }
+  select { width: 100%; }
   .mirror {
-    font-family: ui-monospace, monospace; font-size: 12.5px;
+    font-family: ui-monospace, monospace; font-size: 11.5px;
     color: var(--ink); background: var(--ground);
-    border: 1px dashed var(--edge); padding: 3px 7px;
+    border: 1px dashed var(--edge); padding: 2px 6px;
   }
-  .mirrornote { font-size: 11.5px; color: var(--soft); }
-  .fixed { font-family: ui-monospace, monospace; font-size: 12px; color: var(--soft); }
+  .mirrornote { font-size: 11px; color: var(--soft); }
+  .fixed { font-family: ui-monospace, monospace; font-size: 11px; color: var(--soft); }
+  .edgelabel {
+    font-family: system-ui, sans-serif; font-size: 10.5px;
+    fill: var(--soft);
+  }
   .legend {
-    display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 18px;
+    display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 16px;
     font-size: 12.5px; color: var(--soft);
   }
   .legend span::before {
@@ -468,7 +520,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <h1>Órrery configuration</h1>
   <p class="sub">The pipeline as it actually runs, generated from the live files under __KIT_DIR__.
      Steps sharing a role share one model, and say so; steps that run no model say that too.</p>
-  <div class="flow" id="flow"></div>
+  <div class="graphwrap"><div class="graph" id="graph"></div></div>
   <div class="scopenote">
     Saving changes the system-wide default for <strong>new sessions</strong>.
     Repositories pinned with <code>claude-codex-init &lt;alias&gt;</code> keep
@@ -485,11 +537,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <script>
 const STATE = __STATE__;
 const FLOW = __FLOW__;
-const BANDS = __BANDS__;
+const LAYOUT = __LAYOUT__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
+const nodes = Object.fromEntries(FLOW.map(n => [n.id, n]));
 const original = Object.fromEntries(STATE.map(s => [s.id, s.model]));
-const flow = document.getElementById("flow");
+const graph = document.getElementById("graph");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
 
@@ -500,13 +553,13 @@ function esc(text) {
 
 function roleColour(id) {
   return {
-    orchestrator: "var(--accent)", luna: "var(--luna)",
-    terra: "var(--terra)", vesta: "var(--vesta)", sol: "var(--sol)",
+    orchestrator: "var(--accent)", luna: "var(--luna)", terra: "var(--terra)",
+    vesta: "var(--vesta)", sol: "var(--sol)",
   }[id] || "var(--edge)";
 }
 
-// The first node of each role owns the control; later nodes mirror it,
-// because those steps genuinely run the same configured model.
+// The first node of each role owns the control; the rest mirror it, since
+// those steps genuinely run the same configured model.
 const owner = {};
 FLOW.forEach(node => {
   if (node.role && !(node.role in owner)) owner[node.role] = node.id;
@@ -514,25 +567,23 @@ FLOW.forEach(node => {
 
 function control(step) {
   const id = esc(step.id);
-  if (step.choices) {
-    const options = step.choices.map(c =>
-      `<option value="${esc(c.value)}" ${c.value === step.model ? "selected" : ""}>` +
-      `${esc(c.alias)} → ${esc(c.value)}</option>`).join("");
-    const custom = step.choices.some(c => c.value === step.model) ? "" : "selected";
-    return `<select data-step="${id}" data-kind="select">${options}` +
-      `<option value="__custom__" ${custom}>custom…</option></select>` +
-      `<input type="text" data-step="${id}" data-kind="custom" ` +
-      `value="${custom ? esc(step.model) : ""}" ` +
-      `style="display:${custom ? "inline-block" : "none"}" ` +
-      `placeholder="exact model identifier">`;
-  }
-  return `<input type="text" data-step="${id}" data-kind="model" value="${esc(step.model)}">`;
+  const options = (step.choices || []).map(c =>
+    `<option value="${esc(c.id)}" ${c.id === step.model ? "selected" : ""}>` +
+    `${esc(c.label)}</option>`).join("");
+  const known = (step.choices || []).some(c => c.id === step.model);
+  return `<select data-step="${id}" data-kind="select">${options}` +
+    `<option value="__custom__" ${known ? "" : "selected"}>custom…</option></select>` +
+    `<input type="text" data-step="${id}" data-kind="custom" ` +
+    `value="${known ? "" : esc(step.model)}" ` +
+    `style="display:${known ? "none" : "block"};width:100%" ` +
+    `placeholder="exact model identifier">`;
 }
 
 function nodeBox(node) {
   const box = document.createElement("div");
   const step = node.role ? roles[node.role] : null;
   box.className = step ? "node" : "node inert";
+  box.dataset.node = node.id;
   if (step) box.style.setProperty("--role", roleColour(step.id));
 
   let body = "";
@@ -540,19 +591,19 @@ function nodeBox(node) {
     body = `<p class="note">${esc(node.note || "No model runs here.")}</p>`;
   } else if (owner[node.role] === node.id) {
     const effort = step.effort
-      ? `<span class="fixed">effort ${esc(step.effort)} · fixed by the role</span>` : "";
-    body = `<div class="control"><label>model</label>${control(step)}${effort}</div>` +
+      ? `<div class="fixed">effort ${esc(step.effort)} · fixed by the role</div>` : "";
+    body = `<div class="control"><label>model</label>${control(step)}</div>${effort}` +
       (node.note ? `<p class="note">${esc(node.note)}</p>` : "");
   } else {
     body = `<div class="control"><span class="mirror" data-mirror="${esc(step.id)}">` +
-      `${esc(step.model)}</span>` +
-      `<span class="mirrornote">same ${esc(step.title)} profile as above</span></div>` +
-      (node.note ? `<p class="note">${esc(node.note)}</p>` : "");
+      `${esc(step.model)}</span></div>` +
+      `<p class="note">Same ${esc(step.title)} profile as above.` +
+      (node.note ? " " + esc(node.note) : "") + `</p>`;
   }
 
   box.innerHTML = `<h2>${esc(node.label)}</h2>` +
-    (step ? `<span class="badge">${esc(step.title)} · ${esc(step.provider)}</span>` :
-      `<span class="badge">no model</span>`) + body;
+    (step ? `<span class="badge">${esc(step.title)}</span>`
+          : `<span class="badge">no model</span>`) + body;
   return box;
 }
 
@@ -561,44 +612,99 @@ function render() {
   legend.className = "legend";
   legend.innerHTML = STATE.map(s =>
     `<span style="--role:${roleColour(s.id)}">${esc(s.title)}</span>`).join("");
-  flow.parentNode.insertBefore(legend, flow);
+  graph.parentNode.parentNode.insertBefore(legend, graph.parentNode);
 
-  const rail = document.createElement("div");
-  rail.className = "rail";
-  let index = 0;
-  let first = true;
-  while (index < FLOW.length) {
-    const group = FLOW[index].group;
-    const band = [];
-    while (index < FLOW.length && FLOW[index].group === group && group) {
-      band.push(FLOW[index]); index += 1;
-    }
-    if (!band.length) { band.push(FLOW[index]); index += 1; }
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.innerHTML =
+    '<defs><marker id="head" viewBox="0 0 8 8" refX="7" refY="4" ' +
+    'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
+    '<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker></defs>';
+  graph.appendChild(svg);
 
-    if (!first) {
-      const arrow = document.createElement("div");
-      arrow.className = "connector";
-      // A band declares how it follows what came before: a step that
-      // continues the pipeline, or a branch taken instead of it.
-      arrow.textContent = (group && BANDS[group] && BANDS[group].connector) || "↓";
-      rail.appendChild(arrow);
-    }
-    first = false;
+  LAYOUT.rows.forEach((row, index) => {
+    const rowElement = document.createElement("div");
+    rowElement.className = "row";
+    rowElement.style.marginTop = index === 0 ? "0" : "46px";
+    row.forEach(cell => {
+      if (Array.isArray(cell)) {
+        const stack = document.createElement("div");
+        stack.className = "stack";
+        cell.forEach(id => stack.appendChild(nodeBox(nodes[id])));
+        rowElement.appendChild(stack);
+      } else {
+        const box = nodeBox(nodes[cell]);
+        if (row.length === 1) box.classList.add("wide");
+        rowElement.appendChild(box);
+      }
+    });
+    graph.appendChild(rowElement);
+  });
 
-    if (group) {
-      const label = document.createElement("div");
-      label.className = "bandlabel";
-      label.textContent = (BANDS[group] && BANDS[group].label) || group;
-      rail.appendChild(label);
-      const wrap = document.createElement("div");
-      wrap.className = "branchband";
-      band.forEach(node => wrap.appendChild(nodeBox(node)));
-      rail.appendChild(wrap);
+  drawEdges(svg);
+  window.addEventListener("resize", () => drawEdges(svg));
+}
+
+function drawEdges(svg) {
+  for (const old of Array.from(svg.querySelectorAll("path.edge, text.edgelabel"))) {
+    old.remove();
+  }
+  const frame = graph.getBoundingClientRect();
+  svg.setAttribute("viewBox", `0 0 ${frame.width} ${frame.height}`);
+  svg.style.height = frame.height + "px";
+  svg.style.color = "var(--soft)";
+
+  const at = id => {
+    const element = graph.querySelector(`[data-node="${id}"]`);
+    if (!element) return null;
+    const box = element.getBoundingClientRect();
+    return {
+      left: box.left - frame.left, right: box.right - frame.left,
+      top: box.top - frame.top, bottom: box.bottom - frame.top,
+      cx: box.left + box.width / 2 - frame.left,
+      cy: box.top + box.height / 2 - frame.top,
+    };
+  };
+
+  for (const edge of LAYOUT.edges) {
+    const a = at(edge.from);
+    const b = at(edge.to);
+    if (!a || !b) continue;
+
+    let d;
+    let labelAt;
+    if (edge.kind === "back") {
+      const lane = Math.min(a.left, b.left) - 26;
+      d = `M ${a.left} ${a.cy} H ${lane} V ${b.cy} H ${b.left}`;
+      labelAt = { x: lane + 4, y: (a.cy + b.cy) / 2, anchor: "start" };
+    } else if (edge.kind === "side") {
+      const lane = Math.max(a.right, b.right) + 26;
+      d = `M ${a.right} ${a.cy} H ${lane} V ${b.cy} H ${b.right}`;
+      labelAt = { x: lane - 4, y: (a.cy + b.cy) / 2, anchor: "end" };
     } else {
-      band.forEach(node => rail.appendChild(nodeBox(node)));
+      const mid = a.bottom + (b.top - a.bottom) / 2;
+      d = `M ${a.cx} ${a.bottom} V ${mid} H ${b.cx} V ${b.top}`;
+      labelAt = { x: b.cx + 5, y: mid - 4, anchor: "start" };
+    }
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("class", "edge");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "1.2");
+    path.setAttribute("marker-end", "url(#head)");
+    svg.appendChild(path);
+
+    if (edge.label) {
+      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      text.setAttribute("class", "edgelabel");
+      text.setAttribute("x", labelAt.x);
+      text.setAttribute("y", labelAt.y);
+      text.setAttribute("text-anchor", labelAt.anchor);
+      text.textContent = edge.label;
+      svg.appendChild(text);
     }
   }
-  flow.appendChild(rail);
 }
 
 function currentModel(id) {
@@ -608,8 +714,7 @@ function currentModel(id) {
     const custom = document.querySelector(`input[data-step="${id}"][data-kind="custom"]`);
     return custom ? custom.value.trim() : "";
   }
-  const field = document.querySelector(`input[data-step="${id}"]`);
-  return field ? field.value.trim() : "";
+  return "";
 }
 
 function syncMirrors() {
@@ -642,7 +747,7 @@ document.addEventListener("change", event => {
     const custom = document.querySelector(
       `input[data-step="${event.target.dataset.step}"][data-kind="custom"]`);
     if (custom) custom.style.display =
-      event.target.value === "__custom__" ? "inline-block" : "none";
+      event.target.value === "__custom__" ? "block" : "none";
   }
   syncMirrors();
   applyButton.disabled = true;
@@ -722,7 +827,7 @@ def render_page(token: str) -> str:
         PAGE_TEMPLATE
         .replace("__STATE__", script_json(snapshot()))
         .replace("__FLOW__", script_json(load_manifest().get("flow", [])))
-        .replace("__BANDS__", script_json(load_manifest().get("bands", {})))
+        .replace("__LAYOUT__", script_json(load_manifest().get("layout", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
         .replace("__KIT_DIR__", escape_html(str(KIT_DIR)))
     )

@@ -4387,6 +4387,44 @@ def test_orchestration_manifest() -> None:
             )
 
 
+@test("every step offers a dropdown covering its provider's models")
+def test_model_catalogue() -> None:
+    """Nobody can type an identifier they have no way of knowing."""
+    catalogue = read_json(KIT_DIR / "global" / "model-catalogue.json")
+    providers = catalogue["providers"]
+    require(
+        {"anthropic", "openai"} <= set(providers),
+        f"the catalogue omits a provider in use: {sorted(providers)}",
+    )
+    for provider, entries in providers.items():
+        require(bool(entries), f"{provider} has no models to offer")
+        for entry in entries:
+            require(
+                isinstance(entry.get("id"), str) and entry["id"].strip(),
+                f"{provider} has an entry with no identifier: {entry}",
+            )
+            require(
+                isinstance(entry.get("label"), str) and entry["label"].strip(),
+                f"{provider} entry {entry['id']} has no label",
+            )
+
+    # Every configured model must be selectable, so that opening the page
+    # and saving cannot silently change anything.
+    module = load_script(
+        KIT_DIR / "scripts" / "claude-codex-config", "kit_config_choices"
+    )
+    for state in module.snapshot():
+        offered = {choice["id"] for choice in state["choices"]}
+        require(
+            state["model"] in offered,
+            f"{state['id']}'s current model {state['model']!r} is not offered",
+        )
+        require(
+            len(offered) > 1,
+            f"{state['id']} has nothing to choose between",
+        )
+
+
 @test("the flow describes the real pipeline and binds controls to roles")
 def test_manifest_flow() -> None:
     """Every node must map to a real role or declare that it runs none."""
@@ -4411,6 +4449,29 @@ def test_manifest_flow() -> None:
     require(
         seen_roles == roles,
         f"roles absent from the flow would be unreachable: {roles - seen_roles}",
+    )
+
+    # The drawn graph must reach every node and name only real ones.
+    layout = manifest["layout"]
+    placed: set[str] = set()
+    for row in layout["rows"]:
+        for cell in row:
+            placed.update(cell if isinstance(cell, list) else [cell])
+    identifiers = {node["id"] for node in flow}
+    require(
+        placed == identifiers,
+        f"layout and flow disagree: {placed ^ identifiers}",
+    )
+    for edge in layout["edges"]:
+        require(
+            edge["from"] in identifiers and edge["to"] in identifiers,
+            f"edge names an unknown node: {edge}",
+        )
+    reachable = {edge["to"] for edge in layout["edges"]}
+    require(
+        identifiers - reachable == {flow[0]["id"]},
+        f"unreachable nodes in the drawn graph: "
+        f"{identifiers - reachable - {flow[0]['id']}}",
     )
     # Shared roles are the honest case the layout exists to show.
     orchestrator_nodes = [n for n in flow if n.get("role") == "orchestrator"]

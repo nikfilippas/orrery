@@ -68,45 +68,38 @@
     {
       "id": "trivial",
       "label": "Trivial: implement directly",
-      "role": "orchestrator",
-      "group": "branches"
+      "role": "orchestrator"
     },
     {
       "id": "mechanical",
       "label": "Mechanical: delegate the edit",
-      "role": "luna",
-      "group": "branches"
+      "role": "luna"
     },
     {
       "id": "standard",
       "label": "Standard: delegate the implementation",
-      "role": "terra",
-      "group": "branches"
+      "role": "terra"
     },
     {
       "id": "investigation",
       "label": "Investigation: diagnose, change nothing",
       "role": "orchestrator",
-      "group": "branches",
       "note": "Read-only sandboxes. Sol may give a second opinion when it materially helps."
     },
     {
       "id": "plan",
       "label": "Complex: write the plan",
-      "role": "orchestrator",
-      "group": "complex"
+      "role": "orchestrator"
     },
     {
       "id": "plan-review",
       "label": "Complex: challenge the plan",
-      "role": "vesta",
-      "group": "complex"
+      "role": "vesta"
     },
     {
       "id": "implement",
       "label": "Complex: implement the approved plan",
-      "role": "terra",
-      "group": "complex"
+      "role": "terra"
     },
     {
       "id": "inspect",
@@ -138,14 +131,126 @@
       "note": "No model runs here."
     }
   ],
-  "bands": {
-    "branches": {
-      "label": "exactly one of these is taken, by classification",
-      "connector": "\u2193"
-    },
-    "complex": {
-      "label": "complex or high-risk work takes this branch instead, in order",
-      "connector": "or"
-    }
+  "layout": {
+    "rows": [
+      [
+        "request"
+      ],
+      [
+        "classify"
+      ],
+      [
+        "trivial",
+        "mechanical",
+        "standard",
+        "investigation",
+        [
+          "plan",
+          "plan-review",
+          "implement"
+        ]
+      ],
+      [
+        "inspect"
+      ],
+      [
+        "verify"
+      ],
+      [
+        "review"
+      ],
+      [
+        "correct"
+      ],
+      [
+        "done"
+      ]
+    ],
+    "edges": [
+      {
+        "from": "request",
+        "to": "classify"
+      },
+      {
+        "from": "classify",
+        "to": "trivial",
+        "label": "trivial"
+      },
+      {
+        "from": "classify",
+        "to": "mechanical",
+        "label": "mechanical"
+      },
+      {
+        "from": "classify",
+        "to": "standard",
+        "label": "standard"
+      },
+      {
+        "from": "classify",
+        "to": "investigation",
+        "label": "investigation"
+      },
+      {
+        "from": "classify",
+        "to": "plan",
+        "label": "complex"
+      },
+      {
+        "from": "plan",
+        "to": "plan-review"
+      },
+      {
+        "from": "plan-review",
+        "to": "implement"
+      },
+      {
+        "from": "trivial",
+        "to": "inspect"
+      },
+      {
+        "from": "mechanical",
+        "to": "inspect"
+      },
+      {
+        "from": "standard",
+        "to": "inspect"
+      },
+      {
+        "from": "implement",
+        "to": "inspect"
+      },
+      {
+        "from": "investigation",
+        "to": "done",
+        "kind": "side",
+        "label": "nothing changed"
+      },
+      {
+        "from": "inspect",
+        "to": "verify"
+      },
+      {
+        "from": "verify",
+        "to": "review"
+      },
+      {
+        "from": "review",
+        "to": "correct",
+        "label": "findings"
+      },
+      {
+        "from": "correct",
+        "to": "verify",
+        "kind": "back",
+        "label": "re-verify"
+      },
+      {
+        "from": "review",
+        "to": "done",
+        "kind": "side",
+        "label": "none survive"
+      }
+    ]
   }
 }

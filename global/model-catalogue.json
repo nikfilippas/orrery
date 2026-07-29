@@ -1,0 +1,57 @@
+{
+  "note": "Models offered in the configuration dropdowns. Neither CLI can list its available models locally, so this is a curated catalogue: add an entry when a provider ships a model you want to use. Anything not listed can still be typed in through the custom option, and nothing here is validated against a provider.",
+  "providers": {
+    "anthropic": [
+      {
+        "id": "opus",
+        "label": "opus \u00b7 newest Opus (alias)"
+      },
+      {
+        "id": "sonnet",
+        "label": "sonnet \u00b7 newest Sonnet (alias)"
+      },
+      {
+        "id": "haiku",
+        "label": "haiku \u00b7 newest Haiku (alias)"
+      },
+      {
+        "id": "claude-fable-5[1m]",
+        "label": "claude-fable-5[1m] \u00b7 1M context"
+      },
+      {
+        "id": "claude-fable-5",
+        "label": "claude-fable-5"
+      },
+      {
+        "id": "claude-opus-5",
+        "label": "claude-opus-5 \u00b7 pinned"
+      },
+      {
+        "id": "claude-sonnet-5",
+        "label": "claude-sonnet-5 \u00b7 pinned"
+      },
+      {
+        "id": "claude-haiku-4-5-20251001",
+        "label": "claude-haiku-4-5 \u00b7 pinned"
+      }
+    ],
+    "openai": [
+      {
+        "id": "gpt-5.6-luna",
+        "label": "gpt-5.6-luna \u00b7 fast"
+      },
+      {
+        "id": "gpt-5.6-terra",
+        "label": "gpt-5.6-terra \u00b7 balanced"
+      },
+      {
+        "id": "gpt-5.6-sol",
+        "label": "gpt-5.6-sol \u00b7 strongest"
+      },
+      {
+        "id": "gpt-5.5",
+        "label": "gpt-5.5 \u00b7 previous generation"
+      }
+    ]
+  }
+}

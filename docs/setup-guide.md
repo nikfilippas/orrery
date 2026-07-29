@@ -39,6 +39,7 @@ Two rules shape everything else:
 | `global/CLAUDE.md` | The development policy, installed as `~/.claude/CLAUDE.md` |
 | `global/claude-settings.json` | Canonical model, hooks, companion state and permission rules |
 | `global/claude-models.json` | Friendly model aliases resolved by `claude-codex-init` |
+| `global/model-catalogue.json` | Models offered in the configuration dropdowns |
 | `global/skills/development-orchestrator/SKILL.md` | Task classification and model routing |
 | `global/hooks/leave-no-trace.py` | Session lifecycle hook and `claude-lnt-*` implementation |
 | `global/codex/luna.config.toml` | Low-effort Codex profile |
@@ -163,11 +164,13 @@ eight minutes, and completed in under three at `medium`.
   the choice is personal and unrelated personal settings survive.
   Instruction files such as `CLAUDE.local.md` cannot change the model;
   Claude Code selects it from settings before any instructions are read.
-- **When a new model is released:** add or repoint its alias in
-  `global/claude-models.json` for Claude, or edit the profile TOML for
-  Codex. The installed paths are symlinks, so both changes are live
-  immediately; repositories that named an updated alias pick it up by
-  rerunning `claude-codex-init <alias>` there.
+- **When a new model is released:** add it to `global/model-catalogue.json`
+  so it appears in the dropdowns, and, for Claude, add or repoint its alias
+  in `global/claude-models.json`. Neither CLI can list its models locally,
+  so the catalogue is curated by hand; anything absent from it can still be
+  typed in through the custom option. The installed paths are symlinks, so
+  changes are live immediately; repositories that named an updated alias
+  pick it up by rerunning `claude-codex-init <alias>` there.
 
 - **Visually:** `claude-codex-config` serves a local page generated from
   the orchestration manifest and the live files, one box per step with its

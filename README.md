@@ -20,7 +20,7 @@ hygiene layer that reverts everything a session creates.
 You describe outcomes in ordinary language. The orchestration decides who
 does what, inspects everything itself, and owns the result.
 
-| 97 | 53 | 4 | 2 |
+| 98 | 53 | 4 | 2 |
 | :---: | :---: | :---: | :---: |
 | deterministic regression tests | doctor checks, no model calls | Codex worker profiles | commands to adopt a repository |
 
@@ -220,9 +220,10 @@ below is live immediately.
 | A Codex worker | `global/codex/<profile>.config.toml` | `claude-codex-doctor` |
 
 **Or configure it visually.** `claude-codex-config` serves a local page
-showing the whole pipeline, one box per step with its current model, a
-dropdown of Claude aliases for the orchestrator and validated fields for
-the workers. Saving shows the exact unified diff of every file it would
+that draws the pipeline as a flowchart, arrows and branches included, with
+every step's model in a dropdown built from `global/model-catalogue.json`.
+Steps that share a role show one control and mirror it, because they
+genuinely run the same model; steps that run no model say so. Saving shows the exact unified diff of every file it would
 touch, applies only through the kit's own atomic write paths, and runs the
 doctor inline so the result is validated before your eyes. The page is
 generated from `global/orchestration.json` and the live files at load, so
@@ -311,7 +312,7 @@ that contradicts delegation before it can misfire.
 ## Proving it works
 
 ```bash
-./tests/run-tests.py     # 97 deterministic tests, stand-in Codex, no credits
+./tests/run-tests.py     # 98 deterministic tests, stand-in Codex, no credits
 claude-codex-doctor      # CLAUDE_CODEX_KIT_READY when everything holds
 ```
 
@@ -328,6 +329,7 @@ configuration and spends no credits.
 | `global/CLAUDE.md` | The development policy, installed as `~/.claude/CLAUDE.md` |
 | `global/claude-settings.json` | Canonical model, hooks, companion state, permissions |
 | `global/claude-models.json` | Friendly model aliases for `claude-codex-init` |
+| `global/model-catalogue.json` | Models offered in the configuration dropdowns |
 | `global/codex/*.toml` | Worker profiles: model and reasoning effort per role |
 | `global/skills/development-orchestrator/` | Task classification and routing |
 | `global/hooks/leave-no-trace.py` | Session hygiene: guard, leases, sweeps, watchdog |
