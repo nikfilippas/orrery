@@ -4425,60 +4425,51 @@ def test_model_catalogue() -> None:
         )
 
 
-@test("the flow describes the real pipeline and binds controls to roles")
-def test_manifest_flow() -> None:
-    """Every node must map to a real role or declare that it runs none."""
+@test("the chart reproduces the documented pipeline and names real roles")
+def test_manifest_chart() -> None:
     manifest = read_json(KIT_DIR / "global" / "orchestration.json")
     roles = {step["id"] for step in manifest["steps"]}
-    flow = manifest["flow"]
-    require(len(flow) >= 8, f"the flow is too short to be the pipeline: {len(flow)}")
+    chart = manifest["chart"]
+    nodes = {node["id"]: node for node in chart["nodes"]}
 
-    seen_roles = set()
-    for node in flow:
+    for node in nodes.values():
         require(bool(node.get("label")), f"node {node['id']} has no label")
-        role = node.get("role")
-        if role is None:
-            require(
-                bool(node.get("note")),
-                f"node {node['id']} runs no model but does not say so",
-            )
-            continue
-        require(role in roles, f"node {node['id']} names an unknown role: {role}")
-        seen_roles.add(role)
-
-    require(
-        seen_roles == roles,
-        f"roles absent from the flow would be unreachable: {roles - seen_roles}",
-    )
-
-    # The drawn graph must reach every node and name only real ones.
-    layout = manifest["layout"]
-    placed: set[str] = set()
-    for row in layout["rows"]:
-        for cell in row:
-            placed.update(cell if isinstance(cell, list) else [cell])
-    identifiers = {node["id"] for node in flow}
-    require(
-        placed == identifiers,
-        f"layout and flow disagree: {placed ^ identifiers}",
-    )
-    for edge in layout["edges"]:
+        for role in node["roles"]:
+            require(role in roles, f"node {node['id']} names an unknown role: {role}")
         require(
-            edge["from"] in identifiers and edge["to"] in identifiers,
+            0 < node["x"] < chart["width"] and 0 < node["y"] < chart["height"],
+            f"node {node['id']} sits outside the canvas",
+        )
+
+    used = {role for node in nodes.values() for role in node["roles"]}
+    require(
+        used == roles,
+        f"roles missing from the chart would be unconfigurable: {roles - used}",
+    )
+
+    for edge in chart["edges"]:
+        require(
+            edge["from"] in nodes and edge["to"] in nodes,
             f"edge names an unknown node: {edge}",
         )
-    reachable = {edge["to"] for edge in layout["edges"]}
+    reached = {edge["to"] for edge in chart["edges"]}
+    entry = chart["nodes"][0]["id"]
     require(
-        identifiers - reachable == {flow[0]["id"]},
-        f"unreachable nodes in the drawn graph: "
-        f"{identifiers - reachable - {flow[0]['id']}}",
+        set(nodes) - reached == {entry},
+        f"unreachable chart nodes: {set(nodes) - reached - {entry}}",
     )
-    # Shared roles are the honest case the layout exists to show.
-    orchestrator_nodes = [n for n in flow if n.get("role") == "orchestrator"]
-    require(
-        len(orchestrator_nodes) > 1,
-        "the orchestrator should appear at several steps",
-    )
+
+    # The chart is the README's flowchart, so its shape must not drift
+    # from the documented one.
+    readme = (KIT_DIR / "README.md").read_text()
+    diagram = readme[readme.index("flowchart TD"):readme.index("```", readme.index("flowchart TD"))]
+    for token in ("classify", "findings", "investigation", "mechanical", "trivial"):
+        require(token in diagram, f"the README flowchart no longer mentions {token}")
+        require(
+            any(token in node["label"] or token in node["id"] for node in nodes.values())
+            or any(edge.get("label") == token for edge in chart["edges"]),
+            f"the chart omits {token}, which the README documents",
+        )
 
 
 @test("the review wrapper accepts a profile and refuses an unsafe one")

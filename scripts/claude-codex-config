@@ -153,6 +153,7 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
         "file": step["file"],
         "summary": step.get("summary", ""),
         "selects": step.get("selects", ""),
+        "profile": step.get("profile", ""),
     }
 
     if step["kind"] == "claude-settings":
@@ -444,14 +445,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --ground: #f3f5f6; --panel: #ffffff; --edge: #d9dfe3;
     --ink: #1b2226; --soft: #4c5a63; --accent: #38617f;
     --luna: #737d94; --terra: #587b50; --vesta: #8a6a9c; --sol: #a97a24;
-    --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
+    --wire: #8b969d; --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ground: #14181b; --panel: #1c2226; --edge: #2c353b;
       --ink: #dde3e6; --soft: #a6b2b9; --accent: #7fa8c9;
       --luna: #98a2b8; --terra: #86a97e; --vesta: #b294c4; --sol: #cfa04a;
-      --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
+      --wire: #6b7880; --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
     }
   }
   * { box-sizing: border-box; }
@@ -462,52 +463,43 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
-  .graphwrap { overflow-x: auto; padding-bottom: 6px; }
-  .graph { position: relative; min-width: 1180px; margin: 0 auto; }
-  .graph svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-  .row { display: flex; justify-content: center; align-items: flex-start; gap: 14px; position: relative; z-index: 1; }
-  .stack { display: flex; flex-direction: column; gap: 26px; }
-  .node {
+  .chartwrap { overflow-x: auto; margin-bottom: 26px; }
+  svg.chart { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  svg.chart .nodeshape { stroke-width: 1; cursor: pointer; }
+  svg.chart .nodelabel {
+    font-family: system-ui, sans-serif; font-size: 12px;
+    pointer-events: none; dominant-baseline: middle; text-anchor: middle;
+  }
+  svg.chart .edgepath { fill: none; stroke: var(--wire); stroke-width: 1.3; }
+  svg.chart .edgelabel {
+    font-family: system-ui, sans-serif; font-size: 11px; fill: var(--soft);
+    text-anchor: middle; dominant-baseline: middle;
+    paint-order: stroke; stroke: var(--ground); stroke-width: 4px;
+    stroke-linejoin: round;
+  }
+  svg.chart g.node.dim { opacity: 0.32; }
+  svg.chart g.node.lit .nodeshape { stroke: var(--ink); stroke-width: 2.2; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+  .card {
     background: var(--panel); border: 1px solid var(--edge);
-    border-top: 3px solid var(--role, var(--edge));
-    padding: 9px 11px; width: 208px;
+    border-top: 3px solid var(--role, var(--accent)); padding: 12px 14px;
   }
-  .node.inert { border-top-style: dotted; background: transparent; }
-  .node.wide { width: 300px; }
-  .node h2 { font-size: 13px; margin: 0 0 2px; font-weight: 600; line-height: 1.35; }
-  .badge {
-    font-family: ui-monospace, monospace; font-size: 9.5px;
-    letter-spacing: 0.07em; text-transform: uppercase;
-    color: var(--role, var(--soft));
+  .card.lit { box-shadow: 0 0 0 2px var(--role, var(--accent)); }
+  .card h2 { font-size: 14.5px; margin: 0 0 2px; }
+  .card .profile {
+    font-family: ui-monospace, monospace; font-size: 11px;
+    color: var(--role, var(--soft)); letter-spacing: 0.04em;
   }
-  .note { font-size: 11.5px; color: var(--soft); margin: 4px 0 0; line-height: 1.4; }
-  .control { margin-top: 7px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  label { font-size: 11.5px; color: var(--soft); }
+  .card .summary { font-size: 12.5px; color: var(--soft); margin: 6px 0 9px; line-height: 1.45; }
+  .card label { font-size: 12px; color: var(--soft); display: block; margin-bottom: 3px; }
   select, input[type=text] {
-    background: var(--ground); color: var(--ink);
-    border: 1px solid var(--edge); padding: 3px 5px; font-size: 12px;
-    font-family: ui-monospace, monospace; max-width: 100%;
+    background: var(--ground); color: var(--ink); width: 100%;
+    border: 1px solid var(--edge); padding: 5px 7px; font-size: 12.5px;
+    font-family: ui-monospace, monospace;
   }
-  select { width: 100%; }
-  .mirror {
-    font-family: ui-monospace, monospace; font-size: 11.5px;
-    color: var(--ink); background: var(--ground);
-    border: 1px dashed var(--edge); padding: 2px 6px;
-  }
-  .mirrornote { font-size: 11px; color: var(--soft); }
-  .fixed { font-family: ui-monospace, monospace; font-size: 11px; color: var(--soft); }
-  .edgelabel {
-    font-family: system-ui, sans-serif; font-size: 10.5px;
-    fill: var(--soft);
-  }
-  .legend {
-    display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0 0 16px;
-    font-size: 12.5px; color: var(--soft);
-  }
-  .legend span::before {
-    content: ""; display: inline-block; width: 9px; height: 9px;
-    margin-right: 6px; background: var(--role, var(--accent));
-  }
+  .fixed { font-family: ui-monospace, monospace; font-size: 11.5px; color: var(--soft); margin-top: 6px; }
+  .where { font-size: 11.5px; color: var(--soft); margin-top: 7px; }
+  .steps { font-size: 11.5px; color: var(--soft); margin-top: 5px; }
 
   .scopenote {
     border-left: 3px solid var(--accent); padding: 8px 12px;
@@ -520,7 +512,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <h1>Órrery configuration</h1>
   <p class="sub">The pipeline as it actually runs, generated from the live files under __KIT_DIR__.
      Steps sharing a role share one model, and say so; steps that run no model say that too.</p>
-  <div class="graphwrap"><div class="graph" id="graph"></div></div>
+  <div class="chartwrap" id="chart"></div>
+  <div class="cards" id="cards"></div>
   <div class="scopenote">
     Saving changes the system-wide default for <strong>new sessions</strong>.
     Repositories pinned with <code>claude-codex-init &lt;alias&gt;</code> keep
@@ -536,191 +529,207 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </div>
 <script>
 const STATE = __STATE__;
-const FLOW = __FLOW__;
-const LAYOUT = __LAYOUT__;
+const CHART = __CHART__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
-const nodes = Object.fromEntries(FLOW.map(n => [n.id, n]));
 const original = Object.fromEntries(STATE.map(s => [s.id, s.model]));
-const graph = document.getElementById("graph");
+const chartHost = document.getElementById("chart");
+const cardHost = document.getElementById("cards");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
+const SVGNS = "http://www.w3.org/2000/svg";
+
+const FILL = {
+  orchestrator: ["#38617f", "#ffffff"], luna: ["#98a2b8", "#1b2226"],
+  terra: ["#587b50", "#ffffff"], vesta: ["#8a6a9c", "#ffffff"],
+  sol: ["#b07e28", "#ffffff"], none: ["#e8ebee", "#1b2226"],
+};
 
 function esc(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function roleColour(id) {
-  return {
-    orchestrator: "var(--accent)", luna: "var(--luna)", terra: "var(--terra)",
-    vesta: "var(--vesta)", sol: "var(--sol)",
-  }[id] || "var(--edge)";
+function element(name, attributes) {
+  const node = document.createElementNS(SVGNS, name);
+  for (const [key, value] of Object.entries(attributes)) {
+    node.setAttribute(key, value);
+  }
+  return node;
 }
 
-// The first node of each role owns the control; the rest mirror it, since
-// those steps genuinely run the same configured model.
-const owner = {};
-FLOW.forEach(node => {
-  if (node.role && !(node.role in owner)) owner[node.role] = node.id;
-});
-
-function control(step) {
-  const id = esc(step.id);
-  const options = (step.choices || []).map(c =>
-    `<option value="${esc(c.id)}" ${c.id === step.model ? "selected" : ""}>` +
-    `${esc(c.label)}</option>`).join("");
-  const known = (step.choices || []).some(c => c.id === step.model);
-  return `<select data-step="${id}" data-kind="select">${options}` +
-    `<option value="__custom__" ${known ? "" : "selected"}>custom…</option></select>` +
-    `<input type="text" data-step="${id}" data-kind="custom" ` +
-    `value="${known ? "" : esc(step.model)}" ` +
-    `style="display:${known ? "none" : "block"};width:100%" ` +
-    `placeholder="exact model identifier">`;
+// A node is filled by the role that acts there; one involving two roles is
+// filled by the one whose model the step is actually chosen for.
+function nodeFill(node) {
+  const role = node.roles.length ? node.roles[node.roles.length - 1] : "none";
+  return FILL[role] || FILL.none;
 }
 
-function nodeBox(node) {
-  const box = document.createElement("div");
-  const step = node.role ? roles[node.role] : null;
-  box.className = step ? "node" : "node inert";
-  box.dataset.node = node.id;
-  if (step) box.style.setProperty("--role", roleColour(step.id));
-
-  let body = "";
-  if (!step) {
-    body = `<p class="note">${esc(node.note || "No model runs here.")}</p>`;
-  } else if (owner[node.role] === node.id) {
-    const effort = step.effort
-      ? `<div class="fixed">effort ${esc(step.effort)} · fixed by the role</div>` : "";
-    body = `<div class="control"><label>model</label>${control(step)}</div>${effort}` +
-      (node.note ? `<p class="note">${esc(node.note)}</p>` : "");
+function boundaryPoint(node, towards) {
+  const dx = towards.x - node.x;
+  const dy = towards.y - node.y;
+  if (!dx && !dy) return { x: node.x, y: node.y };
+  const halfWidth = node.w / 2;
+  const halfHeight = node.h / 2;
+  let scale;
+  if (node.shape === "diamond") {
+    // |x|/a + |y|/b = 1
+    scale = 1 / (Math.abs(dx) / halfWidth + Math.abs(dy) / halfHeight);
   } else {
-    body = `<div class="control"><span class="mirror" data-mirror="${esc(step.id)}">` +
-      `${esc(step.model)}</span></div>` +
-      `<p class="note">Same ${esc(step.title)} profile as above.` +
-      (node.note ? " " + esc(node.note) : "") + `</p>`;
+    scale = Math.min(
+      Math.abs(dx) > 1e-6 ? halfWidth / Math.abs(dx) : Infinity,
+      Math.abs(dy) > 1e-6 ? halfHeight / Math.abs(dy) : Infinity);
+  }
+  return { x: node.x + dx * scale, y: node.y + dy * scale };
+}
+
+function renderChart() {
+  const svg = element("svg", {
+    class: "chart", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
+    width: CHART.width, height: CHART.height,
+    role: "img", "aria-label": "The orchestration pipeline",
+  });
+  svg.appendChild(element("defs", {})).innerHTML =
+    '<marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" ' +
+    'markerHeight="6" orient="auto-start-reverse">' +
+    '<path d="M0,0 L8,4 L0,8 z" fill="context-stroke"/></marker>';
+
+  const byId = Object.fromEntries(CHART.nodes.map(n => [n.id, n]));
+  const labels = [];
+
+  for (const edge of CHART.edges) {
+    const a = byId[edge.from];
+    const b = byId[edge.to];
+    if (!a || !b) continue;
+    const start = boundaryPoint(a, b);
+    const end = boundaryPoint(b, a);
+    const lift = Math.max(24, Math.abs(end.y - start.y) * 0.42);
+    const direction = end.y >= start.y ? 1 : -1;
+    const path = `M ${start.x} ${start.y} C ${start.x} ${start.y + lift * direction},` +
+      ` ${end.x} ${end.y - lift * direction}, ${end.x} ${end.y}`;
+    svg.appendChild(element("path", {
+      class: "edgepath", d: path, "marker-end": "url(#arrow)",
+    }));
+    if (edge.label) {
+      const t = 0.45;
+      const c1 = { x: start.x, y: start.y + lift * direction };
+      const c2 = { x: end.x, y: end.y - lift * direction };
+      const at = (p0, p1, p2, p3) =>
+        (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 +
+        3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3;
+      const label = element("text", {
+        class: "edgelabel",
+        x: at(start.x, c1.x, c2.x, end.x),
+        y: at(start.y, c1.y, c2.y, end.y),
+      });
+      label.textContent = edge.label;
+      labels.push(label);
+    }
   }
 
-  box.innerHTML = `<h2>${esc(node.label)}</h2>` +
-    (step ? `<span class="badge">${esc(step.title)}</span>`
-          : `<span class="badge">no model</span>`) + body;
-  return box;
-}
-
-function render() {
-  const legend = document.createElement("div");
-  legend.className = "legend";
-  legend.innerHTML = STATE.map(s =>
-    `<span style="--role:${roleColour(s.id)}">${esc(s.title)}</span>`).join("");
-  graph.parentNode.parentNode.insertBefore(legend, graph.parentNode);
-
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.innerHTML =
-    '<defs><marker id="head" viewBox="0 0 8 8" refX="7" refY="4" ' +
-    'markerWidth="7" markerHeight="7" orient="auto-start-reverse">' +
-    '<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker></defs>';
-  graph.appendChild(svg);
-
-  LAYOUT.rows.forEach((row, index) => {
-    const rowElement = document.createElement("div");
-    rowElement.className = "row";
-    rowElement.style.marginTop = index === 0 ? "0" : "46px";
-    row.forEach(cell => {
-      if (Array.isArray(cell)) {
-        const stack = document.createElement("div");
-        stack.className = "stack";
-        cell.forEach(id => stack.appendChild(nodeBox(nodes[id])));
-        rowElement.appendChild(stack);
-      } else {
-        const box = nodeBox(nodes[cell]);
-        if (row.length === 1) box.classList.add("wide");
-        rowElement.appendChild(box);
+  for (const node of CHART.nodes) {
+    const [fill, ink] = nodeFill(node);
+    const group = element("g", { class: "node", "data-node": node.id });
+    if (node.shape === "diamond") {
+      group.appendChild(element("polygon", {
+        class: "nodeshape", fill, stroke: fill,
+        points: [
+          [node.x, node.y - node.h / 2], [node.x + node.w / 2, node.y],
+          [node.x, node.y + node.h / 2], [node.x - node.w / 2, node.y],
+        ].map(p => p.join(",")).join(" "),
+      }));
+    } else {
+      group.appendChild(element("rect", {
+        class: "nodeshape", fill, stroke: fill,
+        x: node.x - node.w / 2, y: node.y - node.h / 2,
+        width: node.w, height: node.h, rx: 3,
+      }));
+    }
+    const lines = node.label.split(String.fromCharCode(10));
+    const text = element("text", { class: "nodelabel", x: node.x, y: node.y, fill: ink });
+    lines.forEach((line, index) => {
+      const span = element("tspan", {
+        x: node.x, dy: index === 0 ? -(lines.length - 1) * 7.5 : 15,
+      });
+      span.textContent = line;
+      text.appendChild(span);
+    });
+    group.appendChild(text);
+    group.addEventListener("mouseenter", () => highlight(node.roles));
+    group.addEventListener("mouseleave", () => highlight(null));
+    group.addEventListener("click", () => {
+      if (node.roles.length) {
+        const card = cardHost.querySelector(`[data-card="${node.roles[0]}"]`);
+        if (card) card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        highlight(node.roles);
       }
     });
-    graph.appendChild(rowElement);
+    svg.appendChild(group);
+  }
+
+  labels.forEach(label => svg.appendChild(label));
+  chartHost.appendChild(svg);
+}
+
+function highlight(active) {
+  const svg = chartHost.querySelector("svg");
+  svg.querySelectorAll("g.node").forEach(group => {
+    const node = CHART.nodes.find(n => n.id === group.dataset.node);
+    const involved = active && node.roles.some(r => active.includes(r));
+    group.classList.toggle("lit", Boolean(involved));
+    group.classList.toggle("dim", Boolean(active) && !involved);
   });
-
-  drawEdges(svg);
-  window.addEventListener("resize", () => drawEdges(svg));
+  cardHost.querySelectorAll("[data-card]").forEach(card => {
+    card.classList.toggle("lit", Boolean(active) && active.includes(card.dataset.card));
+  });
 }
 
-function drawEdges(svg) {
-  for (const old of Array.from(svg.querySelectorAll("path.edge, text.edgelabel"))) {
-    old.remove();
-  }
-  const frame = graph.getBoundingClientRect();
-  svg.setAttribute("viewBox", `0 0 ${frame.width} ${frame.height}`);
-  svg.style.height = frame.height + "px";
-  svg.style.color = "var(--soft)";
+function stepsUsing(roleId) {
+  return CHART.nodes.filter(n => n.roles.includes(roleId)).length;
+}
 
-  const at = id => {
-    const element = graph.querySelector(`[data-node="${id}"]`);
-    if (!element) return null;
-    const box = element.getBoundingClientRect();
-    return {
-      left: box.left - frame.left, right: box.right - frame.left,
-      top: box.top - frame.top, bottom: box.bottom - frame.top,
-      cx: box.left + box.width / 2 - frame.left,
-      cy: box.top + box.height / 2 - frame.top,
-    };
-  };
-
-  for (const edge of LAYOUT.edges) {
-    const a = at(edge.from);
-    const b = at(edge.to);
-    if (!a || !b) continue;
-
-    let d;
-    let labelAt;
-    if (edge.kind === "back") {
-      const lane = Math.min(a.left, b.left) - 26;
-      d = `M ${a.left} ${a.cy} H ${lane} V ${b.cy} H ${b.left}`;
-      labelAt = { x: lane + 4, y: (a.cy + b.cy) / 2, anchor: "start" };
-    } else if (edge.kind === "side") {
-      const lane = Math.max(a.right, b.right) + 26;
-      d = `M ${a.right} ${a.cy} H ${lane} V ${b.cy} H ${b.right}`;
-      labelAt = { x: lane - 4, y: (a.cy + b.cy) / 2, anchor: "end" };
-    } else {
-      const mid = a.bottom + (b.top - a.bottom) / 2;
-      d = `M ${a.cx} ${a.bottom} V ${mid} H ${b.cx} V ${b.top}`;
-      labelAt = { x: b.cx + 5, y: mid - 4, anchor: "start" };
-    }
-
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("class", "edge");
-    path.setAttribute("d", d);
-    path.setAttribute("fill", "none");
-    path.setAttribute("stroke", "currentColor");
-    path.setAttribute("stroke-width", "1.2");
-    path.setAttribute("marker-end", "url(#head)");
-    svg.appendChild(path);
-
-    if (edge.label) {
-      const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      text.setAttribute("class", "edgelabel");
-      text.setAttribute("x", labelAt.x);
-      text.setAttribute("y", labelAt.y);
-      text.setAttribute("text-anchor", labelAt.anchor);
-      text.textContent = edge.label;
-      svg.appendChild(text);
-    }
+function renderCards() {
+  for (const step of STATE) {
+    const card = document.createElement("div");
+    card.className = "card";
+    card.dataset.card = step.id;
+    card.style.setProperty("--role", (FILL[step.id] || FILL.none)[0]);
+    const options = (step.choices || []).map(c =>
+      `<option value="${esc(c.id)}" ${c.id === step.model ? "selected" : ""}>` +
+      `${esc(c.label)}</option>`).join("");
+    const known = (step.choices || []).some(c => c.id === step.model);
+    const count = stepsUsing(step.id);
+    card.innerHTML =
+      `<h2>${esc(step.title)}</h2>` +
+      (step.profile ? `<div class="profile">codex profile: ${esc(step.profile)}</div>`
+                    : `<div class="profile">claude code session model</div>`) +
+      `<p class="summary">${esc(step.summary)}</p>` +
+      `<label for="m-${esc(step.id)}">model</label>` +
+      `<select id="m-${esc(step.id)}" data-step="${esc(step.id)}" data-kind="select">${options}` +
+      `<option value="__custom__" ${known ? "" : "selected"}>custom…</option></select>` +
+      `<input type="text" data-step="${esc(step.id)}" data-kind="custom" ` +
+      `value="${known ? "" : esc(step.model)}" ` +
+      `style="display:${known ? "none" : "block"};margin-top:5px" ` +
+      `placeholder="exact model identifier">` +
+      (step.effort ? `<div class="fixed">effort ${esc(step.effort)} · fixed by the role</div>` : "") +
+      `<p class="steps">${count} step${count === 1 ? "" : "s"} in the chart ` +
+      `${count === 1 ? "runs" : "run"} this` +
+      (count > 1 ? ", all with this one model." : ".") + `</p>` +
+      `<p class="where">${esc(step.file)}</p>`;
+    card.addEventListener("mouseenter", () => highlight([step.id]));
+    card.addEventListener("mouseleave", () => highlight(null));
+    cardHost.appendChild(card);
   }
 }
+
+function render() { renderChart(); renderCards(); }
 
 function currentModel(id) {
   const select = document.querySelector(`select[data-step="${id}"]`);
-  if (select) {
-    if (select.value !== "__custom__") return select.value;
-    const custom = document.querySelector(`input[data-step="${id}"][data-kind="custom"]`);
-    return custom ? custom.value.trim() : "";
-  }
-  return "";
-}
-
-function syncMirrors() {
-  document.querySelectorAll("[data-mirror]").forEach(element => {
-    element.textContent = currentModel(element.dataset.mirror) || "(empty)";
-  });
+  if (!select) return "";
+  if (select.value !== "__custom__") return select.value;
+  const custom = document.querySelector(`input[data-step="${id}"][data-kind="custom"]`);
+  return custom ? custom.value.trim() : "";
 }
 
 function changes() {
@@ -741,7 +750,7 @@ async function post(endpoint, body) {
   return response.json();
 }
 
-document.addEventListener("input", () => { syncMirrors(); applyButton.disabled = true; });
+document.addEventListener("input", () => { applyButton.disabled = true; });
 document.addEventListener("change", event => {
   if (event.target.dataset && event.target.dataset.kind === "select") {
     const custom = document.querySelector(
@@ -749,7 +758,6 @@ document.addEventListener("change", event => {
     if (custom) custom.style.display =
       event.target.value === "__custom__" ? "block" : "none";
   }
-  syncMirrors();
   applyButton.disabled = true;
 });
 
@@ -827,7 +835,7 @@ def render_page(token: str) -> str:
         PAGE_TEMPLATE
         .replace("__STATE__", script_json(snapshot()))
         .replace("__FLOW__", script_json(load_manifest().get("flow", [])))
-        .replace("__LAYOUT__", script_json(load_manifest().get("layout", {})))
+        .replace("__CHART__", script_json(load_manifest().get("chart", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
         .replace("__KIT_DIR__", escape_html(str(KIT_DIR)))
     )

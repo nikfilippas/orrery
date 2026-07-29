@@ -12,8 +12,8 @@ name from the orrery: a clockwork model of the solar system, one mechanism
 keeping every body in its proper orbit. This kit does the same for AI-assisted
 development. It makes **Claude Code the principal engineer** of every
 session and the **Codex CLI its specialist crew**, named for their orbits:
-**Luna** for mechanical work, **Terra** for implementation, **Vesta** to
-challenge a plan and **Sol** to review the result. Around them sits an atomic configuration system, a
+a mechanical worker, an implementer, a plan reviewer and a final
+reviewer, carried by the Codex profiles Luna, Terra, Vesta and Sol. Around them sits an atomic configuration system, a
 cross-model review harness with hard cleanup guarantees, and a session
 hygiene layer that reverts everything a session creates.
 
@@ -76,17 +76,22 @@ review is reported as a limitation rather than papered over.
 
 ## The cast
 
-| Role | Backed by | Effort | Used for |
-| --- | --- | --- | --- |
-| Principal orchestrator | the active Claude Code model (default `opus`) | session setting | classification, planning, inspection, verification, ownership |
-| Luna | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
-| Terra | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| Vesta | `gpt-5.6-sol` | high | challenging a plan before any code is written |
-| Sol | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
+| Role | Codex profile | Model | Effort | Used for |
+| --- | --- | --- | --- | --- |
+| Principal orchestrator | — | the active Claude Code model (default `opus`) | session setting | classification, planning, inspection, verification, ownership |
+| Mechanical worker | `luna` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
+| Implementer | `terra` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
+| Plan reviewer | `vesta` | `gpt-5.6-sol` | high | challenging a plan before any code is written |
+| Final reviewer | `sol` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
 
-Vesta and Sol ship with the same model so behaviour is unchanged out of the
-box, but they are separate profiles: reviewing foundations and reviewing
-consequences can be priced differently.
+Roles are named for what they do. The celestial names are the Codex profile
+identifiers you pass to `--profile`, and they keep the orrery's own
+metaphor: Luna, Terra, Vesta and Sol.
+
+The plan reviewer and the final reviewer ship with the same model, so
+behaviour is unchanged out of the box, but they are separate profiles:
+reviewing foundations and reviewing consequences can be priced
+differently.
 
 The orchestrator understands the request, inspects the repository,
 classifies the task, delegates bounded work with explicit acceptance
@@ -220,10 +225,11 @@ below is live immediately.
 | A Codex worker | `global/codex/<profile>.config.toml` | `claude-codex-doctor` |
 
 **Or configure it visually.** `claude-codex-config` serves a local page
-that draws the pipeline as a flowchart, arrows and branches included, with
-every step's model in a dropdown built from `global/model-catalogue.json`.
-Steps that share a role show one control and mirror it, because they
-genuinely run the same model; steps that run no model say so. Saving shows the exact unified diff of every file it would
+that draws this same flowchart, then a card per role beneath it with the
+model in a dropdown built from `global/model-catalogue.json`. Hovering a
+card lights the steps it governs, and the card says how many steps share
+it, because several steps run on one model and the page should say so
+rather than imply otherwise. Saving shows the exact unified diff of every file it would
 touch, applies only through the kit's own atomic write paths, and runs the
 doctor inline so the result is validated before your eyes. The page is
 generated from `global/orchestration.json` and the live files at load, so

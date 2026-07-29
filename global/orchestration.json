@@ -13,158 +13,202 @@
     },
     {
       "id": "luna",
-      "title": "Luna",
+      "title": "Mechanical worker",
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/luna.config.toml",
       "expected_effort": "low",
       "summary": "The mechanical worker: narrow, repetitive, well-specified edits and boilerplate.",
-      "selects": "The Codex model behind the luna profile. Its low reasoning effort defines the role and is not configurable."
+      "selects": "The Codex model behind the luna profile. Its low reasoning effort defines the role and is not configurable.",
+      "profile": "luna"
     },
     {
       "id": "terra",
-      "title": "Terra",
+      "title": "Implementer",
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/terra.config.toml",
       "expected_effort": "medium",
       "summary": "The implementation worker: contained features, real bug fixes, multi-file changes, one bounded task per run.",
-      "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable."
+      "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable.",
+      "profile": "terra"
     },
     {
       "id": "vesta",
-      "title": "Vesta",
+      "title": "Plan reviewer",
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/vesta.config.toml",
       "expected_effort": "high",
       "summary": "The plan reviewer: challenges a plan before any code is written, when the work is complex or high-risk.",
-      "selects": "The Codex model behind the vesta profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer."
+      "selects": "The Codex model behind the vesta profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer.",
+      "profile": "vesta"
     },
     {
       "id": "sol",
-      "title": "Sol",
+      "title": "Final reviewer",
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/sol.config.toml",
       "expected_effort": "high",
       "summary": "The final reviewer: fresh read-only sessions that review completed work, and difficult diagnosis.",
-      "selects": "The Codex model behind the sol profile, used for the review that gates completion."
+      "selects": "The Codex model behind the sol profile, used for the review that gates completion.",
+      "profile": "sol"
     }
   ],
-  "flow": [
-    {
-      "id": "request",
-      "label": "An ordinary request, in your own words",
-      "role": null,
-      "note": "No model runs here."
-    },
-    {
-      "id": "classify",
-      "label": "Classify the work",
-      "role": "orchestrator",
-      "note": "Trivial, mechanical, standard, complex, or investigation."
-    },
-    {
-      "id": "trivial",
-      "label": "Trivial: implement directly",
-      "role": "orchestrator"
-    },
-    {
-      "id": "mechanical",
-      "label": "Mechanical: delegate the edit",
-      "role": "luna"
-    },
-    {
-      "id": "standard",
-      "label": "Standard: delegate the implementation",
-      "role": "terra"
-    },
-    {
-      "id": "investigation",
-      "label": "Investigation: diagnose, change nothing",
-      "role": "orchestrator",
-      "note": "Read-only sandboxes. Sol may give a second opinion when it materially helps."
-    },
-    {
-      "id": "plan",
-      "label": "Complex: write the plan",
-      "role": "orchestrator"
-    },
-    {
-      "id": "plan-review",
-      "label": "Complex: challenge the plan",
-      "role": "vesta"
-    },
-    {
-      "id": "implement",
-      "label": "Complex: implement the approved plan",
-      "role": "terra"
-    },
-    {
-      "id": "inspect",
-      "label": "Inspect the real diff, never the worker's summary",
-      "role": "orchestrator"
-    },
-    {
-      "id": "verify",
-      "label": "Tests, lint, type checks, build",
-      "role": null,
-      "note": "Shell commands. No model runs here."
-    },
-    {
-      "id": "review",
-      "label": "Independent review of the finished work",
-      "role": "sol",
-      "note": "Fresh session, read-only, contained. Always for complex work; for standard work when logic or regression risk warrants it; not for trivial changes."
-    },
-    {
-      "id": "correct",
-      "label": "Reproduce each finding, fix, add regression tests",
-      "role": "orchestrator",
-      "note": "Only when a review produced findings that survived verification."
-    },
-    {
-      "id": "done",
-      "label": "Done. Nothing committed without an explicit request",
-      "role": null,
-      "note": "No model runs here."
-    }
-  ],
-  "layout": {
-    "rows": [
-      [
-        "request"
-      ],
-      [
-        "classify"
-      ],
-      [
-        "trivial",
-        "mechanical",
-        "standard",
-        "investigation",
-        [
-          "plan",
-          "plan-review",
-          "implement"
+  "chart": {
+    "width": 880,
+    "height": 950,
+    "nodes": [
+      {
+        "id": "request",
+        "label": "ordinary request:\n'add a --top flag with tests'",
+        "x": 457,
+        "y": 56,
+        "w": 190,
+        "h": 54,
+        "shape": "rect",
+        "roles": []
+      },
+      {
+        "id": "classify",
+        "label": "classify",
+        "x": 457,
+        "y": 158,
+        "w": 78,
+        "h": 78,
+        "shape": "diamond",
+        "roles": [
+          "orchestrator"
         ]
-      ],
-      [
-        "inspect"
-      ],
-      [
-        "verify"
-      ],
-      [
-        "review"
-      ],
-      [
-        "correct"
-      ],
-      [
-        "done"
-      ]
+      },
+      {
+        "id": "complex",
+        "label": "Claude plans,\nplan reviewer challenges it",
+        "x": 121,
+        "y": 272,
+        "w": 186,
+        "h": 58,
+        "shape": "rect",
+        "roles": [
+          "orchestrator",
+          "vesta"
+        ]
+      },
+      {
+        "id": "investigation",
+        "label": "read-only sandboxes only",
+        "x": 325,
+        "y": 272,
+        "w": 172,
+        "h": 44,
+        "shape": "rect",
+        "roles": [
+          "orchestrator"
+        ]
+      },
+      {
+        "id": "standard",
+        "label": "implementer writes it\nworkspace-write",
+        "x": 289,
+        "y": 378,
+        "w": 156,
+        "h": 58,
+        "shape": "rect",
+        "roles": [
+          "terra"
+        ]
+      },
+      {
+        "id": "mechanical",
+        "label": "mechanical worker edits\nworkspace-write",
+        "x": 578,
+        "y": 378,
+        "w": 164,
+        "h": 58,
+        "shape": "rect",
+        "roles": [
+          "luna"
+        ]
+      },
+      {
+        "id": "trivial",
+        "label": "Claude implements directly",
+        "x": 726,
+        "y": 486,
+        "w": 180,
+        "h": 44,
+        "shape": "rect",
+        "roles": [
+          "orchestrator"
+        ]
+      },
+      {
+        "id": "inspect",
+        "label": "Claude inspects the real diff,\nnever the worker's summary",
+        "x": 368,
+        "y": 486,
+        "w": 196,
+        "h": 58,
+        "shape": "rect",
+        "roles": [
+          "orchestrator"
+        ]
+      },
+      {
+        "id": "verify",
+        "label": "tests, lint, type checks, build",
+        "x": 476,
+        "y": 590,
+        "w": 190,
+        "h": 40,
+        "shape": "rect",
+        "roles": []
+      },
+      {
+        "id": "review",
+        "label": "final reviewer, fresh session,\nread-only, ephemeral",
+        "x": 545,
+        "y": 676,
+        "w": 190,
+        "h": 58,
+        "shape": "rect",
+        "roles": [
+          "sol"
+        ]
+      },
+      {
+        "id": "findings",
+        "label": "findings",
+        "x": 545,
+        "y": 778,
+        "w": 86,
+        "h": 78,
+        "shape": "diamond",
+        "roles": []
+      },
+      {
+        "id": "correct",
+        "label": "Claude reproduces, fixes,\nadds regression tests",
+        "x": 375,
+        "y": 890,
+        "w": 180,
+        "h": 56,
+        "shape": "rect",
+        "roles": [
+          "orchestrator"
+        ]
+      },
+      {
+        "id": "done",
+        "label": "done: nothing committed\nwithout explicit approval",
+        "x": 585,
+        "y": 890,
+        "w": 180,
+        "h": 56,
+        "shape": "rect",
+        "roles": []
+      }
     ],
     "edges": [
       {
@@ -173,18 +217,8 @@
       },
       {
         "from": "classify",
-        "to": "trivial",
-        "label": "trivial"
-      },
-      {
-        "from": "classify",
-        "to": "mechanical",
-        "label": "mechanical"
-      },
-      {
-        "from": "classify",
-        "to": "standard",
-        "label": "standard"
+        "to": "complex",
+        "label": "complex"
       },
       {
         "from": "classify",
@@ -193,20 +227,22 @@
       },
       {
         "from": "classify",
-        "to": "plan",
-        "label": "complex"
+        "to": "standard",
+        "label": "standard"
       },
       {
-        "from": "plan",
-        "to": "plan-review"
+        "from": "classify",
+        "to": "mechanical",
+        "label": "mechanical"
       },
       {
-        "from": "plan-review",
-        "to": "implement"
+        "from": "classify",
+        "to": "trivial",
+        "label": "trivial"
       },
       {
-        "from": "trivial",
-        "to": "inspect"
+        "from": "complex",
+        "to": "standard"
       },
       {
         "from": "mechanical",
@@ -217,14 +253,8 @@
         "to": "inspect"
       },
       {
-        "from": "implement",
-        "to": "inspect"
-      },
-      {
-        "from": "investigation",
-        "to": "done",
-        "kind": "side",
-        "label": "nothing changed"
+        "from": "trivial",
+        "to": "verify"
       },
       {
         "from": "inspect",
@@ -236,20 +266,21 @@
       },
       {
         "from": "review",
+        "to": "findings"
+      },
+      {
+        "from": "findings",
         "to": "correct",
-        "label": "findings"
+        "label": "verified real"
+      },
+      {
+        "from": "findings",
+        "to": "done",
+        "label": "none survive"
       },
       {
         "from": "correct",
-        "to": "verify",
-        "kind": "back",
-        "label": "re-verify"
-      },
-      {
-        "from": "review",
-        "to": "done",
-        "kind": "side",
-        "label": "none survive"
+        "to": "verify"
       }
     ]
   }
