@@ -57,27 +57,27 @@
     }
   ],
   "chart": {
-    "width": 880,
-    "height": 950,
+    "width": 960,
+    "height": 1400,
     "nodes": [
       {
         "id": "request",
         "label": "ordinary request:\n'add a --top flag with tests'",
-        "x": 457,
-        "y": 56,
-        "w": 190,
-        "h": 54,
+        "x": 500,
+        "y": 78,
+        "w": 210,
+        "h": 56,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "classify",
         "label": "classify",
-        "x": 457,
-        "y": 158,
-        "w": 78,
-        "h": 78,
-        "shape": "diamond",
+        "x": 500,
+        "y": 226,
+        "w": 215,
+        "h": 100,
+        "shape": "rect",
         "roles": [
           "orchestrator"
         ]
@@ -85,10 +85,10 @@
       {
         "id": "complex",
         "label": "Claude plans,\nplan reviewer challenges it",
-        "x": 121,
-        "y": 272,
-        "w": 186,
-        "h": 58,
+        "x": 140,
+        "y": 400,
+        "w": 225,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "orchestrator",
@@ -98,10 +98,10 @@
       {
         "id": "investigation",
         "label": "read-only sandboxes only",
-        "x": 325,
-        "y": 272,
-        "w": 172,
-        "h": 44,
+        "x": 392,
+        "y": 396,
+        "w": 200,
+        "h": 100,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -110,10 +110,10 @@
       {
         "id": "standard",
         "label": "implementer writes it\nworkspace-write",
-        "x": 289,
-        "y": 378,
-        "w": 156,
-        "h": 58,
+        "x": 300,
+        "y": 566,
+        "w": 215,
+        "h": 104,
         "shape": "rect",
         "roles": [
           "terra"
@@ -122,10 +122,10 @@
       {
         "id": "mechanical",
         "label": "mechanical worker edits\nworkspace-write",
-        "x": 578,
-        "y": 378,
-        "w": 164,
-        "h": 58,
+        "x": 620,
+        "y": 566,
+        "w": 215,
+        "h": 104,
         "shape": "rect",
         "roles": [
           "luna"
@@ -134,10 +134,10 @@
       {
         "id": "trivial",
         "label": "Claude implements directly",
-        "x": 726,
-        "y": 486,
-        "w": 180,
-        "h": 44,
+        "x": 790,
+        "y": 726,
+        "w": 215,
+        "h": 100,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -146,10 +146,10 @@
       {
         "id": "inspect",
         "label": "Claude inspects the real diff,\nnever the worker's summary",
-        "x": 368,
-        "y": 486,
-        "w": 196,
-        "h": 58,
+        "x": 400,
+        "y": 726,
+        "w": 225,
+        "h": 104,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -158,20 +158,20 @@
       {
         "id": "verify",
         "label": "tests, lint, type checks, build",
-        "x": 476,
-        "y": 590,
-        "w": 190,
-        "h": 40,
+        "x": 520,
+        "y": 884,
+        "w": 210,
+        "h": 50,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "review",
         "label": "final reviewer, fresh session,\nread-only, ephemeral",
-        "x": 545,
-        "y": 676,
-        "w": 190,
-        "h": 58,
+        "x": 590,
+        "y": 998,
+        "w": 225,
+        "h": 104,
         "shape": "rect",
         "roles": [
           "sol"
@@ -180,20 +180,20 @@
       {
         "id": "findings",
         "label": "findings",
-        "x": 545,
-        "y": 778,
-        "w": 86,
-        "h": 78,
+        "x": 590,
+        "y": 1136,
+        "w": 92,
+        "h": 84,
         "shape": "diamond",
         "roles": []
       },
       {
         "id": "correct",
         "label": "Claude reproduces, fixes,\nadds regression tests",
-        "x": 375,
-        "y": 890,
-        "w": 180,
-        "h": 56,
+        "x": 390,
+        "y": 1284,
+        "w": 215,
+        "h": 104,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -202,10 +202,10 @@
       {
         "id": "done",
         "label": "done: nothing committed\nwithout explicit approval",
-        "x": 585,
-        "y": 890,
-        "w": 180,
-        "h": 56,
+        "x": 690,
+        "y": 1284,
+        "w": 205,
+        "h": 62,
         "shape": "rect",
         "roles": []
       }

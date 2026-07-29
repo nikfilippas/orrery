@@ -15,7 +15,7 @@ linked, and the file itself is the specification.
 Claude decides and stays accountable. Codex does bounded work Claude has
 scoped, and Claude inspects the result rather than trusting the report.
 
-Three Codex profiles, each pinning its own model and reasoning effort:
+Four Codex profiles, each pinning its own model and reasoning effort:
 
 | Profile | Model | Reasoning | Role |
 | --- | --- | --- | --- |
@@ -102,8 +102,8 @@ The installer creates:
 
 - `~/.claude/CLAUDE.md`, `~/.claude/skills/development-orchestrator`,
   `~/.claude/hooks/leave-no-trace.py`
-- `$CODEX_HOME/{luna,terra,sol}.config.toml`
-- `~/.local/bin/claude-codex-{init,doctor,review}` and
+- `$CODEX_HOME/{luna,terra,vesta,sol}.config.toml`
+- `~/.local/bin/claude-codex-{init,doctor,review,usage,config}` and
   `~/.local/bin/claude-lnt-{start,register,cleanup,status}`
 
 and then applies the canonical settings into `~/.claude/settings.json` in one
@@ -172,9 +172,10 @@ eight minutes, and completed in under three at `medium`.
   changes are live immediately; repositories that named an updated alias
   pick it up by rerunning `claude-codex-init <alias>` there.
 
-- **Visually:** `claude-codex-config` serves a local page generated from
-  the orchestration manifest and the live files, one box per step with its
-  model. Changes are previewed as exact unified diffs before an Apply that
+- **Visually:** `claude-codex-config` serves a local page that draws the
+  pipeline as a flowchart from the orchestration manifest and the live
+  files, with each step's model in a dropdown inside its node and an 🛈
+  explaining the step on hover. Changes are previewed as exact unified diffs before an Apply that
   writes only through the kit's own paths and then runs the doctor inline.
   It binds to 127.0.0.1 behind a random URL token and exits after ten
   minutes idle. `claude-codex-config --print` shows the same state in the

@@ -225,11 +225,12 @@ below is live immediately.
 | A Codex worker | `global/codex/<profile>.config.toml` | `claude-codex-doctor` |
 
 **Or configure it visually.** `claude-codex-config` serves a local page
-that draws this same flowchart, then a card per role beneath it with the
-model in a dropdown built from `global/model-catalogue.json`. Hovering a
-card lights the steps it governs, and the card says how many steps share
-it, because several steps run on one model and the page should say so
-rather than imply otherwise. Saving shows the exact unified diff of every file it would
+that draws this same flowchart with the model for each step in a dropdown
+inside its node, built from `global/model-catalogue.json`. An 🛈 on each
+node explains on hover what runs there, which profile and file it comes
+from, and how many other steps share it. Several steps run on one model,
+so changing any one of them visibly moves the others rather than hiding
+the fact. Saving shows the exact unified diff of every file it would
 touch, applies only through the kit's own atomic write paths, and runs the
 doctor inline so the result is validated before your eyes. The page is
 generated from `global/orchestration.json` and the live files at load, so
