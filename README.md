@@ -20,6 +20,10 @@ hygiene layer that reverts everything a session creates.
 You describe outcomes in ordinary language. The orchestration decides who
 does what, inspects everything itself, and owns the result.
 
+| 93 | 48 | 3 | 2 |
+| :---: | :---: | :---: | :---: |
+| deterministic regression tests | doctor checks, no model calls | Codex worker profiles | commands to adopt a repository |
+
 ## How a request flows
 
 ```mermaid
@@ -38,12 +42,35 @@ flowchart TD
     S --> F{findings}
     F -->|verified real| X[Claude reproduces, fixes,<br/>adds regression tests] --> V
     F -->|none survive| D[done: nothing committed<br/>without explicit approval]
+
+    classDef claude fill:#38617f,stroke:#2a4a62,color:#ffffff
+    classDef luna fill:#98a2b8,stroke:#737d94,color:#1b2226
+    classDef terra fill:#587b50,stroke:#44603e,color:#ffffff
+    classDef sol fill:#b07e28,stroke:#8c641f,color:#ffffff
+    classDef quiet fill:#e8ebee,stroke:#b8c0c7,color:#1b2226
+    class U,C,K,I,P,X claude
+    class L luna
+    class T terra
+    class S sol
+    class R,V,F,D quiet
 ```
 
+What each class sounds like, and who touches it:
+
+| Class | Sounds like | Implements | Reviews |
+| --- | --- | --- | --- |
+| Trivial | "fix this typo", "bump the timeout" | Claude directly, smallest relevant check | diff inspection only |
+| Mechanical | "rename this across the repo" | Luna, workspace-write | diff inspection |
+| Standard | "add a `--top` flag with tests" | Terra, workspace-write, one bounded task per run | Sol, when logic or regression risk warrants it |
+| Complex | auth, migrations, concurrency | Claude plans, Sol challenges the plan, then Terra in batches | Sol, fresh session, findings verified before any fix |
+| Investigation | "why does this leak?" | nobody: read-only sandboxes only | Sol as a second opinion when it materially helps |
+
 Delegation never transfers responsibility. Codex failure never strands a
-task: account-level errors fall back to Claude-only work under the same
-acceptance criteria, transient errors get exactly one retry, and a missing
-independent review is reported as a limitation rather than papered over.
+task: account-level errors (quota, billing, authentication) fall back to
+Claude-only work under the same acceptance criteria, transient errors get
+exactly one retry, a worker that dies mid-change has its partial diff
+inspected and repaired rather than trusted, and a missing independent
+review is reported as a limitation rather than papered over.
 
 ## The cast
 
@@ -54,13 +81,44 @@ independent review is reported as a limitation rather than papered over.
 | Terra | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
 | Sol | `gpt-5.6-sol` | high | independent review and difficult diagnosis |
 
+The orchestrator understands the request, inspects the repository,
+classifies the task, delegates bounded work with explicit acceptance
+criteria, inspects every diff itself, runs verification, and owns the
+outcome. Workers receive one bounded task per run, pointed at repository
+paths rather than pasted context, and never review their own work.
+
 No role is defined by a model name in workflow logic. Workers live in
 `$CODEX_HOME/<profile>.config.toml`; the orchestrator's model lives in
 settings. Swapping any of them is an edit, not a rewrite.
 
 ## Independent review, engineered
 
+Reviews run through `claude-codex-review`, which places
+`codex --profile sol exec` inside a transient systemd user service. That
+single decision buys hard guarantees:
+
+- **Nothing survives.** `KillMode=control-group` plus a `RuntimeMaxSec`
+  backstop: timeout, Ctrl-C, SIGKILL of the wrapper, even detached
+  SIGTERM-immune descendants all end with the whole control group stopped
+  and the runtime state reclaimed. A stale run directory left by an
+  uncatchable death is swept by the next invocation.
+- **The verdict is never lost.** It reaches stdout before publication is
+  attempted; an unwritable `--output` destination, or a closed stdout,
+  degrades gracefully instead of destroying a completed, paid-for review.
+- **Independence is a fact, not a claim.** A fresh ephemeral session per
+  review, a read-only sandbox, and a hard refusal to run if the `sol`
+  profile is missing, because Codex silently substitutes its default model
+  for an unknown profile, and a review by an unannounced model is not an
+  independent review.
+
 ```mermaid
+%%{init: {'theme': 'base', 'themeVariables': {
+    'actorBkg': '#38617f', 'actorTextColor': '#ffffff',
+    'actorBorder': '#2a4a62', 'signalColor': '#5c6a73',
+    'signalTextColor': '#3d4850',
+    'noteBkgColor': '#f0e2c8', 'noteTextColor': '#5c4a1e',
+    'noteBorderColor': '#b07e28',
+    'sequenceNumberColor': '#ffffff'}}}%%
 sequenceDiagram
     participant O as Orchestrator
     participant W as claude-codex-review
@@ -74,11 +132,18 @@ sequenceDiagram
     Note over W,M: timeout, Ctrl-C, SIGKILL of the wrapper,<br/>detached SIGTERM-immune descendants:<br/>the whole control group stops, state is reclaimed
 ```
 
-The wrapper refuses to run if the `sol` profile is missing, because Codex
-silently substitutes its default model for an unknown profile, and a review
-by an unannounced model is not an independent review. A completed verdict
-is never lost: it reaches stdout before publication is attempted, and a
-broken destination or closed stdout degrades gracefully.
+In the transcript, a review looks like a discreet handover and return:
+
+```text
+↳ Codex Sol · gpt-5.6-sol · independent review
+  still running · 30s elapsed
+  still running · 60s elapsed
+↳ Principal orchestrator · control resumed
+```
+
+Review findings are advisory, not authoritative: the orchestrator
+reproduces each one against the repository before fixing anything, rejects
+what it cannot substantiate, and adds a regression test with every fix.
 
 ## Leave No Trace
 
@@ -151,7 +216,7 @@ git clone <remote> ~/src/claude-codex-kit
 cd ~/src/claude-codex-kit
 ./scripts/install.sh     # symlinks, hooks, one atomic settings merge
 codex login              # once per machine
-claude-codex-doctor      # 40+ checks, no model calls
+claude-codex-doctor      # 48 checks, no model calls
 ```
 
 `~/.local/bin` must be on `PATH`; the installer warns and the doctor fails
@@ -187,7 +252,7 @@ that contradicts delegation before it can misfire.
 ## Proving it works
 
 ```bash
-./tests/run-tests.py     # 92 deterministic tests, stand-in Codex, no credits
+./tests/run-tests.py     # 93 deterministic tests, stand-in Codex, no credits
 claude-codex-doctor      # CLAUDE_CODEX_KIT_READY when everything holds
 ```
 
