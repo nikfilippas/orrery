@@ -145,6 +145,47 @@ Review findings are advisory, not authoritative: the orchestrator
 reproduces each one against the repository before fixing anything, rejects
 what it cannot substantiate, and adds a regression test with every fix.
 
+## A real session, excerpted
+
+Verbatim lines from a recorded first run ("implement a small CLI tool with
+tests, get it independently reviewed"), lightly trimmed. Note the middle
+passage: the hygiene layer denies the orchestrator's own unregistered
+background delegation, which is then relaunched correctly under a lease.
+The system polices itself.
+
+```text
+↳ Principal orchestrator · Fable 5
+
+● I'll start by loading the development-orchestrator skill, since the
+  user-level policy mandates it for implementation work like this.
+
+● Bash(codex --profile terra exec --sandbox workspace-write --color never
+      "<task> Create a small Python command-line tool 'wordfreq' in this
+      repository, plus a pytest…)
+  ⎿  Error: Unregistered detached process blocked by Leave No Trace.
+     Use claude-lnt-start --ttl <seconds> -- <command>, or keep the
+     process in this tool call with trap-based cleanup and wait.
+
+● Bash(claude-lnt-start --ttl 1200 -- codex --profile terra exec
+      --sandbox workspace-write --color never "<task> ...")
+
+● Terra completed successfully. Reading its report and inspecting what
+  it actually produced.
+
+↳ Codex Sol · gpt-5.6-sol · independent review
+  still running · 30s elapsed
+  still running · 60s elapsed
+↳ Principal orchestrator · control resumed
+
+● ... it correctly caught that print() crashed with a UnicodeEncodeError
+  on non-ASCII words under LC_ALL=C — I reproduced that, fixed it, and
+  added its suggested tests plus a regression test for the encoding fix.
+```
+
+That run ended with eleven passing tests, a Sol finding reproduced before
+being fixed, and nothing committed, because committing needs an explicit
+request.
+
 ## Leave No Trace
 
 Five layers guarantee a session reverts every process, socket, temporary
