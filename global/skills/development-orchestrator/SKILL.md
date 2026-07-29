@@ -5,7 +5,8 @@ description: >
   testing, and substantial code review using the active Claude model as the principal
   decision-maker and Codex as a specialist worker. Use when the user asks to
   add, implement, fix, debug, refactor, optimize, test, or materially review
-  code. Select Luna, Terra, or Sol according to task complexity without
+  code. Select the mechanic, implementer or reviewer profile according to
+  task complexity without
   requiring the user to invoke a workflow command.
 user-invocable: false
 ---
@@ -134,7 +135,7 @@ Workflow:
    profile is materially justified as the implementer.
 6. The principal orchestrator inspects all changed files and the complete diff.
 7. Run the complete relevant verification suite.
-8. A fresh Sol session reviews the completed uncommitted changes.
+8. A fresh reviewer session reviews the completed uncommitted changes.
 9. The principal orchestrator verifies each finding and corrects legitimate problems.
 10. Rerun affected verification.
 
@@ -153,7 +154,7 @@ changes:
 
 ### Mechanical worker: `luna` profile
 
-Use Luna for:
+Use the mechanic profile for:
 
 - Mechanical edits.
 - Repetitive transformations.
@@ -172,7 +173,7 @@ Example invocation:
 
 ### Implementation worker: `terra` profile
 
-Use Terra for:
+Use the implementer profile for:
 
 - Standard feature implementation.
 - Non-trivial bug fixes.
@@ -192,7 +193,7 @@ Example invocation:
 
 ### Plan reviewer: `vesta` profile
 
-Use Vesta for:
+Use the plan-reviewer profile for:
 
 - Independent review of a plan, before any code is written.
 
@@ -210,19 +211,19 @@ Or, with the same containment and cleanup as any other review:
 
     claude-codex-review --profile vesta --timeout 600 -- "<PROMPT>"
 
-Vesta and Sol are separate profiles so that challenging a plan and
+The plan-reviewer and reviewer are separate profiles so that challenging a plan and
 reviewing finished work can use different models. They ship configured
 identically, so nothing changes until one of them is repointed.
 
 ### Independent reviewer: `sol` profile
 
-Use Sol for:
+Use the reviewer profile for:
 
 - Independent final code review.
 - Difficult diagnosis.
 - Security-sensitive reasoning.
 - Architectural analysis.
-- Exceptionally difficult implementation where Terra is insufficient.
+- Exceptionally difficult implementation where the implementer is insufficient.
 
 Default reasoning effort: high.
 
@@ -249,7 +250,7 @@ orchestration legible there by narrating stage boundaries discreetly:
 - Before every Codex invocation, print a handover line naming the role,
   the model its profile configures, and the stage:
 
-      ↳ Terra · gpt-5.6-terra · implementation
+      ↳ the implementer · gpt-5.6-terra · implementation
 
 - When the invocation returns and its output has been collected, print:
 
@@ -334,11 +335,11 @@ For standard implementation work:
    CLAUDE.md bootstrap first when meaningful placeholders remain in it.
 2. Identify concise acceptance criteria.
 3. Form a short internal plan.
-4. Delegate substantial implementation to Terra.
+4. Delegate substantial implementation to the implementer.
 5. Inspect the actual Git diff.
 6. Correct small integration issues directly.
 7. Run relevant tests, linting, type checks, and builds.
-8. Request a fresh Sol review when the change:
+8. Request a fresh reviewer review when the change:
    - contains meaningful logic,
    - spans multiple components,
    - changes an interface,
@@ -348,7 +349,7 @@ For standard implementation work:
 10. Correct legitimate findings that remain within the approved scope.
 11. Rerun affected verification.
 
-For simple standard work with strong tests and low regression risk, omit the Sol
+For simple standard work with strong tests and low regression risk, omit the reviewer
 review when its expected value does not justify its cost.
 
 ## Complex workflow
@@ -358,15 +359,15 @@ For complex or high-risk work:
 1. Inspect architecture, implementation, tests, and relevant history.
 2. Define explicit acceptance criteria and failure conditions.
 3. Write an implementation plan.
-4. Ask a fresh Vesta session to challenge the plan.
+4. Ask a fresh the plan reviewer session to challenge the plan.
 5. Evaluate the review independently.
 6. Revise the plan only where criticism is supported.
-7. Delegate implementation to Terra in one coherent run where practical.
+7. Delegate implementation to the implementer in one coherent run where practical.
 8. Split implementation into batches only when necessary for correctness,
    context management, or verification.
 9. Inspect every changed file and the complete diff.
 10. Run the complete relevant verification suite.
-11. Ask a fresh Sol session to review the final uncommitted changes against the
+11. Ask a fresh reviewer session to review the final uncommitted changes against the
     approved plan and acceptance criteria.
 12. Verify every finding.
 13. Correct legitimate defects without expanding scope.
@@ -465,7 +466,7 @@ Never assume that partial Codex output represents a valid implementation.
 
 ### Review fallback
 
-When Sol or another independent Codex reviewer is unavailable:
+When the reviewer profile or another independent Codex reviewer is unavailable:
 
 - The principal orchestrator must review the complete diff against the approved plan and acceptance
   criteria.
@@ -522,7 +523,7 @@ why.
 ## Token and execution efficiency
 
 - Do not invoke Codex for trivial tasks.
-- Do not use Sol where Luna or Terra is sufficient.
+- Do not use the reviewer profile where the mechanic or implementer is sufficient.
 - Do not request plan review for straightforward, low-risk work.
 - Keep plans concise unless complexity requires detail.
 - Keep Codex prompts bounded and structured.

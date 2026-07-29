@@ -83,20 +83,31 @@ link_file \
     "$HOME/.claude/skills/development-orchestrator"
 
 link_file \
-    "$KIT_DIR/global/codex/luna.config.toml" \
-    "$CODEX_HOME/luna.config.toml"
+    "$KIT_DIR/global/codex/mechanic.config.toml" \
+    "$CODEX_HOME/mechanic.config.toml"
 
 link_file \
-    "$KIT_DIR/global/codex/terra.config.toml" \
-    "$CODEX_HOME/terra.config.toml"
+    "$KIT_DIR/global/codex/implementer.config.toml" \
+    "$CODEX_HOME/implementer.config.toml"
 
 link_file \
-    "$KIT_DIR/global/codex/vesta.config.toml" \
-    "$CODEX_HOME/vesta.config.toml"
+    "$KIT_DIR/global/codex/plan-reviewer.config.toml" \
+    "$CODEX_HOME/plan-reviewer.config.toml"
 
 link_file \
-    "$KIT_DIR/global/codex/sol.config.toml" \
-    "$CODEX_HOME/sol.config.toml"
+    "$KIT_DIR/global/codex/reviewer.config.toml" \
+    "$CODEX_HOME/reviewer.config.toml"
+
+# Profiles renamed for what they do; remove the links the old names left.
+for stale in luna terra vesta sol; do
+    stale_link="$CODEX_HOME/$stale.config.toml"
+    if [ -L "$stale_link" ] &&
+       case "$(readlink "$stale_link")" in "$KIT_DIR"/*) true ;; *) false ;; esac
+    then
+        rm -f -- "$stale_link"
+        printf 'Removed the renamed profile link: %s\n' "$stale_link"
+    fi
+done
 
 mkdir -p "$HOME/.local/bin"
 link_file \

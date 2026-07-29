@@ -79,7 +79,7 @@ check_link \
     "$HOME/.claude/skills/development-orchestrator" \
     "$KIT_DIR/global/skills/development-orchestrator"
 
-for profile in luna terra vesta sol; do
+for profile in mechanic implementer plan-reviewer reviewer; do
     check_link \
         "$CODEX_HOME/$profile.config.toml" \
         "$KIT_DIR/global/codex/$profile.config.toml"
@@ -139,10 +139,10 @@ PYPROFILE
     fi
 }
 
-validate_codex_profile "luna" "low"
-validate_codex_profile "terra" "medium"
-validate_codex_profile "vesta" "high"
-validate_codex_profile "sol" "high"
+validate_codex_profile "mechanic" "low"
+validate_codex_profile "implementer" "medium"
+validate_codex_profile "plan-reviewer" "high"
+validate_codex_profile "reviewer" "high"
 
 printf "\n=== Claude model aliases ===\n"
 if python3 - "$KIT_DIR/global/claude-models.json" <<'PY'
@@ -569,7 +569,7 @@ if not isinstance(steps, list) or not steps:
     raise SystemExit(1)
 
 identifiers = {step.get("id") for step in steps}
-if not {"orchestrator", "luna", "terra", "vesta", "sol"} <= identifiers:
+if not {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"} <= identifiers:
     raise SystemExit(1)
 
 for step in steps:

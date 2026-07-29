@@ -12,48 +12,48 @@
       "shared_note": "One continuous session runs every orchestrator step, so they necessarily share a model."
     },
     {
-      "id": "luna",
+      "id": "mechanic",
       "title": "Mechanical worker",
       "provider": "openai",
       "kind": "codex-profile",
-      "file": "global/codex/luna.config.toml",
+      "file": "global/codex/mechanic.config.toml",
       "expected_effort": "low",
       "summary": "The mechanical worker: narrow, repetitive, well-specified edits and boilerplate.",
       "selects": "The Codex model behind the luna profile. Its low reasoning effort defines the role and is not configurable.",
-      "profile": "luna"
+      "profile": "mechanic"
     },
     {
-      "id": "terra",
+      "id": "implementer",
       "title": "Implementer",
       "provider": "openai",
       "kind": "codex-profile",
-      "file": "global/codex/terra.config.toml",
+      "file": "global/codex/implementer.config.toml",
       "expected_effort": "medium",
       "summary": "The implementation worker: contained features, real bug fixes, multi-file changes, one bounded task per run.",
       "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable.",
-      "profile": "terra"
+      "profile": "implementer"
     },
     {
-      "id": "vesta",
+      "id": "plan-reviewer",
       "title": "Plan reviewer",
       "provider": "openai",
       "kind": "codex-profile",
-      "file": "global/codex/vesta.config.toml",
+      "file": "global/codex/plan-reviewer.config.toml",
       "expected_effort": "high",
       "summary": "The plan reviewer: challenges a plan before any code is written, when the work is complex or high-risk.",
       "selects": "The Codex model behind the vesta profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer.",
-      "profile": "vesta"
+      "profile": "plan-reviewer"
     },
     {
-      "id": "sol",
+      "id": "reviewer",
       "title": "Final reviewer",
       "provider": "openai",
       "kind": "codex-profile",
-      "file": "global/codex/sol.config.toml",
+      "file": "global/codex/reviewer.config.toml",
       "expected_effort": "high",
       "summary": "The final reviewer: fresh read-only sessions that review completed work, and difficult diagnosis.",
       "selects": "The Codex model behind the sol profile, used for the review that gates completion.",
-      "profile": "sol"
+      "profile": "reviewer"
     }
   ],
   "chart": {
@@ -84,7 +84,7 @@
       },
       {
         "id": "complex",
-        "label": "Claude plans,\nplan reviewer challenges it",
+        "label": "Claude plans,\nthe plan reviewer challenges it",
         "x": 140,
         "y": 400,
         "w": 225,
@@ -92,7 +92,7 @@
         "shape": "rect",
         "roles": [
           "orchestrator",
-          "vesta"
+          "plan-reviewer"
         ]
       },
       {
@@ -116,7 +116,7 @@
         "h": 104,
         "shape": "rect",
         "roles": [
-          "terra"
+          "implementer"
         ]
       },
       {
@@ -128,13 +128,13 @@
         "h": 104,
         "shape": "rect",
         "roles": [
-          "luna"
+          "mechanic"
         ]
       },
       {
         "id": "trivial",
         "label": "Claude implements directly",
-        "x": 775,
+        "x": 900,
         "y": 726,
         "w": 215,
         "h": 100,
@@ -174,7 +174,7 @@
         "h": 104,
         "shape": "rect",
         "roles": [
-          "sol"
+          "reviewer"
         ]
       },
       {

@@ -13,7 +13,7 @@ keeping every body in its proper orbit. This kit does the same for AI-assisted
 development. It makes **Claude Code the principal engineer** of every
 session and the **Codex CLI its specialist crew**, named for their orbits:
 a mechanical worker, an implementer, a plan reviewer and a final
-reviewer, carried by the Codex profiles Luna, Terra, Vesta and Sol. Around them sits an atomic configuration system, a
+reviewer, each a Codex profile named for its job. Around them sits an atomic configuration system, a
 cross-model review harness with hard cleanup guarantees, and a session
 hygiene layer that reverts everything a session creates.
 
@@ -30,30 +30,30 @@ does what, inspects everything itself, and owns the result.
 flowchart TD
     U["ordinary request:<br/>'add a --top flag with tests'"] --> C{classify}
     C -->|trivial| K[Claude implements directly]
-    C -->|mechanical| L[Luna executes<br/>workspace-write]
-    C -->|standard| T[Terra implements<br/>workspace-write]
-    C -->|complex| P[Claude plans,<br/>Vesta challenges the plan] --> T
+    C -->|mechanical| L[mechanical worker edits<br/>workspace-write]
+    C -->|standard| T[implementer writes it<br/>workspace-write]
+    C -->|complex| P[Claude plans,<br/>the plan reviewer challenges it] --> T
     C -->|investigation| R[read-only sandboxes only]
     L --> I[Claude inspects the real diff,<br/>never the worker's summary]
     T --> I
     K --> V
     I --> V[tests, lint, type checks, build]
-    V --> S[Sol reviews, fresh session,<br/>read-only, ephemeral]
+    V --> S[final reviewer, fresh session,<br/>read-only, ephemeral]
     S --> F{findings}
     F -->|verified real| X[Claude reproduces, fixes,<br/>adds regression tests] --> V
     F -->|none survive| D[done: nothing committed<br/>without explicit approval]
 
     classDef claude fill:#38617f,stroke:#2a4a62,color:#ffffff
-    classDef luna fill:#98a2b8,stroke:#737d94,color:#1b2226
-    classDef terra fill:#587b50,stroke:#44603e,color:#ffffff
-    classDef vesta fill:#8a6a9c,stroke:#6d5279,color:#ffffff
-    classDef sol fill:#b07e28,stroke:#8c641f,color:#ffffff
+    classDef mechanic fill:#98a2b8,stroke:#737d94,color:#1b2226
+    classDef implementer fill:#587b50,stroke:#44603e,color:#ffffff
+    classDef planreviewer fill:#8a6a9c,stroke:#6d5279,color:#ffffff
+    classDef reviewer fill:#b07e28,stroke:#8c641f,color:#ffffff
     classDef quiet fill:#e8ebee,stroke:#b8c0c7,color:#1b2226
     class U,C,K,I,X claude
-    class L luna
-    class T terra
-    class P vesta
-    class S sol
+    class L mechanic
+    class T implementer
+    class P planreviewer
+    class S reviewer
     class R,V,F,D quiet
 ```
 
@@ -62,10 +62,10 @@ What each class sounds like, and who touches it:
 | Class | Sounds like | Implements | Reviews |
 | --- | --- | --- | --- |
 | Trivial | "fix this typo", "bump the timeout" | Claude directly, smallest relevant check | diff inspection only |
-| Mechanical | "rename this across the repo" | Luna, workspace-write | diff inspection |
-| Standard | "add a `--top` flag with tests" | Terra, workspace-write, one bounded task per run | Sol, when logic or regression risk warrants it |
-| Complex | auth, migrations, concurrency | Claude plans, Vesta challenges the plan, then Terra in batches | Sol, fresh session, findings verified before any fix |
-| Investigation | "why does this leak?" | nobody: read-only sandboxes only | Sol as a second opinion when it materially helps |
+| Mechanical | "rename this across the repo" | the mechanical worker, workspace-write | diff inspection |
+| Standard | "add a `--top` flag with tests" | the implementer, workspace-write, one bounded task per run | the final reviewer, when logic or regression risk warrants it |
+| Complex | auth, migrations, concurrency | Claude plans, the plan reviewer challenges it, then the implementer in batches | the final reviewer, fresh session, findings verified before any fix |
+| Investigation | "why does this leak?" | nobody: read-only sandboxes only | the final reviewer as a second opinion when it materially helps |
 
 Delegation never transfers responsibility. Codex failure never strands a
 task: account-level errors (quota, billing, authentication) fall back to
@@ -86,7 +86,6 @@ review is reported as a limitation rather than papered over.
 
 Roles are named for what they do. The celestial names are the Codex profile
 identifiers you pass to `--profile`, and they keep the orrery's own
-metaphor: Luna, Terra, Vesta and Sol.
 
 The plan reviewer and the final reviewer ship with the same model, so
 behaviour is unchanged out of the box, but they are separate profiles:
@@ -135,7 +134,7 @@ sequenceDiagram
     participant O as Orchestrator
     participant W as claude-codex-review
     participant M as systemd user manager
-    participant X as Codex Sol
+    participant X as Codex reviewer
     O->>W: review prompt
     W->>M: transient unit, KillMode=control-group,<br/>RuntimeMaxSec backstop
     M->>X: codex --profile sol exec --sandbox read-only --ephemeral
@@ -159,7 +158,9 @@ what it cannot substantiate, and adds a regression test with every fix.
 
 ## A real session, excerpted
 
-Verbatim lines from a recorded first run ("implement a small CLI tool with
+Verbatim lines from a recorded first run, before the profiles were
+renamed for their roles (Terra is now the implementer, Sol the final
+reviewer) ("implement a small CLI tool with
 tests, get it independently reviewed"), lightly trimmed. Note the middle
 passage: the hygiene layer denies the orchestrator's own unregistered
 background delegation, which is then relaunched correctly under a lease.
@@ -194,7 +195,7 @@ The system polices itself.
   added its suggested tests plus a regression test for the encoding fix.
 ```
 
-That run ended with eleven passing tests, a Sol finding reproduced before
+That run ended with eleven passing tests, a review finding reproduced before
 being fixed, and nothing committed, because committing needs an explicit
 request.
 
@@ -342,7 +343,7 @@ configuration and spends no credits.
 | `global/hooks/leave-no-trace.py` | Session hygiene: guard, leases, sweeps, watchdog |
 | `scripts/install.sh` | Installs every link and applies canonical settings |
 | `scripts/init-project.sh` | `claude-codex-init`: migrates a repository |
-| `scripts/claude-codex-review` | Synchronous independent Sol review |
+| `scripts/claude-codex-review` | Synchronous independent review |
 | `scripts/claude-codex-usage` | Token usage across both providers |
 | `scripts/claude-codex-config` | Visual configuration: schematic, diffs, doctor |
 | `global/orchestration.json` | Declarative manifest of steps and their config |

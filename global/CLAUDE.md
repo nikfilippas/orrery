@@ -155,7 +155,7 @@ a mistyped profile produces work from a model you did not choose. Confirm the
 profile exists rather than assuming the run used it.
 
 For an independent review, prefer the `claude-codex-review` wrapper over a
-bare `codex --profile sol exec`. It runs Sol read-only inside a transient
+bare `codex --profile reviewer exec`. It runs the reviewer read-only inside a transient
 systemd user service, so a timeout or an interruption stops the whole control
 group, and it refuses to run at all if the `sol` profile is missing.
 
@@ -209,7 +209,7 @@ Examples include:
 In these cases:
 
 1. Do not retry the same request.
-2. Do not cycle through Luna, Terra, and Sol, because an account-level failure
+2. Do not cycle through the worker profiles, because an account-level failure
    is unlikely to be solved by model switching.
 3. Continue the task using the principal orchestrator as the sole implementation and review agent.
 4. Apply the same acceptance criteria and verification requirements.

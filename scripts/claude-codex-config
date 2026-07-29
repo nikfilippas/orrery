@@ -129,7 +129,11 @@ def model_choices(step: dict[str, Any], current: str) -> list[dict[str, str]]:
             aliases = {}
         for alias, value in sorted(aliases.items()):
             if isinstance(value, str) and value not in seen:
-                choices.append({"id": value, "label": f"{alias} → {value}"})
+                label = (
+                    f"{alias} · moving alias" if alias == value
+                    else f"{alias} → {value}"
+                )
+                choices.append({"id": value, "label": label})
                 seen.add(value)
 
     for entry in load_catalogue().get(step.get("provider", ""), []):
@@ -444,14 +448,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   :root {
     --ground: #f3f5f6; --panel: #ffffff; --edge: #d9dfe3;
     --ink: #1b2226; --soft: #4c5a63; --accent: #38617f; --accent-ink: #ffffff;
-    --luna: #737d94; --terra: #587b50; --vesta: #8a6a9c; --sol: #a97a24;
+    --mechanic: #737d94; --implementer: #587b50; --plan-reviewer: #8a6a9c; --reviewer: #a97a24;
     --wire: #8b969d; --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --ground: #14181b; --panel: #1c2226; --edge: #2c353b;
       --ink: #dde3e6; --soft: #a6b2b9; --accent: #7fa8c9; --accent-ink: #10161a;
-      --luna: #98a2b8; --terra: #86a97e; --vesta: #b294c4; --sol: #cfa04a;
+      --mechanic: #98a2b8; --implementer: #86a97e; --plan-reviewer: #b294c4; --reviewer: #cfa04a;
       --wire: #6b7880; --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
     }
   }
@@ -481,8 +485,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     display: flex; flex-direction: column; gap: 7px;
   }
   .cnode.diamond { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
-  .cnode.dim { opacity: 0.35; }
-  .cnode.lit { box-shadow: 0 0 0 2px var(--ink), 0 6px 18px rgba(0,0,0,.22); }
+  .cnode.dim { opacity: 0.26; }
+  .cnode.self { box-shadow: 0 0 0 2.5px var(--ink), 0 10px 28px rgba(0,0,0,.34); }
+  .cnode.kin { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 45%, transparent); }
   .cnode:hover, .cnode:focus-within { z-index: 90; opacity: 1; }
   .cnode:hover { box-shadow: 0 4px 16px rgba(0,0,0,.26); }
   .cnode .title {
@@ -581,9 +586,9 @@ const applyButton = document.getElementById("apply");
 const SVGNS = "http://www.w3.org/2000/svg";
 
 const FILL = {
-  orchestrator: ["#38617f", "#ffffff"], luna: ["#8891a8", "#ffffff"],
-  terra: ["#4f7047", "#ffffff"], vesta: ["#7d5d90", "#ffffff"],
-  sol: ["#a2711d", "#ffffff"], none: ["#e4e8eb", "#1b2226"],
+  orchestrator: ["#38617f", "#ffffff"], mechanic: ["#8891a8", "#ffffff"],
+  implementer: ["#4f7047", "#ffffff"], "plan-reviewer": ["#7d5d90", "#ffffff"],
+  reviewer: ["#a2711d", "#ffffff"], none: ["#e4e8eb", "#1b2226"],
 };
 
 function esc(text) {
@@ -680,9 +685,8 @@ function render() {
         `<button class="info" type="button" aria-label="About this step">&#128712;</button>` +
         `<div class="tip">${tip(node)}</div>`) +
       node.roles.map(id => picker(roles[id])).join("");
-    box.addEventListener("mouseenter", () =>
-      highlight(node.roles.length ? node.roles : null));
-    box.addEventListener("mouseleave", () => highlight(null));
+    box.addEventListener("mouseenter", () => highlight(node.id, node.roles));
+    box.addEventListener("mouseleave", () => highlight(null, null));
     canvas.appendChild(box);
   }
 
@@ -750,13 +754,17 @@ function drawWires(svg, marks, canvas) {
   labels.forEach(label => marks.appendChild(label));
 }
 
-function highlight(active) {
+function highlight(sourceId, active) {
+  // An empty list of roles is still truthy, so a step that runs no model
+  // must not be read as a request to highlight nothing at all.
   const chosen = active && active.length ? active : null;
   document.querySelectorAll(".cnode").forEach(box => {
     const node = CHART.nodes.find(n => n.id === box.dataset.node);
-    const involved = chosen && node.roles.some(r => chosen.includes(r));
-    box.classList.toggle("lit", Boolean(involved));
-    box.classList.toggle("dim", Boolean(chosen) && !involved);
+    const self = sourceId === node.id;
+    const kin = Boolean(chosen && !self && node.roles.some(r => chosen.includes(r)));
+    box.classList.toggle("self", self);
+    box.classList.toggle("kin", kin);
+    box.classList.toggle("dim", Boolean(chosen) && !self && !kin);
   });
 }
 
@@ -887,6 +895,14 @@ def escape_html(text: str) -> str:
     )
 
 
+def display_path(path: Path) -> str:
+    """A path as its owner would write it, home abbreviated."""
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
 def render_page(token: str) -> str:
     return (
         PAGE_TEMPLATE
@@ -894,7 +910,7 @@ def render_page(token: str) -> str:
         .replace("__FLOW__", script_json(load_manifest().get("flow", [])))
         .replace("__CHART__", script_json(load_manifest().get("chart", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
-        .replace("__KIT_DIR__", escape_html(str(KIT_DIR)))
+        .replace("__KIT_DIR__", escape_html(display_path(KIT_DIR)))
     )
 
 

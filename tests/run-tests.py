@@ -2243,7 +2243,7 @@ def test_missing_profile_refused() -> None:
             )
 
             # A profile that exists but sets no model is equally unusable.
-            (home / "sol.config.toml").write_text('model_reasoning_effort = "high"\n')
+            (home / "reviewer.config.toml").write_text('model_reasoning_effort = "high"\n')
             result = subprocess.run(
                 [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
                 env=environment,
@@ -2424,7 +2424,7 @@ def test_proc_fallback() -> None:
         )
 
 
-@test("Codex is invoked with the sol profile, read-only sandbox and prompt")
+@test("Codex is invoked with the reviewer profile, read-only sandbox and prompt")
 def test_codex_invocation_contract() -> None:
     """The wrapper's central promises live in the argv it hands to Codex."""
     with tempfile.TemporaryDirectory() as directory:
@@ -2444,7 +2444,7 @@ def test_codex_invocation_contract() -> None:
         arguments = arguments_path.read_text().splitlines()
 
         for flag, value in (
-            ("--profile", "sol"),
+            ("--profile", "reviewer"),
             ("--sandbox", "read-only"),
         ):
             require(flag in arguments, f"codex was not passed {flag}")
@@ -2556,7 +2556,7 @@ def test_normal_completion() -> None:
         require(output.exists(), "verdict was not published")
         require("# PASS" in output.read_text(), "published verdict is wrong")
         require(
-            "Codex Sol" in stderr and "control resumed" in stderr,
+            "Codex Reviewer" in stderr and "control resumed" in stderr,
             f"handover messages missing: {stderr!r}",
         )
         require(
@@ -4367,7 +4367,7 @@ def test_orchestration_manifest() -> None:
     manifest = read_json(KIT_DIR / "global" / "orchestration.json")
     steps = {step["id"]: step for step in manifest["steps"]}
     require(
-        {"orchestrator", "luna", "terra", "vesta", "sol"} <= set(steps),
+        {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"} <= set(steps),
         f"manifest is missing core steps: {sorted(steps)}",
     )
     for step in steps.values():
@@ -4476,8 +4476,8 @@ def test_manifest_chart() -> None:
 def test_review_profile_option() -> None:
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
-        (home / "vesta.config.toml").write_text(
-            'model = "fake-vesta"\nmodel_reasoning_effort = "high"\n'
+        (home / "plan-reviewer.config.toml").write_text(
+            'model = "fake-plan-model"\nmodel_reasoning_effort = "high"\n'
         )
         environment = review_environment("success")
         environment["CODEX_HOME"] = str(home)
@@ -4487,26 +4487,26 @@ def test_review_profile_option() -> None:
 
         try:
             process = start_review(
-                environment, "--profile", "vesta", "--timeout", "60", "--", "prompt"
+                environment, "--profile", "plan-reviewer", "--timeout", "60", "--", "prompt"
             )
             _, stderr = finish_review(process, environment)
             require(
                 process.returncode == 0,
-                f"a vesta review failed ({process.returncode}): {stderr}",
+                f"a plan-reviewer review failed ({process.returncode}): {stderr}",
             )
             require(
-                "Codex Vesta · fake-vesta · plan review" in stderr,
+                "Codex Plan reviewer · fake-plan-model · plan review" in stderr,
                 f"the handover did not name the profile's role: {stderr!r}",
             )
             arguments = arguments_path.read_text().splitlines()
             require(
-                arguments[arguments.index("--profile") + 1] == "vesta",
+                arguments[arguments.index("--profile") + 1] == "plan-reviewer",
                 "codex was not invoked with the requested profile",
             )
             assert_no_review_residue(f"claude-codex-review-{process.pid}-")
 
             # A profile name becomes a filename and must not escape.
-            for hostile in ("../sol", "a/b", ""):
+            for hostile in ("../reviewer", "a/b", ""):
                 result = subprocess.run(
                     [
                         sys.executable,
@@ -4546,7 +4546,7 @@ def test_config_surface() -> None:
         home.mkdir()
         # User-added keys must survive a model rewrite, including a quoted
         # key that would become invalid TOML if emitted bare.
-        terra_toml = kit / "global" / "codex" / "terra.config.toml"
+        terra_toml = kit / "global" / "codex" / "implementer.config.toml"
         terra_toml.write_text(
             terra_toml.read_text()
             + 'approval_policy = "never"\n'
@@ -4610,7 +4610,7 @@ def test_config_surface() -> None:
                 except urllib.error.HTTPError as error:
                     return json.loads(error.read())
 
-            preview = post("preview", {"terra": {"model": "gpt-7-terra"}})
+            preview = post("preview", {"implementer": {"model": "gpt-7-terra"}})
             require(
                 len(preview["edits"]) == 1
                 and '-model = "gpt-5.6-terra"' in preview["edits"][0]["diff"]
@@ -4619,11 +4619,11 @@ def test_config_surface() -> None:
             )
             require(
                 "gpt-5.6-terra"
-                in (kit / "global" / "codex" / "terra.config.toml").read_text(),
+                in (kit / "global" / "codex" / "implementer.config.toml").read_text(),
                 "a preview must not modify anything",
             )
 
-            rejected = post("preview", {"terra": {"effort": "xhigh"}})
+            rejected = post("preview", {"implementer": {"effort": "xhigh"}})
             require(
                 "only the model" in rejected.get("error", ""),
                 "changing a role's effort was not refused",
@@ -4637,7 +4637,7 @@ def test_config_surface() -> None:
                 "x" * 200,
                 "",
             ):
-                refused = post("preview", {"terra": {"model": hostile}})
+                refused = post("preview", {"implementer": {"model": hostile}})
                 require(
                     "error" in refused,
                     f"a hostile model name was accepted: {hostile!r}",
@@ -4645,7 +4645,7 @@ def test_config_surface() -> None:
 
             require(
                 "before" not in json.dumps(
-                    post("preview", {"terra": {"model": "gpt-7-terra"}})
+                    post("preview", {"implementer": {"model": "gpt-7-terra"}})
                 ),
                 "the preview leaked file contents back to the page",
             )
@@ -4658,7 +4658,7 @@ def test_config_surface() -> None:
             )
 
             both = {
-                "terra": {"model": "gpt-7-terra"},
+                "implementer": {"model": "gpt-7-terra"},
                 "orchestrator": {"model": "claude-fable-5[1m]"},
             }
             post("preview", both)
@@ -4667,25 +4667,25 @@ def test_config_surface() -> None:
                 sorted(applied["applied"])
                 == [
                     "global/claude-settings.json",
-                    "global/codex/terra.config.toml",
+                    "global/codex/implementer.config.toml",
                 ],
                 f"unexpected apply result: {applied}",
             )
 
             with terra_toml.open("rb") as handle:
-                terra = __import__("tomllib").load(handle)
+                implementer = __import__("tomllib").load(handle)
             require(
-                terra["model"] == "gpt-7-terra"
-                and terra["model_reasoning_effort"] == "medium"
-                and terra["approval_policy"] == "never"
-                and terra.get("custom key") == "keep",
-                f"the profile rewrite lost or corrupted content: {terra}",
+                implementer["model"] == "gpt-7-terra"
+                and implementer["model_reasoning_effort"] == "medium"
+                and implementer["approval_policy"] == "never"
+                and implementer.get("custom key") == "keep",
+                f"the profile rewrite lost or corrupted content: {implementer}",
             )
 
             # Applying a different model than the one previewed is refused:
             # the preview is a contract about an exact change.
-            post("preview", {"terra": {"model": "gpt-8-terra"}})
-            swapped = post("apply", {"terra": {"model": "gpt-9-terra"}})
+            post("preview", {"implementer": {"model": "gpt-8-terra"}})
+            swapped = post("apply", {"implementer": {"model": "gpt-9-terra"}})
             require(
                 "not the one that was previewed" in swapped.get("error", ""),
                 f"an unpreviewed substitution was applied: {swapped}",
@@ -4693,12 +4693,12 @@ def test_config_surface() -> None:
 
             # An external edit after the preview must refuse rather than
             # silently overwrite.
-            stale = post("preview", {"terra": {"model": "gpt-8-terra"}})
+            stale = post("preview", {"implementer": {"model": "gpt-8-terra"}})
             require(stale["edits"], "expected a pending edit to test staleness")
             terra_toml.write_text(
                 terra_toml.read_text() + 'extra = "added"\n'
             )
-            refused = post("apply", {"terra": {"model": "gpt-8-terra"}})
+            refused = post("apply", {"implementer": {"model": "gpt-8-terra"}})
             require(
                 "changed since" in refused.get("error", ""),
                 f"a concurrent external edit was overwritten: {refused}",
@@ -4715,8 +4715,8 @@ def test_config_surface() -> None:
                 'model_reasoning_effort = "medium"\n'
                 'note = "😀 keep"\n'
             )
-            post("preview", {"terra": {"model": "gpt-10-terra"}})
-            emoji = post("apply", {"terra": {"model": "gpt-10-terra"}})
+            post("preview", {"implementer": {"model": "gpt-10-terra"}})
+            emoji = post("apply", {"implementer": {"model": "gpt-10-terra"}})
             require("applied" in emoji, f"the astral rewrite failed: {emoji}")
             with terra_toml.open("rb") as handle:
                 rewritten = __import__("tomllib").load(handle)
@@ -4898,7 +4898,7 @@ def test_installer_refuses_self_source() -> None:
             result.returncode != 0,
             "the installer accepted a target inside its own source tree",
         )
-        for profile in ("luna", "terra", "vesta", "sol"):
+        for profile in ("mechanic", "implementer", "plan-reviewer", "reviewer"):
             path = kit / "global" / "codex" / f"{profile}.config.toml"
             require(
                 path.is_file() and not path.is_symlink(),

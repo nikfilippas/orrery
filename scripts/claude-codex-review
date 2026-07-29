@@ -87,9 +87,16 @@ def interrupting_signals() -> set[int]:
 
 
 PROFILE_ROLES = {
-    "sol": "independent review",
-    "vesta": "plan review",
+    "reviewer": ("Reviewer", "independent review"),
+    "plan-reviewer": ("Plan reviewer", "plan review"),
 }
+
+
+def profile_label(profile: str) -> tuple[str, str]:
+    return PROFILE_ROLES.get(
+        profile,
+        (profile.replace("-", " ").capitalize(), "independent review"),
+    )
 
 
 def usage() -> str:
@@ -100,7 +107,7 @@ def usage() -> str:
         "  printf '%s\\n' \"PROMPT\" | claude-codex-review "
         "[--timeout SECONDS] [--output PATH]\n\n"
         "Runs a synchronous independent review through a read-only Codex "
-        "profile, `sol` by default and `vesta` for plan review. The run is "
+        "profile, `reviewer` by default and `plan-reviewer` for plan review. The run is "
         "placed in a transient systemd user service so timeout and "
         "interruption stop its complete control group.\n"
     )
@@ -118,7 +125,7 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
 
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
-    profile = "sol"
+    profile = "reviewer"
 
     index = 0
     while index < len(argv):
@@ -841,9 +848,9 @@ def main() -> int:
     except UsageError as exc:
         print(f"claude-codex-review: {exc}", file=sys.stderr)
         return 2
+    display, role = profile_label(profile)
     print(
-        f"↳ Codex {profile.capitalize()} · {model} · "
-        f"{PROFILE_ROLES.get(profile, 'independent review')}",
+        f"↳ Codex {display} · {model} · {role}",
         file=sys.stderr,
         flush=True,
     )

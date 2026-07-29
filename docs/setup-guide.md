@@ -42,10 +42,10 @@ Two rules shape everything else:
 | `global/model-catalogue.json` | Models offered in the configuration dropdowns |
 | `global/skills/development-orchestrator/SKILL.md` | Task classification and model routing |
 | `global/hooks/leave-no-trace.py` | Session lifecycle hook and `claude-lnt-*` implementation |
-| `global/codex/luna.config.toml` | Low-effort Codex profile |
-| `global/codex/terra.config.toml` | Medium-effort Codex profile |
-| `global/codex/vesta.config.toml` | High-effort Codex profile for plan review |
-| `global/codex/sol.config.toml` | High-effort Codex profile |
+| `global/codex/mechanic.config.toml` | Low-effort profile for mechanical edits |
+| `global/codex/implementer.config.toml` | Medium-effort profile for implementation |
+| `global/codex/plan-reviewer.config.toml` | High-effort profile for plan review |
+| `global/codex/reviewer.config.toml` | High-effort profile for final review |
 | `project-template/CLAUDE.md` | Shared per-repository template |
 | `project-template/CLAUDE.local.md` | Private per-repository workflow block |
 | `scripts/install.sh` | Installs every link and applies the canonical settings |
@@ -53,7 +53,7 @@ Two rules shape everything else:
 | `scripts/set-claude-model.sh` | Compatibility wrapper for `--model` |
 | `scripts/set-codex-companion-state.sh` | Compatibility wrapper for `--companion` |
 | `scripts/install-lnt-hooks.sh` | Installs the Leave No Trace links and hooks |
-| `scripts/claude-codex-review` | Synchronous independent review through Sol |
+| `scripts/claude-codex-review` | Synchronous independent review through the reviewer profile |
 | `scripts/claude-codex-usage` | Aggregates Claude and Codex token usage from local session logs |
 | `scripts/claude-codex-config` | Local web page for viewing and changing each step's model |
 | `global/orchestration.json` | Declarative manifest of the orchestration steps and their config files |
