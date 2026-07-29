@@ -483,6 +483,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .cnode.diamond { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
   .cnode.dim { opacity: 0.35; }
   .cnode.lit { box-shadow: 0 0 0 2px var(--ink), 0 6px 18px rgba(0,0,0,.22); }
+  .cnode:hover, .cnode:focus-within { z-index: 90; opacity: 1; }
+  .cnode:hover { box-shadow: 0 4px 16px rgba(0,0,0,.26); }
   .cnode .title {
     font-size: 12px; font-weight: 600; line-height: 1.32;
     padding-right: 16px; white-space: pre-line;
@@ -501,6 +503,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     border-radius: 8px; padding: 10px 12px; font-size: 11.5px; line-height: 1.45;
     box-shadow: 0 8px 24px rgba(0,0,0,.28); font-weight: 400;
     display: none; text-align: left; white-space: normal;
+    opacity: 1; isolation: isolate;
   }
   .info:hover + .tip, .info:focus-visible + .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
@@ -677,7 +680,8 @@ function render() {
         `<button class="info" type="button" aria-label="About this step">&#128712;</button>` +
         `<div class="tip">${tip(node)}</div>`) +
       node.roles.map(id => picker(roles[id])).join("");
-    box.addEventListener("mouseenter", () => highlight(node.roles));
+    box.addEventListener("mouseenter", () =>
+      highlight(node.roles.length ? node.roles : null));
     box.addEventListener("mouseleave", () => highlight(null));
     canvas.appendChild(box);
   }
@@ -747,11 +751,12 @@ function drawWires(svg, marks, canvas) {
 }
 
 function highlight(active) {
+  const chosen = active && active.length ? active : null;
   document.querySelectorAll(".cnode").forEach(box => {
     const node = CHART.nodes.find(n => n.id === box.dataset.node);
-    const involved = active && node.roles.some(r => active.includes(r));
+    const involved = chosen && node.roles.some(r => chosen.includes(r));
     box.classList.toggle("lit", Boolean(involved));
-    box.classList.toggle("dim", Boolean(active) && !involved);
+    box.classList.toggle("dim", Boolean(chosen) && !involved);
   });
 }
 
