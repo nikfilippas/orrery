@@ -239,6 +239,7 @@ fi
 for python_script in \
     "$KIT_DIR/scripts/apply-claude-settings.py" \
     "$KIT_DIR/scripts/claude-codex-usage" \
+    "$KIT_DIR/scripts/claude-codex-config" \
     "$KIT_DIR/global/hooks/leave-no-trace.py" \
     "$KIT_DIR/tests/run-tests.py" \
     "$KIT_DIR/tests/fake-codex"
@@ -544,6 +545,54 @@ if [ "$(readlink -f "$HOME/.local/bin/claude-codex-usage")" = \
     pass "claude-codex-usage is correctly installed"
 else
     fail "claude-codex-usage is not correctly installed"
+fi
+
+if [ "$(readlink -f "$HOME/.local/bin/claude-codex-config")" = \
+     "$(readlink -f "$KIT_DIR/scripts/claude-codex-config")" ]; then
+    pass "claude-codex-config is correctly installed"
+else
+    fail "claude-codex-config is not correctly installed"
+fi
+
+if python3 - "$KIT_DIR" <<'PY'
+import json
+import sys
+import tomllib
+from pathlib import Path
+
+kit = Path(sys.argv[1])
+manifest = json.loads((kit / "global" / "orchestration.json").read_text())
+steps = manifest.get("steps")
+
+if not isinstance(steps, list) or not steps:
+    raise SystemExit(1)
+
+identifiers = {step.get("id") for step in steps}
+if not {"orchestrator", "luna", "terra", "sol"} <= identifiers:
+    raise SystemExit(1)
+
+for step in steps:
+    path = kit / step["file"]
+    if not path.is_file():
+        print(f"missing: {step['file']}", file=sys.stderr)
+        raise SystemExit(1)
+    if step["kind"] == "codex-profile":
+        with path.open("rb") as handle:
+            profile = tomllib.load(handle)
+        if profile.get("model_reasoning_effort") != step.get("expected_effort"):
+            print(f"effort drift: {step['id']}", file=sys.stderr)
+            raise SystemExit(1)
+    elif step["kind"] == "claude-settings":
+        model = json.loads(path.read_text()).get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+PY
+then
+    pass "Orchestration manifest matches the live configuration files"
+else
+    fail "Orchestration manifest is missing, invalid, or drifted"
 fi
 
 printf "\n=== Direct Codex review ===\n"

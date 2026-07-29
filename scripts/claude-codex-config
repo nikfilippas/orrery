@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Visual configuration surface for the Órrery orchestration kit.
+
+Serves a single local page generated from the orchestration manifest and
+the live configuration files, showing the whole pipeline with the model
+behind each step. Changes are previewed as unified diffs and applied only
+through the kit's own write paths, then validated by the doctor. The page
+is a veneer over the files; it never holds knowledge of its own.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+
+KIT_DIR = Path(__file__).resolve().parent.parent
+
+# A request carries only a few short model names.
+MAX_BODY_BYTES = 64 * 1024
+
+
+class ConfigError(Exception):
+    pass
+
+
+def load_manifest() -> dict[str, Any]:
+    path = KIT_DIR / "global" / "orchestration.json"
+    manifest = json.loads(path.read_text())
+    steps = manifest.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ConfigError(f"no steps defined in {path}")
+    return manifest
+
+
+def read_toml(path: Path) -> dict[str, Any]:
+    with path.open("rb") as handle:
+        return tomllib.load(handle)
+
+
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        # JSON string quoting is valid TOML basic-string quoting, but only
+        # without ASCII escaping: json's \uXXXX form uses surrogate pairs
+        # for astral characters, and a TOML escape must be a scalar value.
+        return json.dumps(value, ensure_ascii=False)
+    raise ConfigError(
+        f"cannot rewrite a profile containing a non-scalar value: {value!r}"
+    )
+
+
+def toml_key(key: str) -> str:
+    """Render a key, quoting anything that is not a bare key.
+
+    An unquoted key containing a space is invalid TOML, and one containing
+    a dot means something else entirely, so a key that was quoted in the
+    original must stay quoted.
+    """
+    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
+
+
+def step_state(step: dict[str, Any]) -> dict[str, Any]:
+    path = KIT_DIR / step["file"]
+    state: dict[str, Any] = {
+        "id": step["id"],
+        "title": step["title"],
+        "provider": step["provider"],
+        "kind": step["kind"],
+        "file": step["file"],
+        "summary": step.get("summary", ""),
+        "selects": step.get("selects", ""),
+    }
+
+    if step["kind"] == "claude-settings":
+        settings = json.loads(path.read_text())
+        state["model"] = settings.get("model", "")
+        aliases_file = step.get("aliases")
+        aliases = {}
+        if aliases_file:
+            aliases = json.loads((KIT_DIR / aliases_file).read_text())
+        state["choices"] = [
+            {"alias": alias, "value": value}
+            for alias, value in sorted(aliases.items())
+        ]
+        live = Path.home() / ".claude" / "settings.json"
+        try:
+            state["live_model"] = json.loads(live.read_text()).get("model", "")
+        except (OSError, json.JSONDecodeError):
+            state["live_model"] = ""
+    elif step["kind"] == "codex-profile":
+        profile = read_toml(path)
+        state["model"] = profile.get("model", "")
+        state["effort"] = profile.get("model_reasoning_effort", "")
+        state["expected_effort"] = step.get("expected_effort", "")
+    else:
+        raise ConfigError(f"unknown step kind: {step['kind']}")
+
+    return state
+
+
+def snapshot() -> list[dict[str, Any]]:
+    return [step_state(step) for step in load_manifest()["steps"]]
+
+
+MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+-]*(\[[A-Za-z0-9.]+\])?$")
+
+
+def validate_model(value: Any) -> str:
+    """Accept only what a model identifier can legitimately look like.
+
+    An allow-list rather than a deny-list: the value is written into TOML
+    and JSON and rendered into a page, so nothing resembling markup, a
+    quote, or a newline may pass at all.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("a model must be a non-empty string")
+    candidate = value.strip()
+    if len(candidate) > 120:
+        raise ConfigError("a model name cannot exceed 120 characters")
+    if not MODEL_NAME.match(candidate):
+        raise ConfigError(
+            "a model name may contain only letters, digits and "
+            f". _ : @ / + - with an optional [suffix]: {candidate!r}"
+        )
+    return candidate
+
+
+def planned_edit(step: dict[str, Any], model: str) -> dict[str, Any] | None:
+    """The new content one step change produces, or None when unchanged."""
+    path = KIT_DIR / step["file"]
+    before = path.read_text()
+
+    if step["kind"] == "claude-settings":
+        settings = json.loads(before)
+        if settings.get("model") == model:
+            return None
+        settings["model"] = model
+        after = json.dumps(settings, indent=2) + "\n"
+    else:
+        profile = read_toml(path)
+        if profile.get("model") == model:
+            return None
+        profile["model"] = model
+        lines = [f"model = {toml_value(profile.pop('model'))}"]
+        effort = profile.pop("model_reasoning_effort", None)
+        if effort is not None:
+            lines.append(f"model_reasoning_effort = {toml_value(effort)}")
+        for key in sorted(profile):
+            lines.append(f"{toml_key(key)} = {toml_value(profile[key])}")
+        after = "\n".join(lines) + "\n"
+
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{step['file']}",
+            tofile=f"b/{step['file']}",
+        )
+    )
+    return {
+        "file": step["file"],
+        "before": before,
+        "after": after,
+        "diff": diff,
+    }
+
+
+def plan(changes: dict[str, Any]) -> list[dict[str, Any]]:
+    steps = {step["id"]: step for step in load_manifest()["steps"]}
+    edits: list[dict[str, Any]] = []
+    for step_id, requested in changes.items():
+        if step_id not in steps:
+            raise ConfigError(f"unknown step: {step_id}")
+        if not isinstance(requested, dict):
+            raise ConfigError(f"invalid change for step {step_id}")
+        unknown = set(requested) - {"model"}
+        if unknown:
+            # Efforts define the roles and the manifest is not mutable
+            # state, so only the model may change here.
+            raise ConfigError(
+                f"only the model can be changed for {step_id}, "
+                f"not: {sorted(unknown)}"
+            )
+        model = validate_model(requested.get("model"))
+        edit = planned_edit(steps[step_id], model)
+        if edit is not None:
+            edit["step"] = step_id
+            edits.append(edit)
+    return edits
+
+
+def write_atomically(path: Path, content: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def stage_edits(edits: list[dict[str, Any]]) -> list[tuple[Path, Path, str]]:
+    """Write every replacement to a sibling temporary file.
+
+    Staging all of them before renaming any means a failure that would
+    otherwise leave the configuration half-applied is caught while nothing
+    has moved yet. The renames afterwards are individually atomic.
+    """
+    staged: list[tuple[Path, Path, str]] = []
+    try:
+        for edit in edits:
+            path = KIT_DIR / edit["file"]
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as handle:
+                handle.write(edit["after"])
+                handle.flush()
+                os.fsync(handle.fileno())
+                staged.append((Path(handle.name), path, edit["before"]))
+    except BaseException:
+        for temporary, _destination, _before in staged:
+            temporary.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+def commit_staged(staged: list[tuple[Path, Path, str]]) -> None:
+    """Rename every staged file into place, undoing the set on failure.
+
+    POSIX has no transaction across several files, so all-or-nothing is
+    approximated: each destination is re-read immediately before its
+    rename, and a failure part way restores the ones already renamed from
+    the content the preview recorded. A writer landing inside the window
+    between that final read and the rename cannot be excluded without its
+    cooperation; the window is microseconds and the check makes anything
+    wider than that impossible.
+    """
+    completed: list[tuple[Path, str, str]] = []
+    try:
+        for temporary, destination, before in staged:
+            if destination.read_text() != before:
+                raise ConfigError(
+                    f"{destination.name} changed while it was being written. "
+                    "Nothing further was applied; preview again."
+                )
+            applied = temporary.read_text()
+            temporary.replace(destination)
+            completed.append((destination, before, applied))
+    except BaseException:
+        # Undo every rename that did land, then clean up. Each rollback is
+        # attempted even if an earlier one failed, and a file another
+        # writer has since changed is left to that writer rather than
+        # having this apply's idea of the past forced back over it.
+        problems: list[str] = []
+        for destination, before, applied in reversed(completed):
+            try:
+                if destination.read_text() != applied:
+                    problems.append(
+                        f"{destination.name} was changed by something else "
+                        "after this apply wrote it and was left alone"
+                    )
+                    continue
+                write_atomically(destination, before)
+            except OSError as exc:
+                problems.append(f"{destination.name} could not be restored: {exc}")
+
+        for temporary, _destination, _before in staged:
+            temporary.unlink(missing_ok=True)
+
+        if problems:
+            raise ConfigError(
+                "The apply failed and the configuration could not be fully "
+                "restored: " + "; ".join(problems) + ". Inspect these files "
+                "before continuing."
+            ) from None
+        raise
+
+
+def run_kit(command: list[str], timeout: float) -> tuple[int, str]:
+    result = subprocess.run(
+        command,
+        cwd=KIT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    return result.returncode, result.stdout
+
+
+def apply_edits(
+    edits: list[dict[str, Any]],
+    previewed: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    # Only the exact change that was previewed may be applied: both the
+    # state it started from and the content it produces must match what
+    # the operator saw, so neither an external edit nor a different model
+    # slipped into the apply request can pass.
+    for edit in edits:
+        expected = previewed.get(edit["file"])
+        if expected is None:
+            raise ConfigError(
+                f"{edit['file']} was not previewed. Preview the changes "
+                "before applying them."
+            )
+        if expected["before"] != edit["before"]:
+            raise ConfigError(
+                f"{edit['file']} changed since the preview was computed. "
+                "Nothing was written; reload the page and preview again."
+            )
+        if expected["after"] != edit["after"]:
+            raise ConfigError(
+                f"the change requested for {edit['file']} is not the one "
+                "that was previewed. Nothing was written; preview again."
+            )
+
+    commit_staged(stage_edits(edits))
+
+    result: dict[str, Any] = {
+        "applied": [edit["file"] for edit in edits],
+        "propagated": None,
+        "doctor_pass": None,
+        "doctor_tail": "",
+    }
+
+    if any(edit["step"] == "orchestrator" for edit in edits):
+        # The canonical settings changed; the kit's own applier carries the
+        # model into the live settings atomically, with a backup.
+        status, output = run_kit(
+            [
+                sys.executable,
+                str(KIT_DIR / "scripts" / "apply-claude-settings.py"),
+                "--model",
+            ],
+            timeout=60,
+        )
+        result["propagated"] = {"status": status, "output": output.strip()}
+
+    doctor = KIT_DIR / "scripts" / "doctor.sh"
+    if doctor.exists():
+        try:
+            status, output = run_kit(["bash", str(doctor)], timeout=300)
+        except subprocess.TimeoutExpired:
+            status, output = 1, "the doctor timed out"
+        result["doctor_pass"] = status == 0
+        result["doctor_tail"] = "\n".join(output.splitlines()[-14:])
+
+    return result
+
+
+PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Órrery configuration</title>
+<style>
+  :root {
+    --ground: #f3f5f6; --panel: #ffffff; --edge: #d9dfe3;
+    --ink: #1b2226; --soft: #4c5a63; --accent: #38617f;
+    --luna: #737d94; --terra: #587b50; --sol: #a97a24;
+    --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #14181b; --panel: #1c2226; --edge: #2c353b;
+      --ink: #dde3e6; --soft: #a6b2b9; --accent: #7fa8c9;
+      --luna: #98a2b8; --terra: #86a97e; --sol: #cfa04a;
+      --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 28px 20px 60px; }
+  h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
+  .flow { display: grid; gap: 14px; }
+  .arrow { text-align: center; color: var(--soft); font-size: 13px; }
+  .step {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-top: 3px solid var(--role, var(--accent)); padding: 14px 16px;
+  }
+  .workers { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+  .step h2 { font-size: 15.5px; margin: 0; display: flex; gap: 8px; align-items: baseline; }
+  .badge {
+    font-family: ui-monospace, monospace; font-size: 10.5px;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--role, var(--accent));
+  }
+  .summary { font-size: 13px; color: var(--soft); margin: 6px 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  label { font-size: 12.5px; color: var(--soft); }
+  select, input[type=text] {
+    background: var(--ground); color: var(--ink);
+    border: 1px solid var(--edge); padding: 5px 8px; font-size: 13.5px;
+    font-family: ui-monospace, monospace; min-width: 200px;
+  }
+  .fixed { font-family: ui-monospace, monospace; font-size: 13px; }
+  .note { font-size: 12px; color: var(--soft); margin-top: 8px; }
+  .live { font-size: 12px; color: var(--soft); }
+  .actions { margin: 26px 0 12px; display: flex; gap: 10px; }
+  button {
+    background: var(--accent); color: #fff; border: none;
+    padding: 9px 18px; font-size: 14px; cursor: pointer;
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  pre {
+    background: var(--code); color: var(--code-ink); padding: 12px 14px;
+    overflow-x: auto; font-size: 12.5px; line-height: 1.55;
+  }
+  .ok { color: var(--good); } .err { color: var(--bad); }
+  #result h3 { font-size: 14px; margin: 18px 0 6px; }
+  .scopenote {
+    border-left: 3px solid var(--accent); padding: 8px 12px;
+    font-size: 13px; color: var(--soft); margin: 20px 0;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Órrery configuration</h1>
+  <p class="sub">Generated from the live files under __KIT_DIR__. The page holds no knowledge of its own.</p>
+  <div class="flow" id="flow"></div>
+  <div class="scopenote">
+    Saving changes the system-wide default for <strong>new sessions</strong>.
+    Repositories pinned with <code>claude-codex-init &lt;alias&gt;</code> keep
+    their pins, and running sessions are unaffected. Worker reasoning efforts
+    define the roles and are shown, not editable.
+  </div>
+  <div class="actions">
+    <button id="preview">Preview changes</button>
+    <button id="apply" disabled>Apply</button>
+    <button id="revert" class="secondary">Revert edits</button>
+  </div>
+  <div id="result"></div>
+</div>
+<script>
+const STATE = __STATE__;
+const TOKEN_PATH = __TOKEN_PATH__;
+const original = {};
+const flow = document.getElementById("flow");
+const result = document.getElementById("result");
+const applyButton = document.getElementById("apply");
+
+function roleColour(id) {
+  return { luna: "var(--luna)", terra: "var(--terra)", sol: "var(--sol)" }[id] || "var(--accent)";
+}
+
+function esc(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function stepBox(step) {
+  const box = document.createElement("div");
+  box.className = "step";
+  box.style.setProperty("--role", roleColour(step.id));
+  original[step.id] = step.model;
+  const id = esc(step.id);
+  let picker;
+  if (step.choices) {
+    const options = step.choices
+      .map(c => `<option value="${esc(c.value)}" ${c.value === step.model ? "selected" : ""}>${esc(c.alias)} → ${esc(c.value)}</option>`)
+      .join("");
+    const custom = step.choices.some(c => c.value === step.model) ? "" : "selected";
+    picker = `<select data-step="${id}" data-kind="select">${options}
+      <option value="__custom__" ${custom}>custom…</option></select>
+      <input type="text" data-step="${id}" data-kind="custom"
+        value="${custom ? esc(step.model) : ""}" style="display:${custom ? "inline-block" : "none"}"
+        placeholder="exact model identifier">`;
+  } else {
+    picker = `<input type="text" data-step="${id}" data-kind="model" value="${esc(step.model)}">`;
+  }
+  const effort = step.effort
+    ? `<span class="fixed" title="Defined by the role">effort: ${esc(step.effort)} (fixed)</span>` : "";
+  const live = step.live_model !== undefined
+    ? `<div class="live">live default now: <code>${esc(step.live_model || "unset")}</code></div>` : "";
+  box.innerHTML = `
+    <h2>${esc(step.title)} <span class="badge">${esc(step.provider)}</span></h2>
+    <p class="summary">${esc(step.summary)}</p>
+    <div class="row"><label>model</label> ${picker} ${effort}</div>
+    ${live}
+    <p class="note">${esc(step.selects)} <code>${esc(step.file)}</code></p>`;
+  return box;
+}
+
+function render() {
+  const byId = Object.fromEntries(STATE.map(s => [s.id, s]));
+  flow.appendChild(stepBox(byId.orchestrator));
+  flow.insertAdjacentHTML("beforeend",
+    '<div class="arrow">↓ classifies, plans, delegates bounded work ↓</div>');
+  const workers = document.createElement("div");
+  workers.className = "workers";
+  ["luna", "terra", "sol"].forEach(id => byId[id] && workers.appendChild(stepBox(byId[id])));
+  flow.appendChild(workers);
+  STATE.filter(s => !["orchestrator", "luna", "terra", "sol"].includes(s.id))
+    .forEach(s => flow.appendChild(stepBox(s)));
+  flow.insertAdjacentHTML("beforeend",
+    '<div class="arrow">↓ diff inspection · verification · independent review · nothing committed without approval ↓</div>');
+}
+
+function currentModel(id) {
+  const select = document.querySelector(`select[data-step="${id}"]`);
+  if (select) {
+    if (select.value !== "__custom__") return select.value;
+    return document.querySelector(`input[data-step="${id}"][data-kind="custom"]`).value.trim();
+  }
+  return document.querySelector(`input[data-step="${id}"]`).value.trim();
+}
+
+function changes() {
+  const out = {};
+  for (const id of Object.keys(original)) {
+    const value = currentModel(id);
+    if (value && value !== original[id]) out[id] = { model: value };
+  }
+  return out;
+}
+
+async function post(endpoint, body) {
+  const response = await fetch(TOKEN_PATH + endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return response.json();
+}
+
+document.addEventListener("change", event => {
+  if (event.target.dataset && event.target.dataset.kind === "select") {
+    const custom = document.querySelector(
+      `input[data-step="${event.target.dataset.step}"][data-kind="custom"]`);
+    if (custom) custom.style.display =
+      event.target.value === "__custom__" ? "inline-block" : "none";
+  }
+  applyButton.disabled = true;
+});
+
+document.getElementById("preview").addEventListener("click", async () => {
+  const body = changes();
+  if (!Object.keys(body).length) {
+    result.innerHTML = "<p>No changes to preview.</p>"; return;
+  }
+  const reply = await post("preview", body);
+  if (reply.error) {
+    result.innerHTML = `<p class="err">${esc(reply.error)}</p>`; return;
+  }
+  if (!reply.edits.length) {
+    result.innerHTML = "<p>Everything already matches.</p>"; return;
+  }
+  result.innerHTML = "<h3>Exactly this will change:</h3>" +
+    reply.edits.map(e => `<pre>${esc(e.diff)}</pre>`).join("");
+  applyButton.disabled = false;
+});
+
+applyButton.addEventListener("click", async () => {
+  applyButton.disabled = true;
+  const reply = await post("apply", changes());
+  if (reply.error) {
+    result.innerHTML = `<p class="err">${esc(reply.error)}</p>`; return;
+  }
+  const doctor = reply.doctor_pass === null ? "" :
+    `<h3>Doctor: <span class="${reply.doctor_pass ? "ok" : "err"}">` +
+    `${reply.doctor_pass ? "READY" : "attention needed"}</span></h3>` +
+    `<pre>${esc(reply.doctor_tail)}</pre>`;
+  const propagated = reply.propagated ?
+    `<h3>Propagated to live settings</h3><pre>${esc(reply.propagated.output)}</pre>` : "";
+  result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
+    propagated + doctor +
+    '<p class="note">Reload the page to edit further; the kit repository now holds these values, ready to commit.</p>';
+});
+
+document.getElementById("revert").addEventListener("click", () => location.reload());
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def script_json(value: Any) -> str:
+    """JSON safe to embed in a <script> element.
+
+    JSON encoding alone does not escape `</script>`, so a value containing
+    one would end the element and let the rest execute as markup. The
+    characters that can start a tag or a comment are escaped instead.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace(" ", "\\u2028")
+        .replace(" ", "\\u2029")
+    )
+
+
+def escape_html(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def render_page(token: str) -> str:
+    return (
+        PAGE_TEMPLATE
+        .replace("__STATE__", script_json(snapshot()))
+        .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
+        .replace("__KIT_DIR__", escape_html(str(KIT_DIR)))
+    )
+
+
+def print_state() -> int:
+    for state in snapshot():
+        effort = f" · effort {state['effort']}" if state.get("effort") else ""
+        print(f"{state['title']:24} {state['provider']:10} "
+              f"{state['model']}{effort}   [{state['file']}]")
+    return 0
+
+
+class Handler(BaseHTTPRequestHandler):
+    token = ""
+    lock = threading.Lock()
+    last_activity = time.time()
+    # The exact edit each file was last previewed with. An apply is only
+    # honoured for the change its operator actually saw.
+    previewed: dict[str, dict[str, str]] = {}
+
+    def log_message(self, *arguments: Any) -> None:
+        pass
+
+    def touch(self) -> bool:
+        # Authenticate first: unauthenticated traffic must never keep the
+        # server alive past its idle timeout.
+        prefix = f"/t/{Handler.token}/"
+        if not secrets.compare_digest(self.path[: len(prefix)], prefix):
+            self.send_error(404)
+            return False
+        Handler.last_activity = time.time()
+        return True
+
+    def endpoint(self) -> str:
+        return self.path[len(f"/t/{Handler.token}/") :]
+
+    def reply(self, payload: dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if not self.touch():
+            return
+        if self.endpoint() not in ("", "/"):
+            self.send_error(404)
+            return
+        body = render_page(Handler.token).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        if not self.touch():
+            return
+        try:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                raise ConfigError("invalid Content-Length")
+            # A request only ever carries a handful of short model names.
+            if length < 0 or length > MAX_BODY_BYTES:
+                raise ConfigError(
+                    f"the request body may not exceed {MAX_BODY_BYTES} bytes"
+                )
+            changes = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(changes, dict):
+                raise ConfigError("the request body must be a JSON object")
+
+            if self.endpoint() == "preview":
+                with Handler.lock:
+                    edits = plan(changes)
+                    for edit in edits:
+                        Handler.previewed[edit["file"]] = {
+                            "before": edit["before"],
+                            "after": edit["after"],
+                        }
+                # The previous content is internal bookkeeping for the
+                # apply-time check, not something the page needs.
+                self.reply(
+                    {
+                        "edits": [
+                            {key: value for key, value in edit.items()
+                             if key != "before"}
+                            for edit in edits
+                        ]
+                    }
+                )
+            elif self.endpoint() == "apply":
+                with Handler.lock:
+                    self.reply(apply_edits(plan(changes), Handler.previewed))
+            else:
+                self.send_error(404)
+        except (ConfigError, json.JSONDecodeError, OSError) as exc:
+            self.reply({"error": str(exc)}, status=400)
+
+
+def serve(port: int, timeout: float, open_browser: bool) -> int:
+    Handler.token = secrets.token_hex(12)
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{server.server_address[1]}/t/{Handler.token}/"
+
+    def watch_idle() -> None:
+        while True:
+            time.sleep(1)
+            if time.time() - Handler.last_activity > timeout:
+                print("Idle timeout reached; exiting.", flush=True)
+                server.shutdown()
+                return
+
+    threading.Thread(target=watch_idle, daemon=True).start()
+
+    print(f"CONFIG_URL={url}", flush=True)
+    print(
+        f"Serving the configuration page at {url}\n"
+        f"Bound to 127.0.0.1 only; exits after {int(timeout)}s idle "
+        "or on Ctrl-C.",
+        flush=True,
+    )
+    if open_browser:
+        webbrowser.open(url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Interrupted; exiting.", flush=True)
+    finally:
+        server.server_close()
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Configure the Órrery orchestration visually."
+    )
+    parser.add_argument("--print", action="store_true", dest="print_state")
+    parser.add_argument("--port", type=int, default=0)
+    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--no-browser", action="store_true")
+    arguments = parser.parse_args()
+
+    try:
+        if arguments.print_state:
+            return print_state()
+        return serve(
+            arguments.port,
+            arguments.timeout,
+            open_browser=not arguments.no_browser,
+        )
+    except ConfigError as exc:
+        print(f"claude-codex-config: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

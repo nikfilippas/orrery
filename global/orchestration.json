@@ -1,0 +1,44 @@
+{
+  "steps": [
+    {
+      "id": "orchestrator",
+      "title": "Principal orchestrator",
+      "provider": "anthropic",
+      "kind": "claude-settings",
+      "file": "global/claude-settings.json",
+      "aliases": "global/claude-models.json",
+      "summary": "Classifies every request, plans, delegates bounded work, inspects each diff itself, runs verification, and owns the outcome.",
+      "selects": "The default Claude Code model for new sessions. Repositories can override it with claude-codex-init <alias>, and a running session with /model."
+    },
+    {
+      "id": "luna",
+      "title": "Luna",
+      "provider": "openai",
+      "kind": "codex-profile",
+      "file": "global/codex/luna.config.toml",
+      "expected_effort": "low",
+      "summary": "The mechanical worker: narrow, repetitive, well-specified edits and boilerplate.",
+      "selects": "The Codex model behind the luna profile. Its low reasoning effort defines the role and is not configurable."
+    },
+    {
+      "id": "terra",
+      "title": "Terra",
+      "provider": "openai",
+      "kind": "codex-profile",
+      "file": "global/codex/terra.config.toml",
+      "expected_effort": "medium",
+      "summary": "The implementation worker: contained features, real bug fixes, multi-file changes, one bounded task per run.",
+      "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable."
+    },
+    {
+      "id": "sol",
+      "title": "Sol",
+      "provider": "openai",
+      "kind": "codex-profile",
+      "file": "global/codex/sol.config.toml",
+      "expected_effort": "high",
+      "summary": "The independent reviewer: fresh read-only sessions that challenge plans and completed work, and difficult diagnosis.",
+      "selects": "The Codex model behind the sol profile. Its high reasoning effort defines the role and is not configurable."
+    }
+  ]
+}

@@ -212,6 +212,17 @@ below is live immediately.
 | One session | nothing: `claude --model <name>` or `/model` | ephemeral |
 | A Codex worker | `global/codex/<profile>.config.toml` | `claude-codex-doctor` |
 
+**Or configure it visually.** `claude-codex-config` serves a local page
+showing the whole pipeline, one box per step with its current model, a
+dropdown of Claude aliases for the orchestrator and validated fields for
+the workers. Saving shows the exact unified diff of every file it would
+touch, applies only through the kit's own atomic write paths, and runs the
+doctor inline so the result is validated before your eyes. The page is
+generated from `global/orchestration.json` and the live files at load, so
+it can never drift from reality; it binds to localhost behind a random URL
+token and exits when idle. Reasoning efforts are shown but fixed: they
+define the roles.
+
 **Running on a single provider.** If Codex is unavailable (quota, billing,
 network), the orchestrator continues alone automatically, under the same
 acceptance criteria, and says so. To make that deliberate rather than a
@@ -317,6 +328,8 @@ configuration and spends no credits.
 | `scripts/init-project.sh` | `claude-codex-init`: migrates a repository |
 | `scripts/claude-codex-review` | Synchronous independent Sol review |
 | `scripts/claude-codex-usage` | Token usage across both providers |
+| `scripts/claude-codex-config` | Visual configuration: schematic, diffs, doctor |
+| `global/orchestration.json` | Declarative manifest of steps and their config |
 | `scripts/apply-claude-settings.py` | Atomic, locked settings updater |
 | `scripts/doctor.sh` | `claude-codex-doctor`: validates the installation |
 | `tests/run-tests.py` | The deterministic regression suite |

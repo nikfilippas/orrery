@@ -111,6 +111,10 @@ link_file \
     "$KIT_DIR/scripts/claude-codex-usage" \
     "$HOME/.local/bin/claude-codex-usage"
 
+link_file \
+    "$KIT_DIR/scripts/claude-codex-config" \
+    "$HOME/.local/bin/claude-codex-config"
+
 "$KIT_DIR/scripts/install-lnt-hooks.sh" --links-only
 "$KIT_DIR/scripts/apply-claude-settings.py" --all
 

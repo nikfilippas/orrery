@@ -4362,6 +4362,243 @@ def test_usage_tracker() -> None:
         )
 
 
+@test("the orchestration manifest matches the live configuration")
+def test_orchestration_manifest() -> None:
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    steps = {step["id"]: step for step in manifest["steps"]}
+    require(
+        {"orchestrator", "luna", "terra", "sol"} <= set(steps),
+        f"manifest is missing core steps: {sorted(steps)}",
+    )
+    for step in steps.values():
+        path = KIT_DIR / step["file"]
+        require(path.is_file(), f"manifest names a missing file: {step['file']}")
+        require(
+            bool(step.get("summary")) and bool(step.get("selects")),
+            f"step {step['id']} lacks its explanatory text",
+        )
+        if step["kind"] == "codex-profile":
+            with path.open("rb") as handle:
+                profile = __import__("tomllib").load(handle)
+            require(
+                profile.get("model_reasoning_effort")
+                == step.get("expected_effort"),
+                f"manifest effort drifted from the profile for {step['id']}",
+            )
+
+
+@test("the configuration surface previews and applies model changes")
+def test_config_surface() -> None:
+    """The GUI is a veneer: reads the live files, writes only through them."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        home = root / "home"
+        home.mkdir()
+        # User-added keys must survive a model rewrite, including a quoted
+        # key that would become invalid TOML if emitted bare.
+        terra_toml = kit / "global" / "codex" / "terra.config.toml"
+        terra_toml.write_text(
+            terra_toml.read_text()
+            + 'approval_policy = "never"\n'
+            + '"custom key" = "keep"\n'
+        )
+
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(kit / "scripts" / "claude-codex-config"),
+                "--port",
+                "0",
+                "--timeout",
+                "120",
+                "--no-browser",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            url = None
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                if line.startswith("CONFIG_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    break
+            require(bool(url), "the server never announced its URL")
+
+            import urllib.error
+            import urllib.request
+
+            page = urllib.request.urlopen(url, timeout=10).read().decode()
+            require(
+                "gpt-5.6-terra" in page and "Principal orchestrator" in page,
+                "the page was not generated from the live configuration",
+            )
+
+            bad = url.replace("/t/", "/t/deadbeef")
+            try:
+                urllib.request.urlopen(bad, timeout=10)
+                raise Failure("a wrong token was accepted")
+            except urllib.error.HTTPError as error:
+                require(error.code == 404, f"wrong token gave {error.code}")
+
+            def post(endpoint: str, body: dict[str, Any]) -> dict[str, Any]:
+                request = urllib.request.Request(
+                    url + endpoint,
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=60) as reply:
+                        return json.loads(reply.read())
+                except urllib.error.HTTPError as error:
+                    return json.loads(error.read())
+
+            preview = post("preview", {"terra": {"model": "gpt-7-terra"}})
+            require(
+                len(preview["edits"]) == 1
+                and '-model = "gpt-5.6-terra"' in preview["edits"][0]["diff"]
+                and '+model = "gpt-7-terra"' in preview["edits"][0]["diff"],
+                f"the preview diff is wrong: {preview}",
+            )
+            require(
+                "gpt-5.6-terra"
+                in (kit / "global" / "codex" / "terra.config.toml").read_text(),
+                "a preview must not modify anything",
+            )
+
+            rejected = post("preview", {"terra": {"effort": "xhigh"}})
+            require(
+                "only the model" in rejected.get("error", ""),
+                "changing a role's effort was not refused",
+            )
+
+            # Nothing resembling markup, a quote or a newline may pass.
+            for hostile in (
+                "</script><img src=x onerror=alert(1)>",
+                'gpt"; rm -rf /',
+                "gpt\nmodel = evil",
+                "x" * 200,
+                "",
+            ):
+                refused = post("preview", {"terra": {"model": hostile}})
+                require(
+                    "error" in refused,
+                    f"a hostile model name was accepted: {hostile!r}",
+                )
+
+            require(
+                "before" not in json.dumps(
+                    post("preview", {"terra": {"model": "gpt-7-terra"}})
+                ),
+                "the preview leaked file contents back to the page",
+            )
+
+            # Applying something that was never previewed is refused.
+            unseen = post("apply", {"orchestrator": {"model": "sonnet"}})
+            require(
+                "not previewed" in unseen.get("error", ""),
+                f"an unpreviewed change was applied: {unseen}",
+            )
+
+            both = {
+                "terra": {"model": "gpt-7-terra"},
+                "orchestrator": {"model": "claude-fable-5[1m]"},
+            }
+            post("preview", both)
+            applied = post("apply", both)
+            require(
+                sorted(applied["applied"])
+                == [
+                    "global/claude-settings.json",
+                    "global/codex/terra.config.toml",
+                ],
+                f"unexpected apply result: {applied}",
+            )
+
+            with terra_toml.open("rb") as handle:
+                terra = __import__("tomllib").load(handle)
+            require(
+                terra["model"] == "gpt-7-terra"
+                and terra["model_reasoning_effort"] == "medium"
+                and terra["approval_policy"] == "never"
+                and terra.get("custom key") == "keep",
+                f"the profile rewrite lost or corrupted content: {terra}",
+            )
+
+            # Applying a different model than the one previewed is refused:
+            # the preview is a contract about an exact change.
+            post("preview", {"terra": {"model": "gpt-8-terra"}})
+            swapped = post("apply", {"terra": {"model": "gpt-9-terra"}})
+            require(
+                "not the one that was previewed" in swapped.get("error", ""),
+                f"an unpreviewed substitution was applied: {swapped}",
+            )
+
+            # An external edit after the preview must refuse rather than
+            # silently overwrite.
+            stale = post("preview", {"terra": {"model": "gpt-8-terra"}})
+            require(stale["edits"], "expected a pending edit to test staleness")
+            terra_toml.write_text(
+                terra_toml.read_text() + 'extra = "added"\n'
+            )
+            refused = post("apply", {"terra": {"model": "gpt-8-terra"}})
+            require(
+                "changed since" in refused.get("error", ""),
+                f"a concurrent external edit was overwritten: {refused}",
+            )
+            require(
+                'extra = "added"' in terra_toml.read_text(),
+                "the refused apply still modified the file",
+            )
+
+            # A profile carrying astral characters must survive a rewrite
+            # as parseable TOML.
+            terra_toml.write_text(
+                'model = "gpt-8-terra"\n'
+                'model_reasoning_effort = "medium"\n'
+                'note = "😀 keep"\n'
+            )
+            post("preview", {"terra": {"model": "gpt-10-terra"}})
+            emoji = post("apply", {"terra": {"model": "gpt-10-terra"}})
+            require("applied" in emoji, f"the astral rewrite failed: {emoji}")
+            with terra_toml.open("rb") as handle:
+                rewritten = __import__("tomllib").load(handle)
+            require(
+                rewritten["note"] == "😀 keep"
+                and rewritten["model"] == "gpt-10-terra",
+                f"astral content was corrupted: {rewritten}",
+            )
+            canonical = read_json(kit / "global" / "claude-settings.json")
+            require(
+                canonical["model"] == "claude-fable-5[1m]",
+                "the canonical model was not updated",
+            )
+            live = read_json(home / ".claude" / "settings.json")
+            require(
+                live.get("model") == "claude-fable-5[1m]",
+                "the applier did not propagate the model to live settings",
+            )
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.stdout.close()
+            process.wait(timeout=20)
+
+
 @test("the model alias map is valid and covers the documented aliases")
 def test_model_alias_map() -> None:
     table = read_json(KIT_DIR / "global" / "claude-models.json")
@@ -4478,6 +4715,7 @@ def test_installer_covers_doctor_commands() -> None:
         "claude-codex-doctor",
         "claude-codex-review",
         "claude-codex-usage",
+        "claude-codex-config",
     ):
         require(
             f"$HOME/.local/bin/{command}" in installer,

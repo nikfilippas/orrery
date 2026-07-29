@@ -52,6 +52,8 @@ Two rules shape everything else:
 | `scripts/install-lnt-hooks.sh` | Installs the Leave No Trace links and hooks |
 | `scripts/claude-codex-review` | Synchronous independent review through Sol |
 | `scripts/claude-codex-usage` | Aggregates Claude and Codex token usage from local session logs |
+| `scripts/claude-codex-config` | Local web page for viewing and changing each step's model |
+| `global/orchestration.json` | Declarative manifest of the orchestration steps and their config files |
 | `scripts/claude-lnt-start` | Runs a process under a lease that outlives the tool call |
 | `scripts/claude-lnt-register` | Registers a rollback command |
 | `scripts/claude-lnt-cleanup` | Runs cleanup for a session on demand |
@@ -165,11 +167,21 @@ eight minutes, and completed in under three at `medium`.
   immediately; repositories that named an updated alias pick it up by
   rerunning `claude-codex-init <alias>` there.
 
+- **Visually:** `claude-codex-config` serves a local page generated from
+  the orchestration manifest and the live files, one box per step with its
+  model. Changes are previewed as exact unified diffs before an Apply that
+  writes only through the kit's own paths and then runs the doctor inline.
+  It binds to 127.0.0.1 behind a random URL token and exits after ten
+  minutes idle. `claude-codex-config --print` shows the same state in the
+  terminal. Worker reasoning efforts define the roles and are displayed,
+  not editable.
+
 Run `claude-codex-doctor` afterwards. It validates that each profile sets a
 model and the expected reasoning effort, that the alias map is well formed,
-and that the default Claude model matches the canonical settings. Until the
-edit is committed, the doctor also reports the kit repository as dirty; that
-single failure is expected and clears with the commit.
+that the orchestration manifest matches the live files, and that the
+default Claude model matches the canonical settings. Until the edit is
+committed, the doctor also reports the kit repository as dirty; that single
+failure is expected and clears with the commit.
 
 ## Validation
 
