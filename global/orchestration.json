@@ -57,7 +57,7 @@
     }
   ],
   "chart": {
-    "width": 960,
+    "width": 1120,
     "height": 1400,
     "nodes": [
       {
@@ -98,8 +98,8 @@
       {
         "id": "investigation",
         "label": "read-only sandboxes only",
-        "x": 392,
-        "y": 396,
+        "x": 985,
+        "y": 300,
         "w": 200,
         "h": 100,
         "shape": "rect",
@@ -122,7 +122,7 @@
       {
         "id": "mechanical",
         "label": "mechanical worker edits\nworkspace-write",
-        "x": 620,
+        "x": 610,
         "y": 566,
         "w": 215,
         "h": 104,
@@ -134,7 +134,7 @@
       {
         "id": "trivial",
         "label": "Claude implements directly",
-        "x": 790,
+        "x": 775,
         "y": 726,
         "w": 215,
         "h": 100,
