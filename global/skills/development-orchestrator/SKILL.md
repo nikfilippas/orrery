@@ -51,9 +51,9 @@ Automated reviews must use direct Codex CLI execution, preferably `claude-codex-
 The orchestration system is role-based.
 
 - Principal orchestrator: the active Claude model selected in Claude Code.
-- Mechanical worker: the Codex `luna` profile.
-- Implementation worker: the Codex `terra` profile.
-- Independent reviewer: the Codex `sol` profile.
+- Mechanical worker: the Codex `mechanic` profile.
+- Implementation worker: the Codex `implementer` profile.
+- Independent reviewer: the Codex `reviewer` profile.
 
 Do not depend on concrete model names in workflow logic.
 
@@ -95,7 +95,7 @@ Examples:
 - Narrow test generation.
 - Straightforward edits with explicit acceptance criteria.
 
-Use the `luna` Codex profile when delegation is worthwhile.
+Use the `mechanic` Codex profile when delegation is worthwhile.
 
 ### Standard implementation
 
@@ -107,7 +107,7 @@ Examples:
 - Multi-file changes with clear architecture.
 - New tests around meaningful application logic.
 
-Use the `terra` Codex profile as the default implementation worker.
+Use the `implementer` Codex profile as the default implementation worker.
 
 Do not require a separate plan-review cycle for routine, low-risk work.
 
@@ -129,9 +129,9 @@ Workflow:
 
 1. The principal orchestrator investigates the repository.
 2. The principal orchestrator produces an explicit plan with acceptance criteria.
-3. A fresh `vesta` profile run challenges the plan in read-only mode.
+3. A fresh `plan-reviewer` profile run challenges the plan in read-only mode.
 4. The principal orchestrator evaluates the criticism and revises the plan where justified.
-5. The `terra` profile implements the approved plan unless the review
+5. The `implementer` profile implements the approved plan unless the review
    profile is materially justified as the implementer.
 6. The principal orchestrator inspects all changed files and the complete diff.
 7. Run the complete relevant verification suite.
@@ -152,7 +152,7 @@ changes:
 
 ## Model routing
 
-### Mechanical worker: `luna` profile
+### Mechanical worker: `mechanic` profile
 
 Use the mechanic profile for:
 
@@ -166,12 +166,12 @@ Default reasoning effort: low.
 
 Example invocation:
 
-    codex --profile luna exec \
+    codex --profile mechanic exec \
       --sandbox workspace-write \
       --color never \
       "<PROMPT>"
 
-### Implementation worker: `terra` profile
+### Implementation worker: `implementer` profile
 
 Use the implementer profile for:
 
@@ -186,12 +186,12 @@ Default reasoning effort: medium.
 
 Example invocation:
 
-    codex --profile terra exec \
+    codex --profile implementer exec \
       --sandbox workspace-write \
       --color never \
       "<PROMPT>"
 
-### Plan reviewer: `vesta` profile
+### Plan reviewer: `plan-reviewer` profile
 
 Use the plan-reviewer profile for:
 
@@ -201,7 +201,7 @@ Default reasoning effort: high.
 
 Example invocation:
 
-    codex --profile vesta exec \
+    codex --profile plan-reviewer exec \
       --sandbox read-only \
       --ephemeral \
       --color never \
@@ -209,13 +209,13 @@ Example invocation:
 
 Or, with the same containment and cleanup as any other review:
 
-    claude-codex-review --profile vesta --timeout 600 -- "<PROMPT>"
+    claude-codex-review --profile plan-reviewer --timeout 600 -- "<PROMPT>"
 
 The plan-reviewer and reviewer are separate profiles so that challenging a plan and
 reviewing finished work can use different models. They ship configured
 identically, so nothing changes until one of them is repointed.
 
-### Independent reviewer: `sol` profile
+### Independent reviewer: `reviewer` profile
 
 Use the reviewer profile for:
 
@@ -229,7 +229,7 @@ Default reasoning effort: high.
 
 Example invocation:
 
-    codex --profile sol exec \
+    codex --profile reviewer exec \
       --sandbox read-only \
       --ephemeral \
       --color never \

@@ -79,10 +79,10 @@ review is reported as a limitation rather than papered over.
 | Role | Codex profile | Model | Effort | Used for |
 | --- | --- | --- | --- | --- |
 | Principal orchestrator | — | the active Claude Code model (default `opus`) | session setting | classification, planning, inspection, verification, ownership |
-| Mechanical worker | `luna` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
-| Implementer | `terra` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| Plan reviewer | `vesta` | `gpt-5.6-sol` | high | challenging a plan before any code is written |
-| Final reviewer | `sol` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
+| Mechanical worker | `mechanic` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
+| Implementer | `implementer` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
+| Plan reviewer | `plan-reviewer` | `gpt-5.6-sol` | high | challenging a plan before any code is written |
+| Final reviewer | `reviewer` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
 
 Roles are named for what they do. The celestial names are the Codex profile
 identifiers you pass to `--profile`, and they keep the orrery's own
@@ -105,7 +105,7 @@ settings. Swapping any of them is an edit, not a rewrite.
 ## Independent review, engineered
 
 Reviews run through `claude-codex-review`, which places
-`codex --profile sol exec` inside a transient systemd user service. That
+`codex --profile reviewer exec` inside a transient systemd user service. That
 single decision buys hard guarantees:
 
 - **Nothing survives.** `KillMode=control-group` plus a `RuntimeMaxSec`
@@ -117,7 +117,7 @@ single decision buys hard guarantees:
   attempted; an unwritable `--output` destination, or a closed stdout,
   degrades gracefully instead of destroying a completed, paid-for review.
 - **Independence is a fact, not a claim.** A fresh ephemeral session per
-  review, a read-only sandbox, and a hard refusal to run if the `sol`
+  review, a read-only sandbox, and a hard refusal to run if the `reviewer`
   profile is missing, because Codex silently substitutes its default model
   for an unknown profile, and a review by an unannounced model is not an
   independent review.
@@ -137,7 +137,7 @@ sequenceDiagram
     participant X as Codex reviewer
     O->>W: review prompt
     W->>M: transient unit, KillMode=control-group,<br/>RuntimeMaxSec backstop
-    M->>X: codex --profile sol exec --sandbox read-only --ephemeral
+    M->>X: codex --profile reviewer exec --sandbox read-only --ephemeral
     X-->>W: verdict file
     W-->>O: verdict on stdout, then published atomically
     Note over W,M: timeout, Ctrl-C, SIGKILL of the wrapper,<br/>detached SIGTERM-immune descendants:<br/>the whole control group stops, state is reclaimed
@@ -172,14 +172,14 @@ The system polices itself.
 ● I'll start by loading the development-orchestrator skill, since the
   user-level policy mandates it for implementation work like this.
 
-● Bash(codex --profile terra exec --sandbox workspace-write --color never
+● Bash(codex --profile implementer exec --sandbox workspace-write --color never
       "<task> Create a small Python command-line tool 'wordfreq' in this
       repository, plus a pytest…)
   ⎿  Error: Unregistered detached process blocked by Leave No Trace.
      Use claude-lnt-start --ttl <seconds> -- <command>, or keep the
      process in this tool call with trap-based cleanup and wait.
 
-● Bash(claude-lnt-start --ttl 1200 -- codex --profile terra exec
+● Bash(claude-lnt-start --ttl 1200 -- codex --profile implementer exec
       --sandbox workspace-write --color never "<task> ...")
 
 ● Terra completed successfully. Reading its report and inspecting what

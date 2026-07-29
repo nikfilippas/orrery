@@ -19,10 +19,10 @@ Four Codex profiles, each pinning its own model and reasoning effort:
 
 | Profile | Model | Reasoning | Role |
 | --- | --- | --- | --- |
-| `luna` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
-| `terra` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| `vesta` | `gpt-5.6-sol` | high | challenging a plan before code is written |
-| `sol` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
+| `mechanic` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
+| `implementer` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
+| `plan-reviewer` | `gpt-5.6-sol` | high | challenging a plan before code is written |
+| `reviewer` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
 
 Two rules shape everything else:
 
@@ -125,9 +125,9 @@ Independent review:
 claude-codex-review --timeout 600 --output verdict.txt -- "REVIEW PROMPT"
 ```
 
-The wrapper runs `codex --profile sol exec` read-only inside a transient
+The wrapper runs `codex --profile reviewer exec` read-only inside a transient
 systemd user service. A timeout, an interruption, or an uncatchable death of
-the wrapper stops the whole control group. It refuses to run if the `sol`
+the wrapper stops the whole control group. It refuses to run if the `reviewer`
 profile is missing, because Codex exits zero on an unknown `--profile` and
 silently substitutes its default model.
 

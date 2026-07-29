@@ -144,10 +144,10 @@ by the stage they serve:
 
 | Profile | Reasoning | Use for |
 | --- | --- | --- |
-| `luna` | low | narrow, mechanical, well-specified edits |
-| `terra` | medium | the default worker for substantial implementation |
-| `vesta` | high | challenging a plan before any code is written |
-| `sol` | high | reviewing finished work, and difficult diagnosis |
+| `mechanic` | low | narrow, mechanical, well-specified edits |
+| `implementer` | medium | the default worker for substantial implementation |
+| `plan-reviewer` | high | challenging a plan before any code is written |
+| `reviewer` | high | reviewing finished work, and difficult diagnosis |
 
 Invoke them as `codex --profile <name> exec`. An unknown profile name is not
 an error to Codex: it silently falls back to the default model and effort, so
@@ -157,7 +157,7 @@ profile exists rather than assuming the run used it.
 For an independent review, prefer the `claude-codex-review` wrapper over a
 bare `codex --profile reviewer exec`. It runs the reviewer read-only inside a transient
 systemd user service, so a timeout or an interruption stops the whole control
-group, and it refuses to run at all if the `sol` profile is missing.
+group, and it refuses to run at all if the `reviewer` profile is missing.
 
 Use Codex primarily as:
 
@@ -381,7 +381,7 @@ npx --yes playwright@1.62.0 screenshot \
 - Render the page headless, write a PNG, then read that file back and assess it. Reading the image is what makes this an assessment rather than a claim.
 - Capture at the viewports the work targets, not just one. A desktop and a narrow mobile width catch different faults.
 - Say what the screenshot shows, including what is wrong or unresolved. A screenshot that was taken but not described is not evidence.
-- Codex accepts images, so a screenshot can be attached to an independent review with `codex --profile sol exec -i shot.png`.
+- Codex accepts images, so a screenshot can be attached to an independent review with `codex --profile reviewer exec -i shot.png`.
 - Do not leave screenshots in the repository. Write them under the session's temporary directory unless the user asked for a file.
 - The snap Chromium is the failure mode this policy exists to prevent, a hazard specific to Ubuntu snap systems and harmless elsewhere. It runs in a private mount namespace, so its profiles accumulate under `/tmp/snap-private-tmp/snap.chromium/tmp/`, which is invisible to ordinary `du`, excluded from systemd tmpfiles ageing, and backed by RAM. The rules below are site notes for such systems and apply only to cleaning up a snap browser that is already running.
 - Snap Chromium detaches into its own systemd user scope (`snap.chromium.chromium-<uuid>.scope`). Killing the launching shell, or letting `timeout` expire, does NOT kill the browser: it is reparented to systemd and survives indefinitely. Verify the browser is gone; do not assume the launcher's death took it with it.
