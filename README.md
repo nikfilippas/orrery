@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="logo.png" width="240"
+       alt="The Órrery logo: a clockwork orrery with a steel-blue central sphere and brass orbit rings carrying small worker spheres">
+</p>
+
 # Órrery
 
 **One orchestrator, three workers, no residue.**

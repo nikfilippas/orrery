@@ -60,6 +60,7 @@ Two rules shape everything else:
 | `scripts/doctor.sh` | Validates the installation without model calls |
 | `tests/run-tests.py` | Deterministic regression suite |
 | `LICENSE` | MIT terms for the kit |
+| `logo.png` | The Órrery mark shown in the README |
 | `tests/fake-codex` | Stand-in Codex CLI used by the suite |
 
 ## Installation
