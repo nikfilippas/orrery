@@ -1,9 +1,10 @@
-# Orrery
+# Órrery
 
 **One orchestrator, three workers, no residue.**
 
-An orrery is a clockwork model of the solar system: one mechanism keeping
-every body in its proper orbit. This kit does the same for AI-assisted
+Órrery, pronounced *OR-ər-ee* with the stress the accent marks, takes its
+name from the orrery: a clockwork model of the solar system, one mechanism
+keeping every body in its proper orbit. This kit does the same for AI-assisted
 development. It makes **Claude Code the principal engineer** of every
 session and the **Codex CLI its specialist crew**, named for their orbits:
 **Luna** for mechanical work, **Terra** for implementation, **Sol** for
