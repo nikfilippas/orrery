@@ -213,6 +213,12 @@ configuration and spends no credits.
 Site-specific facts in `global/CLAUDE.md` (port exclusions, snap-browser
 notes) are marked as such; edit them for your machine.
 
+## Licence
+
+MIT. The licence covers this kit only: using it requires your own paid
+Claude Code and Codex subscriptions, and the model and product names in the
+configuration belong to their respective owners.
+
 ## Design principles
 
 - **Claude decides and stays accountable.** Workers do bounded work Claude
