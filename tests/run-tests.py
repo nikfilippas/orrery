@@ -10,6 +10,8 @@ Claude or Codex configuration.
 from __future__ import annotations
 
 import contextlib
+import copy
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
@@ -222,6 +224,29 @@ def start_review(
     )
 
 
+def finish_review(
+    process: subprocess.Popen[str],
+    environment: dict[str, str],
+    timeout: float = 120.0,
+) -> tuple[str, str]:
+    """Collect a wrapper's output, reclaiming everything on every path.
+
+    A test that fails or times out must not itself leak the wrapper, its
+    transient unit, or the fake Codex directory: this suite polices exactly
+    that behaviour in the code under test.
+    """
+    try:
+        return process.communicate(timeout=timeout)
+    finally:
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.communicate(timeout=20)
+        stop_stray_units(f"claude-codex-review-{process.pid}-")
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
 def wait_for_unit(process: subprocess.Popen[str], timeout: float = 20.0) -> str:
     """Return the transient unit name once systemd has registered it."""
     deadline = time.monotonic() + timeout
@@ -265,7 +290,12 @@ def assert_no_review_residue(prefix: str) -> None:
             break
         time.sleep(0.1)
 
-    residue = [name for name in runtime_residue() if name.startswith("run.")]
+    # Only this wrapper's own run directories. The runtime root is shared,
+    # so reading it whole would blame this test for the state of an
+    # unrelated review, or a second copy of this suite, running concurrently.
+    owner = re.search(r"-(\d+)-$", prefix)
+    marker = f"run.{owner.group(1)}." if owner else "run."
+    residue = [name for name in runtime_residue() if name.startswith(marker)]
     if units or residue:
         stop_stray_units(prefix)
         raise Failure(f"residue left behind: units={units} runtime={residue}")
@@ -1635,9 +1665,10 @@ def shell_codex_home(script: Path, environment: dict[str, str]) -> str:
         [
             "bash",
             "-c",
-            'sed -n "/^if ! CODEX_HOME=/,/^fi$/p" "$1" > /tmp/.kit-probe-$$ ; '
-            'set -euo pipefail; source /tmp/.kit-probe-$$; '
-            'rm -f /tmp/.kit-probe-$$; printf "%s" "$CODEX_HOME"',
+            'probe="$(mktemp "${TMPDIR:-/tmp}/kit-probe.XXXXXX")" || exit 1; '
+            "trap 'rm -f \"$probe\"' EXIT; "
+            'sed -n "/^if ! CODEX_HOME=/,/^fi$/p" "$1" > "$probe"; '
+            'set -euo pipefail; source "$probe"; printf "%s" "$CODEX_HOME"',
             "bash",
             str(script),
         ],
@@ -2133,18 +2164,21 @@ def test_codex_home_consistent() -> None:
 
 @test("an explicitly empty CODEX_HOME is rejected with status 2")
 def test_empty_codex_home() -> None:
-    environment = os.environ.copy()
+    environment = review_environment("success")
     environment["CODEX_HOME"] = ""
 
-    result = subprocess.run(
-        [sys.executable, str(REVIEW_SCRIPT), "--", "prompt"],
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=60,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(REVIEW_SCRIPT), "--", "prompt"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
     require(
         result.returncode == 2,
         f"expected status 2, got {result.returncode}: {result.stderr}",
@@ -2154,21 +2188,29 @@ def test_empty_codex_home() -> None:
         f"unexpected diagnostic: {result.stderr}",
     )
 
-    for script in (INSTALL_SCRIPT, DOCTOR_SCRIPT):
-        shell = subprocess.run(
-            ["bash", str(script)],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        require(
-            shell.returncode == 2,
-            f"{script.name} accepted an empty CODEX_HOME "
-            f"(status {shell.returncode})",
-        )
+    # HOME is isolated so that a regression in the guard under test cannot
+    # let the installer loose on the real home directory.
+    with tempfile.TemporaryDirectory() as directory:
+        isolated = os.environ.copy()
+        isolated["CODEX_HOME"] = ""
+        isolated["HOME"] = str(Path(directory) / "home")
+        Path(isolated["HOME"]).mkdir()
+
+        for script in (INSTALL_SCRIPT, DOCTOR_SCRIPT):
+            shell = subprocess.run(
+                ["bash", str(script)],
+                env=isolated,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            require(
+                shell.returncode == 2,
+                f"{script.name} accepted an empty CODEX_HOME "
+                f"(status {shell.returncode})",
+            )
 
 
 @test("a missing Codex profile is refused rather than silently substituted")
@@ -2180,39 +2222,42 @@ def test_missing_profile_refused() -> None:
         environment = review_environment("success")
         environment["CODEX_HOME"] = str(home)
 
-        result = subprocess.run(
-            [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=180,
-        )
-        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        # The stand-in stays on PATH for both invocations, so neither
+        # depends on a real Codex CLI being installed on this machine.
+        try:
+            result = subprocess.run(
+                [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+            )
+            require(
+                result.returncode == 2,
+                f"a missing profile was accepted (status {result.returncode})",
+            )
+            require(
+                "not readable" in result.stderr,
+                f"unexpected diagnostic: {result.stderr.strip()!r}",
+            )
 
-        require(
-            result.returncode == 2,
-            f"a missing profile was accepted (status {result.returncode})",
-        )
-        require(
-            "not readable" in result.stderr,
-            f"unexpected diagnostic: {result.stderr.strip()!r}",
-        )
-
-        # A profile that exists but sets no model is equally unusable.
-        (home / "sol.config.toml").write_text('model_reasoning_effort = "high"\n')
-        result = subprocess.run(
-            [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=180,
-        )
-        require(
-            result.returncode == 2 and "does not set a model" in result.stderr,
-            f"a model-less profile was accepted: {result.stderr.strip()!r}",
-        )
+            # A profile that exists but sets no model is equally unusable.
+            (home / "sol.config.toml").write_text('model_reasoning_effort = "high"\n')
+            result = subprocess.run(
+                [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+            )
+            require(
+                result.returncode == 2 and "does not set a model" in result.stderr,
+                f"a model-less profile was accepted: {result.stderr.strip()!r}",
+            )
+        finally:
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 @test("an empty or missing prompt is rejected")
@@ -2227,6 +2272,259 @@ def test_prompt_required() -> None:
         check=False,
     )
     require(result.returncode == 2, "an empty prompt was accepted")
+
+
+def fallback_environment(mode: str) -> dict[str, str]:
+    """A review environment whose PATH has no systemd tools at all.
+
+    The interpreter's own directory stays on PATH so the stand-in's
+    `env python3` shebang still resolves; it contains no systemd tools.
+    """
+    environment = review_environment(mode)
+    environment["PATH"] = os.pathsep.join(
+        [environment["KIT_FAKE_BIN"], str(Path(sys.executable).parent)]
+    )
+    return environment
+
+
+@test("without systemd the review degrades to a process group and completes")
+def test_fallback_completion() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "verdict.txt"
+        environment = fallback_environment("success")
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--output",
+            str(output),
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment)
+
+        require(
+            process.returncode == 0,
+            f"fallback run failed ({process.returncode}): {stderr}",
+        )
+        require("# PASS" in stdout, f"verdict not printed: {stdout!r}")
+        require(output.exists(), "verdict was not published")
+        require(
+            "without control-group containment" in stderr,
+            f"the degraded mode was not announced: {stderr!r}",
+        )
+        own_units = [
+            line
+            for line in list_review_units()
+            if line.strip()
+            .lstrip("● ")
+            .split()[0]
+            .startswith(f"claude-codex-review-{process.pid}-")
+        ]
+        require(
+            not own_units,
+            "a transient unit appeared despite systemd being unavailable",
+        )
+        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+
+
+@test("without systemd a timeout still kills the run and leaves no residue")
+def test_fallback_timeout() -> None:
+    environment = fallback_environment("sleep")
+    process = start_review(environment, "--timeout", "5", "--", "prompt")
+    _, stderr = finish_review(process, environment, timeout=180)
+
+    require(
+        process.returncode == 124,
+        f"expected status 124, got {process.returncode}: {stderr}",
+    )
+    survivors = subprocess.run(
+        ["pgrep", "-f", "CODEX_FAKE_MODE"],
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=20,
+        check=False,
+    ).stdout.strip()
+    require(not survivors, f"the fake codex survived the timeout: {survivors}")
+    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+
+
+@test("without systemd a same-group descendant dies with the run")
+def test_fallback_group_descendant() -> None:
+    marker = Path(tempfile.mkdtemp(prefix="kit-marker.")) / "child.pid"
+    environment = fallback_environment("linger")
+    environment["CODEX_FAKE_MARKER"] = str(marker)
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    try:
+        stdout, stderr = finish_review(process, environment)
+
+        require(
+            process.returncode == 0,
+            f"linger run failed ({process.returncode}): {stderr}",
+        )
+        child = int(marker.read_text().strip())
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            with contextlib.suppress(OSError):
+                os.kill(child, signal.SIGKILL)
+            raise Failure(
+                "a same-group descendant survived the fallback cleanup"
+            )
+    finally:
+        shutil.rmtree(marker.parent, ignore_errors=True)
+
+
+@test("a missing procfs degrades liveness and scanning conservatively")
+def test_proc_fallback() -> None:
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_no_proc",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        hook.PROC_ROOT = Path(directory) / "no-proc"
+
+        require(
+            hook.live_same_process(os.getpid(), 12345),
+            "a live process was reported dead without procfs",
+        )
+        reaped = subprocess.run(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.DEVNULL,
+            timeout=30,
+            check=True,
+        )
+        # A start-time mismatch cannot be detected without procfs; only a
+        # genuinely absent identifier may be reported dead.
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        require(
+            not hook.live_same_process(finished.pid, 12345),
+            "a reaped process was reported alive without procfs",
+        )
+        del reaped
+        require(
+            hook.scan_session_processes("any-session") == [],
+            "ownership was invented without procfs to attribute it",
+        )
+        require(
+            hook.live_command_lines() == [],
+            "command lines were invented without procfs",
+        )
+        # Verification requires a checkable start time. Without procfs a
+        # signal must never be authorised by an identifier alone.
+        require(
+            not hook.live_verified_process(os.getpid(), 12345),
+            "an unverifiable process was treated as verified without procfs",
+        )
+
+
+@test("Codex is invoked with the sol profile, read-only sandbox and prompt")
+def test_codex_invocation_contract() -> None:
+    """The wrapper's central promises live in the argv it hands to Codex."""
+    with tempfile.TemporaryDirectory() as directory:
+        arguments_path = Path(directory) / "argv.txt"
+        environment = review_environment("success")
+        environment["CODEX_FAKE_ARGS"] = str(arguments_path)
+
+        process = start_review(
+            environment, "--timeout", "60", "--", "-p", "the prompt"
+        )
+        _, stderr = finish_review(process, environment)
+
+        require(
+            process.returncode == 0,
+            f"wrapper failed ({process.returncode}): {stderr}",
+        )
+        arguments = arguments_path.read_text().splitlines()
+
+        for flag, value in (
+            ("--profile", "sol"),
+            ("--sandbox", "read-only"),
+        ):
+            require(flag in arguments, f"codex was not passed {flag}")
+            require(
+                arguments[arguments.index(flag) + 1] == value,
+                f"codex was passed {flag} "
+                f"{arguments[arguments.index(flag) + 1]!r}, not {value!r}",
+            )
+        for expected in ("exec", "--ephemeral", "--output-last-message"):
+            require(expected in arguments, f"codex was not passed {expected}")
+        require(
+            arguments[-1] == "-p the prompt",
+            f"the prompt was mangled: {arguments[-1]!r}",
+        )
+        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+
+
+@test("an unwritable --output destination cannot lose a completed verdict")
+def test_output_failure_preserves_verdict() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        blocker = Path(directory) / "blocker"
+        blocker.write_text("")
+
+        environment = review_environment("success")
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--output",
+            str(blocker / "verdict.txt"),
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment)
+
+        require(
+            process.returncode == 1,
+            f"expected status 1, got {process.returncode}: {stderr}",
+        )
+        require(
+            "# PASS" in stdout,
+            "the completed verdict was lost with the failed publication",
+        )
+        require(
+            "could not be written" in stderr,
+            f"the publication failure was not reported: {stderr!r}",
+        )
+        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+
+
+@test("a closed stdout still publishes and never loses the verdict")
+def test_closed_stdout_still_publishes() -> None:
+    """Each destination is attempted independently of the others."""
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "verdict.txt"
+        environment = review_environment("success")
+
+        process = subprocess.Popen(
+            [
+                "bash",
+                "-c",
+                'exec "$1" "$2" --timeout 60 --output "$3" -- prompt 1>&-',
+                "bash",
+                sys.executable,
+                str(REVIEW_SCRIPT),
+                str(output),
+            ],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        _, stderr = finish_review(process, environment)
+
+        require(
+            output.exists() and "# PASS" in output.read_text(),
+            "a closed stdout prevented publication of the verdict",
+        )
+        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
 
 
 # ---------------------------------------------------------------------------
@@ -2248,8 +2546,7 @@ def test_normal_completion() -> None:
             "--",
             "-a prompt beginning with a hyphen",
         )
-        stdout, stderr = process.communicate(timeout=120)
-        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        stdout, stderr = finish_review(process, environment)
 
         require(
             process.returncode == 0,
@@ -2338,8 +2635,7 @@ def test_restrictive_umask() -> None:
 def test_failing_run() -> None:
     environment = review_environment("fail")
     process = start_review(environment, "--timeout", "60", "--", "prompt")
-    _, stderr = process.communicate(timeout=120)
-    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+    _, stderr = finish_review(process, environment)
 
     require(process.returncode == 7, f"expected status 7: {process.returncode}")
     require("exit status 7" in stderr, f"failure not reported: {stderr!r}")
@@ -2350,8 +2646,7 @@ def test_failing_run() -> None:
 def test_empty_verdict() -> None:
     environment = review_environment("empty")
     process = start_review(environment, "--timeout", "60", "--", "prompt")
-    _, stderr = process.communicate(timeout=120)
-    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+    _, stderr = finish_review(process, environment)
 
     require(process.returncode == 1, f"expected status 1: {process.returncode}")
     require("no final verdict" in stderr, f"not reported: {stderr!r}")
@@ -2362,8 +2657,7 @@ def test_empty_verdict() -> None:
 def test_timeout() -> None:
     environment = review_environment("sleep")
     process = start_review(environment, "--timeout", "5", "--", "prompt")
-    _, stderr = process.communicate(timeout=180)
-    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+    _, stderr = finish_review(process, environment, timeout=180)
 
     require(
         process.returncode == 124,
@@ -2376,9 +2670,10 @@ def test_timeout() -> None:
 def test_detached_descendant() -> None:
     environment = review_environment("detach")
     process = start_review(environment, "--timeout", "5", "--", "prompt")
-    unit = wait_for_unit(process)
-    process.communicate(timeout=180)
-    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+    try:
+        unit = wait_for_unit(process)
+    finally:
+        finish_review(process, environment, timeout=180)
 
     assert_no_review_residue(f"claude-codex-review-{process.pid}-")
 
@@ -2389,6 +2684,15 @@ def test_detached_descendant() -> None:
         timeout=20,
         check=False,
     ).stdout
+
+    # A survivor is a finding, not a pet: it would otherwise sleep for an
+    # hour after the suite that discovered it has exited.
+    for line in survivors.splitlines():
+        first = line.split()[0] if line.split() else ""
+        if "3600" in line and first.isdigit():
+            with contextlib.suppress(OSError):
+                os.kill(int(first), signal.SIGKILL)
+
     require(
         "3600" not in survivors,
         f"a detached descendant of {unit} survived: {survivors}",
@@ -3589,6 +3893,551 @@ def test_orphan_browser_profiles() -> None:
             shutil.rmtree(hook.state_dir(session), ignore_errors=True)
 
 
+@test("the watchdog lapses rather than tearing down a live session")
+def test_watchdog_deadline_lapse() -> None:
+    """Reaching the 24h watch bound must not be treated as Claude dying."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_watch_lapse",
+    )
+    calls: list[dict[str, Any]] = []
+    hook.cleanup = lambda session_id, **kwargs: (calls.append(kwargs), [])[1]
+    hook.append_log = lambda *args, **kwargs: None
+
+    hook.live_same_process = lambda pid, start: True
+    hook.MAX_WATCH_SECONDS = 0
+    status = hook.watch("kit-tests-watch", 12345, 67890)
+    require(status == 0, f"watch returned {status}")
+    require(
+        calls == [],
+        f"a live session was cleaned up at the deadline: {calls}",
+    )
+
+    # Claude exiting in the window between the loop test and the deadline
+    # test is a crash to clean up after, not a term to lapse.
+    answers = iter([True, False])
+    hook.live_same_process = lambda pid, start: next(answers, False)
+    hook.watch("kit-tests-watch", 12345, 67890)
+    require(
+        calls and calls[-1].get("remove_state") is True,
+        f"a death at the deadline was treated as a lapse: {calls}",
+    )
+    calls.clear()
+
+    # When Claude has genuinely died the terminal cleanup must still run.
+    hook.live_same_process = lambda pid, start: False
+    hook.watch("kit-tests-watch", 12345, 67890)
+    require(
+        calls and calls[-1].get("remove_state") is True,
+        f"a dead session was not torn down: {calls}",
+    )
+
+
+@test("a pre-existing browser profile is preserved, not deleted")
+def test_persistent_profile_preserved() -> None:
+    """Recency of writes must never be read as proof of session creation."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_profiles",
+    )
+    hook.append_log = lambda *args, **kwargs: None
+    session = f"kit-tests-{os.getpid()}-profile"
+
+    with tempfile.TemporaryDirectory() as directory:
+        # A persistent profile a session browser merely opened: it is the
+        # user's own uid and freshly modified, exactly what the old
+        # recency heuristic deleted.
+        profile = Path(directory) / "chromium-work"
+        (profile / "Default").mkdir(parents=True)
+        (profile / "Default" / "Cookies").write_text("precious")
+
+        require(
+            hook.safe_remove_profile(profile, session),
+            "preservation must not be reported as a failure",
+        )
+        require(profile.is_dir(), "a pre-existing profile was deleted")
+        require(
+            (profile / "Default" / "Cookies").read_text() == "precious",
+            "a pre-existing profile was damaged",
+        )
+
+    # A profile under the session's own temporary directory is removed.
+    state_tmp = hook.state_dir(session) / "tmp"
+    state_tmp.mkdir(parents=True, exist_ok=True)
+    session_profile = state_tmp / "profile-x"
+    session_profile.mkdir()
+    try:
+        require(
+            hook.safe_remove_profile(session_profile, session),
+            "removing a session-created profile failed",
+        )
+        require(
+            not session_profile.exists(),
+            "a session-created profile was not removed",
+        )
+
+        # The session temporary directory itself is what TMPDIR names, so
+        # a browser pointed straight at it must not cost the session its
+        # own working directory.
+        require(
+            hook.safe_remove_profile(state_tmp, session),
+            "preserving the session TMPDIR must not be a failure",
+        )
+        require(
+            state_tmp.is_dir(),
+            "the session temporary directory itself was removed",
+        )
+    finally:
+        shutil.rmtree(hook.state_dir(session), ignore_errors=True)
+
+    # An ephemeral automation profile in the system temporary directory is
+    # removed too.
+    ephemeral = Path(tempfile.gettempdir()) / (
+        f"playwright_chromiumdev_profile-kittest{os.getpid()}"
+    )
+    ephemeral.mkdir()
+    try:
+        require(
+            hook.safe_remove_profile(ephemeral, session),
+            "removing an ephemeral automation profile failed",
+        )
+        require(
+            not ephemeral.exists(),
+            "an ephemeral automation profile was not removed",
+        )
+    finally:
+        shutil.rmtree(ephemeral, ignore_errors=True)
+
+
+def guard_decision(command: str) -> bool:
+    """True when hook-guard denies the command."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(KIT_DIR / "global" / "hooks" / "leave-no-trace.py"),
+            "hook-guard",
+        ],
+        input=json.dumps(
+            {"tool_name": "Bash", "tool_input": {"command": command}}
+        ),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return '"deny"' in result.stdout
+
+
+@test("the detach guard ignores heredoc bodies and quoted text")
+def test_guard_precision() -> None:
+    blocked = [
+        "sleep 30 &",
+        "nohup ./server >log 2>&1 &",
+        "./worker & disown",
+        "setsid ./daemon",
+        "make; nohup ./x",
+        "cmd1\nnohup ./y",
+        # Indentation and prefix commands do not stop a detach from being
+        # the command that runs.
+        "  nohup sh -c 'sleep 999 &' >/tmp/log 2>&1",
+        "env nohup ./server",
+        "FOO=1 nohup ./server",
+        # A substitution runs wherever it appears, including inside a
+        # double-quoted string or an expanding heredoc body.
+        'echo "$(nohup sleep 999 >/tmp/log 2>&1 &)"',
+        "cat <<EOF\n$(nohup sleep 999 &)\nEOF",
+        "echo `setsid ./daemon`",
+        # A quoted `<<EOF` is text, so it cannot hide the next line.
+        "printf '%s\\n' '<<EOF'\nnohup sh -c 'sleep 999 &' >/tmp/log 2>&1",
+    ]
+    allowed = [
+        "git grep -n disown",
+        "cat docs/disown.md",
+        "grep -rn setsid .",
+        "cat > entry.sh <<'EOF'\n#!/bin/sh\nnginx &\nexec app\nEOF",
+        # A tab-indented delimiter only ends a `<<-` heredoc; for a plain
+        # `<<` it is body text and the backgrounding line is data too.
+        "cat <<EOF\n\tEOF\nsleep 30 &\nEOF",
+        "cat <<-EOF\n\tnginx &\n\tEOF",
+        # Only an exact delimiter line ends a heredoc, so a line with
+        # trailing spaces leaves the rest of the body as data.
+        "cat <<EOF\nEOF   \nserver &\nEOF",
+        # Delimiters are not restricted to word characters.
+        "cat <<'END-MARK'\nserver &\nEND-MARK",
+        # A single-quoted delimiter suppresses expansion, so even a
+        # substitution in that body is literal text.
+        "cat <<'EOF'\n$(nohup sleep 999 &)\nEOF",
+        "echo 'a &\nb'",
+        "echo 'first\nsleep 30 &'",
+        'printf "%s" "x & y"',
+        "make && make test",
+        "cmd > out 2>&1",
+        "grep -c '&' file",
+    ]
+    for command in blocked:
+        require(
+            guard_decision(command),
+            f"a genuine detach was allowed: {command!r}",
+        )
+    for command in allowed:
+        require(
+            not guard_decision(command),
+            f"a legitimate command was denied: {command!r}",
+        )
+
+
+@test("session state and TMPDIR exist even when the stale sweep fails")
+def test_hook_start_survives_sweep_failure() -> None:
+    """A slow or failing sweep must not cost the session its own setup."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_start_order",
+    )
+    session = f"kit-tests-{os.getpid()}-order"
+
+    def explode() -> None:
+        raise RuntimeError("sweep failed")
+
+    hook.sweep_stale_states = explode
+    hook.start_watchdog = lambda *args, **kwargs: None
+    hook.read_json_stdin = lambda: {"session_id": session, "cwd": os.getcwd()}
+
+    saved = {
+        name: os.environ.get(name)
+        for name in ("CLAUDE_ENV_FILE", "CLAUDE_PID")
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        env_file = Path(directory) / "environment"
+        os.environ["CLAUDE_ENV_FILE"] = str(env_file)
+        os.environ["CLAUDE_PID"] = str(os.getpid())
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(captured):
+                try:
+                    hook.hook_start()
+                    raise Failure("the stubbed sweep did not run")
+                except RuntimeError:
+                    pass
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        state = hook.state_dir(session)
+        try:
+            require(
+                "TMPDIR=" in env_file.read_text(),
+                "TMPDIR redirection was not written before the sweep",
+            )
+            require(
+                (state / "tmp").is_dir(),
+                "the session temporary directory was not created first",
+            )
+            require(
+                (state / "meta.json").exists(),
+                "session metadata was not written before the sweep",
+            )
+            require(
+                "Leave No Trace automation is active" in captured.getvalue(),
+                "the hook context was not printed before the sweep",
+            )
+        finally:
+            shutil.rmtree(state, ignore_errors=True)
+
+
+@test("an aged state directory without metadata is reclaimed")
+def test_unattributed_state_reclaimed() -> None:
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_unattributed",
+    )
+    hook.append_log = lambda *args, **kwargs: None
+    root = hook.runtime_root()
+
+    aged = root / f"kit-tests-unattr-{os.getpid()}-aged"
+    aged.mkdir(parents=True, exist_ok=True)
+    hook.save_json(aged / "leases.json", {})
+    old = time.time() - hook.MAX_WATCH_SECONDS - 60
+    os.utime(aged, (old, old))
+    try:
+        hook.reclaim_unattributed_state(aged)
+        require(not aged.exists(), "aged unattributed state was not reclaimed")
+    finally:
+        shutil.rmtree(aged, ignore_errors=True)
+
+    fresh = root / f"kit-tests-unattr-{os.getpid()}-fresh"
+    fresh.mkdir(parents=True, exist_ok=True)
+    try:
+        hook.reclaim_unattributed_state(fresh)
+        require(fresh.exists(), "fresh state was reclaimed prematurely")
+    finally:
+        shutil.rmtree(fresh, ignore_errors=True)
+
+    # Reclamation takes the same lock a launch takes, so a launch holding
+    # it is never raced.
+    contended = root / f"kit-tests-unattr-{os.getpid()}-locked"
+    contended.mkdir(parents=True, exist_ok=True)
+    os.utime(contended, (old, old))
+    lock = root / f".{contended.name}.lock"
+    holder = lock.open("a+b")
+    try:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        finished = threading.Event()
+        threading.Thread(
+            target=lambda: (
+                hook.reclaim_unattributed_state(contended),
+                finished.set(),
+            ),
+            daemon=True,
+        ).start()
+        require(
+            not finished.wait(1.0),
+            "reclamation proceeded while a launch held the lock",
+        )
+        require(contended.is_dir(), "locked state was removed anyway")
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        require(
+            finished.wait(10.0),
+            "reclamation never completed after the lock was released",
+        )
+        require(not contended.exists(), "released state was not reclaimed")
+    finally:
+        holder.close()
+        shutil.rmtree(contended, ignore_errors=True)
+        lock.unlink(missing_ok=True)
+
+
+@test("token usage is aggregated, deduplicated and cumulative-aware")
+def test_usage_tracker() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        project = home / ".claude" / "projects" / "-x"
+        project.mkdir(parents=True)
+
+        def assistant(identifier, request, tokens, when, model="m-1"):
+            return json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": when,
+                    "requestId": request,
+                    "message": {
+                        "id": identifier,
+                        "model": model,
+                        "usage": {
+                            "input_tokens": tokens,
+                            "cache_read_input_tokens": tokens * 10,
+                            "cache_creation_input_tokens": 0,
+                            "output_tokens": tokens * 2,
+                        },
+                    },
+                }
+            )
+
+        recent = "2026-07-29T00:00:00Z"
+        (project / "a.jsonl").write_text(
+            "\n".join(
+                [
+                    # A zero-usage synthetic twin precedes the real row with
+                    # the same identity: it must not swallow the count.
+                    assistant("msg_1", "req_1", 0, recent),
+                    assistant("msg_1", "req_1", 100, recent),
+                    # The same response replayed into a resumed transcript.
+                    assistant("msg_1", "req_1", 100, recent),
+                    assistant("msg_2", "req_2", 50, recent),
+                    # Too old to count.
+                    assistant("msg_3", "req_3", 999, "2020-01-01T00:00:00Z"),
+                    "not json at all",
+                ]
+            )
+            + "\n"
+        )
+
+        codex = home / "codex" / "sessions" / "2026" / "07" / "29"
+        codex.mkdir(parents=True)
+
+        def token_count(total, when):
+            return json.dumps(
+                {
+                    "timestamp": when,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": total,
+                                "cached_input_tokens": total // 2,
+                                "cache_write_input_tokens": 0,
+                                "output_tokens": 10,
+                                "total_tokens": total + 10,
+                            }
+                        },
+                    },
+                }
+            )
+
+        (codex / "rollout-2026-07-29T00-00-00-x.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "session_meta",
+                            "payload": {
+                                "type": "session_meta",
+                                "model_provider": "openai",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "turn_context",
+                            "payload": {
+                                "type": "turn_context",
+                                "model": "gpt-5.6-terra",
+                            },
+                        }
+                    ),
+                    # Cumulative: only the final count may be charged.
+                    token_count(1000, recent),
+                    token_count(4000, recent),
+                    # A model switch after the last count must not steal
+                    # the attribution of tokens it never produced.
+                    json.dumps(
+                        {
+                            "type": "turn_context",
+                            "payload": {
+                                "type": "turn_context",
+                                "model": "gpt-9-imaginary",
+                            },
+                        }
+                    ),
+                ]
+            )
+            + "\n"
+        )
+
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(home / "codex")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(KIT_DIR / "scripts" / "claude-codex-usage"),
+                "--since",
+                "2026-07-28",
+                "--json",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        require(result.returncode == 0, f"usage tracker failed: {result.stderr}")
+        report = json.loads(result.stdout)
+        usage = {
+            (row["provider"], row["model"]): row for row in report["usage"]
+        }
+
+        claude = usage[("claude", "m-1")]
+        require(
+            claude["fresh_in"] == 150
+            and claude["cache_read"] == 1500
+            and claude["output"] == 300
+            and claude["events"] == 2,
+            f"claude usage was miscounted: {claude}",
+        )
+
+        codex_row = usage[("openai", "gpt-5.6-terra")]
+        require(
+            codex_row["total"] == 4010
+            and codex_row["cache_read"] == 2000
+            and codex_row["fresh_in"] == 2000
+            and codex_row["events"] == 1,
+            f"codex cumulative usage was miscounted: {codex_row}",
+        )
+
+
+@test("the model alias map is valid and covers the documented aliases")
+def test_model_alias_map() -> None:
+    table = read_json(KIT_DIR / "global" / "claude-models.json")
+    require(
+        isinstance(table, dict) and bool(table),
+        "the alias map must be a non-empty JSON object",
+    )
+    for alias, model in table.items():
+        require(
+            isinstance(alias, str)
+            and bool(alias.strip())
+            and isinstance(model, str)
+            and bool(model.strip()),
+            f"invalid alias entry: {alias!r} -> {model!r}",
+        )
+    require("opus" in table, "the opus default alias is missing")
+    require("fable" in table, "the fable alias is missing")
+
+
+@test("residual reporting counts only survivors of this cleanup's own kills")
+def test_residual_reports_survivors_only() -> None:
+    """A poller's next short-lived child must not block completion."""
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_residual",
+    )
+    hook.append_log = lambda *args, **kwargs: None
+    hook.stop_snap_scopes = lambda *args, **kwargs: None
+    hook.terminate_processes = lambda *args, **kwargs: None
+    hook.sweep_orphan_browser_profiles = lambda *args, **kwargs: None
+
+    session = f"kit-tests-{os.getpid()}-residual"
+    env = {
+        "CLAUDE_CODE_SESSION_ID": session,
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+    }
+
+    def scripted(snapshots: list[list[tuple[int, str, dict[str, str]]]]):
+        queue = list(snapshots)
+        return lambda _session: queue.pop(0) if len(queue) > 1 else queue[0]
+
+    # The terminated poll child is replaced by a fresh one mid-cleanup: the
+    # newcomer is the next sweep's business, not this cleanup's failure.
+    hook.scan_session_processes = scripted(
+        [
+            [(100, "sleep 2", env)],
+            [(100, "sleep 2", env)],
+            [(200, "sleep 2", env)],
+            [(200, "sleep 2", env)],
+        ]
+    )
+    failures = hook.cleanup_locked(
+        session,
+        detached_only=False,
+        ignore_leases=False,
+        run_registry=False,
+    )
+    require(
+        failures == [],
+        f"a process spawned during cleanup was reported as residual: {failures}",
+    )
+
+    # A process that survives its own termination is a genuine failure.
+    hook.scan_session_processes = scripted([[(300, "stubborn", env)]])
+    failures = hook.cleanup_locked(
+        session,
+        detached_only=False,
+        ignore_leases=False,
+        run_registry=False,
+    )
+    require(
+        any("300" in failure for failure in failures),
+        f"a kill survivor was not reported as residual: {failures}",
+    )
+
+
 @test("the canonical settings disable the companion with a JSON Boolean")
 def test_canonical_companion_boolean() -> None:
     canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
@@ -3628,6 +4477,7 @@ def test_installer_covers_doctor_commands() -> None:
         "claude-codex-init",
         "claude-codex-doctor",
         "claude-codex-review",
+        "claude-codex-usage",
     ):
         require(
             f"$HOME/.local/bin/{command}" in installer,
@@ -3676,6 +4526,329 @@ def test_installer_refuses_self_source() -> None:
                 "model" in path.read_text(),
                 f"the canonical {profile} profile was emptied",
             )
+
+
+@test("a fresh install succeeds, reruns idempotently and migrates a new repository")
+def test_green_path_install() -> None:
+    """The exact out-of-box sequence: install, reinstall, migrate, remigrate."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        home = root / "home"
+        home.mkdir()
+
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(root / "codex")
+
+        def run_install() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["bash", str(kit / "scripts" / "install.sh")],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+
+        first = run_install()
+        require(
+            first.returncode == 0,
+            f"a fresh install failed: {first.stderr}",
+        )
+
+        settings = read_json(home / ".claude" / "settings.json")
+        require(bool(settings.get("model")), "the canonical model was not applied")
+        require(
+            settings.get("enabledPlugins", {}).get("codex@openai-codex") is False,
+            "the companion plugin was not disabled",
+        )
+        require(
+            "SessionStart" in settings.get("hooks", {}),
+            "the canonical hooks were not applied",
+        )
+        for name in (
+            "claude-codex-init",
+            "claude-codex-doctor",
+            "claude-codex-review",
+            "claude-lnt-start",
+            "claude-lnt-register",
+            "claude-lnt-cleanup",
+            "claude-lnt-status",
+        ):
+            require(
+                (home / ".local" / "bin" / name).is_symlink(),
+                f"{name} was not installed",
+            )
+
+        second = run_install()
+        require(
+            second.returncode == 0,
+            f"an idempotent rerun failed: {second.stderr}",
+        )
+        require(
+            not (home / ".claude-codex-kit-backups").exists(),
+            "an idempotent rerun created backups",
+        )
+
+        repository = root / "repo"
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repository)],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            check=True,
+        )
+
+        def run_init(*extra: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "bash",
+                    str(kit / "scripts" / "init-project.sh"),
+                    *extra,
+                    str(repository),
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        migrated = run_init()
+        require(
+            migrated.returncode == 0,
+            f"claude-codex-init failed on a new repository: {migrated.stderr}",
+        )
+        require(
+            (repository / "CLAUDE.md").exists()
+            and (repository / "CLAUDE.local.md").exists(),
+            "the project instruction files were not created",
+        )
+        exclude = (repository / ".git" / "info" / "exclude").read_text()
+        require(
+            "/CLAUDE.local.md" in exclude,
+            "CLAUDE.local.md was not excluded from Git",
+        )
+
+        remigrated = run_init()
+        require(
+            remigrated.returncode == 0,
+            f"remigration failed: {remigrated.stderr}",
+        )
+        require(
+            (repository / "CLAUDE.local.md")
+            .read_text()
+            .count("claude-codex-kit:start")
+            == 1,
+            "remigration duplicated the managed block",
+        )
+
+        # Selecting a principal orchestrator for one repository.
+        models = read_json(kit / "global" / "claude-models.json")
+        chosen = run_init("fable")
+        require(
+            chosen.returncode == 0,
+            f"model selection failed: {chosen.stderr}",
+        )
+        local_settings = repository / ".claude" / "settings.local.json"
+        require(
+            read_json(local_settings).get("model") == models["fable"],
+            "the fable alias was not resolved into settings.local.json",
+        )
+        exclude = (repository / ".git" / "info" / "exclude").read_text()
+        for pattern in (
+            "/.claude/settings.local.json",
+            "/.claude/settings.local.json.backup-claude-codex-*",
+            "/.claude/.settings.local.json.claude-codex.lock",
+        ):
+            require(
+                pattern in exclude,
+                f"the personal settings artefact was not excluded: {pattern}",
+            )
+
+        # Unrelated personal settings survive a model change.
+        seeded = read_json(local_settings)
+        seeded["effortLevel"] = "medium"
+        write_json(local_settings, seeded)
+        switched = run_init("opus")
+        require(
+            switched.returncode == 0,
+            f"switching the model failed: {switched.stderr}",
+        )
+        data = read_json(local_settings)
+        require(
+            data.get("model") == models["opus"],
+            "switching back to opus did not update the model",
+        )
+        require(
+            data.get("effortLevel") == "medium",
+            "a model change destroyed unrelated personal settings",
+        )
+
+        rejected = run_init("no-such-model")
+        require(
+            rejected.returncode != 0,
+            "an unknown model alias was accepted",
+        )
+
+        # A second directory must be refused, not silently win.
+        second = root / "repo2"
+        second.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(second)],
+            env=environment,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+            check=True,
+        )
+        two_directories = run_init(str(second))
+        require(
+            two_directories.returncode != 0,
+            "two directory arguments were silently accepted",
+        )
+
+        # A symlinked settings.local.json gets exclusions derived from its
+        # referent, where the updater's backup and lock artefacts land. The
+        # referent's name carries glob metacharacters, which the generated
+        # patterns must escape, and it is tracked, which must be warned
+        # about because exclusion cannot hide changes to a tracked file.
+        referent_name = "custom[1].json"
+        (second / ".claude").mkdir()
+        (second / ".claude" / referent_name).write_text(
+            '{"effortLevel": "low"}\n'
+        )
+        (second / ".claude" / "settings.local.json").symlink_to(referent_name)
+        for arguments in (
+            ["add", "--", f":(literal).claude/{referent_name}"],
+            [
+                "-c",
+                "user.name=kit",
+                "-c",
+                "user.email=kit@example.invalid",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+        ):
+            subprocess.run(
+                ["git", "-C", str(second), *arguments],
+                env=environment,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+                check=True,
+            )
+        linked = subprocess.run(
+            [
+                "bash",
+                str(kit / "scripts" / "init-project.sh"),
+                "fable",
+                str(second),
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        require(
+            linked.returncode == 0,
+            f"model selection through a symlink failed: {linked.stderr}",
+        )
+        require(
+            "tracked by Git" in linked.stdout,
+            "modifying a tracked referent did not warn",
+        )
+        require(
+            (second / ".claude" / "settings.local.json").is_symlink(),
+            "the settings symlink was replaced by a regular file",
+        )
+        referent = read_json(second / ".claude" / referent_name)
+        require(
+            referent.get("model") == models["fable"]
+            and referent.get("effortLevel") == "low",
+            "the symlink referent was not updated in place",
+        )
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(second),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout
+        require(
+            "claude-codex" not in status,
+            f"artefacts of the update are visible to Git: {status!r}",
+        )
+
+
+@test("the doctor rejects a hook installed under the wrong matcher or timeout")
+def test_doctor_hook_fidelity() -> None:
+    """A right command under a wrong matcher never runs for its tool."""
+    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+
+    def check(live: dict[str, Any]) -> bool:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            write_json(home / ".claude" / "settings.json", live)
+
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["CODEX_HOME"] = str(home / ".codex")
+
+            result = subprocess.run(
+                ["bash", str(DOCTOR_SCRIPT)],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            return (
+                "PASS  Live settings contain every canonical Leave No Trace hook"
+                in result.stdout
+            )
+
+    require(
+        check(copy.deepcopy(canonical)),
+        "the canonical settings themselves failed the hook check",
+    )
+
+    wrong_matcher = copy.deepcopy(canonical)
+    wrong_matcher["hooks"]["PreToolUse"][0]["matcher"] = "Read"
+    require(
+        not check(wrong_matcher),
+        "a hook moved to another matcher passed the check",
+    )
+
+    wrong_timeout = copy.deepcopy(canonical)
+    wrong_timeout["hooks"]["SessionStart"][0]["hooks"][0]["timeout"] = 10
+    require(
+        not check(wrong_timeout),
+        "a hook with a shortened timeout passed the check",
+    )
 
 
 @test("the setup guide documents every file in the kit")
@@ -3749,11 +4922,27 @@ def test_policy_commands_allowed() -> None:
     commands = re.findall(r"`((?:npx|codex|claude-codex-review)[^`]*)`", policy)
 
     # Fenced blocks too. The screenshot command lives in one, and shell line
-    # continuations have to be folded before it can be matched.
+    # continuations have to be folded before it can be matched. The
+    # pre-completion battery commands are as mandatory as any other: one
+    # that stops for approval blocks every completion in a headless run.
     for block in re.findall(r"```(?:bash|sh)?\n(.*?)```", policy, re.S):
         for line in re.sub(r"\\\n\s*", " ", block).splitlines():
             line = line.strip()
-            if line.startswith(("npx ", "codex ", "claude-codex-review ")):
+            if line.startswith(
+                (
+                    "npx ",
+                    "codex ",
+                    "claude-codex-review ",
+                    "pgrep ",
+                    "ss ",
+                    "ps ",
+                    "ls ",
+                    "grep ",
+                    "command -v ",
+                    "nvidia-smi ",
+                    "git status",
+                )
+            ):
                 commands.append(line)
 
     gaps = []

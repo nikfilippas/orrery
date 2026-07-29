@@ -24,7 +24,19 @@ PY
     exit 2
 fi
 export CODEX_HOME
-BACKUP_DIR="$HOME/.claude-codex-kit-backups/$(date +%Y%m%d-%H%M%S)-$$-$(date +%N)"
+# Nanoseconds via Python: BSD date on macOS prints a literal N for %N.
+BACKUP_DIR="$HOME/.claude-codex-kit-backups/$(date +%Y%m%d-%H%M%S)-$$-$(
+    python3 -c 'import time; print(time.time_ns())'
+)"
+
+# Files moved aside are announced even when a later step aborts the
+# installer, so nothing a user owned can vanish without a printed pointer.
+report_backups() {
+    if [ -d "$BACKUP_DIR" ]; then
+        printf "Previous files were backed up to:\n%s\n" "$BACKUP_DIR"
+    fi
+}
+trap report_backups EXIT
 
 backup_existing() {
     local target="$1"
@@ -95,11 +107,21 @@ link_file \
     "$KIT_DIR/scripts/claude-codex-review" \
     "$HOME/.local/bin/claude-codex-review"
 
+link_file \
+    "$KIT_DIR/scripts/claude-codex-usage" \
+    "$HOME/.local/bin/claude-codex-usage"
+
 "$KIT_DIR/scripts/install-lnt-hooks.sh" --links-only
 "$KIT_DIR/scripts/apply-claude-settings.py" --all
 
 printf "\nInstallation complete.\n"
 
-if [ -d "$BACKUP_DIR" ]; then
-    printf "Previous files were backed up to:\n%s\n" "$BACKUP_DIR"
-fi
+case ":$PATH:" in
+    *":$HOME/.local/bin:"* | *":$HOME/.local/bin/:"*)
+        ;;
+    *)
+        printf '\nWARNING: %s is not on PATH.\n' "$HOME/.local/bin" >&2
+        printf 'The installed commands cannot be invoked by name until it is.\n' >&2
+        printf 'Add it in your shell profile and start a new shell.\n' >&2
+        ;;
+esac

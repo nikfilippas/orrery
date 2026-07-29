@@ -8,7 +8,7 @@
           {
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/leave-no-trace.py\" hook-start",
-            "timeout": 10
+            "timeout": 60
           }
         ]
       }
@@ -108,7 +108,15 @@
       "Bash(claude-codex-doctor:*)",
       "Bash(claude-lnt-status:*)",
       "Bash(npx --yes playwright@1.62.0 screenshot:*)",
-      "Bash(npx --yes playwright@1.62.0 install chromium:*)"
+      "Bash(npx --yes playwright@1.62.0 install chromium:*)",
+      "Bash(pgrep:*)",
+      "Bash(ss:*)",
+      "Bash(ps:*)",
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(command -v:*)",
+      "Bash(nvidia-smi --query-compute-apps:*)",
+      "Bash(git status:*)"
     ]
   }
 }

@@ -26,6 +26,8 @@ fi
 export CODEX_HOME
 FAILURES=0
 
+KERNEL="$(uname -s)"
+
 pass() {
     printf "PASS  %s\n" "$1"
 }
@@ -33,6 +35,10 @@ pass() {
 fail() {
     printf "FAIL  %s\n" "$1" >&2
     FAILURES=$((FAILURES + 1))
+}
+
+skip() {
+    printf "SKIP  %s\n" "$1"
 }
 
 check_command() {
@@ -137,6 +143,35 @@ validate_codex_profile "luna" "low"
 validate_codex_profile "terra" "medium"
 validate_codex_profile "sol" "high"
 
+printf "\n=== Claude model aliases ===\n"
+if python3 - "$KIT_DIR/global/claude-models.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    table = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if not isinstance(table, dict) or not table:
+    raise SystemExit(1)
+
+for alias, model in table.items():
+    if not isinstance(alias, str) or not alias.strip():
+        raise SystemExit(1)
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit(1)
+
+if "opus" not in table:
+    raise SystemExit(1)
+PY
+then
+    pass "Model alias map is valid"
+else
+    fail "Model alias map is missing, invalid, or lacks the opus default"
+fi
+
 printf "\n=== Authentication ===\n"
 if codex login status 2>&1 | grep -q "Logged in"; then
     pass "Codex authentication is active"
@@ -203,6 +238,7 @@ fi
 
 for python_script in \
     "$KIT_DIR/scripts/apply-claude-settings.py" \
+    "$KIT_DIR/scripts/claude-codex-usage" \
     "$KIT_DIR/global/hooks/leave-no-trace.py" \
     "$KIT_DIR/tests/run-tests.py" \
     "$KIT_DIR/tests/fake-codex"
@@ -239,13 +275,59 @@ done
 for required_command in systemd-run systemctl; do
     if command -v "$required_command" >/dev/null 2>&1; then
         pass "Command available: $required_command"
+    elif [ "$KERNEL" != "Linux" ]; then
+        skip "$required_command not applicable on $KERNEL: reviews run without control-group containment"
     else
         fail "Command unavailable: $required_command"
     fi
 done
 
-PYTHON3_PATH="$(command -v python3)"
-if python3 - "$PYTHON3_PATH" <<'PY'
+# The settings updater refuses to run without an atomic exchange syscall,
+# so a home directory on a filesystem without one (some NFS and eCryptfs
+# setups) is worth discovering before the first update, not during it.
+if python3 - "$KIT_DIR/scripts/apply-claude-settings.py" "$HOME/.claude" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+import tempfile
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+script = Path(sys.argv[1])
+target = Path(sys.argv[2])
+target.mkdir(parents=True, exist_ok=True)
+
+spec = importlib.util.spec_from_file_location(
+    "kit_settings_probe",
+    script,
+    loader=importlib.machinery.SourceFileLoader("kit_settings_probe", str(script)),
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+with tempfile.TemporaryDirectory(dir=target) as directory:
+    first = Path(directory) / "first"
+    second = Path(directory) / "second"
+    first.write_text("a")
+    second.write_text("b")
+    try:
+        module.exchange_paths(first, second)
+    except module.AtomicExchangeUnavailable as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(1)
+    if first.read_text() != "b" or second.read_text() != "a":
+        raise SystemExit(1)
+PY
+then
+    pass "Atomic settings exchange works on the settings filesystem"
+else
+    fail "Atomic settings exchange is unavailable on the settings filesystem"
+fi
+
+if [ "$KERNEL" != "Linux" ]; then
+    skip "Transient systemd user services not applicable on $KERNEL"
+    PYTHON3_PATH="$(command -v python3)"
+elif PYTHON3_PATH="$(command -v python3)" && python3 - "$PYTHON3_PATH" <<'PY'
 import os
 import subprocess
 import sys
@@ -457,6 +539,13 @@ else
     fail "claude-codex-doctor is not correctly installed"
 fi
 
+if [ "$(readlink -f "$HOME/.local/bin/claude-codex-usage")" = \
+     "$(readlink -f "$KIT_DIR/scripts/claude-codex-usage")" ]; then
+    pass "claude-codex-usage is correctly installed"
+else
+    fail "claude-codex-usage is not correctly installed"
+fi
+
 printf "\n=== Direct Codex review ===\n"
 if [ -x "$HOME/.local/bin/claude-codex-review" ] &&
    [ "$(readlink -f "$HOME/.local/bin/claude-codex-review")" = \
@@ -466,14 +555,107 @@ else
     fail "claude-codex-review is not correctly installed"
 fi
 
-printf "\n=== Claude default model ===\n"
-if [ -r "$HOME/.claude/settings.json" ] &&
-   jq -e '.model == "opus"' "$HOME/.claude/settings.json" \
-       >/dev/null 2>&1
+case ":$PATH:" in
+    *":$HOME/.local/bin:"* | *":$HOME/.local/bin/:"*)
+        pass "~/.local/bin is on PATH"
+        ;;
+    *)
+        fail "~/.local/bin is not on PATH, so no installed command is invocable by name"
+        ;;
+esac
+
+printf "\n=== Leave No Trace layer ===\n"
+check_link \
+    "$HOME/.claude/hooks/leave-no-trace.py" \
+    "$KIT_DIR/global/hooks/leave-no-trace.py"
+
+for lnt_command in start register cleanup status; do
+    check_link \
+        "$HOME/.local/bin/claude-lnt-$lnt_command" \
+        "$KIT_DIR/scripts/claude-lnt-$lnt_command"
+done
+
+if python3 - \
+    "$KIT_DIR/global/claude-settings.json" \
+    "$HOME/.claude/settings.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+try:
+    canonical = json.loads(Path(sys.argv[1]).read_text())
+    live = json.loads(Path(sys.argv[2]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+
+def handlers(hooks):
+    """Every hook handler as an exactly comparable entry.
+
+    The command alone is not enough: a handler installed under a different
+    matcher never runs for the tool it was meant to guard, and one with a
+    shortened timeout is cancelled before it finishes. Both would leave the
+    cleanup guarantee broken while the command string still looked right.
+    """
+    entries = set()
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher", "")
+            for handler in group.get("hooks", []):
+                if not isinstance(handler, dict):
+                    continue
+                if not isinstance(handler.get("command"), str):
+                    continue
+                entries.add(
+                    (
+                        event,
+                        matcher if isinstance(matcher, str) else "",
+                        handler.get("type"),
+                        handler["command"],
+                        handler.get("timeout"),
+                    )
+                )
+    return entries
+
+
+missing = sorted(
+    handlers(canonical.get("hooks", {})) - handlers(live.get("hooks", {}))
+)
+
+if missing:
+    for event, matcher, kind, command, timeout in missing:
+        print(
+            f"{event}[matcher={matcher!r}, type={kind!r}, "
+            f"timeout={timeout!r}]: {command}",
+            file=sys.stderr,
+        )
+    raise SystemExit(1)
+PY
 then
-    pass "Claude default model uses the moving opus alias"
+    pass "Live settings contain every canonical Leave No Trace hook"
 else
-    fail "Claude default model is not set to opus"
+    fail "Live settings are missing canonical Leave No Trace hooks"
+fi
+
+printf "\n=== Claude default model ===\n"
+# Compared against the canonical settings, not a hard-coded name: changing
+# the model is a documented flow, and the doctor validates consistency.
+CANONICAL_MODEL="$(
+    jq -r '.model // empty' "$KIT_DIR/global/claude-settings.json" 2>/dev/null
+)"
+if [ -z "$CANONICAL_MODEL" ]; then
+    fail "Canonical settings do not define a model"
+elif [ -r "$HOME/.claude/settings.json" ] &&
+     jq -e --arg model "$CANONICAL_MODEL" '.model == $model' \
+         "$HOME/.claude/settings.json" >/dev/null 2>&1
+then
+    pass "Claude default model matches the canonical settings ($CANONICAL_MODEL)"
+else
+    fail "Claude default model does not match the canonical settings ($CANONICAL_MODEL)"
 fi
 
 printf "\n=== Kit repository ===\n"

@@ -1,0 +1,6 @@
+{
+  "opus": "opus",
+  "sonnet": "sonnet",
+  "haiku": "haiku",
+  "fable": "claude-fable-5[1m]"
+}

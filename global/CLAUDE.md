@@ -166,6 +166,10 @@ Use Codex primarily as:
 
 When delegating:
 
+- run a Codex execution in the foreground of one tool call where practical,
+  and launch it with `claude-lnt-start --ttl <seconds> -- codex ...` when it
+  must span tool calls, because an unleased background process is terminated
+  at the next turn boundary,
 - include the task, constraints, acceptance criteria, and relevant paths,
 - avoid sending unrelated conversation history,
 - prefer persistent threads for successive parts of one task,
@@ -338,9 +342,11 @@ in prompts, reports, logs, commits, or generated documentation.
 
 ```bash
 pgrep -af "headless|playwright|chromedriver|--remote-debugging"
+# 22/80/443 plus this machine's own services; adjust the ports per site.
 ss -ltnp 2>/dev/null | grep -vE ':(22|80|443|8600|8601)\b'
 ls -d /tmp/tmp.* /tmp/mh_* /tmp/playwright_* 2>/dev/null | head
-nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+command -v nvidia-smi >/dev/null 2>&1 &&
+    nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
 git status --short   # in every checkout AND worktree
 ```
 
@@ -375,8 +381,8 @@ npx --yes playwright@1.62.0 screenshot \
 - Say what the screenshot shows, including what is wrong or unresolved. A screenshot that was taken but not described is not evidence.
 - Codex accepts images, so a screenshot can be attached to an independent review with `codex --profile sol exec -i shot.png`.
 - Do not leave screenshots in the repository. Write them under the session's temporary directory unless the user asked for a file.
-- The snap Chromium is the failure mode this policy exists to prevent. It runs in a private mount namespace, so its profiles accumulate under `/tmp/snap-private-tmp/snap.chromium/tmp/`, which is invisible to ordinary `du`, excluded from systemd tmpfiles ageing, and backed by RAM. The rules below apply only to cleaning up a snap browser that is already running.
-- Snap Chromium detaches into its own systemd user scope (`snap.chromium.chromium-<uuid>.scope`). Killing the launching shell, or letting `timeout` expire, does NOT kill the browser: it is reparented to systemd (ppid 1/2282) and survives indefinitely. Verify the browser is gone; do not assume the launcher's death took it with it.
+- The snap Chromium is the failure mode this policy exists to prevent, a hazard specific to Ubuntu snap systems and harmless elsewhere. It runs in a private mount namespace, so its profiles accumulate under `/tmp/snap-private-tmp/snap.chromium/tmp/`, which is invisible to ordinary `du`, excluded from systemd tmpfiles ageing, and backed by RAM. The rules below are site notes for such systems and apply only to cleaning up a snap browser that is already running.
+- Snap Chromium detaches into its own systemd user scope (`snap.chromium.chromium-<uuid>.scope`). Killing the launching shell, or letting `timeout` expire, does NOT kill the browser: it is reparented to systemd and survives indefinitely. Verify the browser is gone; do not assume the launcher's death took it with it.
 - `kill` from a Claude-Code-in-VS-Code shell is DENIED by AppArmor even at the same uid and even with sandboxing disabled, because the shell's label is `vscode`:
 
 ```text

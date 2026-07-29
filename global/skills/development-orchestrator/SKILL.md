@@ -134,7 +134,7 @@ Workflow:
    profile is materially justified as the implementer.
 6. The principal orchestrator inspects all changed files and the complete diff.
 7. Run the complete relevant verification suite.
-8. A fresh GPT-5.6 Sol run reviews the completed uncommitted changes.
+8. A fresh Sol session reviews the completed uncommitted changes.
 9. The principal orchestrator verifies each finding and corrects legitimate problems.
 10. Rerun affected verification.
 
@@ -282,7 +282,8 @@ Do not ask Codex to make architectural decisions that the principal orchestrator
 
 For standard implementation work:
 
-1. Inspect the relevant repository files.
+1. Inspect the relevant repository files, and complete the project
+   CLAUDE.md bootstrap first when meaningful placeholders remain in it.
 2. Identify concise acceptance criteria.
 3. Form a short internal plan.
 4. Delegate substantial implementation to Terra.
@@ -330,14 +331,28 @@ a clear and material expected benefit.
 
 Prefer one coherent Codex implementation run for a bounded task.
 
+Run a delegated Codex execution in the foreground of a single tool call
+whenever practical. When it must span tool calls or turns, launch it with
+`claude-lnt-start --ttl <seconds> -- codex ...` so it holds a lease. A
+background process without a lease, including one moved to the background
+interactively after launch, is terminated at the next turn boundary by the
+Leave No Trace hooks. That termination is by design; the lease is the
+mechanism that says otherwise.
+
 Do not use `--ephemeral` for an implementation thread that may require a
 follow-up.
 
 Record the exact Codex session identifier returned by the implementation run.
 
-When a follow-up must continue the same task, resume that exact session:
+When a follow-up must continue the same task, resume that exact session with
+the same profile and sandbox as the original run. Neither is restored from
+the session: a bare `codex exec resume` silently falls back to the base
+configuration's model and effort and to the read-only sandbox, so name the
+profile the implementation actually used:
 
-    codex exec resume <SESSION_ID> "<FOLLOW_UP_PROMPT>"
+    codex --profile <SAME_PROFILE_AS_THE_ORIGINAL_RUN> exec \
+      --sandbox workspace-write \
+      resume <SESSION_ID> "<FOLLOW_UP_PROMPT>"
 
 Never use `resume --last` automatically. Another task may have created the most
 recent Codex session.

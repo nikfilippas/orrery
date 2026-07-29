@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Aggregate Claude Code and Codex CLI token usage from local session logs.
+
+Claude Code writes one JSONL transcript per session under
+~/.claude/projects, with per-message usage. The Codex CLI writes one
+rollout file per session under $CODEX_HOME/sessions, with a cumulative
+token count per session. Both are read here, never modified. The numbers
+are what the providers reported at the time and are an accounting of
+usage, not of billing.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+COLUMNS = ("fresh_in", "cache_read", "cache_write", "output", "total")
+
+
+def codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME")
+
+    if raw is None:
+        raw = str(Path.home() / ".codex")
+
+    if not raw.strip():
+        print("claude-codex-usage: CODEX_HOME cannot be empty", file=sys.stderr)
+        raise SystemExit(2)
+
+    return Path(raw).expanduser().resolve(strict=False)
+
+
+def parse_since(value: str) -> datetime:
+    try:
+        return datetime.now(timezone.utc) - timedelta(days=int(value))
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(
+            f"claude-codex-usage: --since must be a day count or a date: {value}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def parse_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def new_bucket() -> dict[str, int]:
+    bucket = {name: 0 for name in COLUMNS}
+    bucket["events"] = 0
+    return bucket
+
+
+def integer(value: Any) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def read_claude(
+    root: Path,
+    since: datetime,
+    totals: dict[tuple[str, str], dict[str, int]],
+) -> int:
+    """Aggregate assistant-message usage; one event per API response.
+
+    A response can be recorded more than once, for example when a session
+    is resumed into a new transcript, so responses are deduplicated by
+    message and request identity across every file.
+    """
+    seen: set[tuple[str, str]] = set()
+    files = 0
+
+    for path in sorted(root.glob("*/*.jsonl")):
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        files += 1
+        with handle:
+            for line in handle:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict) or data.get("type") != "assistant":
+                    continue
+                message = data.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+
+                timestamp = parse_timestamp(data.get("timestamp"))
+                if timestamp is None or timestamp < since:
+                    continue
+
+                fresh = integer(usage.get("input_tokens"))
+                cache_read = integer(usage.get("cache_read_input_tokens"))
+                cache_write = integer(usage.get("cache_creation_input_tokens"))
+                output = integer(usage.get("output_tokens"))
+                if not (fresh or cache_read or cache_write or output):
+                    # Synthetic bookkeeping messages carry no tokens. They
+                    # are skipped before deduplication so a zero-usage twin
+                    # can never swallow the counted row's identity.
+                    continue
+
+                message_id = message.get("id")
+                if isinstance(message_id, str) and message_id:
+                    key = (message_id, str(data.get("requestId", "")))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                model = message.get("model")
+                if not isinstance(model, str) or not model:
+                    model = "unknown"
+                bucket = totals.setdefault(("claude", model), new_bucket())
+                bucket["fresh_in"] += fresh
+                bucket["cache_read"] += cache_read
+                bucket["cache_write"] += cache_write
+                bucket["output"] += output
+                bucket["total"] += fresh + cache_read + cache_write + output
+                bucket["events"] += 1
+
+    return files
+
+
+def read_codex(
+    root: Path,
+    since: datetime,
+    totals: dict[tuple[str, str], dict[str, int]],
+) -> int:
+    """Aggregate per-session cumulative usage from rollout files.
+
+    Codex records a running total, so only the last complete count in each
+    file matters; summing the intermediate ones would multiply the truth.
+    """
+    files = 0
+
+    for path in sorted(root.rglob("rollout-*.jsonl")):
+        try:
+            handle = path.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        provider = "codex"
+        model = "unknown"
+        last_usage: dict[str, Any] | None = None
+        last_timestamp: datetime | None = None
+        # The model current when the count was recorded, not whatever a
+        # later turn switched to before the file ended.
+        model_at_last_usage = "unknown"
+
+        with handle:
+            for line in handle:
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                payload = data.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                kind = payload.get("type") or data.get("type")
+
+                if kind == "session_meta":
+                    recorded = payload.get("model_provider")
+                    if isinstance(recorded, str) and recorded:
+                        provider = recorded
+                elif kind == "turn_context":
+                    recorded = payload.get("model")
+                    if isinstance(recorded, str) and recorded:
+                        model = recorded
+                elif kind == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict):
+                        usage = info.get("total_token_usage")
+                        if isinstance(usage, dict) and usage:
+                            last_usage = usage
+                            model_at_last_usage = model
+                            stamp = parse_timestamp(data.get("timestamp"))
+                            if stamp is not None:
+                                last_timestamp = stamp
+
+        if last_usage is None:
+            continue
+        if last_timestamp is None or last_timestamp < since:
+            continue
+
+        files += 1
+        bucket = totals.setdefault((provider, model_at_last_usage), new_bucket())
+        cache_read = integer(last_usage.get("cached_input_tokens"))
+        fresh = max(0, integer(last_usage.get("input_tokens")) - cache_read)
+        cache_write = integer(last_usage.get("cache_write_input_tokens"))
+        output = integer(last_usage.get("output_tokens"))
+        total = integer(last_usage.get("total_tokens"))
+        bucket["fresh_in"] += fresh
+        bucket["cache_read"] += cache_read
+        bucket["cache_write"] += cache_write
+        bucket["output"] += output
+        bucket["total"] += total or (fresh + cache_read + cache_write + output)
+        bucket["events"] += 1
+
+    return files
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Report Claude Code and Codex token usage from local logs."
+        )
+    )
+    parser.add_argument(
+        "--since",
+        default="30",
+        help="day count or ISO date to start from (default: 30)",
+    )
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    args = parser.parse_args()
+
+    since = parse_since(args.since)
+    totals: dict[tuple[str, str], dict[str, int]] = {}
+
+    claude_files = read_claude(
+        Path.home() / ".claude" / "projects", since, totals
+    )
+    codex_files = read_codex(codex_home() / "sessions", since, totals)
+
+    if args.as_json:
+        print(
+            json.dumps(
+                {
+                    "since": since.isoformat(),
+                    "files": {"claude": claude_files, "codex": codex_files},
+                    "usage": [
+                        {"provider": provider, "model": model, **bucket}
+                        for (provider, model), bucket in sorted(totals.items())
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"Token usage since {since:%Y-%m-%d %H:%M} UTC")
+    print(
+        f"Sources: {claude_files} Claude transcript(s), "
+        f"{codex_files} Codex session(s)\n"
+    )
+    header = (
+        f"{'PROVIDER':10} {'MODEL':26} {'FRESH IN':>12} {'CACHE RD':>12} "
+        f"{'CACHE WR':>12} {'OUTPUT':>10} {'TOTAL':>14} {'EVENTS':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    grand = new_bucket()
+    for (provider, model), bucket in sorted(totals.items()):
+        for name in (*COLUMNS, "events"):
+            grand[name] += bucket[name]
+        print(
+            f"{provider:10} {model[:26]:26} {bucket['fresh_in']:>12,} "
+            f"{bucket['cache_read']:>12,} {bucket['cache_write']:>12,} "
+            f"{bucket['output']:>10,} {bucket['total']:>14,} "
+            f"{bucket['events']:>7,}"
+        )
+
+    print("-" * len(header))
+    print(
+        f"{'all':10} {'':26} {grand['fresh_in']:>12,} "
+        f"{grand['cache_read']:>12,} {grand['cache_write']:>12,} "
+        f"{grand['output']:>10,} {grand['total']:>14,} {grand['events']:>7,}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

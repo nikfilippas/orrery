@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -144,9 +145,20 @@ def current_session(data: dict[str, Any] | None = None) -> str:
     return value
 
 
+# The procfs root, patchable in tests. On systems without /proc, such as
+# macOS, everything derived from it degrades conservatively: liveness falls
+# back to signal 0 probes and ownership scanning finds nothing, so cleanup
+# never kills what it cannot attribute.
+PROC_ROOT = Path("/proc")
+
+
+def proc_available() -> bool:
+    return PROC_ROOT.is_dir()
+
+
 def proc_stat(pid: int) -> tuple[int, int] | None:
     try:
-        text = Path(f"/proc/{pid}/stat").read_text()
+        text = (PROC_ROOT / str(pid) / "stat").read_text()
         rest = text[text.rfind(")") + 2 :].split()
         return int(rest[1]), int(rest[19])
     except (OSError, ValueError, IndexError):
@@ -165,7 +177,7 @@ def proc_ppid(pid: int) -> int | None:
 
 def proc_cmdline(pid: int) -> str:
     try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        raw = (PROC_ROOT / str(pid) / "cmdline").read_bytes()
         return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
     except OSError:
         return ""
@@ -173,7 +185,7 @@ def proc_cmdline(pid: int) -> str:
 
 def proc_env(pid: int) -> dict[str, str]:
     try:
-        raw = Path(f"/proc/{pid}/environ").read_bytes()
+        raw = (PROC_ROOT / str(pid) / "environ").read_bytes()
     except OSError:
         return {}
     result: dict[str, str] = {}
@@ -239,11 +251,41 @@ def metadata(session_id: str) -> dict[str, Any]:
 
 
 def live_same_process(pid: int, expected_start: int | None) -> bool:
-    if pid <= 1 or not Path(f"/proc/{pid}").exists():
+    if pid <= 1:
+        return False
+    if not proc_available():
+        # Without procfs there is no start time to compare, so liveness is
+        # the best that can be known. Erring towards "alive" protects live
+        # sessions from being reclaimed as stale.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+    if not (PROC_ROOT / str(pid)).exists():
         return False
     if expected_start is None:
         return True
     return proc_start(pid) == expected_start
+
+
+def live_verified_process(pid: object, start: object) -> bool:
+    """True only when the identifier and the recorded start time both match.
+
+    Unlike `live_same_process`, a missing start time is not accepted, and
+    neither is a missing procfs: without it the start time cannot be
+    checked at all, and a signal must never be authorised by an identifier
+    alone, which a reused one would satisfy.
+    """
+    return (
+        isinstance(pid, int)
+        and pid > 1
+        and isinstance(start, int)
+        and proc_available()
+        and live_same_process(pid, start)
+    )
 
 
 def lease_records(session_id: str) -> dict[str, Any]:
@@ -267,8 +309,18 @@ def session_lock(session_id: str) -> Any:
     leaves the new holder running with no state. Both sides take this lock,
     so teardown completes before a lease is granted, or the other way round.
     """
-    path = session_lock_path(session_id)
+    with path_lock(session_lock_path(session_id)):
+        yield
 
+
+@contextlib.contextmanager
+def path_lock(path: Path) -> Any:
+    """Hold the lock file at `path`, by path rather than by session.
+
+    Reclaiming a state directory whose metadata is gone cannot name its
+    session, but the lock file is derived from the same key as the directory,
+    so it can still be taken by path and serialise against a launch.
+    """
     while True:
         handle = path.open("a+b")
         try:
@@ -314,7 +366,13 @@ def scan_session_processes(
     """
     found: list[tuple[int, str, dict[str, str]]] = []
 
-    for entry in Path("/proc").iterdir():
+    try:
+        entries = list(PROC_ROOT.iterdir())
+    except OSError:
+        # No procfs, no attribution: report nothing rather than guess.
+        return found
+
+    for entry in entries:
         if not entry.name.isdigit():
             continue
 
@@ -453,7 +511,11 @@ def profile_dirs_from_commands(commands: list[str]) -> set[Path]:
 
 def live_command_lines() -> list[str]:
     lines: list[str] = []
-    for entry in Path("/proc").iterdir():
+    try:
+        entries = list(PROC_ROOT.iterdir())
+    except OSError:
+        return lines
+    for entry in entries:
         if not entry.name.isdigit():
             continue
         command = proc_cmdline(int(entry.name))
@@ -567,10 +629,12 @@ def terminate_processes(processes: list[tuple[int, str, dict[str, str]]], sessio
         except (ProcessLookupError, PermissionError) as exc:
             append_log(session_id, f"SIGTERM {pid}: {exc}")
     deadline = time.monotonic() + TERM_GRACE_SECONDS
-    while time.monotonic() < deadline and any(Path(f"/proc/{pid}").exists() for pid in pids):
+    while time.monotonic() < deadline and any(
+        live_same_process(pid, None) for pid in pids
+    ):
         time.sleep(0.1)
     for pid in ordered:
-        if not Path(f"/proc/{pid}").exists():
+        if not live_same_process(pid, None):
             continue
         try:
             os.kill(pid, signal.SIGKILL)
@@ -579,22 +643,40 @@ def terminate_processes(processes: list[tuple[int, str, dict[str, str]]], sessio
 
 
 def safe_remove_profile(path: Path, session_id: str) -> bool:
+    """Remove a browser profile the session created, sparing everything else.
+
+    Only two classes of directory are provably session-owned: one under the
+    session's redirected temporary directory, and one in a system temporary
+    directory whose name matches the ephemeral prefixes the automation
+    drivers generate. Anything else may be a persistent profile that existed
+    before the session: a browser that merely opened it updates its
+    timestamps, so recency proves nothing about creation, and Linux exposes
+    no creation time. A pre-existing profile holds logins, bookmarks and
+    extensions and its deletion is irreversible, so it is preserved rather
+    than guessed about. Preserving it is a success, not a failure.
+    """
     try:
         resolved = path.resolve()
         info = resolved.stat()
     except OSError:
         return True
-    meta = metadata(session_id)
-    start_epoch = float(meta.get("start_epoch", 0) or 0)
-    cwd = Path(str(meta.get("cwd", "/"))).resolve()
     home = Path.home().resolve()
     tmp_root = (state_dir(session_id) / "tmp").resolve()
-    if resolved in {Path("/"), home, cwd} or info.st_uid != os.getuid():
-        return False
-    recent = max(info.st_ctime, info.st_mtime) >= start_epoch - 2
-    in_tmp = resolved == tmp_root or tmp_root in resolved.parents
-    if not in_tmp and not recent:
-        return False
+    if resolved in {Path("/"), home} or info.st_uid != os.getuid():
+        append_log(session_id, f"preserved profile {resolved}")
+        return True
+    # Strictly under the session temporary directory. The directory itself
+    # is what TMPDIR names for the whole session, so removing it would break
+    # every later mktemp in a session that is still running.
+    in_tmp = tmp_root in resolved.parents
+    temp_roots = {Path(tempfile.gettempdir()).resolve(), Path("/tmp")}
+    ephemeral = resolved.parent in temp_roots and any(
+        fnmatch.fnmatch(resolved.name, pattern)
+        for pattern in BROWSER_PROFILE_PATTERNS
+    )
+    if not in_tmp and not ephemeral:
+        append_log(session_id, f"preserved pre-existing profile {resolved}")
+        return True
     try:
         if resolved.is_dir():
             shutil.rmtree(resolved)
@@ -618,40 +700,44 @@ def run_registered_cleanup(session_id: str) -> list[str]:
         env = os.environ.copy()
         env.pop("CLAUDE_CODE_CHILD_SESSION", None)
         env["CLAUDE_LNT_INTERNAL"] = "1"
+        if isinstance(item.get("argv"), list):
+            argv = [str(value) for value in item["argv"]]
+        elif isinstance(item.get("shell"), str):
+            argv = ["bash", "-lc", item["shell"]]
+        else:
+            failures.append(f"invalid cleanup entry {path.name}")
+            continue
         try:
-            if isinstance(item.get("argv"), list):
-                result = subprocess.run(
-                    [str(value) for value in item["argv"]],
-                    cwd=cwd if Path(cwd).is_dir() else None,
-                    env=env,
-                    timeout=30,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            elif isinstance(item.get("shell"), str):
-                result = subprocess.run(
-                    ["bash", "-lc", item["shell"]],
-                    cwd=cwd if Path(cwd).is_dir() else None,
-                    env=env,
-                    timeout=30,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-            else:
-                failures.append(f"invalid cleanup entry {path.name}")
-                continue
+            # Its own session, so a command that times out can be killed as
+            # a whole group. Killing only the direct child would leave any
+            # process it forked running with CLAUDE_LNT_INTERNAL=1, which is
+            # permanently invisible to every later sweep.
+            process = subprocess.Popen(
+                argv,
+                cwd=cwd if Path(cwd).is_dir() else None,
+                env=env,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                output, _ = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    process.communicate(timeout=5)
+                raise
         except (OSError, subprocess.TimeoutExpired) as exc:
             failures.append(f"{path.name}: {exc}")
             continue
-        append_log(session_id, f"cleanup {path.name}: rc={result.returncode} {result.stdout.strip()}")
-        if result.returncode == 0:
+        append_log(session_id, f"cleanup {path.name}: rc={process.returncode} {output.strip()}")
+        if process.returncode == 0:
             path.unlink(missing_ok=True)
         else:
-            failures.append(f"{path.name}: exit {result.returncode}")
+            failures.append(f"{path.name}: exit {process.returncode}")
     return failures
 
 
@@ -723,10 +809,12 @@ def cleanup_locked(
     processes = owned(detached_only)
     commands = [command for _, command, _ in processes]
     profile_dirs = profile_dirs_from_commands(commands)
+    targeted: set[int] = set()
     if processes:
         append_log(session_id, f"cleanup found {len(processes)} owned process(es)")
         stop_snap_scopes(processes, session_id)
         processes = owned(detached_only)
+        targeted = {pid for pid, _, _ in processes}
         terminate_processes(processes, session_id)
 
     # One more reading before anything is torn down, purely to complete the
@@ -762,11 +850,13 @@ def cleanup_locked(
     # clearing it would leave that process alive without its sockets,
     # profiles and working data. Surviving the turn has to mean surviving
     # intact. The end of the session overrides leases and clears it.
+    tore_down = False
     if (
         not detached_only
         and not leased_work_in_progress
         and state_dir(session_id).is_dir()
     ):
+        tore_down = True
         # Teardown and lease revocation happen together, under the lock that
         # claude-lnt-start also takes. A lease whose holder was not
         # observable when its directory was removed is void: nothing is left
@@ -792,7 +882,19 @@ def cleanup_locked(
         except OSError as exc:
             failures.append(f"temporary directory {tmp_root}: {exc}")
 
-    residual = owned(detached_only)
+    # Residual means a process this cleanup tried to terminate and could
+    # not. An unleased process that only appeared while cleanup was
+    # running, such as a monitor's next short-lived poll child, belongs to
+    # the next sweep; reporting it would block completion on something
+    # nobody failed to clean. A late-visible lease holder after teardown is
+    # different: its lease was just revoked and its state removed, so it is
+    # stranded and has to be reported.
+    residual = [
+        entry
+        for entry in owned(detached_only)
+        if entry[0] in targeted
+        or (tore_down and entry[2].get("CLAUDE_LNT_LEASE_ID"))
+    ]
     failures.extend(f"process {pid}: {command}" for pid, command, _ in residual)
     return failures
 
@@ -807,8 +909,15 @@ def stop_watchdog(session_id: str) -> None:
             timeout=10,
             check=False,
         )
-    watcher_pid = load_json(state / "watcher.json", {}).get("pid")
-    if isinstance(watcher_pid, int) and watcher_pid != os.getpid():
+    record = load_json(state / "watcher.json", {})
+    watcher_pid = record.get("pid")
+    # The start time distinguishes the recorded watcher from an unrelated
+    # process that reused its identifier. A record without one, including
+    # any written by an earlier version, is not acted on: the systemd unit
+    # stopped above is the watchdog's primary handle either way.
+    if watcher_pid != os.getpid() and live_verified_process(
+        watcher_pid, record.get("start")
+    ):
         try:
             os.kill(watcher_pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
@@ -873,7 +982,10 @@ def start_watchdog(session_id: str, claude_pid: int, claude_start: int | None) -
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    save_json(state_dir(session_id) / "watcher.json", {"pid": process.pid})
+    save_json(
+        state_dir(session_id) / "watcher.json",
+        {"pid": process.pid, "start": proc_start(process.pid)},
+    )
 
 
 def sweep_orphan_locks() -> None:
@@ -898,6 +1010,47 @@ def sweep_orphan_locks() -> None:
             continue
 
 
+def reclaim_unattributed_state(path: Path) -> None:
+    """Reclaim a state directory that has no readable session metadata.
+
+    claude-lnt-start can recreate a state directory after its session has
+    ended, and nothing writes metadata into it again, so without this the
+    directory and any process recorded in its leases would leak for good.
+    Lease terms are capped at a day, so once the directory has been
+    untouched for that long nothing in it can still be legitimately
+    protected. Processes are only killed when their recorded start time
+    still matches, so a reused identifier is never a casualty.
+    """
+    try:
+        if time.time() - path.stat().st_mtime < MAX_WATCH_SECONDS:
+            return
+    except OSError:
+        return
+
+    # The same lock a launch takes, named from the directory rather than
+    # from a session identifier this state no longer records. Without it a
+    # launch landing after the age check would have its brand new lease and
+    # its process destroyed.
+    with path_lock(path.parent / f".{path.name}.lock"):
+        try:
+            # Rechecked under the lock: a launch may have refreshed the
+            # directory between the first check and the acquisition.
+            if time.time() - path.stat().st_mtime < MAX_WATCH_SECONDS:
+                return
+        except OSError:
+            return
+
+        leases = load_json(path / "leases.json", {})
+        if isinstance(leases, dict):
+            for item in leases.values():
+                if isinstance(item, dict) and live_verified_process(
+                    item.get("pid"), item.get("start")
+                ):
+                    with contextlib.suppress(OSError):
+                        os.kill(item["pid"], signal.SIGKILL)
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def sweep_stale_states() -> None:
     sweep_orphan_locks()
 
@@ -909,6 +1062,7 @@ def sweep_stale_states() -> None:
         pid = int(meta.get("claude_pid", 0) or 0)
         start = meta.get("claude_start")
         if not isinstance(session_id, str) or not session_id:
+            reclaim_unattributed_state(path)
             continue
         if live_same_process(pid, int(start) if isinstance(start, int) else None):
             continue
@@ -924,7 +1078,6 @@ def sweep_stale_states() -> None:
 def hook_start() -> int:
     data = read_json_stdin()
     session_id = current_session(data)
-    sweep_stale_states()
     state = state_dir(session_id)
     private_dir(state)
     private_dir(state / "cleanup.d")
@@ -967,7 +1120,208 @@ def hook_start() -> int:
             }
         )
     )
+    sys.stdout.flush()
+    # The sweep of other sessions' stale state runs last. This session's own
+    # state, TMPDIR redirection and watchdog must exist even when reclaiming
+    # a dirty machine is slow enough to hit the hook timeout, because losing
+    # them silently disables Leave No Trace for the whole session.
+    sweep_stale_states()
     return 0
+
+
+HEREDOC_OPENER = re.compile(
+    r"<<(-?)[ \t]*(?:'([^']*)'|\"([^\"]*)\"|([\w.-]+))"
+)
+
+# A detach keyword only detaches when it is the command being run. The same
+# word as an argument, a filename or a search pattern does not, so `git grep
+# disown` must not be blocked. Assignments and prefix commands may precede it.
+DETACH_COMMAND = re.compile(
+    r"(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b)"
+    r"(?:[ \t]*(?:[A-Za-z_]\w*=\S*|command|env|exec|nice|ionice|stdbuf|time))*"
+    r"[ \t]*(?:nohup|setsid|disown)\b",
+    re.M,
+)
+
+# An unquoted `&` that ends a command, rather than `&&`, `2>&1` or a literal.
+TRAILING_AMPERSAND = re.compile(r"(?<![>&])&\s*(?:$|[;\n])")
+
+
+def matching_paren(text: str, start: int) -> int:
+    """Index of the `)` closing the `(` at `start`, or -1."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def collect_substitutions(text: str, pieces: list[str]) -> None:
+    """Collect command substitutions from text that is otherwise literal.
+
+    A heredoc body and a double-quoted string are data, but `$(...)` and
+    backticks inside them still run, so their contents are executable even
+    though everything around them is not.
+    """
+    index = 0
+    while index < len(text):
+        if text.startswith("$(", index):
+            end = matching_paren(text, index + 1)
+            if end == -1:
+                return
+            collect_executable(text[index + 2 : end], pieces)
+            index = end + 1
+            continue
+        if text[index] == "`":
+            end = text.find("`", index + 1)
+            if end == -1:
+                return
+            collect_executable(text[index + 1 : end], pieces)
+            index = end + 1
+            continue
+        index += 1
+
+
+def collect_executable(text: str, pieces: list[str]) -> None:
+    """Append every fragment of `text` that bash would execute to `pieces`.
+
+    Detach detection has to run on what executes, not on the raw command.
+    Single-quoted spans and heredoc bodies are literal data, so a script
+    written with `cat <<EOF` that contains `server &` starts nothing. A
+    substitution runs wherever it appears, including inside a double-quoted
+    string or an unquoted heredoc body, so each one is collected as its own
+    fragment: it begins a fresh command context, which is what makes a
+    detach keyword inside it recognisable as the command being run.
+
+    The result is not a runnable reconstruction. It only has to contain
+    everything bash would run and nothing bash would treat as text.
+    """
+    code: list[str] = []
+    queued: list[tuple[str, bool, bool]] = []
+    index = 0
+    length = len(text)
+
+    while index < length:
+        character = text[index]
+
+        if character == "\n":
+            code.append("\n")
+            index += 1
+            for terminator, expands, strip_tabs in queued:
+                index, body = consume_heredoc(text, index, terminator, strip_tabs)
+                if expands:
+                    collect_substitutions(body, pieces)
+            queued = []
+            continue
+
+        if character == "\\" and index + 1 < length:
+            # An escaped alphanumeric is part of a word, so `no\hup` still
+            # names nohup. An escaped punctuation character is a literal and
+            # must not be read as syntax.
+            if text[index + 1].isalnum():
+                code.append(text[index + 1])
+            index += 2
+            continue
+
+        if character == "'":
+            end = text.find("'", index + 1)
+            code.append(" ")
+            index = length if end == -1 else end + 1
+            continue
+
+        if character == '"':
+            end = index + 1
+            while end < length:
+                if text[end] == "\\" and end + 1 < length:
+                    end += 2
+                    continue
+                if text[end] == '"':
+                    break
+                end += 1
+            collect_substitutions(text[index + 1 : end], pieces)
+            code.append(" ")
+            index = end + 1
+            continue
+
+        if text.startswith("$(", index):
+            end = matching_paren(text, index + 1)
+            if end == -1:
+                index = length
+                continue
+            collect_executable(text[index + 2 : end], pieces)
+            code.append(" ")
+            index = end + 1
+            continue
+
+        if character == "`":
+            end = text.find("`", index + 1)
+            if end == -1:
+                index = length
+                continue
+            collect_executable(text[index + 1 : end], pieces)
+            code.append(" ")
+            index = end + 1
+            continue
+
+        if text.startswith("<<", index) and not text.startswith("<<<", index):
+            opened = HEREDOC_OPENER.match(text, index)
+            if opened:
+                terminator = opened.group(2) or opened.group(3) or opened.group(4)
+                # A single-quoted delimiter suppresses expansion, so even
+                # substitutions in that body are literal.
+                queued.append(
+                    (terminator, opened.group(2) is None, opened.group(1) == "-")
+                )
+                code.append(" ")
+                index = opened.end()
+                continue
+
+        code.append(character)
+        index += 1
+
+    pieces.append("".join(code))
+
+
+def consume_heredoc(
+    text: str,
+    index: int,
+    terminator: str,
+    strip_tabs: bool,
+) -> tuple[int, str]:
+    """Skip a heredoc body, returning the index after it and the body.
+
+    The delimiter line must match exactly, as bash requires. Only `<<-`
+    strips leading tabs, so a tab-indented delimiter after a plain `<<` is
+    still body text.
+    """
+    body: list[str] = []
+    length = len(text)
+
+    while index < length:
+        end = text.find("\n", index)
+        if end == -1:
+            end = length
+        line = text[index:end]
+        index = end + 1 if end < length else length
+
+        candidate = line.rstrip("\r")
+        if strip_tabs:
+            candidate = candidate.lstrip("\t")
+        if candidate == terminator:
+            break
+        body.append(line)
+
+    return index, "\n".join(body)
+
+
+def executable_text(command: str) -> str:
+    pieces: list[str] = []
+    collect_executable(command, pieces)
+    return "\n".join(pieces)
 
 
 def hook_guard() -> int:
@@ -984,12 +1338,11 @@ def hook_guard() -> int:
         re.search(r"\btrap\b.*\b(EXIT|INT|TERM)\b", command, re.S)
         and re.search(r"\bwait\b", command)
     )
+    executable = executable_text(command)
     raw_detach = bool(
         background
-        or re.search(r"(^|[;&|]\s*)nohup\b", command)
-        or re.search(r"\bdisown\b", command)
-        or re.search(r"(^|[;&|]\s*)setsid\b", command)
-        or re.search(r"(?<![>&])&\s*(?:$|[;\n])", command)
+        or DETACH_COMMAND.search(executable)
+        or TRAILING_AMPERSAND.search(executable)
     )
     if raw_detach and not safe_wrapper and not self_cleaning:
         print(
@@ -1056,7 +1409,24 @@ def hook_cleanup(action: str) -> int:
 
 def watch(session_id: str, claude_pid: int, claude_start: int | None) -> int:
     deadline = time.monotonic() + MAX_WATCH_SECONDS
-    while time.monotonic() < deadline and live_same_process(claude_pid, claude_start):
+    while live_same_process(claude_pid, claude_start):
+        if time.monotonic() >= deadline:
+            # Liveness is rechecked here rather than trusted from the loop
+            # condition: Claude may have exited in between, and that is a
+            # crash to clean up after, not a term to lapse.
+            if not live_same_process(claude_pid, claude_start):
+                break
+            # The watch term ended with Claude still alive. Tearing down now
+            # would kill a live session's processes, revoke valid leases and
+            # delete the state directory its exported TMPDIR points into.
+            # The watchdog lapses instead: the session's own Stop and
+            # SessionEnd hooks still clean up, and only crash protection is
+            # lost for the remainder of the session.
+            append_log(
+                session_id,
+                "watchdog term expired with the session still alive",
+            )
+            return 0
         cleanup(
             session_id,
             detached_only=True,

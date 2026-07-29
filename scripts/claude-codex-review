@@ -143,9 +143,14 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str]:
             if index + 1 >= len(argv):
                 raise UsageError("missing value for --output")
             index += 1
+            if not argv[index]:
+                raise UsageError("--output requires a non-empty path")
             output_path = Path(argv[index])
         elif argument.startswith("--output="):
-            output_path = Path(argument.split("=", 1)[1])
+            value = argument.split("=", 1)[1]
+            if not value:
+                raise UsageError("--output requires a non-empty path")
+            output_path = Path(value)
         elif argument.startswith("-"):
             raise UsageError(f"unknown wrapper option: {argument}")
         else:
@@ -218,6 +223,21 @@ def profile_model(profile: str) -> str:
     return value.strip()
 
 
+def report(message: str) -> None:
+    """Write a diagnostic to stderr, tolerating a closed descriptor.
+
+    Every stream this wrapper writes to can be closed by its caller. A
+    diagnostic that raised in place of being delivered would replace a
+    reportable outcome with a traceback.
+    """
+    try:
+        if sys.stderr is None:
+            return
+        print(f"claude-codex-review: {message}", file=sys.stderr)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
 def tail_text(path: Path, lines: int = 80) -> str:
     if not path.exists():
         return ""
@@ -238,6 +258,8 @@ def run_systemctl(
             check=False,
             text=True,
         )
+    except FileNotFoundError as exc:
+        raise RuntimeError("systemctl is unavailable") from exc
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
             f"systemctl timed out: {' '.join(arguments)}"
@@ -389,12 +411,43 @@ def stop_unit(unit: str) -> None:
 
     # `systemctl stop` can fail, time out, or report success while the
     # control group is still alive.
-    attempt("kill", "--kill-whom=all", "--signal=KILL", unit)
+    # `--kill-who`, not `--kill-whom`: the older spelling is accepted by
+    # every supported systemd release, while the newer one is rejected
+    # before systemd 252 and would silently disarm this escalation there.
+    attempt("kill", "--kill-who=all", "--signal=KILL", unit)
     if settled():
         return
 
     problems.append(f"transient review unit did not stop: {unit}")
     raise RuntimeError("; ".join(problems))
+
+
+def terminate_group(process: subprocess.Popen[bytes]) -> None:
+    """Signal the whole process group, even after its leader has exited.
+
+    In the fallback mode the group is the only containment there is, so a
+    descendant must not survive merely because the leader finished first.
+    The group identifier cannot be reused while any member lives; the
+    window after the last member dies is unavoidable without procfs and is
+    kept minimal by signalling immediately.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
 
 
 def terminate_client(process: subprocess.Popen[bytes]) -> None:
@@ -525,6 +578,16 @@ def process_start_time(pid: int) -> int | None:
         return None
 
 
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def record_runtime_owner(run_dir: Path, unit: str = "") -> None:
     # No numeric sentinel for an unknown start time. It has to read back as
     # unattributable rather than as a match for any owner.
@@ -623,6 +686,15 @@ def sweep_stale_runtime(root: Path) -> None:
         recorded, unit = read_runtime_owner(entry)
         live_start = process_start_time(owner)
 
+        if (
+            live_start is None
+            and not Path("/proc").is_dir()
+            and process_alive(owner)
+        ):
+            # Without procfs a live owner has no readable start time. Never
+            # reclaim state from under a process that is demonstrably alive.
+            continue
+
         if live_start is not None:
             # Only a recorded start time that matches proves the directory
             # belongs to the process that is currently alive. Matching on
@@ -720,16 +792,28 @@ def main() -> int:
         print(usage(), file=sys.stderr, end="")
         return 2
 
-    for command in ("codex", "systemd-run", "systemctl"):
-        if shutil.which(command) is None:
-            print(
-                f"claude-codex-review: required command unavailable: {command}",
-                file=sys.stderr,
-            )
-            return 127
-
     codex_path = shutil.which("codex")
-    assert codex_path is not None
+    if codex_path is None:
+        print(
+            "claude-codex-review: required command unavailable: codex",
+            file=sys.stderr,
+        )
+        return 127
+
+    # systemd gives the run control-group containment and a RuntimeMaxSec
+    # backstop. Where it does not exist, such as on macOS, the run degrades
+    # to a plain process group: timeout and interruption still kill the
+    # group, but a descendant that detaches from it can only be caught by
+    # the surrounding Leave No Trace sweeps.
+    use_systemd = all(
+        shutil.which(tool) is not None for tool in ("systemd-run", "systemctl")
+    )
+    if not use_systemd:
+        print(
+            "claude-codex-review: systemd is unavailable; running without "
+            "control-group containment.",
+            file=sys.stderr,
+        )
 
     profile = "sol"
     try:
@@ -770,6 +854,10 @@ def main() -> int:
             control_returned = True
 
     def handle_signal(signum: int, _frame: object) -> None:
+        # Every other handled signal is blocked before the exception is
+        # raised, so a second interruption cannot land inside the cleanup in
+        # `finally` and abandon it part way through.
+        signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
         raise ReviewInterrupted(signum)
 
     # Deliberately not a TemporaryDirectory: its finaliser would remove the
@@ -801,40 +889,14 @@ def main() -> int:
         )
         # mkdtemp's mode is masked by the umask, so it is set explicitly.
         run_dir.chmod(0o700)
-        record_runtime_owner(run_dir, unit)
+        record_runtime_owner(run_dir, unit if use_systemd else "")
         tmp_dir = run_dir / "tmp"
         tmp_dir.mkdir()
         tmp_dir.chmod(0o700)
         verdict_path = run_dir / "verdict.txt"
         log_path = run_dir / "codex.log"
-        launcher_path, environment_path = write_service_launcher(
-            run_dir,
-            tmp_dir,
-        )
 
-        command = [
-            "systemd-run",
-            "--user",
-            "--quiet",
-            "--wait",
-            "--collect",
-            "--pipe",
-            f"--unit={unit_base}",
-            "--property=Type=exec",
-            "--property=KillMode=control-group",
-            "--property=TimeoutStopSec=10s",
-            # The service is started by the user manager, not forked from
-            # this process, so it does not inherit the umask set in main().
-            "--property=UMask=0077",
-            # Backstop owned by systemd rather than by this process, so an
-            # uncatchable death of the wrapper (SIGKILL, power loss of the
-            # controlling terminal) still cannot leave Codex running forever.
-            # The wrapper's own timeout fires first and reports diagnostics.
-            f"--property=RuntimeMaxSec={timeout_seconds + 60}s",
-            f"--working-directory={Path.cwd()}",
-            sys.executable,
-            str(launcher_path),
-            str(environment_path),
+        codex_arguments = [
             codex_path,
             "--profile",
             profile,
@@ -849,6 +911,43 @@ def main() -> int:
             prompt,
         ]
 
+        if use_systemd:
+            launcher_path, environment_path = write_service_launcher(
+                run_dir,
+                tmp_dir,
+            )
+            command = [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--wait",
+                "--collect",
+                "--pipe",
+                f"--unit={unit_base}",
+                "--property=Type=exec",
+                "--property=KillMode=control-group",
+                "--property=TimeoutStopSec=10s",
+                # The service is started by the user manager, not forked
+                # from this process, so it does not inherit the umask set
+                # in main().
+                "--property=UMask=0077",
+                # Backstop owned by systemd rather than by this process, so
+                # an uncatchable death of the wrapper (SIGKILL, power loss
+                # of the controlling terminal) still cannot leave Codex
+                # running forever. The wrapper's own timeout fires first
+                # and reports diagnostics.
+                f"--property=RuntimeMaxSec={timeout_seconds + 60}s",
+                f"--working-directory={Path.cwd()}",
+                sys.executable,
+                str(launcher_path),
+                str(environment_path),
+                *codex_arguments,
+            ]
+        else:
+            # Codex runs as a direct child in its own session, with the
+            # same scrubbed environment the launcher would have applied.
+            command = codex_arguments
+
         started = time.monotonic()
         deadline = started + timeout_seconds
 
@@ -858,15 +957,25 @@ def main() -> int:
                 handled_signals,
             )
             try:
-                unit_may_exist = True
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                wait_for_unit_registration(process, unit)
+                if use_systemd:
+                    unit_may_exist = True
+                    process = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                    wait_for_unit_registration(process, unit)
+                else:
+                    process = subprocess.Popen(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                        env=codex_environment(tmp_dir),
+                    )
             finally:
                 signal.pthread_sigmask(
                     signal.SIG_SETMASK,
@@ -894,9 +1003,9 @@ def main() -> int:
                     )
 
             if timed_out:
-                stop_unit(unit)
-                terminate_client(process)
-
+                # Reported before the stop, so a wedged user bus or an
+                # unstoppable unit cannot swallow the timeout message and
+                # the Codex diagnostics along with the 124 status.
                 print(
                     f"Codex review timed out after {timeout_seconds}s.",
                     file=sys.stderr,
@@ -908,6 +1017,17 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(diagnostics, file=sys.stderr)
+
+                # A stop that fails here must not turn the documented
+                # timeout status into a generic failure: the `finally`
+                # block retries the stop and reports a genuine cleanup
+                # failure, so a transient one still exits 124.
+                if use_systemd:
+                    try:
+                        stop_unit(unit)
+                    except RuntimeError as exc:
+                        print(f"claude-codex-review: {exc}", file=sys.stderr)
+                terminate_client(process)
                 return 124
 
         if return_code != 0:
@@ -943,13 +1063,43 @@ def main() -> int:
 
         verdict = verdict_path.read_text(errors="replace")
 
-        if output_path is not None:
-            publish_atomically(verdict_path, output_path)
+        # A completed review is expensive and unrepeatable, so every
+        # destination is attempted independently and a failure of one never
+        # skips another. The run directory is removed in `finally`, so a
+        # verdict that reached nowhere would be lost for good.
+        printed = True
+        try:
+            if sys.stdout is None:
+                # Python leaves sys.stdout as None when the descriptor was
+                # closed before the process started, so this is an ordinary
+                # invocation to survive rather than an internal error.
+                raise OSError("stdout is closed")
+            sys.stdout.write(verdict)
+            if not verdict.endswith("\n"):
+                sys.stdout.write("\n")
+            sys.stdout.flush()
+        except (OSError, ValueError, AttributeError) as exc:
+            printed = False
+            report(f"the verdict could not be printed: {exc}")
 
-        sys.stdout.write(verdict)
-        if not verdict.endswith("\n"):
-            sys.stdout.write("\n")
-        return 0
+        published: bool | None = None
+        if output_path is not None:
+            try:
+                publish_atomically(verdict_path, output_path)
+                published = True
+            except OSError as exc:
+                published = False
+                report(
+                    f"the verdict could not be written to {output_path}: {exc}"
+                )
+
+        if not printed and not published:
+            # Last resort, so that a review that reached neither stdout nor
+            # its destination is still recoverable from the transcript.
+            report("--- Codex verdict ---")
+            report(verdict)
+
+        return 0 if printed and published is not False else 1
     except ReviewInterrupted as exc:
         print(
             f"Codex review interrupted by signal {exc.signum}.",
@@ -972,6 +1122,8 @@ def main() -> int:
 
         if process is not None:
             terminate_client(process)
+            if not use_systemd:
+                terminate_group(process)
 
         if run_dir is not None:
             if unit_stopped:

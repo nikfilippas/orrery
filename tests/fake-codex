@@ -25,9 +25,17 @@ def output_path(argv: list[str]) -> Path | None:
 def main() -> int:
     mode = os.environ.get("CODEX_FAKE_MODE", "success")
     marker = os.environ.get("CODEX_FAKE_MARKER")
+    arguments_path = os.environ.get("CODEX_FAKE_ARGS")
 
     if marker:
         Path(marker).write_text(f"{os.getpid()}\n")
+
+    if arguments_path:
+        # One argument per line, so the tests can assert the exact
+        # invocation contract the wrapper promises.
+        Path(arguments_path).write_text(
+            "\n".join(sys.argv[1:]) + "\n"
+        )
 
     if mode == "detach":
         # A descendant that ignores SIGTERM, lives in its own session, and
@@ -51,6 +59,22 @@ def main() -> int:
 
     if mode == "sleep":
         time.sleep(3600)
+        return 0
+
+    if mode == "linger":
+        # A descendant in the same process group that outlives its parent:
+        # writes its identifier to the marker so a test can prove it died.
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if marker:
+            Path(marker).write_text(f"{child.pid}\n")
+        destination = output_path(sys.argv[1:])
+        if destination is not None:
+            destination.write_text("# PASS\nfake verdict\n")
         return 0
 
     if mode == "empty":

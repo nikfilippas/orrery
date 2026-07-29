@@ -49,7 +49,31 @@ def load_renameat2() -> Any:
     return entry
 
 
+# Darwin's atomic swap. RENAME_SWAP per <sys/stdio.h>; the semantics match
+# RENAME_EXCHANGE. This path follows Apple's manpage and is exercised only
+# where renameat2 is absent; on Linux it is never reached.
+DARWIN_RENAME_SWAP = 0x00000002
+
+
+def load_renamex_np() -> Any:
+    if sys.platform != "darwin":
+        return None
+    try:
+        library = ctypes.CDLL(
+            ctypes.util.find_library("c") or "libc.dylib",
+            use_errno=True,
+        )
+        entry = library.renamex_np
+    except (AttributeError, OSError):
+        return None
+
+    entry.restype = ctypes.c_int
+    entry.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    return entry
+
+
 RENAMEAT2 = load_renameat2()
+RENAMEX_NP = load_renamex_np()
 
 
 UNSUPPORTED_EXCHANGE = (
@@ -67,28 +91,39 @@ class AtomicExchangeUnavailable(RuntimeError):
 def exchange_paths(first: Path, second: Path) -> None:
     """Atomically swap two directory entries.
 
-    There is no weaker fallback. Without RENAME_EXCHANGE the update would
-    have to check the target and then replace it in a separate syscall,
-    which silently discards anything a writer outside the sidecar lock
-    installs in between, so an update is refused instead.
+    There is no weaker fallback. Without an atomic exchange the update
+    would have to check the target and then replace it in a separate
+    syscall, which silently discards anything a writer outside the sidecar
+    lock installs in between, so an update is refused instead. Linux
+    provides renameat2 with RENAME_EXCHANGE; Darwin provides renamex_np
+    with RENAME_SWAP.
     """
-    if RENAMEAT2 is None:
-        raise AtomicExchangeUnavailable("renameat2 is unavailable in libc")
+    if RENAMEAT2 is not None:
+        status = RENAMEAT2(
+            AT_FDCWD,
+            os.fsencode(str(first)),
+            AT_FDCWD,
+            os.fsencode(str(second)),
+            RENAME_EXCHANGE,
+        )
+    elif RENAMEX_NP is not None:
+        status = RENAMEX_NP(
+            os.fsencode(str(first)),
+            os.fsencode(str(second)),
+            DARWIN_RENAME_SWAP,
+        )
+    else:
+        raise AtomicExchangeUnavailable(
+            "no atomic exchange syscall is available in libc"
+        )
 
-    status = RENAMEAT2(
-        AT_FDCWD,
-        os.fsencode(str(first)),
-        AT_FDCWD,
-        os.fsencode(str(second)),
-        RENAME_EXCHANGE,
-    )
     if status == 0:
         return
 
     code = ctypes.get_errno()
     if code in UNSUPPORTED_EXCHANGE:
         raise AtomicExchangeUnavailable(
-            f"RENAME_EXCHANGE is unsupported here: {os.strerror(code)}"
+            f"atomic exchange is unsupported here: {os.strerror(code)}"
         )
 
     raise OSError(code, os.strerror(code), str(first), None, str(second))

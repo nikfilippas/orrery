@@ -4,7 +4,61 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 KIT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
-REQUESTED_DIR="${1:-$PWD}"
+MODELS_FILE="$KIT_DIR/global/claude-models.json"
+
+usage() {
+    printf 'Usage: claude-codex-init [model] [directory]\n' >&2
+    printf 'A bare argument that names a known model alias selects the\n' >&2
+    printf 'principal orchestrator for the repository; anything else must\n' >&2
+    printf 'be an existing directory. Known model aliases:\n' >&2
+    python3 - "$MODELS_FILE" <<'PY' >&2 || true
+import json
+import sys
+from pathlib import Path
+
+try:
+    table = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+for alias in sorted(table):
+    print(f"  {alias} -> {table[alias]}")
+PY
+}
+
+is_model_alias() {
+    python3 - "$MODELS_FILE" "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    table = json.loads(Path(sys.argv[1]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+raise SystemExit(0 if isinstance(table, dict) and sys.argv[2] in table else 1)
+PY
+}
+
+MODEL_ALIAS=""
+REQUESTED_DIR="$PWD"
+DIRECTORY_CHOSEN=0
+
+for argument in "$@"; do
+    if [ -z "$MODEL_ALIAS" ] && is_model_alias "$argument"; then
+        MODEL_ALIAS="$argument"
+    elif [ -d "$argument" ] && [ "$DIRECTORY_CHOSEN" -eq 0 ]; then
+        REQUESTED_DIR="$argument"
+        DIRECTORY_CHOSEN=1
+    else
+        # A second directory is refused rather than silently winning, so an
+        # accidental extra argument cannot migrate the wrong repository.
+        printf 'Unexpected argument: %s\n' "$argument" >&2
+        usage
+        exit 2
+    fi
+done
 
 if [ ! -d "$REQUESTED_DIR" ]; then
     printf "Directory does not exist: %s\n" "$REQUESTED_DIR" >&2
@@ -90,12 +144,17 @@ else:
     print(f"Appended managed workflow block:\n{target_path}")
 PYCODE
 
+# `--git-path` output is relative to the repository root unless Git already
+# absolutised it, as it does for worktrees. `--path-format=absolute` would
+# be simpler but only exists from Git 2.31, and older rev-parse echoes an
+# unknown option instead of failing.
 EXCLUDE_FILE="$(
-    git -C "$PROJECT_ROOT" \
-        rev-parse \
-        --path-format=absolute \
-        --git-path info/exclude
+    git -C "$PROJECT_ROOT" rev-parse --git-path info/exclude
 )"
+case "$EXCLUDE_FILE" in
+    /*) ;;
+    *) EXCLUDE_FILE="$PROJECT_ROOT/$EXCLUDE_FILE" ;;
+esac
 
 mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
@@ -113,6 +172,120 @@ else
         printf "\n/CLAUDE.local.md\n" >> "$EXCLUDE_FILE"
         printf "\nAdded CLAUDE.local.md to:\n%s\n" "$EXCLUDE_FILE"
     fi
+fi
+
+if [ -n "$MODEL_ALIAS" ]; then
+    if ! MODEL_VALUE="$(
+        python3 - "$MODELS_FILE" "$MODEL_ALIAS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+table = json.loads(Path(sys.argv[1]).read_text())
+value = table.get(sys.argv[2])
+
+if not isinstance(value, str) or not value.strip():
+    raise SystemExit(f"invalid model alias entry: {sys.argv[2]}")
+
+print(value.strip())
+PY
+    )"; then
+        printf 'Could not resolve the model alias: %s\n' "$MODEL_ALIAS" >&2
+        exit 2
+    fi
+
+    # The model is a personal choice, so it goes into the repository's
+    # settings.local.json rather than the shared settings, through the
+    # atomic updater so that unrelated personal settings survive.
+    MODEL_SOURCE="$(mktemp "${TMPDIR:-/tmp}/claude-codex-model.XXXXXX")"
+    trap 'rm -f "$MODEL_SOURCE"' EXIT
+    python3 - "$MODEL_VALUE" > "$MODEL_SOURCE" <<'PY'
+import json
+import sys
+
+print(json.dumps({"model": sys.argv[1]}, indent=2))
+PY
+
+    printf "\n=== Principal orchestrator ===\n"
+    LOCAL_SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
+
+    # The updater follows a settings symlink, so the file that actually
+    # changes is the resolved referent. The tracked-file warning and the
+    # exclusion patterns are both derived from that resolution; a referent
+    # outside the repository needs neither, because nothing in this
+    # repository's status can change.
+    RELATIVE_TARGET="$(
+        python3 - "$PROJECT_ROOT" "$LOCAL_SETTINGS" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+link = Path(sys.argv[2])
+target = link.resolve(strict=False) if link.is_symlink() else link
+
+try:
+    print(target.resolve(strict=False).relative_to(root))
+except ValueError:
+    print("")
+PY
+    )"
+
+    # `:(literal)` because brackets and asterisks are glob syntax in a Git
+    # pathspec, and the referent's name is a literal file name.
+    if [ -n "$RELATIVE_TARGET" ] &&
+       git -C "$PROJECT_ROOT" \
+           ls-files --error-unmatch -- ":(literal)$RELATIVE_TARGET" \
+           >/dev/null 2>&1
+    then
+        printf 'WARNING: %s is tracked by Git.\n' "$RELATIVE_TARGET"
+        printf 'The model selection will appear as a tracked change; untrack\n'
+        printf 'the file to keep the choice personal.\n'
+    fi
+
+    "$KIT_DIR/scripts/apply-claude-settings.py" \
+        --model \
+        --source "$MODEL_SOURCE" \
+        --target "$LOCAL_SETTINGS"
+
+    while IFS= read -r pattern; do
+        [ -n "$pattern" ] || continue
+        if ! grep -Fxq "$pattern" "$EXCLUDE_FILE"; then
+            printf '%s\n' "$pattern" >> "$EXCLUDE_FILE"
+        fi
+    done <<PATTERNS
+$(
+        python3 - "$RELATIVE_TARGET" <<'PY'
+import re
+import sys
+
+patterns = ["/.claude/settings.local.json"]
+relative = sys.argv[1]
+
+
+def escape(text: str) -> str:
+    # Git reads exclude patterns as globs, so a literal name containing
+    # `*`, `?`, `[`, `]` or a backslash has to escape them to keep
+    # matching literally.
+    return re.sub(r"([\\*?\[\]])", r"\\\1", text)
+
+
+if relative:
+    parts = relative.rsplit("/", 1)
+    if len(parts) == 2:
+        prefix, name = escape(parts[0] + "/"), parts[1]
+    else:
+        prefix, name = "", parts[0]
+    stem = escape(name)
+    patterns.append(f"/{prefix}{stem}.backup-claude-codex-*")
+    patterns.append(f"/{prefix}.{stem}.claude-codex.lock")
+
+print("\n".join(patterns))
+PY
+)
+PATTERNS
+
+    printf 'Model for this repository: %s -> %s\n' \
+        "$MODEL_ALIAS" "$MODEL_VALUE"
 fi
 
 printf "\n=== Conflict scan ===\n"

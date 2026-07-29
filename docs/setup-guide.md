@@ -37,6 +37,7 @@ Two rules shape everything else:
 | --- | --- |
 | `global/CLAUDE.md` | The development policy, installed as `~/.claude/CLAUDE.md` |
 | `global/claude-settings.json` | Canonical model, hooks, companion state and permission rules |
+| `global/claude-models.json` | Friendly model aliases resolved by `claude-codex-init` |
 | `global/skills/development-orchestrator/SKILL.md` | Task classification and model routing |
 | `global/hooks/leave-no-trace.py` | Session lifecycle hook and `claude-lnt-*` implementation |
 | `global/codex/luna.config.toml` | Low-effort Codex profile |
@@ -50,6 +51,7 @@ Two rules shape everything else:
 | `scripts/set-codex-companion-state.sh` | Compatibility wrapper for `--companion` |
 | `scripts/install-lnt-hooks.sh` | Installs the Leave No Trace links and hooks |
 | `scripts/claude-codex-review` | Synchronous independent review through Sol |
+| `scripts/claude-codex-usage` | Aggregates Claude and Codex token usage from local session logs |
 | `scripts/claude-lnt-start` | Runs a process under a lease that outlives the tool call |
 | `scripts/claude-lnt-register` | Registers a rollback command |
 | `scripts/claude-lnt-cleanup` | Runs cleanup for a session on demand |
@@ -61,15 +63,25 @@ Two rules shape everything else:
 
 ## Installation
 
-Requires Ubuntu or another systemd Linux, Claude Code, Codex CLI, Python 3.11
-or newer, `git` and `jq`.
+Requires Claude Code, Codex CLI, Python 3.11 or newer, `git` and `jq`.
+Linux with systemd is the primary platform. macOS is supported with reduced
+containment: reviews run in a plain process group instead of a transient
+systemd service, and without procfs the hygiene hooks degrade conservatively
+(they never kill what they cannot attribute). The macOS code paths follow
+the platform documentation but have been validated on Linux only.
 
 ```bash
 git clone <remote> ~/src/claude-codex-kit
 cd ~/src/claude-codex-kit
 ./scripts/install.sh
+codex login      # once per machine; the doctor checks authentication
 claude-codex-doctor
 ```
+
+The installed commands live in `~/.local/bin`, which must be on `PATH`.
+The installer warns when it is not, and the doctor fails until it is. On
+Ubuntu, `~/.profile` adds it automatically at the next login once the
+directory exists.
 
 `install.sh` is idempotent: a link that is already correct is left alone, and
 nothing is backed up on a rerun. It refuses to run if a target resolves to
@@ -94,6 +106,7 @@ locked transaction, preserving everything the kit does not own.
 
 ```bash
 claude-codex-init /path/to/repository   # migrate a repository
+claude-codex-init fable                 # migrate and set the repository model
 claude-codex-doctor                     # validate, no model calls
 ./tests/run-tests.py                    # full regression suite
 ./tests/run-tests.py CODEX_HOME         # only matching tests
@@ -110,6 +123,14 @@ systemd user service. A timeout, an interruption, or an uncatchable death of
 the wrapper stops the whole control group. It refuses to run if the `sol`
 profile is missing, because Codex exits zero on an unknown `--profile` and
 silently substitutes its default model.
+
+Token usage across both providers, read from the local session logs and
+never from the network:
+
+```bash
+claude-codex-usage --since 7        # last seven days, per provider and model
+claude-codex-usage --json           # machine-readable
+```
 
 Non-interactive sessions should run at moderate effort:
 
@@ -129,11 +150,24 @@ eight minutes, and completed in under three at `medium`.
   `global/claude-settings.json`, then run
   `./scripts/apply-claude-settings.py --model`.
 - **For one session:** `claude --model <name>`.
-- **For one repository:** set it in that repository's `CLAUDE.local.md`.
+- **For one repository:** `claude-codex-init <alias> [repository]`, for
+  example `claude-codex-init fable`. The alias is resolved through
+  `global/claude-models.json` and written into that repository's
+  `.claude/settings.local.json`, which the migration keeps out of Git, so
+  the choice is personal and unrelated personal settings survive.
+  Instruction files such as `CLAUDE.local.md` cannot change the model;
+  Claude Code selects it from settings before any instructions are read.
+- **When a new model is released:** add or repoint its alias in
+  `global/claude-models.json` for Claude, or edit the profile TOML for
+  Codex. The installed paths are symlinks, so both changes are live
+  immediately; repositories that named an updated alias pick it up by
+  rerunning `claude-codex-init <alias>` there.
 
 Run `claude-codex-doctor` afterwards. It validates that each profile sets a
-model and the expected reasoning effort, and that the default Claude model
-matches the canonical settings.
+model and the expected reasoning effort, that the alias map is well formed,
+and that the default Claude model matches the canonical settings. Until the
+edit is committed, the doctor also reports the kit repository as dirty; that
+single failure is expected and clears with the commit.
 
 ## Validation
 
@@ -180,7 +214,11 @@ a typo produces work from a model you did not choose.
 
 **The active model does not match the kit** — `~/.claude/settings.json` is
 authoritative for the default. Run `./scripts/apply-claude-settings.py
---model`, and check for a per-repository override in `CLAUDE.local.md`.
+--model`, and check for a per-repository override in that repository's
+`.claude/settings.local.json` or `.claude/settings.json`.
+
+**The doctor fails on Codex authentication** — run `codex login` once on the
+machine and rerun the doctor.
 
 **`CLAUDE.local.md` appears in Git status** — `init-project.sh` adds it to
 `.git/info/exclude`. If it was committed before migration, remove it from the
