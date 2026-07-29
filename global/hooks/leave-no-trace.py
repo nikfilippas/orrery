@@ -1114,7 +1114,11 @@ def hook_start() -> int:
                     "additionalContext": (
                         "Leave No Trace automation is active. Use claude-lnt-start for any "
                         "process that must span tool calls and claude-lnt-register before "
-                        "an external mutation that needs a custom rollback."
+                        "an external mutation that needs a custom rollback. "
+                        "Open the first reply of this session with one discreet line "
+                        "naming the active model, in the form: "
+                        "↳ Principal orchestrator · <model>. Surfaces such as "
+                        "the VS Code extension show no model header of their own."
                     ),
                 }
             }
