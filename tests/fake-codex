@@ -8,6 +8,7 @@ exercised without spending Codex credits or reaching the network.
 from __future__ import annotations
 
 import os
+import json
 import signal
 import subprocess
 import sys
@@ -26,6 +27,8 @@ def main() -> int:
     mode = os.environ.get("CODEX_FAKE_MODE", "success")
     marker = os.environ.get("CODEX_FAKE_MARKER")
     arguments_path = os.environ.get("CODEX_FAKE_ARGS")
+    stdin_path = os.environ.get("CODEX_FAKE_STDIN")
+    environment_path = os.environ.get("CODEX_FAKE_ENV")
 
     if marker:
         Path(marker).write_text(f"{os.getpid()}\n")
@@ -36,6 +39,18 @@ def main() -> int:
         Path(arguments_path).write_text(
             "\n".join(sys.argv[1:]) + "\n"
         )
+
+    assignment = sys.stdin.read()
+    if stdin_path:
+        Path(stdin_path).write_text(assignment)
+
+    if environment_path:
+        selected = {
+            name: value
+            for name, value in os.environ.items()
+            if name.startswith(("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_"))
+        }
+        Path(environment_path).write_text(json.dumps(selected, sort_keys=True))
 
     if mode == "detach":
         # A descendant that ignores SIGTERM, lives in its own session, and

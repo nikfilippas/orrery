@@ -37,9 +37,12 @@ sys.dont_write_bytecode = True
 KIT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_SCRIPT = KIT_DIR / "scripts" / "apply-claude-settings.py"
 REVIEW_SCRIPT = KIT_DIR / "scripts" / "orrery-review"
+RUNTIME_SCRIPT = KIT_DIR / "scripts" / "orrery_runtime.py"
+CONFIG_SCRIPT = KIT_DIR / "scripts" / "orrery-config"
 INSTALL_SCRIPT = KIT_DIR / "scripts" / "install.sh"
 DOCTOR_SCRIPT = KIT_DIR / "scripts" / "doctor.sh"
 FAKE_CODEX = Path(__file__).resolve().parent / "fake-codex"
+FAKE_CLAUDE = Path(__file__).resolve().parent / "fake-claude"
 
 UNIT_GLOB = "orrery-review-*"
 
@@ -80,6 +83,7 @@ def load_script(path: Path, name: str) -> types.ModuleType:
 
 settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
 review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
+runtime_module = sys.modules["orrery_runtime"]
 
 
 # ---------------------------------------------------------------------------
@@ -199,11 +203,14 @@ def runtime_residue() -> list[str]:
 def review_environment(mode: str, marker: Path | None = None) -> dict[str, str]:
     bin_dir = Path(tempfile.mkdtemp(prefix="kit-fake-bin."))
     shutil.copy2(FAKE_CODEX, bin_dir / "codex")
+    shutil.copy2(FAKE_CLAUDE, bin_dir / "claude")
     (bin_dir / "codex").chmod(0o755)
+    (bin_dir / "claude").chmod(0o755)
 
     environment = os.environ.copy()
     environment["PATH"] = f"{bin_dir}{os.pathsep}{environment.get('PATH', '')}"
     environment["CODEX_FAKE_MODE"] = mode
+    environment["CLAUDE_FAKE_MODE"] = mode
     environment["KIT_FAKE_BIN"] = str(bin_dir)
     if marker is not None:
         environment["CODEX_FAKE_MARKER"] = str(marker)
@@ -2082,6 +2089,7 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
 
     environment = review_environment("success")
     original_stop = review_module.stop_unit
+    original_program_name = review_module.PROGRAM_NAME
     original_argv = sys.argv
     saved_environment = os.environ.copy()
 
@@ -2102,6 +2110,7 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
         os.environ["PATH"] = environment["PATH"]
         os.environ["CODEX_FAKE_MODE"] = "success"
         review_module.stop_unit = refuse
+        review_module.PROGRAM_NAME = "orrery-review"
         sys.argv = ["orrery-review", "--timeout", "60", "--", "prompt"]
 
         reported = False
@@ -2119,6 +2128,7 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
         )
     finally:
         review_module.stop_unit = original_stop
+        review_module.PROGRAM_NAME = original_program_name
         sys.argv = original_argv
         os.environ.clear()
         os.environ.update(saved_environment)
@@ -2318,48 +2328,74 @@ def test_empty_codex_home() -> None:
             )
 
 
-@test("a missing Codex profile is refused rather than silently substituted")
-def test_missing_profile_refused() -> None:
-    """Codex exits 0 on an unknown --profile, using its default model."""
+@test("an invalid manifest role is refused rather than silently substituted")
+def test_invalid_manifest_role_refused() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        home = Path(directory)
-
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
         environment = review_environment("success")
-        environment["CODEX_HOME"] = str(home)
-
-        # The stand-in stays on PATH for both invocations, so neither
-        # depends on a real Codex CLI being installed on this machine.
         try:
+            manifest_path = kit / "global" / "orchestration.json"
+            manifest = read_json(manifest_path)
+            reviewer = next(
+                step for step in manifest["steps"] if step["id"] == "reviewer"
+            )
+            reviewer["model"] = ""
+            write_json(manifest_path, manifest)
             result = subprocess.run(
-                [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
+                [
+                    sys.executable,
+                    str(kit / "scripts" / "orrery-review"),
+                    "--timeout",
+                    "60",
+                    "--",
+                    "prompt",
+                ],
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=180,
+                timeout=60,
+                check=False,
             )
             require(
                 result.returncode == 2,
-                f"a missing profile was accepted (status {result.returncode})",
+                f"a model-less role was accepted (status {result.returncode})",
             )
             require(
-                "not readable" in result.stderr,
+                "has no model" in result.stderr,
                 f"unexpected diagnostic: {result.stderr.strip()!r}",
             )
 
-            # A profile that exists but sets no model is equally unusable.
-            (home / "reviewer.config.toml").write_text('model_reasoning_effort = "high"\n')
+            reviewer["model"] = "gpt-5.6-sol"
+            reviewer["provider"] = "anthropic"
+            reviewer["thinking"] = "max"
+            write_json(manifest_path, manifest)
             result = subprocess.run(
-                [sys.executable, str(REVIEW_SCRIPT), "--timeout", "60", "--", "prompt"],
+                [
+                    sys.executable,
+                    str(kit / "scripts" / "orrery-review"),
+                    "--timeout",
+                    "60",
+                    "--",
+                    "prompt",
+                ],
                 env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=180,
+                timeout=60,
+                check=False,
             )
             require(
-                result.returncode == 2 and "does not set a model" in result.stderr,
-                f"a model-less profile was accepted: {result.stderr.strip()!r}",
+                result.returncode == 2
+                and "belongs to openai, not anthropic" in result.stderr,
+                f"a cross-provider mismatch was accepted: {result.stderr!r}",
             )
         finally:
             shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
@@ -2529,13 +2565,19 @@ def test_proc_fallback() -> None:
         )
 
 
-@test("Codex is invoked with the reviewer profile, read-only sandbox and prompt")
+@test("Codex receives an explicit model, thinking, sandbox and private prompt")
 def test_codex_invocation_contract() -> None:
     """The wrapper's central promises live in the argv it hands to Codex."""
     with tempfile.TemporaryDirectory() as directory:
         arguments_path = Path(directory) / "argv.txt"
+        stdin_path = Path(directory) / "stdin.txt"
+        environment_path = Path(directory) / "environment.json"
         environment = review_environment("success")
         environment["CODEX_FAKE_ARGS"] = str(arguments_path)
+        environment["CODEX_FAKE_STDIN"] = str(stdin_path)
+        environment["CODEX_FAKE_ENV"] = str(environment_path)
+        environment["OPENAI_ORRERY_TEST"] = "openai-kept"
+        environment["ANTHROPIC_ORRERY_TEST"] = "anthropic-dropped"
 
         process = start_review(
             environment, "--timeout", "60", "--", "-p", "the prompt"
@@ -2549,8 +2591,9 @@ def test_codex_invocation_contract() -> None:
         arguments = arguments_path.read_text().splitlines()
 
         for flag, value in (
-            ("--profile", "reviewer"),
+            ("--model", "gpt-5.6-sol"),
             ("--sandbox", "read-only"),
+            ("-c", 'model_reasoning_effort="ultra"'),
         ):
             require(flag in arguments, f"codex was not passed {flag}")
             require(
@@ -2558,13 +2601,268 @@ def test_codex_invocation_contract() -> None:
                 f"codex was passed {flag} "
                 f"{arguments[arguments.index(flag) + 1]!r}, not {value!r}",
             )
-        for expected in ("exec", "--ephemeral", "--output-last-message"):
+        for expected in (
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            "-",
+        ):
             require(expected in arguments, f"codex was not passed {expected}")
         require(
-            arguments[-1] == "-p the prompt",
-            f"the prompt was mangled: {arguments[-1]!r}",
+            "-p the prompt" not in arguments
+            and all("the prompt" not in argument for argument in arguments),
+            f"the private prompt leaked into argv: {arguments!r}",
+        )
+        handoff = stdin_path.read_text()
+        require(
+            handoff.startswith("ORRERY ROLE HANDOFF\nRole: reviewer\n")
+            and "bounded non-principal session" in handoff
+            and "Read-only: do not modify files." in handoff
+            and handoff.rstrip().endswith("-p the prompt"),
+            f"the role handoff was incomplete or mangled: {handoff!r}",
+        )
+        provider_env = read_json(environment_path)
+        require(
+            provider_env.get("OPENAI_ORRERY_TEST") == "openai-kept"
+            and "ANTHROPIC_ORRERY_TEST" not in provider_env,
+            f"the OpenAI adapter leaked the other provider's environment: "
+            f"{provider_env}",
         )
         assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("Claude receives an explicit model, maximum effort, cache flag and sandbox")
+def test_claude_invocation_contract() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        reviewer = next(
+            step for step in manifest["steps"] if step["id"] == "reviewer"
+        )
+        reviewer.update(
+            provider="anthropic",
+            model="sonnet",
+            thinking="max",
+        )
+        write_json(manifest_path, manifest)
+
+        arguments_path = root / "argv.txt"
+        stdin_path = root / "stdin.txt"
+        settings_path = root / "settings.json"
+        environment_path = root / "environment.json"
+        environment = review_environment("success")
+        environment["CLAUDE_FAKE_ARGS"] = str(arguments_path)
+        environment["CLAUDE_FAKE_STDIN"] = str(stdin_path)
+        environment["CLAUDE_FAKE_SETTINGS"] = str(settings_path)
+        environment["CLAUDE_FAKE_ENV"] = str(environment_path)
+        environment["ANTHROPIC_ORRERY_TEST"] = "anthropic-kept"
+        environment["OPENAI_ORRERY_TEST"] = "openai-dropped"
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(kit / "scripts" / "orrery-review"),
+                "--timeout",
+                "60",
+                "--",
+                "private Claude assignment",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=120)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            stop_stray_units(f"orrery-review-{process.pid}-")
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"Claude adapter failed ({process.returncode}): {stderr}",
+        )
+        arguments = arguments_path.read_text().splitlines()
+        for flag, value in (
+            ("--model", "sonnet"),
+            ("--effort", "max"),
+            ("--output-format", "json"),
+            ("--permission-mode", "plan"),
+        ):
+            require(
+                flag in arguments
+                and arguments[arguments.index(flag) + 1] == value,
+                f"Claude did not receive {flag} {value}: {arguments}",
+            )
+        for flag in (
+            "--print",
+            "--exclude-dynamic-system-prompt-sections",
+            "--no-session-persistence",
+            "--settings",
+        ):
+            require(flag in arguments, f"Claude was not passed {flag}")
+        require(
+            all("private Claude assignment" not in value for value in arguments)
+            and stdin_path.read_text().rstrip().endswith(
+                "private Claude assignment"
+            ),
+            "the Claude assignment was exposed in argv or lost from stdin",
+        )
+
+        settings = read_json(settings_path)
+        sandbox = settings.get("sandbox", {})
+        deny = settings.get("permissions", {}).get("deny", [])
+        require(
+            sandbox.get("enabled") is True
+            and sandbox.get("failIfUnavailable") is True
+            and sandbox.get("allowUnsandboxedCommands") is False
+            and str(Path.cwd().resolve())
+            in sandbox.get("filesystem", {}).get("denyWrite", [])
+            and {"Edit", "Write", "NotebookEdit"} <= set(deny),
+            f"the Claude reviewer sandbox is not fail-closed: {settings}",
+        )
+        provider_env = read_json(environment_path)
+        require(
+            provider_env.get("ANTHROPIC_ORRERY_TEST") == "anthropic-kept"
+            and "OPENAI_ORRERY_TEST" not in provider_env,
+            f"the Anthropic adapter leaked the other provider environment: "
+            f"{provider_env}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("every runtime role can use either provider without profiles")
+def test_every_role_is_provider_neutral() -> None:
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    original_which = runtime_module.shutil.which
+    runtime_module.shutil.which = lambda command: f"/fake/{command}"
+    try:
+        for provider, model, thinking, executable in (
+            ("anthropic", "fable", "max", "/fake/claude"),
+            ("openai", "gpt-5.6-sol", "ultra", "/fake/codex"),
+        ):
+            configured = copy.deepcopy(manifest)
+            for step in configured["steps"]:
+                step.update(
+                    provider=provider,
+                    model=model,
+                    thinking=thinking,
+                )
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "orchestration.json"
+                write_json(path, configured)
+                roles = {
+                    role_id: runtime_module.load_role(role_id, path)
+                    for role_id in (
+                        "orchestrator",
+                        "mechanic",
+                        "implementer",
+                        "plan-reviewer",
+                        "reviewer",
+                    )
+                }
+                principal = runtime_module.principal_command(
+                    roles["orchestrator"], []
+                )
+                require(
+                    principal[0] == executable
+                    and model in principal
+                    and any(thinking in argument for argument in principal),
+                    f"{provider} could not act as principal: {principal}",
+                )
+                for role_id in (
+                    "mechanic",
+                    "implementer",
+                    "plan-reviewer",
+                    "reviewer",
+                ):
+                    settings = (
+                        Path(directory) / "claude-settings.json"
+                        if provider == "anthropic"
+                        else None
+                    )
+                    command = runtime_module.delegated_command(
+                        roles[role_id],
+                        Path(directory) / "verdict.txt",
+                        settings,
+                    )
+                    require(
+                        command[0] == executable
+                        and model in command
+                        and any(thinking in argument for argument in command),
+                        f"{provider} could not run {role_id}: {command}",
+                    )
+                    expected_access = (
+                        "read-only"
+                        if role_id in ("plan-reviewer", "reviewer")
+                        else "workspace-write"
+                    )
+                    if provider == "openai":
+                        require(
+                            command[command.index("--sandbox") + 1]
+                            == expected_access,
+                            f"{role_id} lost its access contract: {command}",
+                        )
+                    else:
+                        require(
+                            command[command.index("--permission-mode") + 1]
+                            == (
+                                "plan"
+                                if expected_access == "read-only"
+                                else "acceptEdits"
+                            ),
+                            f"{role_id} lost its Claude permission mode",
+                        )
+    finally:
+        runtime_module.shutil.which = original_which
+
+
+@test("a repository can select Codex as its principal without changing defaults")
+def test_repository_principal_override() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        (repository / ".git").mkdir()
+        write_json(
+            repository / ".orrery.json",
+            {
+                "orchestrator": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "thinking": "ultra",
+                }
+            },
+        )
+        role = runtime_module.load_role(
+            "orchestrator",
+            cwd=repository,
+        )
+        require(
+            (role.provider, role.model, role.thinking)
+            == ("openai", "gpt-5.6-sol", "ultra"),
+            f"repository principal override was ignored: {role}",
+        )
+        global_role = runtime_module.load_role(
+            "orchestrator",
+            cwd=KIT_DIR,
+        )
+        require(
+            (global_role.provider, global_role.model, global_role.thinking)
+            == ("anthropic", "fable", "max"),
+            "the repository override mutated global defaults",
+        )
 
 
 @test("an unwritable --output destination cannot lose a completed verdict")
@@ -2661,7 +2959,9 @@ def test_normal_completion() -> None:
         require(output.exists(), "verdict was not published")
         require("# PASS" in output.read_text(), "published verdict is wrong")
         require(
-            "Codex Reviewer" in stderr and "control resumed" in stderr,
+            "Reviewer · openai · gpt-5.6-sol · thinking ultra"
+            in stderr
+            and "control resumed" in stderr,
             f"handover messages missing: {stderr!r}",
         )
         require(
@@ -2754,7 +3054,7 @@ def test_empty_verdict() -> None:
     _, stderr = finish_review(process, environment)
 
     require(process.returncode == 1, f"expected status 1: {process.returncode}")
-    require("no final verdict" in stderr, f"not reported: {stderr!r}")
+    require("no final result" in stderr, f"not reported: {stderr!r}")
     assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
@@ -4542,40 +4842,77 @@ def test_orchestration_manifest() -> None:
         }
         for provider, entries in catalogue["providers"].items()
     }
+    expected_ids = [
+        "orchestrator",
+        "mechanic",
+        "implementer",
+        "plan-reviewer",
+        "reviewer",
+    ]
+    require(
+        [step.get("id") for step in manifest["steps"]] == expected_ids,
+        "manifest roles are missing, duplicated, or reordered",
+    )
     steps = {step["id"]: step for step in manifest["steps"]}
     require(
-        {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"} <= set(steps),
+        set(expected_ids) == set(steps),
         f"manifest is missing core steps: {sorted(steps)}",
     )
-    for step in steps.values():
-        path = KIT_DIR / step["file"]
-        require(path.is_file(), f"manifest names a missing file: {step['file']}")
+    expected_access = {
+        "orchestrator": "principal",
+        "mechanic": "workspace-write",
+        "implementer": "workspace-write",
+        "plan-reviewer": "read-only",
+        "reviewer": "read-only",
+    }
+    for role_id, step in steps.items():
         require(
             bool(step.get("summary")) and bool(step.get("selects")),
             f"step {step['id']} lacks its explanatory text",
         )
-        if step["kind"] == "codex-profile":
-            with path.open("rb") as handle:
-                profile = __import__("tomllib").load(handle)
-            model = profile.get("model")
-            thinking = profile.get("model_reasoning_effort")
-        else:
-            settings_data = read_json(path)
-            model = settings_data.get("model")
-            environment = settings_data.get("env", {})
-            thinking = (
-                environment.get("CLAUDE_CODE_EFFORT_LEVEL")
-                if isinstance(environment, dict)
-                else None
-            ) or settings_data.get("effortLevel")
-        choice = known.get(step["provider"], {}).get(model)
+        require(
+            step.get("provider") in {"anthropic", "openai"}
+            and step.get("access") == expected_access[role_id],
+            f"{role_id} has an invalid provider or access contract",
+        )
+        choice = known.get(step["provider"], {}).get(step.get("model"))
         if choice is not None:
             levels = choice["thinking_levels"]
             require(
-                (thinking in levels) if levels else thinking is None,
-                f"{step['id']} has unsupported thinking {thinking!r} "
-                f"for {model!r}",
+                (step.get("thinking") in levels)
+                if levels
+                else step.get("thinking") is None,
+                f"{step['id']} has unsupported thinking "
+                f"{step.get('thinking')!r} for {step.get('model')!r}",
             )
+
+    require(
+        (
+            steps["orchestrator"]["provider"],
+            steps["orchestrator"]["model"],
+            steps["orchestrator"]["thinking"],
+        )
+        == ("anthropic", "fable", "max"),
+        "the principal default is not Fable at maximum thinking",
+    )
+    for role_id in ("plan-reviewer", "reviewer"):
+        require(
+            (
+                steps[role_id]["provider"],
+                steps[role_id]["model"],
+                steps[role_id]["thinking"],
+            )
+            == ("openai", "gpt-5.6-sol", "ultra"),
+            f"{role_id} does not default to Sol at maximum thinking",
+        )
+    claude_settings = read_json(KIT_DIR / "global" / "claude-settings.json")
+    require(
+        "model" not in claude_settings
+        and "effortLevel" not in claude_settings
+        and "CLAUDE_CODE_EFFORT_LEVEL"
+        not in claude_settings.get("env", {}),
+        "Claude settings duplicate the provider-neutral role manifest",
+    )
 
     settings = manifest.get("settings")
     require(isinstance(settings, dict), "manifest settings are not an object")
@@ -4617,13 +4954,6 @@ def test_model_catalogue() -> None:
             "opus": ["low", "medium", "high", "xhigh", "max"],
             "sonnet": ["low", "medium", "high", "xhigh", "max"],
             "haiku": [],
-            "claude-fable-5[1m]": [
-                "low", "medium", "high", "xhigh", "max"
-            ],
-            "claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
-            "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
-            "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
-            "claude-haiku-4-5-20251001": [],
         },
         "openai": {
             "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -4672,25 +5002,45 @@ def test_model_catalogue() -> None:
             f"catalogue still characterises a model as {characterisation}",
         )
 
-    # Every configured model must be selectable, so that opening the page
-    # and saving cannot silently change anything.
+    all_identities = {
+        (provider, entry["id"])
+        for provider, entries in providers.items()
+        for entry in entries
+    }
+    all_labels = [
+        entry["label"]
+        for entries in providers.values()
+        for entry in entries
+    ]
+    require(
+        len(all_labels) == len(set(all_labels)),
+        f"the ordinary dropdown contains duplicate labels: {all_labels}",
+    )
+
+    # Every role gets the complete provider-neutral menu, and opening the
+    # page cannot silently change its current selection.
     module = load_script(
         KIT_DIR / "scripts" / "orrery-config", "kit_config_choices"
     )
     for state in module.snapshot():
-        offered = {choice["id"] for choice in state["choices"]}
+        offered = {
+            (choice["provider"], choice["id"])
+            for choice in state["choices"]
+            if choice["known"]
+        }
         require(
-            state["model"] in offered,
-            f"{state['id']}'s current model {state['model']!r} is not offered",
+            offered == all_identities,
+            f"{state['id']} does not offer both providers completely",
         )
         require(
-            len(offered) > 1,
-            f"{state['id']} has nothing to choose between",
+            (state["provider"], state["model"]) in offered,
+            f"{state['id']}'s current provider/model is not offered",
         )
         current = next(
             choice
             for choice in state["choices"]
-            if choice["id"] == state["model"]
+            if choice["provider"] == state["provider"]
+            and choice["id"] == state["model"]
         )
         if current["known"]:
             levels = current["thinking_levels"]
@@ -4701,34 +5051,23 @@ def test_model_catalogue() -> None:
                 f"{state['id']} exposes an impossible thinking choice",
             )
 
-    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+    manifest_steps = {
+        step["id"]: step
+        for step in read_json(
+            KIT_DIR / "global" / "orchestration.json"
+        )["steps"]
+    }
     require(
-        canonical.get("model") == "fable"
-        and canonical.get("env", {}).get("CLAUDE_CODE_EFFORT_LEVEL") == "max",
+        manifest_steps["orchestrator"]["model"] == "fable"
+        and manifest_steps["orchestrator"]["thinking"] == "max",
         "the orchestrator does not default to Fable 5 at max",
     )
-    with (
-        KIT_DIR / "global" / "codex" / "plan-reviewer.config.toml"
-    ).open("rb") as handle:
-        plan_reviewer = __import__("tomllib").load(handle)
-    require(
-        plan_reviewer == {
-            "model": "gpt-5.6-sol",
-            "model_reasoning_effort": "ultra",
-        },
-        f"the plan reviewer does not default to maximum Sol thinking: {plan_reviewer}",
-    )
-    with (
-        KIT_DIR / "global" / "codex" / "reviewer.config.toml"
-    ).open("rb") as handle:
-        reviewer = __import__("tomllib").load(handle)
-    require(
-        reviewer == {
-            "model": "gpt-5.6-sol",
-            "model_reasoning_effort": "ultra",
-        },
-        f"the final reviewer does not default to maximum Sol thinking: {reviewer}",
-    )
+    for role_id in ("plan-reviewer", "reviewer"):
+        require(
+            manifest_steps[role_id]["model"] == "gpt-5.6-sol"
+            and manifest_steps[role_id]["thinking"] == "ultra",
+            f"{role_id} does not default to maximum Sol thinking",
+        )
 
     defaults = {
         entry["id"]: entry.get("default_thinking")
@@ -4738,9 +5077,6 @@ def test_model_catalogue() -> None:
     for model in (
         "fable",
         "sonnet",
-        "claude-fable-5[1m]",
-        "claude-fable-5",
-        "claude-sonnet-5",
     ):
         require(
             defaults.get(model) == "max",
@@ -4906,6 +5242,7 @@ def test_manifest_chart() -> None:
     readme = (KIT_DIR / "README.md").read_text()
     diagram_start = readme.index("flowchart TB")
     diagram = readme[diagram_start:readme.index("```", diagram_start)]
+    diagram_lower = diagram.lower()
     for token in (
         "classify",
         "findings",
@@ -4915,18 +5252,23 @@ def test_manifest_chart() -> None:
         "blocking",
         "round cap",
     ):
-        require(token in diagram, f"the README flowchart no longer mentions {token}")
+        require(
+            token in diagram_lower,
+            f"the README flowchart no longer mentions {token}",
+        )
         require(
             any(token in node["label"] or token in node["id"] for node in nodes.values())
             or any(token in edge.get("label", "") for edge in chart["edges"]),
             f"the chart omits {token}, which the README documents",
         )
     require(
-        "direction LR" in diagram and "R[read-only sandboxes only] ~~~ K" in diagram,
+        "direction LR" in diagram
+        and 'I0["investigation"] ~~~ T0["trivial"]' in diagram
+        and 'S0["standard"] ~~~ X0["complex"]' in diagram,
         "the README does not constrain the classifier results left to right",
     )
     readme_branch_positions = [
-        diagram.index(f"C -->|{label}|")
+        diagram.index(f"C ---->|{label}|")
         for label, _target in expected_branches
     ]
     require(
@@ -5023,7 +5365,7 @@ def test_plan_review_setting_validation() -> None:
 
 @test("policy, skill and SessionStart agree on bounded plan review")
 def test_plan_review_contract_alignment() -> None:
-    policy = (KIT_DIR / "global" / "CLAUDE.md").read_text()
+    policy = (KIT_DIR / "global" / "AGENTS.md").read_text()
     skill = (
         KIT_DIR / "global" / "skills" / "development-orchestrator" / "SKILL.md"
     ).read_text()
@@ -5035,7 +5377,7 @@ def test_plan_review_contract_alignment() -> None:
             "advisory",
             "stop early",
             "stop before implementation",
-            "ask the user to decide",
+            "ask the user to choose",
         ):
             require(
                 phrase in text_lower,
@@ -5053,13 +5395,10 @@ def test_plan_review_contract_alignment() -> None:
     )
 
 
-@test("the review wrapper accepts a profile and refuses an unsafe one")
-def test_review_profile_option() -> None:
+@test("the agent runner accepts a role and refuses an unsafe one")
+def test_agent_role_option() -> None:
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory)
-        (home / "plan-reviewer.config.toml").write_text(
-            'model = "fake-plan-model"\nmodel_reasoning_effort = "high"\n'
-        )
         environment = review_environment("success")
         environment["CODEX_HOME"] = str(home)
 
@@ -5068,7 +5407,13 @@ def test_review_profile_option() -> None:
 
         try:
             process = start_review(
-                environment, "--profile", "plan-reviewer", "--timeout", "60", "--", "prompt"
+                environment,
+                "--role",
+                "plan-reviewer",
+                "--timeout",
+                "60",
+                "--",
+                "prompt",
             )
             _, stderr = finish_review(process, environment)
             require(
@@ -5076,23 +5421,25 @@ def test_review_profile_option() -> None:
                 f"a plan-reviewer review failed ({process.returncode}): {stderr}",
             )
             require(
-                "Codex Plan reviewer · fake-plan-model · plan review" in stderr,
-                f"the handover did not name the profile's role: {stderr!r}",
+                "Plan reviewer · openai · gpt-5.6-sol · thinking ultra"
+                in stderr,
+                f"the handover did not name the configured role: {stderr!r}",
             )
             arguments = arguments_path.read_text().splitlines()
             require(
-                arguments[arguments.index("--profile") + 1] == "plan-reviewer",
-                "codex was not invoked with the requested profile",
+                arguments[arguments.index("--model") + 1] == "gpt-5.6-sol"
+                and arguments[arguments.index("--sandbox") + 1] == "read-only",
+                "the plan reviewer did not receive its static adapter",
             )
             assert_no_review_residue(f"orrery-review-{process.pid}-")
 
-            # A profile name becomes a filename and must not escape.
+            # A role identifier can select only one manifest entry.
             for hostile in ("../reviewer", "a/b", ""):
                 result = subprocess.run(
                     [
                         sys.executable,
                         str(REVIEW_SCRIPT),
-                        f"--profile={hostile}",
+                        f"--role={hostile}",
                         "--",
                         "prompt",
                     ],
@@ -5105,16 +5452,18 @@ def test_review_profile_option() -> None:
                 )
                 require(
                     result.returncode == 2
-                    and "invalid profile name" in result.stderr,
-                    f"an unsafe profile was accepted: {hostile!r}",
+                    and (
+                        "invalid role name" in result.stderr
+                        or "--role is required" in result.stderr
+                    ),
+                    f"an unsafe role was accepted: {hostile!r}",
                 )
         finally:
             shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
-@test("the configuration surface previews and applies model changes")
-def test_config_surface() -> None:
-    """The GUI is a veneer: reads the live files, writes only through them."""
+def exercise_provider_neutral_config_surface() -> None:
+    """Exercise the HTTP surface against an isolated checkout."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         kit = root / "kit"
@@ -5125,17 +5474,9 @@ def test_config_surface() -> None:
         )
         home = root / "home"
         home.mkdir()
-        # User-added keys must survive a model rewrite, including a quoted
-        # key that would become invalid TOML if emitted bare.
-        terra_toml = kit / "global" / "codex" / "implementer.config.toml"
-        terra_toml.write_text(
-            terra_toml.read_text()
-            + 'approval_policy = "never"\n'
-            + '"custom key" = "keep"\n'
-        )
-
         environment = os.environ.copy()
         environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(home / ".codex")
 
         process = subprocess.Popen(
             [
@@ -5167,19 +5508,13 @@ def test_config_surface() -> None:
             import urllib.request
 
             page = urllib.request.urlopen(url, timeout=10).read().decode()
-            require(
-                "gpt-5.6-terra" in page
-                and "Principal orchestrator" in page
-                and "plan_review_rounds" in page
-                and "review rounds" in page
-                and "const offset = Number(link.offset || 0);" in page,
-                "the page was not generated from the live configuration",
-            )
             for forbidden in (
                 "No model runs here",
                 "· fast",
                 "· balanced",
                 "· strongest",
+                "claude-fable-5[1m]",
+                "claude-sonnet-5",
             ):
                 require(
                     forbidden not in page,
@@ -5187,15 +5522,45 @@ def test_config_surface() -> None:
                 )
             require(
                 'data-kind="thinking"' in page
-                and "function syncRole(" in page
-                and "selectThinking(" in page,
-                "the page lacks dependent, tandem thinking controls",
+                and '["anthropic", "openai"].map(provider =>' in page
+                and 'provider === "anthropic" ? "Anthropic" : "OpenAI"'
+                in page
+                and "const kin = Boolean(chosen && !self" in page
+                and 'box.classList.toggle("self", self)' in page,
+                "the page lacks provider-neutral controls or tandem hover logic",
+            )
+            require(
+                ".cnode.self { box-shadow:" in page
+                and ".cnode.kin { box-shadow:" not in page,
+                "a tandem node receives the hovered node's outline",
             )
 
-            bad = url.replace("/t/", "/t/deadbeef")
+            catalogue = read_json(kit / "global" / "model-catalogue.json")
+            identities = {
+                f"{provider}::{entry['id']}"
+                for provider, entries in catalogue["providers"].items()
+                for entry in entries
+            }
+            module = load_script(
+                kit / "scripts" / "orrery-config",
+                f"kit_config_isolated_{time.time_ns()}",
+            )
+            for state in module.snapshot():
+                values = [
+                    f"{choice['provider']}::{choice['id']}"
+                    for choice in state["choices"]
+                    if choice["known"]
+                ]
+                require(
+                    set(values) == identities
+                    and len(values) == len(set(values)),
+                    f"a model menu is incomplete or duplicated: {values}",
+                )
+
+            bad = url.replace("/t/", "/t/deadbeef", 1)
             try:
                 urllib.request.urlopen(bad, timeout=10)
-                raise Failure("a wrong token was accepted")
+                raise Failure("a wrong URL token was accepted")
             except urllib.error.HTTPError as error:
                 require(error.code == 404, f"wrong token gave {error.code}")
 
@@ -5211,293 +5576,195 @@ def test_config_surface() -> None:
                 except urllib.error.HTTPError as error:
                     return json.loads(error.read())
 
-            preview = post("preview", {"implementer": {"model": "gpt-7-terra"}})
-            require(
-                len(preview["edits"]) == 1
-                and '-model = "gpt-5.6-terra"' in preview["edits"][0]["diff"]
-                and '+model = "gpt-7-terra"' in preview["edits"][0]["diff"],
-                f"the preview diff is wrong: {preview}",
-            )
-            require(
-                "gpt-5.6-terra"
-                in (kit / "global" / "codex" / "implementer.config.toml").read_text(),
-                "a preview must not modify anything",
-            )
-
-            rounds_preview = post(
-                "preview", {"plan_review_rounds": {"value": 4}}
-            )
-            require(
-                len(rounds_preview["edits"]) == 1
-                and '"value": 2' in rounds_preview["edits"][0]["diff"]
-                and '"value": 4' in rounds_preview["edits"][0]["diff"],
-                f"the plan-review preview is wrong: {rounds_preview}",
-            )
-            require(
-                read_json(kit / "global" / "orchestration.json")["settings"]
-                ["plan_review_rounds"]["value"]
-                == 2,
-                "previewing the round cap modified the manifest",
-            )
-
-            thinking_preview = post(
-                "preview",
-                {
-                    "implementer": {
-                        "model": "gpt-5.6-terra",
-                        "thinking": "high",
-                    }
+            all_anthropic = {
+                "mechanic": {
+                    "provider": "anthropic",
+                    "model": "opus",
+                    "thinking": "max",
                 },
-            )
-            require(
-                len(thinking_preview.get("edits", [])) == 1
-                and '-model_reasoning_effort = "medium"'
-                in thinking_preview["edits"][0]["diff"]
-                and '+model_reasoning_effort = "high"'
-                in thinking_preview["edits"][0]["diff"],
-                f"thinking-only preview is wrong: {thinking_preview}",
-            )
-            unsupported = (
-                ("gpt-5.5", "max"),
-                ("gpt-5.6-luna", "ultra"),
-            )
-            for model, thinking in unsupported:
-                rejected = post(
-                    "preview",
-                    {
-                        "implementer": {
-                            "model": model,
-                            "thinking": thinking,
-                        }
-                    },
-                )
-                require(
-                    "error" in rejected,
-                    f"unsupported {model} + {thinking} was accepted",
-                )
-            rejected = post(
-                "preview",
-                {
-                    "orchestrator": {
-                        "model": "haiku",
-                        "thinking": "high",
-                    }
+                "implementer": {
+                    "provider": "anthropic",
+                    "model": "sonnet",
+                    "thinking": "max",
                 },
-            )
-            require(
-                "does not offer a thinking selector" in rejected.get("error", ""),
-                "Haiku accepted a thinking level",
-            )
-            rejected = post(
-                "preview", {"implementer": {"effort": "xhigh"}}
-            )
-            require(
-                "only model and thinking" in rejected.get("error", ""),
-                "the retired effort request field was accepted",
-            )
-
-            # Nothing resembling markup, a quote or a newline may pass.
-            for hostile in (
-                "</script><img src=x onerror=alert(1)>",
-                'gpt"; rm -rf /',
-                "gpt\nmodel = evil",
-                "x" * 200,
-                "",
-            ):
-                refused = post("preview", {"implementer": {"model": hostile}})
-                require(
-                    "error" in refused,
-                    f"a hostile model name was accepted: {hostile!r}",
-                )
-            for invalid in (0, 5, True, "2", 2.5):
-                refused = post(
-                    "preview", {"plan_review_rounds": {"value": invalid}}
-                )
-                require(
-                    "error" in refused,
-                    f"an invalid plan-review cap was accepted: {invalid!r}",
-                )
-
-            require(
-                "before" not in json.dumps(
-                    post("preview", {"implementer": {"model": "gpt-7-terra"}})
-                ),
-                "the preview leaked file contents back to the page",
-            )
-
-            # Applying something that was never previewed is refused.
-            unseen = post("apply", {"orchestrator": {"model": "sonnet"}})
-            require(
-                "not previewed" in unseen.get("error", ""),
-                f"an unpreviewed change was applied: {unseen}",
-            )
-
-            both = {
-                "implementer": {"model": "gpt-7-terra"},
-                "orchestrator": {
-                    "model": "claude-fable-5[1m]",
+                "plan-reviewer": {
+                    "provider": "anthropic",
+                    "model": "sonnet",
+                    "thinking": "max",
+                },
+                "reviewer": {
+                    "provider": "anthropic",
+                    "model": "opus",
                     "thinking": "max",
                 },
                 "plan_review_rounds": {"value": 4},
             }
-            post("preview", both)
-            applied = post("apply", both)
+            preview = post("preview", all_anthropic)
             require(
-                sorted(applied["applied"])
-                == [
-                    "global/claude-settings.json",
-                    "global/codex/implementer.config.toml",
-                    "global/orchestration.json",
-                ],
-                f"unexpected apply result: {applied}",
+                len(preview.get("edits", [])) == 1
+                and preview["edits"][0]["file"]
+                == "global/orchestration.json"
+                and '"provider": "anthropic"' in preview["edits"][0]["diff"],
+                f"multi-role preview was not one manifest edit: {preview}",
+            )
+            unchanged = read_json(kit / "global" / "orchestration.json")
+            require(
+                next(
+                    step
+                    for step in unchanged["steps"]
+                    if step["id"] == "reviewer"
+                )["provider"]
+                == "openai",
+                "preview modified the manifest",
             )
 
-            with terra_toml.open("rb") as handle:
-                implementer = __import__("tomllib").load(handle)
+            applied = post("apply", all_anthropic)
             require(
-                implementer["model"] == "gpt-7-terra"
-                and implementer["model_reasoning_effort"] == "medium"
-                and implementer["approval_policy"] == "never"
-                and implementer.get("custom key") == "keep",
-                f"the profile rewrite lost or corrupted content: {implementer}",
+                applied.get("applied") == ["global/orchestration.json"],
+                f"the atomic apply wrote unexpected files: {applied}",
+            )
+            manifest = read_json(kit / "global" / "orchestration.json")
+            require(
+                {step["provider"] for step in manifest["steps"]}
+                == {"anthropic"}
+                and manifest["settings"]["plan_review_rounds"]["value"] == 4,
+                "the all-Anthropic configuration was not applied",
             )
 
-            # Applying a different model than the one previewed is refused:
-            # the preview is a contract about an exact change.
-            post("preview", {"implementer": {"model": "gpt-8-terra"}})
-            swapped = post("apply", {"implementer": {"model": "gpt-9-terra"}})
-            require(
-                "not the one that was previewed" in swapped.get("error", ""),
-                f"an unpreviewed substitution was applied: {swapped}",
-            )
-
-            # An external edit after the preview must refuse rather than
-            # silently overwrite.
-            stale = post("preview", {"implementer": {"model": "gpt-8-terra"}})
-            require(stale["edits"], "expected a pending edit to test staleness")
-            terra_toml.write_text(
-                terra_toml.read_text() + 'extra = "added"\n'
-            )
-            refused = post("apply", {"implementer": {"model": "gpt-8-terra"}})
-            require(
-                "changed since" in refused.get("error", ""),
-                f"a concurrent external edit was overwritten: {refused}",
-            )
-            require(
-                'extra = "added"' in terra_toml.read_text(),
-                "the refused apply still modified the file",
-            )
-
-            # A profile carrying astral characters must survive a rewrite
-            # as parseable TOML.
-            terra_toml.write_text(
-                'model = "gpt-8-terra"\n'
-                'model_reasoning_effort = "medium"\n'
-                'note = "😀 keep"\n'
-            )
-            post("preview", {"implementer": {"model": "gpt-10-terra"}})
-            emoji = post("apply", {"implementer": {"model": "gpt-10-terra"}})
-            require("applied" in emoji, f"the astral rewrite failed: {emoji}")
-            with terra_toml.open("rb") as handle:
-                rewritten = __import__("tomllib").load(handle)
-            require(
-                rewritten["note"] == "😀 keep"
-                and rewritten["model"] == "gpt-10-terra",
-                f"astral content was corrupted: {rewritten}",
-            )
-            canonical = read_json(kit / "global" / "claude-settings.json")
-            require(
-                canonical["model"] == "claude-fable-5[1m]",
-                "the canonical model was not updated",
-            )
-            live = read_json(home / ".claude" / "settings.json")
-            require(
-                live.get("model") == "claude-fable-5[1m]",
-                "the applier did not propagate the model to live settings",
-            )
-            require(
-                canonical.get("env", {}).get(
-                    "CLAUDE_CODE_EFFORT_LEVEL"
-                ) == "max"
-                and live.get("env", {}).get(
-                    "CLAUDE_CODE_EFFORT_LEVEL"
-                ) == "max"
-                and "effortLevel" not in canonical
-                and "effortLevel" not in live,
-                "Fable max was not represented and propagated correctly",
-            )
-            require(
-                read_json(kit / "global" / "orchestration.json")["settings"]
-                ["plan_review_rounds"]["value"]
-                == 4,
-                "the plan-review cap was not applied",
-            )
-
-            # A settings-only apply must not assume that every edit is a
-            # model/profile edit, nor trigger model propagation.
-            post("preview", {"plan_review_rounds": {"value": 3}})
-            settings_only = post(
-                "apply", {"plan_review_rounds": {"value": 3}}
-            )
-            require(
-                settings_only.get("applied") == ["global/orchestration.json"]
-                and settings_only.get("propagated") is None
-                and read_json(kit / "global" / "orchestration.json")["settings"]
-                ["plan_review_rounds"]["value"]
-                == 3,
-                f"a settings-only apply failed: {settings_only}",
-            )
-
-            # The manifest setting has the same preview contract as model
-            # files: an external edit after preview must survive a refusal.
-            post("preview", {"plan_review_rounds": {"value": 4}})
-            manifest_path = kit / "global" / "orchestration.json"
-            manifest = read_json(manifest_path)
-            manifest["external"] = "preserve"
-            write_json(manifest_path, manifest)
-            stale_rounds = post(
-                "apply", {"plan_review_rounds": {"value": 4}}
-            )
-            require(
-                "changed since" in stale_rounds.get("error", ""),
-                f"a concurrent manifest edit was overwritten: {stale_rounds}",
-            )
-            require(
-                read_json(manifest_path).get("external") == "preserve",
-                "the refused settings apply lost the external manifest edit",
-            )
-
-            # Ordinary Claude levels use its persisted setting; the max-only
-            # environment override must disappear from canonical and live
-            # state without disturbing unrelated environment entries.
-            live = read_json(home / ".claude" / "settings.json")
-            live.setdefault("env", {})["UNRELATED"] = "keep"
-            write_json(home / ".claude" / "settings.json", live)
-            claude_xhigh = {
+            # A Codex principal and Claude reviewers are equally valid.
+            codex_principal = {
                 "orchestrator": {
-                    "model": "claude-fable-5[1m]",
-                    "thinking": "xhigh",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "thinking": "ultra",
                 }
             }
-            post("preview", claude_xhigh)
-            applied_xhigh = post("apply", claude_xhigh)
+            post("preview", codex_principal)
+            switched = post("apply", codex_principal)
             require(
-                "global/claude-settings.json"
-                in applied_xhigh.get("applied", []),
-                f"Claude xhigh was not applied: {applied_xhigh}",
+                switched.get("applied") == ["global/orchestration.json"],
+                f"the Codex-principal switch failed: {switched}",
             )
-            canonical = read_json(
-                kit / "global" / "claude-settings.json"
-            )
-            live = read_json(home / ".claude" / "settings.json")
+            manifest = read_json(kit / "global" / "orchestration.json")
+            by_id = {step["id"]: step for step in manifest["steps"]}
             require(
-                canonical.get("effortLevel") == "xhigh"
-                and live.get("effortLevel") == "xhigh"
-                and "CLAUDE_CODE_EFFORT_LEVEL"
-                not in canonical.get("env", {})
-                and "CLAUDE_CODE_EFFORT_LEVEL" not in live.get("env", {})
-                and live.get("env", {}).get("UNRELATED") == "keep",
-                "Claude xhigh or unrelated live environment was mishandled",
+                by_id["orchestrator"]["provider"] == "openai"
+                and by_id["reviewer"]["provider"] == "anthropic",
+                "principal and reviewer providers remain artificially coupled",
+            )
+
+            for body, fragment in (
+                (
+                    {"reviewer": {"model": "vendor/custom-model"}},
+                    "custom model change must include its provider",
+                ),
+                (
+                    {
+                        "reviewer": {
+                            "provider": "anthropic",
+                            "model": "gpt-5.6-sol",
+                            "thinking": "max",
+                        }
+                    },
+                    "belongs to openai",
+                ),
+                (
+                    {
+                        "reviewer": {
+                            "provider": "openai",
+                            "model": "gpt-5.5",
+                            "thinking": "ultra",
+                        }
+                    },
+                    "thinking must be one of",
+                ),
+                (
+                    {
+                        "reviewer": {
+                            "provider": "openai",
+                            "model": "vendor/custom-model",
+                            "thinking": "high",
+                        }
+                    },
+                    "available thinking levels are unknown",
+                ),
+            ):
+                refused = post("preview", body)
+                require(
+                    fragment in refused.get("error", ""),
+                    f"unsafe model/provider combination was accepted: {refused}",
+                )
+
+            custom = {
+                "reviewer": {
+                    "provider": "openai",
+                    "model": "vendor/custom-model",
+                }
+            }
+            custom_preview = post("preview", custom)
+            require(
+                len(custom_preview.get("edits", [])) == 1
+                and '"model": "vendor/custom-model"'
+                in custom_preview["edits"][0]["diff"]
+                and '"thinking": null' in custom_preview["edits"][0]["diff"],
+                f"a provider-qualified custom model was not planned: {custom_preview}",
+            )
+
+            for hostile in (
+                "</script><img src=x>",
+                'gpt"; rm -rf /',
+                "gpt\nmodel=evil",
+                "x" * 121,
+                "",
+            ):
+                refused = post(
+                    "preview",
+                    {
+                        "reviewer": {
+                            "provider": "openai",
+                            "model": hostile,
+                        }
+                    },
+                )
+                require(
+                    "error" in refused,
+                    f"a hostile model identifier was accepted: {hostile!r}",
+                )
+
+            # Preview is an exact-content contract.
+            post("preview", custom)
+            substituted = post(
+                "apply",
+                {
+                    "reviewer": {
+                        "provider": "openai",
+                        "model": "vendor/other-model",
+                    }
+                },
+            )
+            require(
+                "not the one that was previewed"
+                in substituted.get("error", ""),
+                f"an unpreviewed substitution was applied: {substituted}",
+            )
+
+            stale_change = {
+                "mechanic": {
+                    "provider": "anthropic",
+                    "model": "fable",
+                    "thinking": "max",
+                }
+            }
+            post("preview", stale_change)
+            manifest_path = kit / "global" / "orchestration.json"
+            externally_changed = read_json(manifest_path)
+            externally_changed["external"] = "preserve"
+            write_json(manifest_path, externally_changed)
+            stale = post("apply", stale_change)
+            require(
+                "changed since" in stale.get("error", "")
+                and read_json(manifest_path).get("external") == "preserve",
+                f"a concurrent manifest edit was overwritten: {stale}",
             )
         finally:
             with contextlib.suppress(ProcessLookupError):
@@ -5507,23 +5774,38 @@ def test_config_surface() -> None:
             process.wait(timeout=20)
 
 
+@test("the configuration surface previews and applies model changes")
+def test_config_surface() -> None:
+    exercise_provider_neutral_config_surface()
+    return
+
 @test("the model alias map is valid and covers the documented aliases")
 def test_model_alias_map() -> None:
-    table = read_json(KIT_DIR / "global" / "claude-models.json")
+    table = read_json(KIT_DIR / "global" / "model-catalogue.json")
+    providers = table.get("providers")
     require(
-        isinstance(table, dict) and bool(table),
-        "the alias map must be a non-empty JSON object",
+        isinstance(providers, dict)
+        and set(providers) == {"anthropic", "openai"},
+        "the provider-neutral catalogue is missing",
     )
-    for alias, model in table.items():
-        require(
-            isinstance(alias, str)
-            and bool(alias.strip())
-            and isinstance(model, str)
-            and bool(model.strip()),
-            f"invalid alias entry: {alias!r} -> {model!r}",
-        )
-    require("opus" in table, "the opus default alias is missing")
-    require("fable" in table, "the fable alias is missing")
+    identities = [
+        (provider, entry.get("id"))
+        for provider, entries in providers.items()
+        for entry in entries
+    ]
+    require(
+        len(identities) == len(set(identities))
+        and all(
+            isinstance(model, str) and model.strip()
+            for _provider, model in identities
+        ),
+        f"invalid or duplicate catalogue identities: {identities}",
+    )
+    aliases = {model for _provider, model in identities}
+    require(
+        {"fable", "opus", "sonnet", "haiku"} <= aliases,
+        "the documented Anthropic aliases are incomplete",
+    )
 
 
 @test("residual reporting counts only survivors of this cleanup's own kills")
@@ -5662,21 +5944,20 @@ def test_installer_refuses_self_source() -> None:
             result.returncode != 0,
             "the installer accepted a target inside its own source tree",
         )
-        for profile in ("mechanic", "implementer", "plan-reviewer", "reviewer"):
-            path = kit / "global" / "codex" / f"{profile}.config.toml"
+        for relative in (
+            "global/AGENTS.md",
+            "global/orchestration.json",
+            "global/model-catalogue.json",
+        ):
+            path = kit / relative
             require(
                 path.is_file() and not path.is_symlink(),
-                f"the canonical {profile} profile was destroyed",
-            )
-            require(
-                "model" in path.read_text(),
-                f"the canonical {profile} profile was emptied",
+                f"the canonical source was destroyed: {relative}",
             )
 
 
-@test("a fresh install succeeds, reruns idempotently and migrates a new repository")
-def test_green_path_install() -> None:
-    """The exact out-of-box sequence: install, reinstall, migrate, remigrate."""
+def exercise_green_path_install() -> None:
+    """Install and initialize using only isolated user and repository state."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         kit = root / "kit"
@@ -5686,22 +5967,21 @@ def test_green_path_install() -> None:
             ignore=shutil.ignore_patterns(".git", "__pycache__"),
         )
         home = root / "home"
-        home.mkdir()
-        bin_directory = home / ".local" / "bin"
-        bin_directory.mkdir(parents=True)
-        retired = "claude" + "-codex"
-        (bin_directory / f"{retired}-init").symlink_to(
-            kit / "scripts" / "init-project.sh"
-        )
-        (bin_directory / f"{retired}-review").symlink_to(
-            kit / "scripts" / "orrery-review"
-        )
+        codex_home_path = root / "codex"
+        (home / ".claude").mkdir(parents=True)
+        codex_home_path.mkdir()
+        (home / ".claude" / "AGENTS.md").write_text("claude-owned\n")
+        (codex_home_path / "AGENTS.md").write_text("codex-owned\n")
 
         environment = os.environ.copy()
         environment["HOME"] = str(home)
-        environment["CODEX_HOME"] = str(root / "codex")
+        environment["CODEX_HOME"] = str(codex_home_path)
+        environment["PATH"] = (
+            f"{home / '.local' / 'bin'}{os.pathsep}"
+            f"{environment.get('PATH', '')}"
+        )
 
-        def run_install() -> subprocess.CompletedProcess[str]:
+        def install() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 ["bash", str(kit / "scripts" / "install.sh")],
                 env=environment,
@@ -5712,67 +5992,85 @@ def test_green_path_install() -> None:
                 check=False,
             )
 
-        first = run_install()
+        first = install()
+        require(first.returncode == 0, f"fresh install failed: {first.stderr}")
         require(
-            first.returncode == 0,
-            f"a fresh install failed: {first.stderr}",
-        )
-
-        settings = read_json(home / ".claude" / "settings.json")
-        require(bool(settings.get("model")), "the canonical model was not applied")
-        require(
-            settings.get("enabledPlugins", {}).get("codex@openai-codex") is False,
-            "the companion plugin was not disabled",
-        )
-        require(
-            "SessionStart" in settings.get("hooks", {}),
-            "the canonical hooks were not applied",
+            (home / ".claude" / "AGENTS.md").resolve()
+            == (kit / "global" / "AGENTS.md").resolve()
+            and (codex_home_path / "AGENTS.md").resolve()
+            == (kit / "global" / "AGENTS.md").resolve()
+            and (home / ".claude" / "CLAUDE.md").resolve()
+            == (kit / "global" / "CLAUDE.md").resolve(),
+            "the canonical shared instruction chain was not linked",
         )
         require(
-            settings.get("model") == "fable"
-            and settings.get("env", {}).get(
-                "CLAUDE_CODE_EFFORT_LEVEL"
-            ) == "max",
-            "the Fable max default was not installed",
-        )
-        require(
-            not (bin_directory / f"{retired}-init").exists()
-            and not (bin_directory / f"{retired}-review").exists(),
-            "retired command links into the kit were not removed",
+            (home / ".claude" / "skills" / "development-orchestrator").is_symlink()
+            and (home / ".agents" / "skills" / "development-orchestrator").is_symlink(),
+            "the provider-neutral skill was not installed for both CLIs",
         )
         for name in (
+            "orrery",
+            "orrery-agent",
+            "orrery-review",
             "orrery-init",
             "orrery-doctor",
-            "orrery-review",
-            "claude-lnt-start",
-            "claude-lnt-register",
-            "claude-lnt-cleanup",
-            "claude-lnt-status",
+            "orrery-config",
+            "orrery-usage",
         ):
             require(
                 (home / ".local" / "bin" / name).is_symlink(),
                 f"{name} was not installed",
             )
 
-        second = run_install()
+        settings = read_json(home / ".claude" / "settings.json")
         require(
-            second.returncode == 0,
-            f"an idempotent rerun failed: {second.stderr}",
+            settings.get("enabledPlugins", {}).get("codex@openai-codex")
+            is False
+            and "SessionStart" in settings.get("hooks", {})
+            and "model" not in settings
+            and "effortLevel" not in settings
+            and "CLAUDE_CODE_EFFORT_LEVEL"
+            not in settings.get("env", {}),
+            "installation duplicated role model settings into Claude settings",
         )
+
+        backups = sorted((home / ".orrery-backups").glob("*"))
+        require(len(backups) == 1, f"expected one backup set: {backups}")
+        backup = backups[0]
         require(
-            not (home / ".orrery-backups").exists(),
-            "an idempotent rerun created backups",
+            (
+                backup
+                / "home"
+                / ".claude"
+                / "AGENTS.md"
+            ).read_text()
+            == "claude-owned\n"
+            and (
+                backup
+                / "absolute"
+                / str(codex_home_path).lstrip("/")
+                / "AGENTS.md"
+            ).read_text()
+            == "codex-owned\n",
+            "same-named AGENTS backups collided",
+        )
+
+        second = install()
+        require(second.returncode == 0, f"idempotent install failed: {second.stderr}")
+        require(
+            sorted((home / ".orrery-backups").glob("*")) == backups,
+            "an idempotent install created another backup set",
         )
 
         repository = root / "repo"
         repository.mkdir()
 
-        def run_init(*extra: str) -> subprocess.CompletedProcess[str]:
+        def initialize(*arguments: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
                 [
                     "bash",
                     str(kit / "scripts" / "init-project.sh"),
-                    *extra,
+                    *arguments,
                     str(repository),
                 ],
                 env=environment,
@@ -5783,188 +6081,59 @@ def test_green_path_install() -> None:
                 check=False,
             )
 
-        migrated = run_init()
+        initialized = initialize()
         require(
-            migrated.returncode == 0,
-            f"orrery-init failed on a new repository: {migrated.stderr}",
-        )
-        require(
-            (repository / ".git").is_dir()
-            and "Initialized Git repository" in migrated.stdout,
-            "orrery-init did not initialize the plain directory",
-        )
-        require(
-            (repository / "CLAUDE.md").exists()
-            and (repository / "CLAUDE.local.md").exists(),
-            "the project instruction files were not created",
+            initialized.returncode == 0
+            and (repository / ".git").is_dir()
+            and (repository / "AGENTS.md").is_file()
+            and (repository / "CLAUDE.md").read_text().strip()
+            == "@AGENTS.md",
+            f"plain-directory initialization failed: {initialized.stderr}",
         )
         exclude = (repository / ".git" / "info" / "exclude").read_text()
         require(
-            "/CLAUDE.local.md" in exclude,
-            "CLAUDE.local.md was not excluded from Git",
+            "/.orrery.json" in exclude
+            and "/CLAUDE.local.md" in exclude,
+            "private project artefacts were not excluded",
         )
 
-        remigrated = run_init()
+        chosen = initialize("fable")
+        require(chosen.returncode == 0, f"Fable override failed: {chosen.stderr}")
+        override = read_json(repository / ".orrery.json")
         require(
-            remigrated.returncode == 0,
-            f"remigration failed: {remigrated.stderr}",
+            override["orchestrator"]
+            == {
+                "provider": "anthropic",
+                "model": "fable",
+                "thinking": "max",
+            },
+            f"Fable did not use maximum thinking: {override}",
+        )
+        override["personal"] = {"keep": True}
+        write_json(repository / ".orrery.json", override)
+        switched = initialize("gpt-5.6-sol")
+        override = read_json(repository / ".orrery.json")
+        require(
+            switched.returncode == 0
+            and override["orchestrator"]
+            == {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "thinking": "ultra",
+            }
+            and override["personal"] == {"keep": True},
+            f"Sol override or unrelated JSON preservation failed: {override}",
         )
         require(
-            (repository / "CLAUDE.local.md")
-            .read_text()
-            .count("orrery:start")
-            == 1,
-            "remigration duplicated the managed block",
+            initialize("no-such-model").returncode != 0,
+            "an unknown model or directory argument was accepted",
         )
 
-        # Selecting a principal orchestrator for one repository.
-        models = read_json(kit / "global" / "claude-models.json")
-        chosen = run_init("fable")
-        require(
-            chosen.returncode == 0,
-            f"model selection failed: {chosen.stderr}",
-        )
-        local_settings = repository / ".claude" / "settings.local.json"
-        require(
-            read_json(local_settings).get("model") == models["fable"],
-            "the fable alias was not resolved into settings.local.json",
-        )
-        exclude = (repository / ".git" / "info" / "exclude").read_text()
-        for pattern in (
-            "/.claude/settings.local.json",
-            "/.claude/settings.local.json.backup-orrery-*",
-            "/.claude/.settings.local.json.orrery.lock",
-        ):
-            require(
-                pattern in exclude,
-                f"the personal settings artefact was not excluded: {pattern}",
-            )
 
-        # Unrelated personal settings survive a model change.
-        seeded = read_json(local_settings)
-        seeded["effortLevel"] = "medium"
-        write_json(local_settings, seeded)
-        switched = run_init("opus")
-        require(
-            switched.returncode == 0,
-            f"switching the model failed: {switched.stderr}",
-        )
-        data = read_json(local_settings)
-        require(
-            data.get("model") == models["opus"],
-            "switching back to opus did not update the model",
-        )
-        require(
-            data.get("effortLevel") == "medium",
-            "a model change destroyed unrelated personal settings",
-        )
-
-        rejected = run_init("no-such-model")
-        require(
-            rejected.returncode != 0,
-            "an unknown model alias was accepted",
-        )
-
-        # A second directory must be refused, not silently win.
-        second = root / "repo2"
-        second.mkdir()
-        subprocess.run(
-            ["git", "init", "-q", str(second)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-            check=True,
-        )
-        two_directories = run_init(str(second))
-        require(
-            two_directories.returncode != 0,
-            "two directory arguments were silently accepted",
-        )
-
-        # A symlinked settings.local.json gets exclusions derived from its
-        # referent, where the updater's backup and lock artefacts land. The
-        # referent's name carries glob metacharacters, which the generated
-        # patterns must escape, and it is tracked, which must be warned
-        # about because exclusion cannot hide changes to a tracked file.
-        referent_name = "custom[1].json"
-        (second / ".claude").mkdir()
-        (second / ".claude" / referent_name).write_text(
-            '{"effortLevel": "low"}\n'
-        )
-        (second / ".claude" / "settings.local.json").symlink_to(referent_name)
-        for arguments in (
-            ["add", "--", f":(literal).claude/{referent_name}"],
-            [
-                "-c",
-                "user.name=kit",
-                "-c",
-                "user.email=kit@example.invalid",
-                "commit",
-                "-qm",
-                "seed",
-            ],
-        ):
-            subprocess.run(
-                ["git", "-C", str(second), *arguments],
-                env=environment,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=60,
-                check=True,
-            )
-        linked = subprocess.run(
-            [
-                "bash",
-                str(kit / "scripts" / "init-project.sh"),
-                "fable",
-                str(second),
-            ],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        require(
-            linked.returncode == 0,
-            f"model selection through a symlink failed: {linked.stderr}",
-        )
-        require(
-            "tracked by Git" in linked.stdout,
-            "modifying a tracked referent did not warn",
-        )
-        require(
-            (second / ".claude" / "settings.local.json").is_symlink(),
-            "the settings symlink was replaced by a regular file",
-        )
-        referent = read_json(second / ".claude" / referent_name)
-        require(
-            referent.get("model") == models["fable"]
-            and referent.get("effortLevel") == "low",
-            "the symlink referent was not updated in place",
-        )
-        status = subprocess.run(
-            [
-                "git",
-                "-C",
-                str(second),
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-            ],
-            env=environment,
-            stdout=subprocess.PIPE,
-            text=True,
-            timeout=60,
-            check=True,
-        ).stdout
-        require(
-            "orrery" not in status,
-            f"artefacts of the update are visible to Git: {status!r}",
-        )
-
+@test("a fresh install succeeds, reruns idempotently and migrates a new repository")
+def test_green_path_install() -> None:
+    exercise_green_path_install()
+    return
 
 @test("project initialization respects Git worktree boundaries")
 def test_initializer_git_boundaries() -> None:
@@ -6131,11 +6300,90 @@ def test_initializer_git_boundaries() -> None:
         migrated = (legacy / "CLAUDE.local.md").read_text()
         require(
             legacy_result.returncode == 0
-            and "<!-- orrery:start -->" in migrated
             and retired not in migrated
             and "personal prefix" in migrated
             and "personal suffix" in migrated,
             f"legacy managed block migration failed: {legacy_result.stderr}",
+        )
+
+
+@test("project instruction migration preserves every existing-file combination")
+def test_initializer_instruction_combinations() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+
+        def repository(name: str) -> Path:
+            path = root / name
+            path.mkdir()
+            subprocess.run(["git", "init", "-q", str(path)], check=True)
+            return path
+
+        def initialize(path: Path) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "bash",
+                    str(kit / "scripts" / "init-project.sh"),
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        agents_only = repository("agents-only")
+        (agents_only / "AGENTS.md").write_text("personal agents\n")
+        result = initialize(agents_only)
+        require(
+            result.returncode == 0
+            and (agents_only / "AGENTS.md").read_text()
+            == "personal agents\n"
+            and (agents_only / "CLAUDE.md").read_text().strip()
+            == "@AGENTS.md",
+            "an existing AGENTS.md was not preserved",
+        )
+
+        claude_only = repository("claude-only")
+        (claude_only / "CLAUDE.md").write_text("personal Claude policy\n")
+        result = initialize(claude_only)
+        require(
+            result.returncode == 0
+            and (claude_only / "CLAUDE.md").read_text()
+            == "personal Claude policy\n"
+            and (claude_only / "AGENTS.md").read_text()
+            == "personal Claude policy\n"
+            and "manual deduplication" in result.stdout,
+            "Claude-only instructions were not safely mirrored",
+        )
+
+        both = repository("both")
+        (both / "AGENTS.md").write_text("agents original\n")
+        (both / "CLAUDE.md").write_text("claude original\n")
+        result = initialize(both)
+        require(
+            result.returncode == 0
+            and (both / "AGENTS.md").read_text() == "agents original\n"
+            and (both / "CLAUDE.md").read_text() == "claude original\n"
+            and "does not import @AGENTS.md" in result.stdout,
+            "two arbitrary instruction files were overwritten or hidden",
+        )
+
+        broken_wrapper = repository("broken-wrapper")
+        (broken_wrapper / "CLAUDE.md").write_text("@AGENTS.md\n")
+        result = initialize(broken_wrapper)
+        require(
+            result.returncode == 0
+            and (broken_wrapper / "AGENTS.md").read_text()
+            == (kit / "project-template" / "AGENTS.md").read_text()
+            and (broken_wrapper / "CLAUDE.md").read_text() == "@AGENTS.md\n",
+            "a Claude import with a missing canonical target was not repaired",
         )
 
 
@@ -6164,7 +6412,7 @@ def test_doctor_hook_fidelity() -> None:
                 check=False,
             )
             return (
-                "PASS  Live settings contain every canonical Leave No Trace hook"
+                "PASS  Live Claude settings contain canonical hooks and permissions"
                 in result.stdout
             )
 
@@ -6283,7 +6531,7 @@ def test_policy_commands_allowed() -> None:
         if rule.startswith("Bash(") and rule.endswith(":*)")
     ]
 
-    policy = (KIT_DIR / "global" / "CLAUDE.md").read_text()
+    policy = (KIT_DIR / "global" / "AGENTS.md").read_text()
 
     commands = re.findall(r"`((?:npx|codex|orrery-review)[^`]*)`", policy)
 

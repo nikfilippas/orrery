@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Offline Claude CLI stand-in for provider-adapter regression tests."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+
+def option_value(name: str) -> str | None:
+    try:
+        index = sys.argv.index(name)
+    except ValueError:
+        return None
+    return sys.argv[index + 1] if index + 1 < len(sys.argv) else None
+
+
+def main() -> int:
+    mode = os.environ.get("CLAUDE_FAKE_MODE", "success")
+
+    if arguments_path := os.environ.get("CLAUDE_FAKE_ARGS"):
+        Path(arguments_path).write_text("\n".join(sys.argv[1:]) + "\n")
+
+    assignment = sys.stdin.read()
+    if stdin_path := os.environ.get("CLAUDE_FAKE_STDIN"):
+        Path(stdin_path).write_text(assignment)
+
+    if settings_copy := os.environ.get("CLAUDE_FAKE_SETTINGS"):
+        settings = option_value("--settings")
+        if settings:
+            Path(settings_copy).write_text(Path(settings).read_text())
+
+    if environment_copy := os.environ.get("CLAUDE_FAKE_ENV"):
+        selected = {
+            name: value
+            for name, value in os.environ.items()
+            if name.startswith(("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_"))
+        }
+        Path(environment_copy).write_text(json.dumps(selected, sort_keys=True))
+
+    if mode == "sleep":
+        time.sleep(3600)
+        return 0
+    if mode == "fail":
+        print("simulated Claude failure", file=sys.stderr)
+        return 8
+    if mode == "empty":
+        print(json.dumps({"result": ""}))
+        return 0
+
+    print(json.dumps({"result": "# PASS\nfake Claude verdict\n"}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
