@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Start Orrery's configured principal orchestrator."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_runtime import (  # noqa: E402
+    RuntimeConfigError,
+    load_role,
+    principal_command,
+)
+
+
+def main() -> int:
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print(
+            "Usage: orrery [PROVIDER-CLI-ARGUMENTS...]\n\n"
+            "Starts the principal orchestrator configured in "
+            "global/orchestration.json. Use orrery-config to choose any "
+            "supported Anthropic or OpenAI model."
+        )
+        return 0
+    try:
+        role = load_role("orchestrator")
+        command = principal_command(role, sys.argv[1:])
+    except RuntimeConfigError as exc:
+        print(f"orrery: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"↳ Principal orchestrator · {role.provider} · {role.model}"
+        + (f" · thinking {role.thinking}" if role.thinking else ""),
+        file=sys.stderr,
+        flush=True,
+    )
+    os.execv(command[0], command)
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

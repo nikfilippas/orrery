@@ -4,70 +4,71 @@ set -euo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 KIT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
-MODELS_FILE="$KIT_DIR/global/claude-models.json"
+MODELS_FILE="$KIT_DIR/global/model-catalogue.json"
 
 usage() {
     printf 'Usage: orrery-init [model] [directory]\n' >&2
-    printf 'A bare argument that names a known model alias selects the\n' >&2
-    printf 'principal orchestrator for the repository; anything else must\n' >&2
-    printf 'be an existing directory. Known model aliases:\n' >&2
+    printf 'A known model selects a private repository override; any other\n' >&2
+    printf 'argument must be an existing directory. Known models:\n' >&2
     python3 - "$MODELS_FILE" <<'PY' >&2 || true
 import json
 import sys
 from pathlib import Path
 
 try:
-    table = json.loads(Path(sys.argv[1]).read_text())
-except (OSError, json.JSONDecodeError):
+    providers = json.loads(Path(sys.argv[1]).read_text())["providers"]
+except (OSError, KeyError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
-
-for alias in sorted(table):
-    print(f"  {alias} -> {table[alias]}")
+for provider, entries in providers.items():
+    for entry in entries:
+        print(f"  {entry['id']} ({provider})")
 PY
 }
 
-is_model_alias() {
+model_spec() {
     python3 - "$MODELS_FILE" "$1" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 try:
-    table = json.loads(Path(sys.argv[1]).read_text())
-except (OSError, json.JSONDecodeError):
+    providers = json.loads(Path(sys.argv[1]).read_text())["providers"]
+except (OSError, KeyError, TypeError, json.JSONDecodeError):
     raise SystemExit(1)
-
-raise SystemExit(0 if isinstance(table, dict) and sys.argv[2] in table else 1)
+matches = [
+    (provider, entry)
+    for provider, entries in providers.items()
+    for entry in entries
+    if entry.get("id") == sys.argv[2]
+]
+if len(matches) != 1:
+    raise SystemExit(1)
+provider, entry = matches[0]
+thinking = entry.get("default_thinking") or ""
+print(f"{provider}\t{entry['id']}\t{thinking}")
 PY
 }
 
-MODEL_ALIAS=""
+MODEL=""
+MODEL_SPEC=""
 REQUESTED_DIR="$PWD"
 DIRECTORY_CHOSEN=0
 
 for argument in "$@"; do
-    if [ -z "$MODEL_ALIAS" ] && is_model_alias "$argument"; then
-        MODEL_ALIAS="$argument"
+    if [ -z "$MODEL" ] && resolved="$(model_spec "$argument" 2>/dev/null)"; then
+        MODEL="$argument"
+        MODEL_SPEC="$resolved"
     elif [ -d "$argument" ] && [ "$DIRECTORY_CHOSEN" -eq 0 ]; then
         REQUESTED_DIR="$argument"
         DIRECTORY_CHOSEN=1
     else
-        # A second directory is refused rather than silently winning, so an
-        # accidental extra argument cannot migrate the wrong repository.
         printf 'Unexpected argument: %s\n' "$argument" >&2
         usage
         exit 2
     fi
 done
 
-if [ ! -d "$REQUESTED_DIR" ]; then
-    printf "Directory does not exist: %s\n" "$REQUESTED_DIR" >&2
-    exit 1
-fi
-
 git_at() (
-    # Repository discovery must describe the directory argument, not an
-    # inherited repository selected by a caller's Git plumbing variables.
     unset \
         GIT_DIR \
         GIT_WORK_TREE \
@@ -82,28 +83,24 @@ git_at() (
 )
 
 PROJECT_ROOT=""
-if INSIDE_WORKTREE="$(git_at \
-        "$REQUESTED_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" &&
+if INSIDE_WORKTREE="$(
+        git_at "$REQUESTED_DIR" rev-parse --is-inside-work-tree 2>/dev/null
+    )" &&
    [ "$INSIDE_WORKTREE" = "true" ] &&
-   PROJECT_ROOT="$(git_at \
-        "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null)"
+   PROJECT_ROOT="$(
+        git_at "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null
+    )"
 then
     :
 else
-    # A bare repository is already a repository, but it has no working tree
-    # in which the project templates can be installed.
-    if [ "$(git_at \
-            "$REQUESTED_DIR" rev-parse --is-bare-repository 2>/dev/null ||
-            true)" = "true" ]
-    then
-        printf "Cannot initialize project files in a bare Git repository: %s\n" \
+    if [ "$(
+        git_at "$REQUESTED_DIR" rev-parse --is-bare-repository 2>/dev/null ||
+            true
+    )" = "true" ]; then
+        printf 'Cannot initialize files in a bare Git repository: %s\n' \
             "$REQUESTED_DIR" >&2
         exit 1
     fi
-
-    # If Git could not open an existing marker, do not paper over a
-    # malformed, inaccessible, or ownership-blocked repository by nesting a
-    # fresh one inside it.
     if EXISTING_MARKER="$(
         python3 - "$REQUESTED_DIR" <<'PY'
 import os
@@ -118,296 +115,184 @@ for directory in (current, *current.parents):
         raise SystemExit(0)
 raise SystemExit(1)
 PY
-    )"
-    then
-        printf "Git metadata exists but is not a usable worktree: %s\n" \
+    )"; then
+        printf 'Git metadata exists but is not a usable worktree: %s\n' \
             "$EXISTING_MARKER" >&2
         exit 1
     fi
-
-    if ! git_at "$REQUESTED_DIR" init --quiet; then
-        printf "Could not initialize a Git repository: %s\n" \
-            "$REQUESTED_DIR" >&2
-        exit 1
-    fi
-    if ! PROJECT_ROOT="$(
-        git_at "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null
-    )"; then
-        printf "Git initialized but its worktree could not be resolved: %s\n" \
-            "$REQUESTED_DIR" >&2
-        exit 1
-    fi
-    printf "Initialized Git repository: %s\n" "$PROJECT_ROOT"
+    git_at "$REQUESTED_DIR" init --quiet
+    PROJECT_ROOT="$(
+        git_at "$REQUESTED_DIR" rev-parse --show-toplevel
+    )"
+    printf 'Initialized Git repository: %s\n' "$PROJECT_ROOT"
 fi
 
-SHARED_TEMPLATE="$KIT_DIR/project-template/CLAUDE.md"
-LOCAL_TEMPLATE="$KIT_DIR/project-template/CLAUDE.local.md"
+printf '\n=== Orrery project instructions ===\n'
+printf 'Repository: %s\n\n' "$PROJECT_ROOT"
 
-SHARED_TARGET="$PROJECT_ROOT/CLAUDE.md"
-LOCAL_TARGET="$PROJECT_ROOT/CLAUDE.local.md"
-
-printf "\n=== Órrery project migration ===\n"
-printf "Repository: %s\n\n" "$PROJECT_ROOT"
-
-if [ -e "$SHARED_TARGET" ] || [ -L "$SHARED_TARGET" ]; then
-    printf "Preserved existing shared instructions:\n%s\n" "$SHARED_TARGET"
-else
-    cp "$SHARED_TEMPLATE" "$SHARED_TARGET"
-    printf "Created shared project template:\n%s\n" "$SHARED_TARGET"
-fi
-
-python3 - "$LOCAL_TEMPLATE" "$LOCAL_TARGET" <<'PYCODE'
-from pathlib import Path
+python3 - \
+    "$KIT_DIR/project-template/AGENTS.md" \
+    "$KIT_DIR/project-template/CLAUDE.md" \
+    "$PROJECT_ROOT" <<'PY'
+import os
+import re
+import shutil
 import sys
+from pathlib import Path
 
-template_path = Path(sys.argv[1])
-target_path = Path(sys.argv[2])
+agents_template = Path(sys.argv[1])
+claude_template = Path(sys.argv[2])
+root = Path(sys.argv[3])
+agents = root / "AGENTS.md"
+claude = root / "CLAUDE.md"
+local = root / "CLAUDE.local.md"
 
-template = template_path.read_text()
-start_marker = "<!-- orrery:start -->"
-end_marker = "<!-- orrery:end -->"
-legacy_name = "claude" + "-codex"
-legacy_start = f"<!-- {legacy_name}-kit:start -->"
-legacy_end = f"<!-- {legacy_name}-kit:end -->"
 
-if start_marker not in template or end_marker not in template:
-    raise SystemExit("Managed-block markers are missing from the local template.")
+def present(path: Path) -> bool:
+    return os.path.lexists(path)
 
-managed_start = template.index(start_marker)
-managed_end = template.index(end_marker) + len(end_marker)
-managed_block = template[managed_start:managed_end]
 
-if not target_path.exists():
-    target_path.write_text(template)
-    print(f"Created private workflow instructions:\n{target_path}")
-    raise SystemExit(0)
-
-existing = target_path.read_text()
-
-marker_pairs = (
-    (start_marker, end_marker),
-    (legacy_start, legacy_end),
-)
-present = [
-    (start, end)
-    for start, end in marker_pairs
-    if start in existing or end in existing
-]
-if any((start in existing) != (end in existing) for start, end in present):
-    raise SystemExit(
-        "A managed workflow marker is incomplete; repair it before rerunning."
-    )
-
-complete = [
-    (start, end)
-    for start, end in marker_pairs
-    if start in existing and end in existing
-]
-if len(complete) > 1:
-    raise SystemExit(
-        "Both current and legacy managed workflow blocks exist; "
-        "remove one before rerunning."
-    )
-
-if complete:
-    existing_start_marker, existing_end_marker = complete[0]
-    existing_start = existing.index(existing_start_marker)
-    existing_end = (
-        existing.index(existing_end_marker) + len(existing_end_marker)
-    )
-
-    prefix = existing[:existing_start].rstrip()
-    suffix = existing[existing_end:].lstrip()
-
-    sections = []
-
-    if prefix:
-        sections.append(prefix)
-
-    sections.append(managed_block)
-
-    if suffix:
-        sections.append(suffix)
-
-    target_path.write_text("\n\n".join(sections).rstrip() + "\n")
-    print(f"Updated managed workflow block:\n{target_path}")
-else:
-    base = existing.rstrip()
-
-    if base:
-        updated = base + "\n\n" + managed_block + "\n"
+if not present(agents) and not present(claude):
+    shutil.copyfile(agents_template, agents)
+    shutil.copyfile(claude_template, claude)
+    print(f"Created canonical project instructions:\n{agents}")
+    print(f"Created Claude import wrapper:\n{claude}")
+elif present(agents):
+    print(f"Preserved existing canonical instructions:\n{agents}")
+    if not present(claude):
+        shutil.copyfile(claude_template, claude)
+        print(f"Created Claude import wrapper:\n{claude}")
     else:
-        updated = template
+        print(f"Preserved existing Claude instructions:\n{claude}")
+        try:
+            claude_text = claude.read_text()
+        except OSError:
+            claude_text = ""
+        if "@AGENTS.md" not in claude_text:
+            print(
+                "WARNING: CLAUDE.md does not import @AGENTS.md; Claude and "
+                "Codex may receive different project instructions."
+            )
+else:
+    try:
+        claude_text = claude.read_text()
+    except OSError as exc:
+        raise SystemExit(f"Cannot read existing CLAUDE.md: {exc}")
+    if claude_text.strip() == "@AGENTS.md":
+        shutil.copyfile(agents_template, agents)
+        print(f"Repaired missing canonical instructions:\n{agents}")
+    else:
+        shutil.copyfile(claude, agents)
+        print(f"Copied existing Claude instructions for Codex:\n{agents}")
+        print(
+            "WARNING: CLAUDE.md was preserved as written; manual deduplication "
+            "is required: reconcile it into AGENTS.md, then replace CLAUDE.md "
+            "with @AGENTS.md."
+        )
 
-    target_path.write_text(updated)
-    print(f"Appended managed workflow block:\n{target_path}")
-PYCODE
+# Retire only Orrery-owned workflow blocks. Personal text around them survives.
+if present(local) and local.is_file():
+    text = local.read_text()
+    names = ("orrery", "claude" + "-codex-kit")
+    for name in names:
+        pattern = re.compile(
+            rf"(?ms)^[ \t]*<!-- {re.escape(name)}:start -->.*?"
+            rf"^[ \t]*<!-- {re.escape(name)}:end -->[ \t]*(?:\n|$)"
+        )
+        text = pattern.sub("", text)
+    cleaned = text.strip()
+    local.write_text(cleaned + "\n" if cleaned else "")
+    print(f"Removed retired Orrery workflow blocks from:\n{local}")
+PY
 
-# `--git-path` output is relative to the repository root unless Git already
-# absolutised it, as it does for worktrees. `--path-format=absolute` would
-# be simpler but only exists from Git 2.31, and older rev-parse echoes an
-# unknown option instead of failing.
-EXCLUDE_FILE="$(
-    git_at "$PROJECT_ROOT" rev-parse --git-path info/exclude
-)"
+EXCLUDE_FILE="$(git_at "$PROJECT_ROOT" rev-parse --git-path info/exclude)"
 case "$EXCLUDE_FILE" in
     /*) ;;
     *) EXCLUDE_FILE="$PROJECT_ROOT/$EXCLUDE_FILE" ;;
 esac
-
 mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
 
-if git_at "$PROJECT_ROOT" \
-    ls-files --error-unmatch -- CLAUDE.local.md \
-    >/dev/null 2>&1
-then
-    printf "\nWARNING: CLAUDE.local.md is already tracked by Git.\n"
-    printf "It was not removed from the index automatically.\n"
-else
-    if grep -Fxq "/CLAUDE.local.md" "$EXCLUDE_FILE"; then
-        printf "\nPrivate instructions are already locally excluded from Git.\n"
-    else
-        printf "\n/CLAUDE.local.md\n" >> "$EXCLUDE_FILE"
-        printf "\nAdded CLAUDE.local.md to:\n%s\n" "$EXCLUDE_FILE"
-    fi
-fi
-
-if [ -n "$MODEL_ALIAS" ]; then
-    if ! MODEL_VALUE="$(
-        python3 - "$MODELS_FILE" "$MODEL_ALIAS" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-table = json.loads(Path(sys.argv[1]).read_text())
-value = table.get(sys.argv[2])
-
-if not isinstance(value, str) or not value.strip():
-    raise SystemExit(f"invalid model alias entry: {sys.argv[2]}")
-
-print(value.strip())
-PY
-    )"; then
-        printf 'Could not resolve the model alias: %s\n' "$MODEL_ALIAS" >&2
-        exit 2
-    fi
-
-    # The model is a personal choice, so it goes into the repository's
-    # settings.local.json rather than the shared settings, through the
-    # atomic updater so that unrelated personal settings survive.
-    MODEL_SOURCE="$(mktemp "${TMPDIR:-/tmp}/orrery-model.XXXXXX")"
-    trap 'rm -f "$MODEL_SOURCE"' EXIT
-    python3 - "$MODEL_VALUE" > "$MODEL_SOURCE" <<'PY'
-import json
-import sys
-
-print(json.dumps({"model": sys.argv[1]}, indent=2))
-PY
-
-    printf "\n=== Principal orchestrator ===\n"
-    LOCAL_SETTINGS="$PROJECT_ROOT/.claude/settings.local.json"
-
-    # The updater follows a settings symlink, so the file that actually
-    # changes is the resolved referent. The tracked-file warning and the
-    # exclusion patterns are both derived from that resolution; a referent
-    # outside the repository needs neither, because nothing in this
-    # repository's status can change.
-    RELATIVE_TARGET="$(
-        python3 - "$PROJECT_ROOT" "$LOCAL_SETTINGS" <<'PY'
-from pathlib import Path
-import sys
-
-root = Path(sys.argv[1]).resolve()
-link = Path(sys.argv[2])
-target = link.resolve(strict=False) if link.is_symlink() else link
-
-try:
-    print(target.resolve(strict=False).relative_to(root))
-except ValueError:
-    print("")
-PY
-    )"
-
-    # `:(literal)` because brackets and asterisks are glob syntax in a Git
-    # pathspec, and the referent's name is a literal file name.
-    if [ -n "$RELATIVE_TARGET" ] &&
-       git_at "$PROJECT_ROOT" \
-           ls-files --error-unmatch -- ":(literal)$RELATIVE_TARGET" \
-           >/dev/null 2>&1
+for pattern in "/.orrery.json" "/CLAUDE.local.md"; do
+    name="${pattern#/}"
+    if git_at "$PROJECT_ROOT" ls-files --error-unmatch -- "$name" \
+        >/dev/null 2>&1
     then
-        printf 'WARNING: %s is tracked by Git.\n' "$RELATIVE_TARGET"
-        printf 'The model selection will appear as a tracked change; untrack\n'
-        printf 'the file to keep the choice personal.\n'
+        printf 'WARNING: %s is tracked; it was not removed from Git.\n' "$name"
+    elif ! grep -Fxq "$pattern" "$EXCLUDE_FILE"; then
+        printf '%s\n' "$pattern" >> "$EXCLUDE_FILE"
+        printf 'Added private exclusion %s to %s\n' "$pattern" "$EXCLUDE_FILE"
     fi
+done
 
-    "$KIT_DIR/scripts/apply-claude-settings.py" \
-        --model \
-        --source "$MODEL_SOURCE" \
-        --target "$LOCAL_SETTINGS"
-
-    while IFS= read -r pattern; do
-        [ -n "$pattern" ] || continue
-        if ! grep -Fxq "$pattern" "$EXCLUDE_FILE"; then
-            printf '%s\n' "$pattern" >> "$EXCLUDE_FILE"
-        fi
-    done <<PATTERNS
-$(
-        python3 - "$RELATIVE_TARGET" <<'PY'
-import re
+if [ -n "$MODEL" ]; then
+    IFS=$'\t' read -r MODEL_PROVIDER MODEL_VALUE MODEL_THINKING <<< "$MODEL_SPEC"
+    python3 - \
+        "$PROJECT_ROOT/.orrery.json" \
+        "$MODEL_PROVIDER" \
+        "$MODEL_VALUE" \
+        "$MODEL_THINKING" <<'PY'
+import json
+import os
 import sys
+import tempfile
+from pathlib import Path
 
-patterns = ["/.claude/settings.local.json"]
-relative = sys.argv[1]
-
-
-def escape(text: str) -> str:
-    # Git reads exclude patterns as globs, so a literal name containing
-    # `*`, `?`, `[`, `]` or a backslash has to escape them to keep
-    # matching literally.
-    return re.sub(r"([\\*?\[\]])", r"\\\1", text)
-
-
-if relative:
-    parts = relative.rsplit("/", 1)
-    if len(parts) == 2:
-        prefix, name = escape(parts[0] + "/"), parts[1]
-    else:
-        prefix, name = "", parts[0]
-    stem = escape(name)
-    patterns.append(f"/{prefix}{stem}.backup-orrery-*")
-    patterns.append(f"/{prefix}.{stem}.orrery.lock")
-
-print("\n".join(patterns))
-PY
+path = Path(sys.argv[1])
+if os.path.lexists(path) and path.is_symlink():
+    raise SystemExit(f"Refusing to replace a symlink: {path}")
+try:
+    data = json.loads(path.read_text()) if path.exists() else {}
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"{path} is not valid JSON: {exc}")
+if not isinstance(data, dict):
+    raise SystemExit(f"{path} must contain a JSON object")
+role = {
+    "provider": sys.argv[2],
+    "model": sys.argv[3],
+    "thinking": sys.argv[4] or None,
+}
+data["orchestrator"] = role
+path.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.NamedTemporaryFile(
+    "w", dir=path.parent, prefix=f".{path.name}.", delete=False
+) as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+    temporary = Path(handle.name)
+temporary.replace(path)
+print(
+    "Repository principal override: "
+    f"{role['provider']} / {role['model']} / "
+    f"{role['thinking'] or 'no thinking selector'}"
 )
-PATTERNS
-
-    printf 'Model for this repository: %s -> %s\n' \
-        "$MODEL_ALIAS" "$MODEL_VALUE"
+PY
 fi
 
-printf "\n=== Conflict scan ===\n"
-
-CONFLICT_PATTERN='((do not|never)[[:space:]]+(use|invoke|call)[[:space:]]+(codex|external agents?|other models?))|((claude|fable)[[:space:]]+only)|((do not|never)[[:space:]]+delegate)|(must[[:space:]]+implement[[:space:]]+directly)|((always|automatically)[[:space:]]+(commit|push|deploy|release))'
-
-if [ -r "$SHARED_TARGET" ]; then
-    MATCHES="$(
-        grep -Ein "$CONFLICT_PATTERN" "$SHARED_TARGET" || true
-    )"
-
-    if [ -n "$MATCHES" ]; then
-        printf "Potential orchestration conflicts found in CLAUDE.md:\n"
-        printf "%s\n" "$MATCHES"
-        printf "\nReview these lines before allowing external-model delegation.\n"
-    else
-        printf "No obvious orchestration conflicts detected.\n"
+printf '\n=== Conflict scan ===\n'
+CONFLICT_PATTERN='((do not|never)[[:space:]]+(use|invoke|call)[[:space:]]+(codex|claude|external agents?|other models?))|((claude|codex|fable)[[:space:]]+only)|((do not|never)[[:space:]]+delegate)|(must[[:space:]]+implement[[:space:]]+directly)|((always|automatically)[[:space:]]+(commit|push|deploy|release))'
+FOUND=0
+for candidate in AGENTS.md CLAUDE.md CLAUDE.local.md; do
+    path="$PROJECT_ROOT/$candidate"
+    [ -r "$path" ] || continue
+    if [ "$candidate" = "CLAUDE.md" ] &&
+       [ "$(tr -d '[:space:]' < "$path")" = "@AGENTS.md" ]
+    then
+        continue
     fi
-else
-    printf "Shared CLAUDE.md could not be read.\n"
-fi
+    matches="$(grep -Ein "$CONFLICT_PATTERN" "$path" || true)"
+    if [ -n "$matches" ]; then
+        printf 'Potential orchestration conflicts in %s:\n%s\n' \
+            "$candidate" "$matches"
+        FOUND=1
+    fi
+done
+[ "$FOUND" -eq 1 ] ||
+    printf 'No obvious orchestration conflicts detected.\n'
 
-printf "\n=== Migration result ===\n"
-printf "Shared instructions: %s\n" "$SHARED_TARGET"
-printf "Private workflow:    %s\n" "$LOCAL_TARGET"
-printf "\nRun /context in a fresh Claude Code session to confirm both files load.\n"
+printf '\n=== Migration result ===\n'
+printf 'Canonical instructions: %s/AGENTS.md\n' "$PROJECT_ROOT"
+printf 'Claude wrapper:         %s/CLAUDE.md\n' "$PROJECT_ROOT"
+printf 'Start a new Orrery session to load the resulting instruction chain.\n'

@@ -11,12 +11,23 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import uuid
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_runtime import (  # noqa: E402
+    RuntimeConfigError,
+    claude_sandbox_settings,
+    codex_home,
+    delegated_command,
+    load_role,
+    provider_environment,
+    role_handoff,
+)
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
+PROGRAM_NAME = Path(sys.argv[0]).name
 
 # How long a transient unit is allowed to reach a terminal state after a stop
 # and again after an escalation to SIGKILL.
@@ -86,46 +97,52 @@ def interrupting_signals() -> set[int]:
     }
 
 
-PROFILE_ROLES = {
+ROLE_LABELS = {
+    "mechanic": ("Mechanical worker", "bounded mechanical work"),
+    "implementer": ("Implementation worker", "bounded implementation"),
     "reviewer": ("Reviewer", "independent review"),
     "plan-reviewer": ("Plan reviewer", "plan review"),
 }
 
 
-def profile_label(profile: str) -> tuple[str, str]:
-    return PROFILE_ROLES.get(
-        profile,
-        (profile.replace("-", " ").capitalize(), "independent review"),
+def role_label(role: str) -> tuple[str, str]:
+    return ROLE_LABELS.get(
+        role,
+        (role.replace("-", " ").capitalize(), "bounded agent work"),
     )
 
 
 def usage() -> str:
     return (
         "Usage:\n"
-        "  orrery-review [--timeout SECONDS] [--output PATH]\n"
-        "                      [--profile NAME] -- PROMPT...\n"
-        "  printf '%s\\n' \"PROMPT\" | orrery-review "
-        "[--timeout SECONDS] [--output PATH]\n\n"
-        "Runs a synchronous independent review through a read-only Codex "
-        "profile, `reviewer` by default and `plan-reviewer` for plan review. The run is "
-        "placed in a transient systemd user service so timeout and "
-        "interruption stop its complete control group.\n"
+        f"  {PROGRAM_NAME} [--timeout SECONDS] [--output PATH]\n"
+        "                 [--role NAME] -- PROMPT...\n"
+        f"  printf '%s\\n' \"PROMPT\" | {PROGRAM_NAME} "
+        "[--role NAME] [--timeout SECONDS] [--output PATH]\n\n"
+        "Runs one configured Orrery role in a separate provider process. "
+        "Reviewer roles are read-only and fresh; worker roles are "
+        "workspace-write. The compatibility command orrery-review defaults "
+        "to reviewer. orrery-agent requires --role. A transient systemd "
+        "service contains the complete process tree where available.\n"
     )
 
 
 def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
     try:
         timeout_seconds = int(
-            os.environ.get("CODEX_REVIEW_TIMEOUT_SECONDS", "600")
+            os.environ.get(
+                "ORRERY_AGENT_TIMEOUT_SECONDS",
+                os.environ.get("CODEX_REVIEW_TIMEOUT_SECONDS", "600"),
+            )
         )
     except ValueError as exc:
         raise UsageError(
-            "CODEX_REVIEW_TIMEOUT_SECONDS must be a positive integer"
+            "ORRERY_AGENT_TIMEOUT_SECONDS must be a positive integer"
         ) from exc
 
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
-    profile = "reviewer"
+    role: str | None = "reviewer" if PROGRAM_NAME == "orrery-review" else None
 
     index = 0
     while index < len(argv):
@@ -168,13 +185,13 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
             if not value:
                 raise UsageError("--output requires a non-empty path")
             output_path = Path(value)
-        elif argument in ("--profile", "-p"):
+        elif argument in ("--role", "-r"):
             if index + 1 >= len(argv):
-                raise UsageError("missing value for --profile")
+                raise UsageError(f"missing value for {argument}")
             index += 1
-            profile = argv[index]
-        elif argument.startswith("--profile="):
-            profile = argument.split("=", 1)[1]
+            role = argv[index]
+        elif argument.startswith("--role="):
+            role = argument.split("=", 1)[1]
         elif argument.startswith("-"):
             raise UsageError(f"unknown wrapper option: {argument}")
         else:
@@ -191,64 +208,17 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
     elif not sys.stdin.isatty():
         prompt = sys.stdin.read()
     else:
-        raise UsageError("a review prompt is required")
+        raise UsageError("an assignment prompt is required")
 
     if not prompt.strip():
-        raise UsageError("the review prompt is empty")
+        raise UsageError("the assignment prompt is empty")
 
-    # A profile name becomes a filename, so it may not escape CODEX_HOME.
-    if not profile or not re.fullmatch(r"[A-Za-z0-9._-]+", profile):
-        raise UsageError(f"invalid profile name: {profile!r}")
+    if role is None:
+        raise UsageError("--role is required")
+    if not role or not re.fullmatch(r"[A-Za-z0-9._-]+", role):
+        raise UsageError(f"invalid role name: {role!r}")
 
-    return timeout_seconds, output_path, prompt, profile
-
-
-def codex_home() -> Path:
-    raw = os.environ.get("CODEX_HOME")
-
-    if raw is None:
-        raw = str(Path.home() / ".codex")
-
-    if not raw.strip():
-        print(
-            "orrery-review: CODEX_HOME cannot be empty",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-
-    return Path(raw).expanduser().resolve(strict=False)
-
-
-def profile_model(profile: str) -> str:
-    """The model configured for a Codex profile, or a fatal error.
-
-    Codex does not fail when `--profile` names a profile it cannot find: it
-    silently falls back to the default model and reasoning effort. A missing
-    or unreadable profile would therefore produce a review by some other
-    model while this wrapper announced the configured one, which would make
-    the independence of the review a claim rather than a fact.
-    """
-    path = codex_home() / f"{profile}.config.toml"
-
-    try:
-        with path.open("rb") as handle:
-            configuration = tomllib.load(handle)
-    except OSError as exc:
-        raise UsageError(
-            f"the Codex {profile} profile is not readable at {path}: {exc}"
-        ) from exc
-    except tomllib.TOMLDecodeError as exc:
-        raise UsageError(
-            f"the Codex {profile} profile at {path} is not valid TOML: {exc}"
-        ) from exc
-
-    value = configuration.get("model")
-    if not isinstance(value, str) or not value.strip():
-        raise UsageError(
-            f"the Codex {profile} profile at {path} does not set a model"
-        )
-
-    return value.strip()
+    return timeout_seconds, output_path, prompt, role
 
 
 def report(message: str) -> None:
@@ -261,7 +231,7 @@ def report(message: str) -> None:
     try:
         if sys.stderr is None:
             return
-        print(f"orrery-review: {message}", file=sys.stderr)
+        print(f"{PROGRAM_NAME}: {message}", file=sys.stderr)
     except (OSError, ValueError, AttributeError):
         pass
 
@@ -504,57 +474,11 @@ def terminate_client(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
-def codex_environment(tmp_dir: Path) -> dict[str, str]:
-    environment = {
-        "HOME": str(Path.home()),
-        "PATH": os.environ.get("PATH", ""),
-        "TMPDIR": str(tmp_dir),
-    }
-
-    exact_names = {
-        "ALL_PROXY",
-        "CURL_CA_BUNDLE",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "GIT_ASKPASS",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "LANG",
-        "LOGNAME",
-        "NO_PROXY",
-        "NODE_EXTRA_CA_CERTS",
-        "REQUESTS_CA_BUNDLE",
-        "SSL_CERT_DIR",
-        "SHELL",
-        "SSH_ASKPASS",
-        "SSH_AUTH_SOCK",
-        "SSL_CERT_FILE",
-        "TERM",
-        "USER",
-        "XDG_CACHE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
-        "all_proxy",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
-    }
-    allowed_prefixes = (
-        "AZURE_OPENAI_",
-        "CODEX_",
-        "LC_",
-        "OPENAI_",
-    )
-
-    for name, value in os.environ.items():
-        if name in exact_names or name.startswith(allowed_prefixes):
-            environment[name] = value
-
-    environment["CODEX_HOME"] = str(codex_home())
-    return environment
-
-
-def write_service_launcher(run_dir: Path, tmp_dir: Path) -> tuple[Path, Path]:
+def write_service_launcher(
+    run_dir: Path,
+    tmp_dir: Path,
+    provider: str,
+) -> tuple[Path, Path]:
     environment_path = run_dir / "service-environment.json"
     environment_fd = os.open(
         environment_path,
@@ -563,7 +487,7 @@ def write_service_launcher(run_dir: Path, tmp_dir: Path) -> tuple[Path, Path]:
     )
     with os.fdopen(environment_fd, "w", encoding="utf-8") as handle:
         json.dump(
-            codex_environment(tmp_dir),
+            provider_environment(provider, tmp_dir),
             handle,
             ensure_ascii=False,
         )
@@ -810,23 +734,23 @@ def main() -> int:
     # reads back. A umask can only remove bits, so setting it here makes
     # that private without a restrictive inherited umask being able to make
     # the log, the verdict, or the service environment unreadable. The
-    # Codex service inherits it too.
+    # delegated provider process inherits it too.
     os.umask(0o077)
 
     try:
-        timeout_seconds, output_path, prompt, profile = parse_args(sys.argv[1:])
+        timeout_seconds, output_path, prompt, role_id = parse_args(sys.argv[1:])
     except UsageError as exc:
-        print(f"orrery-review: {exc}", file=sys.stderr)
+        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
         print(usage(), file=sys.stderr, end="")
         return 2
 
-    codex_path = shutil.which("codex")
-    if codex_path is None:
-        print(
-            "orrery-review: required command unavailable: codex",
-            file=sys.stderr,
-        )
-        return 127
+    try:
+        role_config = load_role(role_id)
+        if role_config.provider == "openai":
+            codex_home()
+    except RuntimeConfigError as exc:
+        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+        return 2
 
     # systemd gives the run control-group containment and a RuntimeMaxSec
     # backstop. Where it does not exist, such as on macOS, the run degrades
@@ -838,19 +762,20 @@ def main() -> int:
     )
     if not use_systemd:
         print(
-            "orrery-review: systemd is unavailable; running without "
+            f"{PROGRAM_NAME}: systemd is unavailable; running without "
             "control-group containment.",
             file=sys.stderr,
         )
 
-    try:
-        model = profile_model(profile)
-    except UsageError as exc:
-        print(f"orrery-review: {exc}", file=sys.stderr)
-        return 2
-    display, role = profile_label(profile)
+    display, purpose = role_label(role_id)
     print(
-        f"↳ Codex {display} · {model} · {role}",
+        f"↳ {display} · {role_config.provider} · {role_config.model}"
+        + (
+            f" · thinking {role_config.thinking}"
+            if role_config.thinking
+            else ""
+        )
+        + f" · {purpose}",
         file=sys.stderr,
         flush=True,
     )
@@ -858,6 +783,8 @@ def main() -> int:
     runtime_base = Path(
         os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache"))
     )
+    # Keep the established internal runtime namespace so interrupted runs
+    # from older Orrery versions are reclaimed by the same sweeper.
     runtime_root = runtime_base / "orrery-review"
     runtime_root.mkdir(parents=True, exist_ok=True)
     runtime_root.chmod(0o700)
@@ -922,27 +849,36 @@ def main() -> int:
         tmp_dir.mkdir()
         tmp_dir.chmod(0o700)
         verdict_path = run_dir / "verdict.txt"
-        log_path = run_dir / "codex.log"
-
-        codex_arguments = [
-            codex_path,
-            "--profile",
-            profile,
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--output-last-message",
-            str(verdict_path),
-            "--",
-            prompt,
-        ]
+        log_path = run_dir / "agent.log"
+        prompt_path = run_dir / "assignment.txt"
+        prompt_path.write_text(role_handoff(role_config, prompt))
+        prompt_path.chmod(0o600)
+        settings_path: Path | None = None
+        if role_config.provider == "anthropic":
+            settings_path = run_dir / "claude-settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    claude_sandbox_settings(role_config, Path.cwd()),
+                    indent=2,
+                )
+                + "\n"
+            )
+            settings_path.chmod(0o600)
+        try:
+            provider_arguments = delegated_command(
+                role_config,
+                verdict_path,
+                settings_path,
+            )
+        except RuntimeConfigError as exc:
+            print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+            return 127
 
         if use_systemd:
             launcher_path, environment_path = write_service_launcher(
                 run_dir,
                 tmp_dir,
+                role_config.provider,
             )
             command = [
                 "systemd-run",
@@ -969,17 +905,20 @@ def main() -> int:
                 sys.executable,
                 str(launcher_path),
                 str(environment_path),
-                *codex_arguments,
+                *provider_arguments,
             ]
         else:
-            # Codex runs as a direct child in its own session, with the
+            # The provider runs as a direct child in its own session, with the
             # same scrubbed environment the launcher would have applied.
-            command = codex_arguments
+            command = provider_arguments
 
         started = time.monotonic()
         deadline = started + timeout_seconds
 
-        with log_path.open("wb") as log_handle:
+        with (
+            log_path.open("wb") as log_handle,
+            prompt_path.open("rb") as prompt_handle,
+        ):
             previous_mask = signal.pthread_sigmask(
                 signal.SIG_BLOCK,
                 handled_signals,
@@ -989,7 +928,7 @@ def main() -> int:
                     unit_may_exist = True
                     process = subprocess.Popen(
                         command,
-                        stdin=subprocess.DEVNULL,
+                        stdin=prompt_handle,
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
@@ -998,11 +937,11 @@ def main() -> int:
                 else:
                     process = subprocess.Popen(
                         command,
-                        stdin=subprocess.DEVNULL,
+                        stdin=prompt_handle,
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        env=codex_environment(tmp_dir),
+                        env=provider_environment(role_config.provider, tmp_dir),
                     )
             finally:
                 signal.pthread_sigmask(
@@ -1035,13 +974,13 @@ def main() -> int:
                 # unstoppable unit cannot swallow the timeout message and
                 # the Codex diagnostics along with the 124 status.
                 print(
-                    f"Codex review timed out after {timeout_seconds}s.",
+                    f"{display} timed out after {timeout_seconds}s.",
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
                 if diagnostics:
                     print(
-                        "--- Codex diagnostic output ---",
+                        "--- provider diagnostic output ---",
                         file=sys.stderr,
                     )
                     print(diagnostics, file=sys.stderr)
@@ -1054,36 +993,59 @@ def main() -> int:
                     try:
                         stop_unit(unit)
                     except RuntimeError as exc:
-                        print(f"orrery-review: {exc}", file=sys.stderr)
+                        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
                 terminate_client(process)
                 return 124
 
         if return_code != 0:
             print(
-                f"Codex review failed with exit status {return_code}.",
+                f"{display} failed with exit status {return_code}.",
                 file=sys.stderr,
             )
             diagnostics = tail_text(log_path)
             if diagnostics:
                 print(
-                    "--- Codex diagnostic output ---",
+                    "--- provider diagnostic output ---",
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
             return return_code
+
+        if role_config.provider == "anthropic":
+            try:
+                payload = json.loads(log_path.read_text())
+                verdict = payload.get("result")
+                if not isinstance(verdict, str) or not verdict.strip():
+                    raise ValueError("the JSON result is empty")
+                verdict_path.write_text(verdict)
+                verdict_path.chmod(0o600)
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                print(
+                    "Claude exited successfully but produced no valid final "
+                    f"result: {exc}",
+                    file=sys.stderr,
+                )
+                diagnostics = tail_text(log_path)
+                if diagnostics:
+                    print(
+                        "--- provider diagnostic output ---",
+                        file=sys.stderr,
+                    )
+                    print(diagnostics, file=sys.stderr)
+                return 1
 
         if (
             not verdict_path.exists()
             or verdict_path.stat().st_size == 0
         ):
             print(
-                "Codex exited successfully but produced no final verdict.",
+                f"{display} exited successfully but produced no final result.",
                 file=sys.stderr,
             )
             diagnostics = tail_text(log_path)
             if diagnostics:
                 print(
-                    "--- Codex diagnostic output ---",
+                    "--- provider diagnostic output ---",
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
@@ -1124,18 +1086,18 @@ def main() -> int:
         if not printed and not published:
             # Last resort, so that a review that reached neither stdout nor
             # its destination is still recoverable from the transcript.
-            report("--- Codex verdict ---")
+            report("--- recovered agent result ---")
             report(verdict)
 
         return 0 if printed and published is not False else 1
     except ReviewInterrupted as exc:
         print(
-            f"Codex review interrupted by signal {exc.signum}.",
+            f"{display} interrupted by signal {exc.signum}.",
             file=sys.stderr,
         )
         return 128 + exc.signum
     except RuntimeError as exc:
-        print(f"orrery-review: {exc}", file=sys.stderr)
+        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
         return 1
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
@@ -1157,16 +1119,16 @@ def main() -> int:
             if unit_stopped:
                 if not force_remove(run_dir):
                     cleanup_errors.append(
-                        f"Could not remove review runtime state: {run_dir}"
+                        f"Could not remove agent runtime state: {run_dir}"
                     )
             else:
                 # The service is detached under systemd, so the client
                 # exiting does not prove the unit stopped. Removing its
                 # temporary directory, log, and verdict path now could pull
-                # them out from under a Codex run that is still going. A
+                # them out from under a provider process that is still going. A
                 # later sweep retries the stop and reclaims the state.
                 cleanup_errors.append(
-                    f"Review runtime state kept for a later sweep: {run_dir}"
+                    f"Agent runtime state kept for a later sweep: {run_dir}"
                 )
 
         return_control()
@@ -1180,7 +1142,7 @@ def entrypoint() -> int:
         return main()
     except CleanupError as exc:
         print(
-            f"orrery-review cleanup failed: {exc}",
+            f"{PROGRAM_NAME} cleanup failed: {exc}",
             file=sys.stderr,
         )
         return 1

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Visual configuration surface for the Órrery orchestration kit.
 
-Serves a single local page generated from the orchestration manifest and
-the live configuration files, showing the whole pipeline with the model
-behind each step. Changes are previewed as unified diffs and applied only
-through the kit's own write paths, then validated by the doctor. The page
-is a veneer over the files; it never holds knowledge of its own.
+Serves a single local page generated from the orchestration manifest,
+showing the whole pipeline with the provider, model and thinking level
+behind each role. Changes are previewed as one unified manifest diff,
+applied atomically, then validated by the doctor.
 """
 
 from __future__ import annotations
@@ -21,7 +20,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,7 +31,7 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 # A request carries only a few short model names.
 MAX_BODY_BYTES = 64 * 1024
 THINKING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
-CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+PROVIDERS = ("anthropic", "openai")
 
 
 class ConfigError(Exception):
@@ -115,39 +113,6 @@ def settings_snapshot(
     return states
 
 
-def read_toml(path: Path) -> dict[str, Any]:
-    with path.open("rb") as handle:
-        return tomllib.load(handle)
-
-
-BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-def toml_value(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        # JSON string quoting is valid TOML basic-string quoting, but only
-        # without ASCII escaping: json's \uXXXX form uses surrogate pairs
-        # for astral characters, and a TOML escape must be a scalar value.
-        return json.dumps(value, ensure_ascii=False)
-    raise ConfigError(
-        f"cannot rewrite a profile containing a non-scalar value: {value!r}"
-    )
-
-
-def toml_key(key: str) -> str:
-    """Render a key, quoting anything that is not a bare key.
-
-    An unquoted key containing a space is invalid TOML, and one containing
-    a dot means something else entirely, so a key that was quoted in the
-    original must stay quoted.
-    """
-    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
-
-
 def load_catalogue() -> dict[str, list[dict[str, Any]]]:
     """Models offered in the dropdowns, per provider.
 
@@ -214,6 +179,7 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
                 )
             parsed.append(
                 {
+                    "provider": provider,
                     "id": model,
                     "label": label,
                     "thinking_levels": levels,
@@ -226,21 +192,28 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
     return catalogue
 
 
-def model_choices(step: dict[str, Any], current: str) -> list[dict[str, Any]]:
-    """The exact curated choices plus a safe representation of a custom one."""
+def model_choices(
+    current_provider: str,
+    current_model: str,
+) -> list[dict[str, Any]]:
+    """Every curated provider/model pair plus the current custom pair."""
     choices: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
 
-    for entry in load_catalogue().get(step.get("provider", ""), []):
-        if entry["id"] not in seen:
-            choices.append(dict(entry))
-            seen.add(entry["id"])
+    for provider, entries in load_catalogue().items():
+        for entry in entries:
+            identity = (provider, entry["id"])
+            if identity not in seen:
+                choices.append(dict(entry))
+                seen.add(identity)
 
-    if current and current not in seen:
+    current = (current_provider, current_model)
+    if current_model and current not in seen:
         choices.append(
             {
-                "id": current,
-                "label": current,
+                "provider": current_provider,
+                "id": current_model,
+                "label": current_model,
                 "thinking_levels": [],
                 "default_thinking": None,
                 "known": False,
@@ -250,82 +223,28 @@ def model_choices(step: dict[str, Any], current: str) -> list[dict[str, Any]]:
     return choices
 
 
-def claude_thinking(settings: dict[str, Any]) -> str:
-    environment = settings.get("env", {})
-    if environment is not None and not isinstance(environment, dict):
-        raise ConfigError("Claude env must be an object")
-    persisted = settings.get("effortLevel")
-    if persisted is not None and not isinstance(persisted, str):
-        raise ConfigError("Claude effortLevel must be a string")
-    override = None
-    if isinstance(environment, dict):
-        override = environment.get(CLAUDE_EFFORT_ENV)
-        if override is not None and not isinstance(override, str):
-            raise ConfigError(f"Claude {CLAUDE_EFFORT_ENV} must be a string")
-    if persisted is not None and override is not None:
-        raise ConfigError(
-            "Claude thinking uses both effortLevel and "
-            f"{CLAUDE_EFFORT_ENV}; keep only the effective representation"
-        )
-    return override or persisted or ""
-
-
-def set_claude_thinking(
-    settings: dict[str, Any],
-    thinking: str | None,
-) -> None:
-    """Store a Claude thinking choice in the representation it supports."""
-    settings.pop("effortLevel", None)
-    environment = settings.get("env", {})
-    if not isinstance(environment, dict):
-        raise ConfigError("Claude env must be an object")
-    environment = dict(environment)
-    environment.pop(CLAUDE_EFFORT_ENV, None)
-
-    if thinking == "max":
-        environment[CLAUDE_EFFORT_ENV] = thinking
-    elif thinking:
-        settings["effortLevel"] = thinking
-
-    if environment:
-        settings["env"] = environment
-    else:
-        settings.pop("env", None)
-
-
 def step_state(step: dict[str, Any]) -> dict[str, Any]:
-    path = KIT_DIR / step["file"]
+    provider = step.get("provider")
+    model = step.get("model")
+    thinking = step.get("thinking")
+    if provider not in PROVIDERS:
+        raise ConfigError(f"{step.get('id', 'step')} has invalid provider")
+    if not isinstance(model, str) or not model:
+        raise ConfigError(f"{step.get('id', 'step')} has no model")
+    if thinking is not None and thinking not in THINKING_LEVELS:
+        raise ConfigError(f"{step.get('id', 'step')} has invalid thinking")
     state: dict[str, Any] = {
         "id": step["id"],
         "title": step["title"],
-        "provider": step["provider"],
-        "kind": step["kind"],
-        "file": step["file"],
+        "provider": provider,
+        "model": model,
+        "thinking": thinking or "",
+        "access": step.get("access", ""),
+        "file": "global/orchestration.json",
         "summary": step.get("summary", ""),
         "selects": step.get("selects", ""),
-        "profile": step.get("profile", ""),
     }
-
-    if step["kind"] == "claude-settings":
-        settings = json.loads(path.read_text())
-        state["model"] = settings.get("model", "")
-        state["thinking"] = claude_thinking(settings)
-        live = Path.home() / ".claude" / "settings.json"
-        try:
-            live_settings = json.loads(live.read_text())
-            state["live_model"] = live_settings.get("model", "")
-            state["live_thinking"] = claude_thinking(live_settings)
-        except (OSError, json.JSONDecodeError):
-            state["live_model"] = ""
-            state["live_thinking"] = ""
-    elif step["kind"] == "codex-profile":
-        profile = read_toml(path)
-        state["model"] = profile.get("model", "")
-        state["thinking"] = profile.get("model_reasoning_effort", "")
-    else:
-        raise ConfigError(f"unknown step kind: {step['kind']}")
-
-    state["choices"] = model_choices(step, state["model"])
+    state["choices"] = model_choices(provider, model)
     return state
 
 
@@ -360,14 +279,22 @@ def validate_model(value: Any) -> str:
     return candidate
 
 
+def validate_provider(value: Any) -> str:
+    if not isinstance(value, str) or value not in PROVIDERS:
+        raise ConfigError(
+            f"provider must be one of: {', '.join(PROVIDERS)}"
+        )
+    return value
+
+
 def catalogue_choice(
-    step: dict[str, Any],
+    provider: str,
     model: str,
 ) -> dict[str, Any] | None:
     return next(
         (
             entry
-            for entry in load_catalogue().get(step.get("provider", ""), [])
+            for entry in load_catalogue().get(provider, [])
             if entry["id"] == model
         ),
         None,
@@ -376,6 +303,7 @@ def catalogue_choice(
 
 def resolved_thinking(
     step: dict[str, Any],
+    provider: str,
     model: str,
     requested: Any,
     *,
@@ -383,14 +311,19 @@ def resolved_thinking(
 ) -> str | None:
     """Validate a model/thinking pair and choose a deterministic fallback."""
     current = step_state(step)
-    choice = catalogue_choice(step, model)
+    choice = catalogue_choice(provider, model)
     if choice is None:
         if supplied and requested not in (None, ""):
             raise ConfigError(
                 f"{model} is a custom model, so its available thinking "
-                "levels are unknown; configure that level manually"
+                "levels are unknown"
             )
-        return current.get("thinking") or None
+        if (
+            provider == current["provider"]
+            and model == current["model"]
+        ):
+            return current.get("thinking") or None
+        return None
 
     levels = choice["thinking_levels"]
     if not levels:
@@ -406,57 +339,13 @@ def resolved_thinking(
         return requested
 
     current_thinking = current.get("thinking")
-    if current_thinking in levels:
+    if (
+        provider == current["provider"]
+        and model == current["model"]
+        and current_thinking in levels
+    ):
         return current_thinking
     return choice.get("default_thinking") or levels[0]
-
-
-def planned_edit(
-    step: dict[str, Any],
-    model: str,
-    thinking: str | None,
-) -> dict[str, Any] | None:
-    """The new content one step change produces, or None when unchanged."""
-    path = KIT_DIR / step["file"]
-    before = path.read_text()
-
-    if step["kind"] == "claude-settings":
-        settings = json.loads(before)
-        settings["model"] = model
-        set_claude_thinking(settings, thinking)
-        after = json.dumps(settings, indent=2) + "\n"
-    else:
-        profile = read_toml(path)
-        profile["model"] = model
-        if thinking is None:
-            profile.pop("model_reasoning_effort", None)
-        else:
-            profile["model_reasoning_effort"] = thinking
-        lines = [f"model = {toml_value(profile.pop('model'))}"]
-        effort = profile.pop("model_reasoning_effort", None)
-        if effort is not None:
-            lines.append(f"model_reasoning_effort = {toml_value(effort)}")
-        for key in sorted(profile):
-            lines.append(f"{toml_key(key)} = {toml_value(profile[key])}")
-        after = "\n".join(lines) + "\n"
-
-    if after == before:
-        return None
-
-    diff = "".join(
-        difflib.unified_diff(
-            before.splitlines(keepends=True),
-            after.splitlines(keepends=True),
-            fromfile=f"a/{step['file']}",
-            tofile=f"b/{step['file']}",
-        )
-    )
-    return {
-        "file": step["file"],
-        "before": before,
-        "after": after,
-        "diff": diff,
-    }
 
 
 def validate_setting_change(
@@ -484,26 +373,85 @@ def validate_setting_change(
     return value
 
 
-def planned_settings_edit(
+def planned_manifest_edit(
     requested: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """One atomic manifest edit for every requested runtime setting."""
+    """One atomic manifest edit for all role and workflow changes."""
     path = KIT_DIR / "global" / "orchestration.json"
     before = path.read_text()
     manifest = json.loads(before)
+    steps = {
+        step.get("id"): step
+        for step in manifest.get("steps", [])
+        if isinstance(step, dict)
+    }
     definitions = manifest.get("settings", {})
     if not isinstance(definitions, dict):
         raise ConfigError("the manifest settings must be an object")
 
     changed: list[str] = []
-    for setting_id, change in requested.items():
-        definition = definitions.get(setting_id)
-        if not isinstance(definition, dict):
-            raise ConfigError(f"unknown setting: {setting_id}")
-        value = validate_setting_change(setting_id, change, definition)
-        if definition.get("value") != value:
-            definition["value"] = value
-            changed.append(setting_id)
+    for item_id, change in requested.items():
+        if item_id in definitions:
+            definition = definitions[item_id]
+            if not isinstance(definition, dict):
+                raise ConfigError(f"invalid setting: {item_id}")
+            value = validate_setting_change(item_id, change, definition)
+            if definition.get("value") != value:
+                definition["value"] = value
+                changed.append(item_id)
+            continue
+
+        step = steps.get(item_id)
+        if step is None:
+            raise ConfigError(f"unknown step or setting: {item_id}")
+        if not isinstance(change, dict):
+            raise ConfigError(f"invalid change for step {item_id}")
+        unknown = set(change) - {"provider", "model", "thinking"}
+        if unknown:
+            raise ConfigError(
+                f"only provider, model and thinking can be changed for "
+                f"{item_id}, not: {sorted(unknown)}"
+            )
+
+        current = step_state(step)
+        model = validate_model(change.get("model", current["model"]))
+        known_providers = [
+            provider
+            for provider, entries in load_catalogue().items()
+            if any(entry["id"] == model for entry in entries)
+        ]
+        provider_value = change.get("provider")
+        if provider_value is None and model != current["model"]:
+            if len(known_providers) == 1:
+                provider_value = known_providers[0]
+            else:
+                raise ConfigError(
+                    "a custom model change must include its provider"
+                )
+        provider = validate_provider(
+            provider_value if provider_value is not None
+            else current["provider"]
+        )
+        if known_providers and provider not in known_providers:
+            raise ConfigError(
+                f"{model} belongs to {known_providers[0]}, not {provider}"
+            )
+        thinking = resolved_thinking(
+            step,
+            provider,
+            model,
+            change.get("thinking"),
+            supplied="thinking" in change,
+        )
+
+        replacement = {
+            "provider": provider,
+            "model": model,
+            "thinking": thinking,
+        }
+        if any(step.get(key) != value for key, value in replacement.items()):
+            step.update(replacement)
+            changed.append(item_id)
 
     if not changed:
         return None
@@ -521,49 +469,15 @@ def planned_settings_edit(
         "before": before,
         "after": after,
         "diff": diff,
-        "settings": sorted(changed),
+        "items": sorted(changed),
     }
 
 
 def plan(changes: dict[str, Any]) -> list[dict[str, Any]]:
     manifest = load_manifest()
-    steps = {step["id"]: step for step in manifest["steps"]}
-    settings = manifest.get("settings", {})
-    if not isinstance(settings, dict):
-        raise ConfigError("the manifest settings must be an object")
     settings_snapshot(manifest)
-    edits: list[dict[str, Any]] = []
-    requested_settings: dict[str, Any] = {}
-    for step_id, requested in changes.items():
-        if step_id in settings:
-            requested_settings[step_id] = requested
-            continue
-        if step_id not in steps:
-            raise ConfigError(f"unknown step or setting: {step_id}")
-        if not isinstance(requested, dict):
-            raise ConfigError(f"invalid change for step {step_id}")
-        unknown = set(requested) - {"model", "thinking"}
-        if unknown:
-            raise ConfigError(
-                f"only model and thinking can be changed for {step_id}, "
-                f"not: {sorted(unknown)}"
-            )
-        current = step_state(steps[step_id])
-        model = validate_model(requested.get("model", current["model"]))
-        thinking = resolved_thinking(
-            steps[step_id],
-            model,
-            requested.get("thinking"),
-            supplied="thinking" in requested,
-        )
-        edit = planned_edit(steps[step_id], model, thinking)
-        if edit is not None:
-            edit["step"] = step_id
-            edits.append(edit)
-    settings_edit = planned_settings_edit(requested_settings)
-    if settings_edit is not None:
-        edits.append(settings_edit)
-    return edits
+    edit = planned_manifest_edit(changes)
+    return [edit] if edit is not None else []
 
 
 def write_atomically(path: Path, content: str) -> None:
@@ -703,24 +617,9 @@ def apply_edits(
 
     result: dict[str, Any] = {
         "applied": [edit["file"] for edit in edits],
-        "propagated": None,
         "doctor_pass": None,
         "doctor_tail": "",
     }
-
-    if any(edit.get("step") == "orchestrator" for edit in edits):
-        # The canonical settings changed; the kit's own applier carries the
-        # model into the live settings atomically, with a backup.
-        status, output = run_kit(
-            [
-                sys.executable,
-                str(KIT_DIR / "scripts" / "apply-claude-settings.py"),
-                "--model",
-                "--effort",
-            ],
-            timeout=60,
-        )
-        result["propagated"] = {"status": status, "output": output.strip()}
 
     doctor = KIT_DIR / "scripts" / "doctor.sh"
     if doctor.exists():
@@ -761,7 +660,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 1440px; margin: 0 auto; padding: 28px 20px 60px; }
+  .wrap { max-width: 1660px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
   .chartwrap { overflow-x: auto; overflow-y: visible; padding: 4px 0 92px; }
@@ -866,10 +765,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
      the stage they govern.</p>
   <div class="chartwrap" id="chart"></div>
   <div class="scopenote">
-    Saving changes the system-wide default for <strong>new sessions</strong>.
-    Repositories pinned with <code>orrery-init &lt;alias&gt;</code> keep
-    their pins, and running sessions are unaffected. Each known model exposes
-    only the thinking levels supported by its current CLI catalogue.
+    Saving changes the defaults for <strong>new Orrery processes</strong>;
+    running sessions are unaffected. A repository's private
+    <code>.orrery.json</code> principal override still wins. Every role may use either provider.
+    Known models expose only the thinking levels supported by their CLI;
+    a custom identifier also requires an explicit provider.
   </div>
   <div class="actions">
     <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
@@ -886,7 +786,9 @@ const CHART = __CHART__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
 const original = Object.fromEntries(
-  STATE.map(s => [s.id, {model: s.model, thinking: s.thinking || ""}])
+  STATE.map(s => [s.id, {
+    provider: s.provider, model: s.model, thinking: s.thinking || ""
+  }])
 );
 const originalSettings = Object.fromEntries(SETTINGS.map(s => [s.id, s.value]));
 const host = document.getElementById("chart");
@@ -927,11 +829,21 @@ function settingsForNode(nodeId) {
 function picker(step) {
   const id = esc(step.id);
   const knownChoices = (step.choices || []).filter(c => c.known);
-  const selectedKnown = knownChoices.some(c => c.id === step.model);
-  const options = knownChoices.map(c =>
-    `<option value="${esc(c.id)}" ${c.id === step.model ? "selected" : ""}>` +
-    `${esc(c.label)}</option>`).join("");
-  const choice = knownChoices.find(c => c.id === step.model);
+  const selectedKnown = knownChoices.some(
+    c => c.provider === step.provider && c.id === step.model
+  );
+  const grouped = ["anthropic", "openai"].map(provider => {
+    const options = knownChoices.filter(c => c.provider === provider).map(c => {
+      const selected = c.provider === step.provider && c.id === step.model;
+      return `<option value="${esc(c.provider + "::" + c.id)}" ` +
+        `${selected ? "selected" : ""}>${esc(c.label)}</option>`;
+    }).join("");
+    const label = provider === "anthropic" ? "Anthropic" : "OpenAI";
+    return `<optgroup label="${label}">${options}</optgroup>`;
+  }).join("");
+  const choice = knownChoices.find(
+    c => c.provider === step.provider && c.id === step.model
+  );
   const levels = choice ? choice.thinking_levels : [];
   const thinkingOptions = levels.length
     ? levels.map(level =>
@@ -941,8 +853,13 @@ function picker(step) {
   return `<div class="role-controls" data-role="${id}">` +
     `<div class="role-label">${esc(step.title)}</div><div class="control-row">` +
     `<div class="pick"><label>model</label>` +
-    `<select data-step="${id}" data-kind="model">${options}` +
+    `<select data-step="${id}" data-kind="model">${grouped}` +
     `<option value="__custom__" ${selectedKnown ? "" : "selected"}>custom…</option></select>` +
+    `<select data-step="${id}" data-kind="provider" ` +
+    `style="display:${selectedKnown ? "none" : "block"}" aria-label="custom model provider">` +
+    `<option value="anthropic" ${step.provider === "anthropic" ? "selected" : ""}>Anthropic</option>` +
+    `<option value="openai" ${step.provider === "openai" ? "selected" : ""}>OpenAI</option>` +
+    `</select>` +
     `<input type="text" data-step="${id}" data-kind="custom" ` +
     `value="${selectedKnown ? "" : esc(step.model)}" ` +
     `style="display:${selectedKnown ? "none" : "block"}" ` +
@@ -970,8 +887,7 @@ function tip(node) {
         `changing it here changes them too.`
       : "Used at this step only.";
     return `<b>${esc(step.title)}</b>${esc(step.summary)} ${shared}` +
-      `<div class="meta">${step.profile ? "codex profile: " + esc(step.profile)
-        : "claude code session model"}` +
+      `<div class="meta">${esc(step.provider)} · ${esc(step.model)}` +
       (step.thinking ? ` · thinking ${esc(step.thinking)}` :
         " · thinking unavailable") +
       `<br>${esc(step.file)}</div>`;
@@ -1132,14 +1048,15 @@ function highlight(sourceId, active) {
 
 // Several steps run one role, so every control for that role moves
 // together; the change is visible rather than hidden.
-function choiceFor(roleId, model) {
+function choiceFor(roleId, provider, model) {
   return (roles[roleId].choices || []).find(
-    choice => choice.known && choice.id === model
+    choice => choice.known &&
+      choice.provider === provider && choice.id === model
   );
 }
 
-function selectThinking(select, roleId, model, preferred) {
-  const choice = choiceFor(roleId, model);
+function selectThinking(select, roleId, provider, model, preferred) {
+  const choice = choiceFor(roleId, provider, model);
   const levels = choice ? choice.thinking_levels : [];
   select.replaceChildren();
   if (!levels.length) {
@@ -1151,7 +1068,8 @@ function selectThinking(select, roleId, model, preferred) {
     return null;
   }
   const remembered = preferred ||
-    (model === roles[roleId].model ? roles[roleId].thinking : "");
+    (provider === roles[roleId].provider &&
+     model === roles[roleId].model ? roles[roleId].thinking : "");
   const chosen = levels.includes(remembered)
     ? remembered
     : (choice.default_thinking || levels[0]);
@@ -1166,14 +1084,21 @@ function selectThinking(select, roleId, model, preferred) {
   return chosen;
 }
 
-function syncRole(roleId, model, preferredThinking) {
-  const known = Boolean(choiceFor(roleId, model));
+function syncRole(roleId, provider, model, preferredThinking) {
+  const known = Boolean(choiceFor(roleId, provider, model));
   document.querySelectorAll(
     `select[data-step="${roleId}"][data-kind="model"]`
   ).forEach(select => {
-    select.value = known ? model : "__custom__";
+    select.value = known ? `${provider}::${model}` : "__custom__";
     const custom = select.parentNode.querySelector('input[data-kind="custom"]');
     if (custom) custom.style.display = known ? "none" : "block";
+    const customProvider = select.parentNode.querySelector(
+      'select[data-kind="provider"]'
+    );
+    if (customProvider) {
+      customProvider.value = provider;
+      customProvider.style.display = known ? "none" : "block";
+    }
   });
   document.querySelectorAll(`input[data-step="${roleId}"][data-kind="custom"]`)
     .forEach(input => {
@@ -1182,8 +1107,20 @@ function syncRole(roleId, model, preferredThinking) {
   document.querySelectorAll(
     `select[data-step="${roleId}"][data-kind="thinking"]`
   ).forEach(select => selectThinking(
-    select, roleId, model, preferredThinking
+    select, roleId, provider, model, preferredThinking
   ));
+}
+
+function currentProvider(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="model"]`
+  );
+  if (!select) return "";
+  if (select.value !== "__custom__") return select.value.split("::", 1)[0];
+  const customProvider = select.parentNode.querySelector(
+    'select[data-kind="provider"]'
+  );
+  return customProvider ? customProvider.value : "";
 }
 
 function currentModel(id) {
@@ -1191,7 +1128,9 @@ function currentModel(id) {
     `select[data-step="${id}"][data-kind="model"]`
   );
   if (!select) return "";
-  if (select.value !== "__custom__") return select.value;
+  if (select.value !== "__custom__") {
+    return select.value.slice(select.value.indexOf("::") + 2);
+  }
   const custom = select.parentNode.querySelector('input[data-kind="custom"]');
   return custom ? custom.value.trim() : "";
 }
@@ -1211,14 +1150,16 @@ function currentSetting(id) {
 function changes() {
   const out = {};
   for (const id of Object.keys(original)) {
+    const provider = currentProvider(id);
     const model = currentModel(id);
     const thinking = currentThinking(id);
     if (
-      model &&
-      (model !== original[id].model ||
+      provider && model &&
+      (provider !== original[id].provider ||
+       model !== original[id].model ||
        (thinking !== null && thinking !== original[id].thinking))
     ) {
-      out[id] = {model};
+      out[id] = {provider, model};
       if (thinking !== null) out[id].thinking = thinking;
     }
   }
@@ -1241,8 +1182,13 @@ async function post(endpoint, body) {
 
 document.addEventListener("input", event => {
   const data = event.target.dataset || {};
-  if (data.step && data.kind === "custom") {
-    syncRole(data.step, currentModel(data.step), currentThinking(data.step));
+  if (data.step && (data.kind === "custom" || data.kind === "provider")) {
+    syncRole(
+      data.step,
+      currentProvider(data.step),
+      currentModel(data.step),
+      currentThinking(data.step)
+    );
   }
   applyButton.disabled = true;
 });
@@ -1252,9 +1198,21 @@ document.addEventListener("change", event => {
   if (data.kind === "model") {
     const custom = event.target.parentNode.querySelector('input[data-kind="custom"]');
     if (custom) custom.style.display = event.target.value === "__custom__" ? "block" : "none";
+    const provider = event.target.parentNode.querySelector(
+      'select[data-kind="provider"]'
+    );
+    if (provider) {
+      provider.style.display =
+        event.target.value === "__custom__" ? "block" : "none";
+    }
   }
   if (data.step) {
-    syncRole(data.step, currentModel(data.step), currentThinking(data.step));
+    syncRole(
+      data.step,
+      currentProvider(data.step),
+      currentModel(data.step),
+      currentThinking(data.step)
+    );
   }
   applyButton.disabled = true;
 });
@@ -1286,10 +1244,8 @@ applyButton.addEventListener("click", async () => {
     `<h3>Doctor: <span class="${reply.doctor_pass ? "ok" : "err"}">` +
     `${reply.doctor_pass ? "READY" : "attention needed"}</span></h3>` +
     `<pre>${esc(reply.doctor_tail)}</pre>`;
-  const propagated = reply.propagated ?
-    `<h3>Propagated to live settings</h3><pre>${esc(reply.propagated.output)}</pre>` : "";
   result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
-    propagated + doctor +
+    doctor +
     '<p class="note">Reload to edit further; the kit repository now holds these values, ready to commit.</p>';
 });
 

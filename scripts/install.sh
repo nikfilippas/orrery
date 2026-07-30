@@ -40,10 +40,16 @@ trap report_backups EXIT
 
 backup_existing() {
     local target="$1"
+    local relative
 
     if [ -e "$target" ] || [ -L "$target" ]; then
+        case "$target" in
+            "$HOME"/*) relative="home/${target#"$HOME"/}" ;;
+            *) relative="absolute/${target#/}" ;;
+        esac
         mkdir -p "$BACKUP_DIR"
-        cp -a "$target" "$BACKUP_DIR/"
+        mkdir -p "$BACKUP_DIR/$(dirname "$relative")"
+        cp -a "$target" "$BACKUP_DIR/$relative"
         rm -rf "$target"
     fi
 }
@@ -51,6 +57,29 @@ backup_existing() {
 link_file() {
     local source="$1"
     local target="$2"
+
+    if python3 - "$target" "$KIT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1]).expanduser()
+if not target.is_absolute():
+    target = Path.cwd() / target
+# Resolve the containing directory, but not the final component: an
+# idempotent target is already a symlink into the kit and must still count as
+# a target outside it.
+target = target.parent.resolve(strict=False) / target.name
+kit = Path(sys.argv[2]).resolve(strict=False)
+try:
+    target.relative_to(kit)
+except ValueError:
+    raise SystemExit(1)
+PY
+    then
+        printf "Refusing to install a managed link inside Orrery's source tree: %s\n" \
+            "$target" >&2
+        exit 2
+    fi
 
     mkdir -p "$(dirname "$target")"
 
@@ -74,6 +103,22 @@ link_file() {
     printf "Linked %s -> %s\n" "$target" "$source"
 }
 
+if [ -e "$CODEX_HOME/AGENTS.override.md" ] ||
+   [ -L "$CODEX_HOME/AGENTS.override.md" ]
+then
+    printf '\nWARNING: %s shadows Orrery'\''s installed Codex policy.\n' \
+        "$CODEX_HOME/AGENTS.override.md" >&2
+    printf 'It was preserved. Remove or reconcile it before relying on Codex orchestration.\n\n' >&2
+fi
+
+link_file \
+    "$KIT_DIR/global/AGENTS.md" \
+    "$HOME/.claude/AGENTS.md"
+
+link_file \
+    "$KIT_DIR/global/AGENTS.md" \
+    "$CODEX_HOME/AGENTS.md"
+
 link_file \
     "$KIT_DIR/global/CLAUDE.md" \
     "$HOME/.claude/CLAUDE.md"
@@ -83,23 +128,12 @@ link_file \
     "$HOME/.claude/skills/development-orchestrator"
 
 link_file \
-    "$KIT_DIR/global/codex/mechanic.config.toml" \
-    "$CODEX_HOME/mechanic.config.toml"
+    "$KIT_DIR/global/skills/development-orchestrator" \
+    "$HOME/.agents/skills/development-orchestrator"
 
-link_file \
-    "$KIT_DIR/global/codex/implementer.config.toml" \
-    "$CODEX_HOME/implementer.config.toml"
-
-link_file \
-    "$KIT_DIR/global/codex/plan-reviewer.config.toml" \
-    "$CODEX_HOME/plan-reviewer.config.toml"
-
-link_file \
-    "$KIT_DIR/global/codex/reviewer.config.toml" \
-    "$CODEX_HOME/reviewer.config.toml"
-
-# Profiles renamed for what they do; remove the links the old names left.
-for stale in luna terra vesta sol; do
+# Role assignments now come from one provider-neutral manifest. Remove only
+# obsolete profile links installed by this checkout; user-owned profiles stay.
+for stale in mechanic implementer plan-reviewer reviewer luna terra vesta sol; do
     stale_link="$CODEX_HOME/$stale.config.toml"
     if [ -L "$stale_link" ] &&
        case "$(readlink "$stale_link")" in "$KIT_DIR"/*) true ;; *) false ;; esac
@@ -144,12 +178,20 @@ PY
 done
 
 link_file \
+    "$KIT_DIR/scripts/orrery" \
+    "$HOME/.local/bin/orrery"
+
+link_file \
     "$KIT_DIR/scripts/init-project.sh" \
     "$HOME/.local/bin/orrery-init"
 
 link_file \
     "$KIT_DIR/scripts/doctor.sh" \
     "$HOME/.local/bin/orrery-doctor"
+
+link_file \
+    "$KIT_DIR/scripts/orrery-review" \
+    "$HOME/.local/bin/orrery-agent"
 
 link_file \
     "$KIT_DIR/scripts/orrery-review" \
@@ -164,7 +206,10 @@ link_file \
     "$HOME/.local/bin/orrery-config"
 
 "$KIT_DIR/scripts/install-lnt-hooks.sh" --links-only
-"$KIT_DIR/scripts/apply-claude-settings.py" --all
+"$KIT_DIR/scripts/apply-claude-settings.py" \
+    --companion \
+    --hooks \
+    --permissions
 
 printf "\nInstallation complete.\n"
 

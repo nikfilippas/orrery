@@ -1,5 +1,5 @@
 {
-  "note": "Models and exact thinking levels offered by the configuration surface. This curated list follows the capabilities exposed by the installed Claude Code and Codex CLIs. Unknown custom identifiers remain usable, but their thinking capabilities cannot be inferred.",
+  "note": "Canonical aliases and exact thinking levels offered by the installed Claude Code and Codex CLIs. Pinned or newly released model identifiers remain available through the custom option, where the provider must be selected explicitly.",
   "providers": {
     "anthropic": [
       {
@@ -24,7 +24,7 @@
           "xhigh",
           "max"
         ],
-        "default_thinking": "high"
+        "default_thinking": "max"
       },
       {
         "id": "sonnet",
@@ -41,59 +41,6 @@
       {
         "id": "haiku",
         "label": "haiku",
-        "thinking_levels": []
-      },
-      {
-        "id": "claude-fable-5[1m]",
-        "label": "claude-fable-5[1m]",
-        "thinking_levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default_thinking": "max"
-      },
-      {
-        "id": "claude-fable-5",
-        "label": "claude-fable-5",
-        "thinking_levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default_thinking": "max"
-      },
-      {
-        "id": "claude-opus-5",
-        "label": "claude-opus-5",
-        "thinking_levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default_thinking": "high"
-      },
-      {
-        "id": "claude-sonnet-5",
-        "label": "claude-sonnet-5",
-        "thinking_levels": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max"
-        ],
-        "default_thinking": "max"
-      },
-      {
-        "id": "claude-haiku-4-5-20251001",
-        "label": "claude-haiku-4-5-20251001",
         "thinking_levels": []
       }
     ],

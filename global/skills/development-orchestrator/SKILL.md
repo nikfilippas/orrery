@@ -1,624 +1,256 @@
 ---
 name: development-orchestrator
-description: >
-  Automatically orchestrate software implementation, debugging, refactoring,
-  testing, and substantial code review using the active Claude model as the principal
-  decision-maker and Codex as a specialist worker. Use when the user asks to
-  add, implement, fix, debug, refactor, optimize, test, or materially review
-  code. Select the mechanic, implementer or reviewer profile according to
-  task complexity without
-  requiring the user to invoke a workflow command.
-user-invocable: false
+description: Classify and run development work through Orrery's provider-neutral principal, mechanical worker, implementation worker, plan reviewer, and final reviewer roles. Use for repository investigation, implementation, testing, complex plan review, or substantial code review.
 ---
 
-# Automatic Órrery Development Orchestration
+# Development Orchestrator
 
-Apply this workflow automatically when the user requests software-development
-work.
+Follow the canonical user and project `AGENTS.md` files first. This skill
+supplies the detailed workflow; it does not replace project instructions.
 
-The user should describe the desired outcome normally. Do not require them to
-remember or invoke workflow skills.
+## Role guard
 
-The active Claude model remains the principal orchestrator. It is responsible for
-understanding the request, inspecting the repository, selecting the workflow,
-delegating bounded work, evaluating Codex output, inspecting all changes,
-running verification, and deciding whether the result is complete.
+An `ORRERY ROLE HANDOFF` naming mechanic, implementer, plan-reviewer, or
+reviewer makes the current session non-principal. Perform only that assignment.
+Do not classify it again, delegate, spawn an agent, or invoke this workflow
+recursively.
 
-Do not use the Codex VS Code extension.
+Without such a handoff, the active session is the principal orchestrator and
+owns every decision and verification result.
 
-Invoke Codex through the installed Codex CLI.
+## Runtime roles
 
-Do not use the `codex:codex-rescue` agent as the normal orchestration mechanism.
-It is a one-shot forwarding tool and does not provide the complete adaptive
-implementation and review workflow defined here.
+`global/orchestration.json` is the only source of role provider, model,
+thinking, and access assignments. Defaults are configuration, not policy.
 
-## Priority order
+Invoke supporting roles through:
 
-Optimize decisions in this order:
+```bash
+orrery-agent --role mechanic -- "<bounded assignment>"
+orrery-agent --role implementer -- "<bounded assignment>"
+orrery-agent --role plan-reviewer -- "<bounded review prompt>"
+orrery-agent --role reviewer -- "<bounded review prompt>"
+```
 
-1. Correctness and effectiveness.
-2. Efficient model and token usage.
-3. Execution speed.
+Every invocation is a distinct CLI process and context. Reviewer roles are
+fresh, ephemeral, and read-only. Worker roles are workspace-write. Any role may
+use Anthropic or OpenAI; same-provider operation remains valid. A fresh
+same-model review is session-independent but not model-diverse.
 
-Do not invoke Codex merely because it is available.
+The principal must inspect the output, repository, and process status itself.
 
-Do not make the principal orchestrator and Codex duplicate the same work without a clear benefit.
+## Classify once
 
-## Model role configuration
+Choose exactly one class before implementation:
 
-Automated reviews must use direct Codex CLI execution, preferably `orrery-review`. Do not use the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
+| Class | Signal | Default route |
+| --- | --- | --- |
+| investigation | explanation or diagnosis; no requested mutation | principal remains read-only |
+| trivial | obvious, local, low-risk correction | principal implements |
+| mechanical | repetitive and precisely specified | mechanic when worthwhile |
+| standard | contained feature, bug fix, focused refactor | concise plan, then implementer when useful |
+| complex | high-risk or architectural work | explicit plan, bounded plan review, implementation batches, full review |
 
-The orchestration system is role-based.
+Authentication, authorisation, cryptography, migrations, concurrency,
+production infrastructure, destructive data operations, and broad
+cross-system changes are complex even when their diff looks small.
 
-- Principal orchestrator: the active Claude model selected in Claude Code.
-- Mechanical worker: the Codex `mechanic` profile.
-- Implementation worker: the Codex `implementer` profile.
-- Plan reviewer: the Codex `plan-reviewer` profile.
-- Independent reviewer: the Codex `reviewer` profile.
+Do not upgrade a class merely because a worker is available. Reclassify only
+when repository evidence shows that the original scope or risk was wrong.
 
-Do not depend on concrete model names in workflow logic.
+## Investigation
 
-The current Codex models and reasoning levels are defined only in:
+1. Restate the question and identify what would answer it.
+2. Inspect authoritative code, configuration, data flow, and history where
+   relevant.
+3. Reproduce the symptom without mutation where practical.
+4. Separate observed facts, supported inferences, and untested hypotheses.
+5. Request a fresh read-only reviewer only when a second context materially
+   improves confidence.
+6. Report the cause and evidence. Do not implement unless the request includes
+   a fix.
 
-- `~/.codex/mechanic.config.toml`
-- `~/.codex/implementer.config.toml`
-- `~/.codex/plan-reviewer.config.toml`
-- `~/.codex/reviewer.config.toml`
+## Trivial work
 
-Changing a worker model should require updating its profile file, not rewriting
-the orchestration workflow.
+1. Confirm the exact local target.
+2. Make the minimal correction.
+3. Inspect the complete diff.
+4. Run the smallest relevant check.
+5. Escalate only if the edit exposes hidden coupling or risk.
 
-## Task classification
+Do not delegate simply to obtain agreement.
 
-Classify every development request internally before acting. Choose exactly
-one result, in this order: investigation, trivial, mechanical, standard,
-complex. High-risk work belongs to complex.
+## Mechanical work
 
-### Investigation
+Use the mechanic for repetitive renames, explicit boilerplate, narrow test
+generation, or transformations with objective acceptance criteria.
 
-When the user asks for diagnosis, research, or explanation without requesting
-changes:
+The handoff must contain:
 
-- Do not modify files.
-- Use a read-only sandbox.
-- Use Codex as an independent second opinion only where it materially improves
-  the result.
-- Separate observed facts, inferences, and unresolved questions.
+- exact paths or match boundaries;
+- the mechanical transformation;
+- exclusions and invariants;
+- the command that verifies completion; and
+- an instruction to stop if judgement beyond the specification is required.
 
-### Trivial work
+Afterward, inspect every changed path and verify both that every intended match
+changed and no unintended match did.
 
-Examples:
+## Standard work
 
-- Text, comment, or documentation corrections.
-- Obvious one-line fixes.
-- Small configuration adjustments.
-- Very local changes with negligible regression risk.
+1. Inspect the relevant architecture and tests.
+2. Write a concise internal plan and acceptance criteria.
+3. Give the implementer one coherent bounded task.
+4. Inspect `git status`, every changed file, and the complete diff.
+5. Correct small integration problems directly.
+6. Run targeted checks, then the full relevant suite.
+7. Use a fresh final reviewer when the diff has meaningful behavioural or
+   regression risk.
+8. Verify every finding before acting on it.
 
-Workflow:
+Do not ask the worker to make architectural decisions that the principal has
+not framed.
 
-1. The principal orchestrator implements directly.
-2. Inspect the diff.
-3. Run the smallest relevant verification.
-4. Do not invoke Codex unless uncertainty materially justifies it.
+## Complex or high-risk work
 
-### Mechanical work
+### Prepare
 
-Examples:
+1. Inspect the repository before proposing changes.
+2. Identify trust boundaries, persisted formats, compatibility constraints,
+   rollback needs, and failure modes.
+3. Write a staged plan with acceptance criteria and verification per stage.
+4. Mark assumptions and irreversible choices.
 
-- Repetitive transformations.
-- Well-specified boilerplate.
-- Narrow test generation.
-- Straightforward edits with explicit acceptance criteria.
+### Bounded plan review
 
-Use the `mechanic` Codex profile when delegation is worthwhile.
+Read `settings.plan_review_rounds.value` from
+`global/orchestration.json`. It is a cap, not a target; use two and never more
+than four if unavailable.
 
-### Standard implementation
+Round one prompt:
 
-Examples:
+```text
+Review this plan before implementation.
+Classify each objection as BLOCKING or ADVISORY.
+BLOCKING means the plan as written creates material correctness, safety,
+security, compatibility, or delivery risk.
+For every objection, cite repository evidence and the concrete failure.
+Do not implement or edit files.
 
-- Contained features.
-- Non-trivial bug fixes.
-- Focused refactors.
-- Multi-file changes with clear architecture.
-- New tests around meaningful application logic.
+Plan:
+...
 
-Use the `implementer` Codex profile as the default implementation worker.
+Acceptance criteria:
+...
+```
 
-Do not require a separate plan-review cycle for routine, low-risk work.
+The principal verifies every objection against the repository. Revise only
+supported findings. Advisory findings may improve the plan but never trigger
+another round.
 
-### Complex or high-risk work
-
-Examples:
-
-- Authentication or authorization.
-- Security-sensitive changes.
-- Database migrations.
-- Concurrency.
-- Architectural changes.
-- Ambiguous failures spanning multiple systems.
-- Large or difficult refactors.
-- Changes to public interfaces or persisted data.
-- Changes with substantial production risk.
-
-Workflow:
-
-1. The principal orchestrator investigates the repository.
-2. The principal orchestrator produces an explicit plan with acceptance criteria.
-3. Run the bounded plan-review procedure below.
-4. The principal orchestrator owns the final plan and any escalation.
-5. The `implementer` profile implements the reviewed plan after the bounded
-   procedure permits implementation, unless the review profile is materially
-   justified as the implementer.
-6. The principal orchestrator inspects all changed files and the complete diff.
-7. Run the complete relevant verification suite.
-8. A fresh reviewer session reviews the completed uncommitted changes.
-9. The principal orchestrator verifies each finding and corrects legitimate problems.
-10. Rerun affected verification.
-
-## Model routing
-
-### Mechanical worker: `mechanic` profile
-
-Use the mechanic profile for:
-
-- Mechanical edits.
-- Repetitive transformations.
-- Narrow boilerplate.
-- Straightforward tests.
-- Low-risk work with explicit instructions.
-
-Default reasoning effort: low.
-
-Example invocation:
-
-    codex --profile mechanic exec \
-      --sandbox workspace-write \
-      --color never \
-      "<PROMPT>"
-
-### Implementation worker: `implementer` profile
-
-Use the implementer profile for:
-
-- Standard feature implementation.
-- Non-trivial bug fixes.
-- Focused refactors.
-- Multi-file implementation.
-- Test creation involving meaningful logic.
-- Most substantial coding work.
-
-Default reasoning effort: medium.
-
-Example invocation:
-
-    codex --profile implementer exec \
-      --sandbox workspace-write \
-      --color never \
-      "<PROMPT>"
-
-### Plan reviewer: `plan-reviewer` profile
-
-Use the plan-reviewer profile for:
-
-- Independent review of a plan, before any code is written.
-
-Default reasoning effort: ultra.
-
-Example invocation:
-
-    codex --profile plan-reviewer exec \
-      --sandbox read-only \
-      --ephemeral \
-      --color never \
-      "<PROMPT>"
-
-Or, with the same containment and cleanup as any other review:
-
-    orrery-review --profile plan-reviewer --timeout 600 -- "<PROMPT>"
-
-The plan-reviewer and reviewer are separate profiles so that challenging a plan and
-reviewing finished work can use different models. They ship configured
-identically, so nothing changes until one of them is repointed.
-
-### Independent reviewer: `reviewer` profile
-
-Use the reviewer profile for:
-
-- Independent final code review.
-- Difficult diagnosis.
-- Security-sensitive reasoning.
-- Architectural analysis.
-- Exceptionally difficult implementation where the implementer is insufficient.
-
-Default reasoning effort: ultra.
-
-Example invocation:
-
-    codex --profile reviewer exec \
-      --sandbox read-only \
-      --ephemeral \
-      --color never \
-      "<PROMPT>"
-
-Do not use the independent-review profile for routine implementation work
-merely because it has a more capable model.
-
-## Bounded plan review
-
-The SessionStart hook injects the configured round cap from
-`global/orchestration.json`. It defaults to two and is constrained to one
-through four. The cap is a backstop, not a goal: stop as soon as no blocking
-objection remains.
-
-### Round one: challenge
-
-Give a fresh plan-reviewer session the repository context, the proposed plan
-and its acceptance criteria. Require a concise table in which every objection
-is classified as:
-
-- **BLOCKING** only when implementing the plan as written would create a
-  material correctness, safety, security, compatibility, or delivery risk.
-- **ADVISORY** for preferences, optional improvements, and trade-offs that do
-  not prevent safe implementation.
-
-The principal orchestrator verifies every objection against the repository.
-Reject unsupported findings. Revise the plan only where criticism is
-supported. Advisory findings may inform that judgement but never force
-another review round.
-
-### Later rounds: confirm
-
-When supported blocking objections existed and another round is available,
-give a fresh plan-reviewer session:
+If blocking objections remain and a round is available, use a fresh plan
+reviewer and provide only:
 
 - the revised plan;
 - the original blocking objections;
-- a short mapping from each objection to the revision or reason it was
-  rejected.
-
-Ask only whether any listed blocking objection remains unaddressed. Do not ask
-for general approval, invite new advisory suggestions, or reopen resolved
-questions. Stop early when none remain.
-
-If the same blocking objection survives a revision, treat it as a cross-model
-deadlock rather than an invitation to keep debating. If that happens, or if a
-blocking objection cannot be cleared within the configured cap, stop before
-implementation and ask the user to decide, presenting the objection, the
-reviewer's position, the orchestrator's position, and the consequence of each
-choice. Never describe an unconfirmed plan as approved.
-
-With a one-round cap, a supported blocking objection cannot receive an
-independent confirmation round and therefore escalates before implementation.
-The plan-review cap is separate from the final code-review correction cap.
-
-## Progress visibility
-
-The transcript is the progress surface. Some clients, including the
-VS Code extension, show little beyond the conversation itself, so make the
-orchestration legible there by narrating stage boundaries discreetly:
-
-- After classifying a request, state the class in one short line before
-  acting on it.
-- Before every Codex invocation, print a handover line naming the role,
-  the model its profile configures, and the stage:
-
-      ↳ the implementer · gpt-5.6-terra · implementation
-
-- When the invocation returns and its output has been collected, print:
-
-      ↳ Principal orchestrator · control resumed
-
-- Mark the other transitions in one short sentence each as they happen:
-  planning, plan review, implementation, diff inspection, verification,
-  independent review, correction.
-
-`orrery-review` prints its own handover and heartbeat lines; do not
-duplicate them around it. Keep the narration to single lines: it is a
-surface, not a report.
-
-## Permissions
-
-Use `workspace-write` only when Codex is explicitly implementing or correcting
-code in the current repository.
-
-Use `read-only` for:
-
-- Planning.
-- Plan review.
-- Code review.
-- Research.
-- Diagnosis without requested edits.
-- Architecture analysis.
-
-Never use `danger-full-access`.
-
-Do not grant network access automatically.
-
-If implementation requires downloading dependencies, accessing external
-services, or modifying files outside the repository, stop and request explicit
-authorization.
-
-## Prompt contract
-
-Give Codex one bounded task per run.
-
-For substantial work, structure the prompt using these sections:
-
-    <task>
-    State the concrete objective.
-    </task>
-
-    <context>
-    Identify relevant repository paths, current behavior, architectural
-    constraints, and prior decisions.
-    </context>
-
-    <acceptance_criteria>
-    List observable conditions that define successful completion.
-    </acceptance_criteria>
-
-    <constraints>
-    Prohibit commits, pushes, releases, unrelated refactors, dependency changes,
-    secret exposure, and modifications outside the repository unless explicitly
-    authorized.
-    </constraints>
-
-    <verification>
-    State the tests, checks, builds, or behaviors that must be verified.
-    </verification>
-
-    <output_contract>
-    Request a concise summary, files changed, verification performed, failures,
-    unresolved concerns, and the Codex session identifier when available.
-    </output_contract>
-
-Point Codex to repository files and paths instead of pasting large files into
-the prompt.
-
-Do not send unrelated conversation history.
-
-Do not ask Codex to make architectural decisions that the principal orchestrator has not framed.
-
-## Standard workflow
-
-For standard implementation work:
-
-1. Inspect the relevant repository files, and complete the project
-   CLAUDE.md bootstrap first when meaningful placeholders remain in it.
-2. Identify concise acceptance criteria.
-3. Form a short internal plan.
-4. Delegate substantial implementation to the implementer.
-5. Inspect the actual Git diff.
-6. Correct small integration issues directly.
-7. Run relevant tests, linting, type checks, and builds.
-8. Request a fresh reviewer review when the change:
-   - contains meaningful logic,
-   - spans multiple components,
-   - changes an interface,
-   - carries regression risk, or
-   - is difficult to verify directly.
-9. Verify every material review finding against the repository.
-10. Correct legitimate findings that remain within the approved scope.
-11. Rerun affected verification.
-
-For simple standard work with strong tests and low regression risk, omit the reviewer
-review when its expected value does not justify its cost.
-
-## Complex workflow
-
-For complex or high-risk work:
-
-1. Inspect architecture, implementation, tests, and relevant history.
-2. Define explicit acceptance criteria and failure conditions.
-3. Write an implementation plan.
-4. Run round one of bounded plan review with a fresh plan-reviewer session.
-5. Evaluate every objection independently and revise supported findings.
-6. Run only the confirmation rounds required by the configured cap, stopping
-   early or escalating under the bounded plan-review rules.
-7. Delegate implementation to the implementer only after the plan-review
-   procedure permits implementation.
-8. Use one coherent implementation run where practical. Split into batches
-   only when necessary for correctness,
-   context management, or verification.
-9. Inspect every changed file and the complete diff.
-10. Run the complete relevant verification suite.
-11. Ask a fresh reviewer session to review the final uncommitted changes
-    against the reviewed plan and acceptance criteria.
-12. Verify every finding.
-13. Correct legitimate defects without expanding scope.
-14. Rerun verification.
-
-Use no more than two review-and-correction cycles unless further iteration has
-a clear and material expected benefit.
-
-## Codex sessions
-
-Prefer one coherent Codex implementation run for a bounded task.
-
-Run a delegated Codex execution in the foreground of a single tool call
-whenever practical. When it must span tool calls or turns, launch it with
-`claude-lnt-start --ttl <seconds> -- codex ...` so it holds a lease. A
-background process without a lease, including one moved to the background
-interactively after launch, is terminated at the next turn boundary by the
-Leave No Trace hooks. That termination is by design; the lease is the
-mechanism that says otherwise.
-
-Do not use `--ephemeral` for an implementation thread that may require a
-follow-up.
-
-Record the exact Codex session identifier returned by the implementation run.
-
-When a follow-up must continue the same task, resume that exact session with
-the same profile and sandbox as the original run. Neither is restored from
-the session: a bare `codex exec resume` silently falls back to the base
-configuration's model and effort and to the read-only sandbox, so name the
-profile the implementation actually used:
-
-    codex --profile <SAME_PROFILE_AS_THE_ORIGINAL_RUN> exec \
-      --sandbox workspace-write \
-      resume <SESSION_ID> "<FOLLOW_UP_PROMPT>"
-
-Never use `resume --last` automatically. Another task may have created the most
-recent Codex session.
-
-Use a fresh session for every independent review.
-
-Do not allow the implementation session to review its own work.
-
-Use `--ephemeral` for one-off independent reviews when no follow-up context is
-needed.
-
-## Codex Failure and Claude-Only Fallback
-
-Every Codex call must be checked for a successful exit status and usable output.
-
-Codex failure must not trigger repeated retries, uncontrolled model switching,
-or abandonment of an ordinary task.
-
-### Account-level unavailability
-
-Treat authentication, subscription, entitlement, billing, quota, and usage
-limit errors as account-level failures.
-
-On an account-level failure:
-
-1. Do not retry.
-2. Do not try another Codex model.
-3. Preserve the current plan and acceptance criteria.
-4. Continue implementation with the principal orchestrator.
-5. Perform direct diff inspection and all relevant verification.
-6. Record that Codex implementation or independent review was unavailable.
-
-### Model-specific failure
-
-If only the selected model is unavailable, one appropriate alternative Codex
-model may be attempted.
-
-Do not try more than one alternative.
-
-Use the principal orchestrator if the alternative would materially reduce implementation quality,
-review independence, or safety.
-
-### Transient failure
-
-Retry a transient process, network, or service failure once.
-
-After the second failure, use the principal orchestrator and do not call Codex again for that task
-unless the user explicitly requests another attempt.
-
-### Partial Codex changes
-
-When Codex fails after modifying the working tree:
-
-1. Inspect `git status`.
-2. Inspect the complete diff.
-3. Determine which changes are complete, relevant, and correct.
-4. Revert or repair incomplete changes.
-5. Continue with the principal orchestrator.
-6. Rerun the relevant verification suite.
-
-Never assume that partial Codex output represents a valid implementation.
-
-### Review fallback
-
-When the reviewer profile or another independent Codex reviewer is unavailable:
-
-- The principal orchestrator must review the complete diff against the
-  implementation plan and acceptance criteria.
-- The principal orchestrator must actively search for regressions, boundary failures, missing tests,
-  security issues, and unrelated changes.
-- Tests and direct inspection remain mandatory.
-- The completion report must state that no independent cross-model review was
-  completed.
-
-For high-risk work, pause and ask the user when proceeding without independent
-review would leave material unresolved risk.
-
-If the user explicitly asked for Codex participation, report the failure before
-substituting Claude-only work.
-
-## Review policy
-
-Codex review findings are advisory, not authoritative.
-
-The principal orchestrator must:
-
-- Verify each material finding against the repository.
-- Reject unsupported, irrelevant, or speculative findings.
-- Preserve the distinction between confirmed defects and possible concerns.
-- Fix legitimate problems that remain within the approved task scope.
-- Avoid adding features merely because a reviewer suggested them.
-- Rerun affected tests after corrections.
-- Stop after two review cycles unless another cycle has clear expected value.
-
-A review that reports no findings does not replace testing or direct inspection.
-
-## Verification
-
-Before reporting substantial work complete:
-
-- Inspect the complete diff.
-- Confirm that every changed line traces to the request or a necessary
-  consequence.
-- Confirm that the implementation matches the acceptance criteria.
-- Run relevant tests.
-- Run linting, formatting checks, type checks, and builds where applicable.
-- Verify important failure paths and boundary conditions.
-- Confirm that no unrelated files were modified.
-- Confirm that no credentials, secrets, generated artifacts, or temporary files
-  were introduced.
-- Review dependency changes explicitly.
-- Check `git status` before completion.
-
-Never claim that a command passed unless its successful result was observed.
-
-If verification cannot be performed, state exactly what was not verified and
-why.
-
-## Token and execution efficiency
-
-- Do not invoke Codex for trivial tasks.
-- Do not use the reviewer profile where the mechanic or implementer is sufficient.
-- Do not request plan review for straightforward, low-risk work.
-- Keep plans concise unless complexity requires detail.
-- Keep Codex prompts bounded and structured.
-- Request concise Codex reports.
-- Reuse the exact implementation session when follow-up is necessary.
-- Use fresh sessions only where independence matters.
-- Avoid repeated repository-wide exploration by both models.
-- Parallelize only independent, non-conflicting work.
-- Prefer targeted checks during implementation.
-- Run the full relevant verification suite before completion.
-- Do not start automatic, unbounded review gates.
-
-## Safety and scope
-
-Codex and the principal orchestrator must not independently:
-
-- Commit or push changes.
-- Create, delete, or merge branches.
-- Create or merge pull requests.
-- Tag or publish releases.
-- Deploy software.
-- Modify production data or infrastructure.
-- Expose credentials, tokens, private keys, or `.env` contents.
-- Modify files outside the current repository.
-- Add, remove, or upgrade dependencies without demonstrated need.
-- Refactor unrelated code.
-- Change public interfaces or persisted data formats without approval.
-
-These actions require an explicit user request.
-
-## Completion report
-
-For substantial work, report concisely:
-
-- What changed.
-- Which work was delegated.
-- Which Codex model was used and why.
-- Which verification commands ran.
-- Whether verification passed.
-- Remaining limitations, assumptions, or risks.
-- Decisions still requiring user approval.
-
-Do not include unnecessary agent narration or reproduce long Codex reports.
+- how each was addressed; and
+- a request to identify which original blocking objections still survive.
+
+Stop early when none survive. If the same blocker survives a revision, or the
+cap is reached, stop before implementation and ask the user to choose between
+the supported positions. Do not seek another reviewer merely to overturn an
+unwelcome result. With a one-round cap, any supported blocking objection after
+round one triggers that escalation; there is no revision-confirmation round.
+
+### Implement and integrate
+
+Delegate coherent batches rather than the entire project at once. Each handoff
+contains the approved slice, constraints, acceptance criteria, relevant paths,
+and required checks. After each batch:
+
+1. inspect process status and output;
+2. inspect `git status` and the complete diff;
+3. read changed logic rather than relying on a summary;
+4. run the batch checks;
+5. integrate or correct before starting the next batch.
+
+### Final review
+
+After full verification, give a fresh reviewer:
+
+- the user request and acceptance criteria;
+- the final diff and relevant paths;
+- test and build results;
+- known constraints and unresolved risks; and
+- instructions to remain read-only and report only actionable findings.
+
+The review prompt should ask for severity, exact evidence, a reproduction or
+failure scenario, and the smallest safe correction. It should also permit
+`NO MATERIAL FINDINGS`.
+
+For each finding, reproduce or otherwise verify it. Reject speculation and
+preference. Correct real defects, add regression coverage where useful, rerun
+affected checks, and review again only when the correction is materially
+substantial. Never run unlimited cycles.
+
+## Handoff quality
+
+Good handoffs are self-contained but small:
+
+```text
+Objective:
+Scope:
+Constraints:
+Acceptance criteria:
+Relevant paths:
+Verification:
+Return format:
+```
+
+Point to files rather than pasting their contents. Keep stable shared policy in
+`AGENTS.md`; append the task-specific delta after it. Choose the provider,
+model, and thinking level before starting the process. Do not switch them
+mid-session. Provider caches are automatic and cannot be shared across models
+or providers.
+
+Do not send secrets, `.env` contents, private keys, access tokens, production
+data, or unrelated conversation history.
+
+## Failure handling
+
+Always check exit status and usable final output.
+
+- Account, quota, billing, authentication, or entitlement failure: do not retry
+  that provider. Use another deliberately configured provider or continue with
+  the principal.
+- Model-specific failure: try at most one suitable configured alternative.
+- Transient failure: retry once.
+- Timeout or interruption: confirm the complete process tree stopped before
+  continuing.
+- Missing or malformed final output: treat the run as failed.
+- Partial write-capable failure: inspect the full working tree before another
+  writer runs. Keep only understood, relevant, verifiable changes.
+
+If independent review is unavailable, the principal performs an explicit
+self-review and reports that limitation. Pause complex work when the missing
+review leaves material unresolved risk. Never silently replace a provider or
+model the user explicitly required.
+
+## Verification and completion
+
+Verification is proportional to risk but never optional. Use the repository's
+authoritative commands. Cover affected tests, lint, format, types, build,
+failure paths, compatibility, and security boundaries as applicable.
+
+Before completion:
+
+1. review the complete diff against the original request;
+2. confirm all acceptance criteria;
+3. confirm observed command success;
+4. check unrelated changes, secrets, and generated artefacts;
+5. perform the Leave No Trace inspection from the global policy; and
+6. report provider/role use honestly, including whether review was fresh,
+   model-diverse, or unavailable.
+
+External actions such as commits, pushes, releases, deployments, and production
+mutations occur only when explicitly authorised.
