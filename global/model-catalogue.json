@@ -5,6 +5,7 @@
       {
         "id": "fable",
         "label": "fable",
+        "fallback_tier": 3,
         "thinking_levels": [
           "low",
           "medium",
@@ -17,6 +18,7 @@
       {
         "id": "opus",
         "label": "opus",
+        "fallback_tier": 3,
         "thinking_levels": [
           "low",
           "medium",
@@ -29,6 +31,7 @@
       {
         "id": "sonnet",
         "label": "sonnet",
+        "fallback_tier": 2,
         "thinking_levels": [
           "low",
           "medium",
@@ -41,6 +44,7 @@
       {
         "id": "haiku",
         "label": "haiku",
+        "fallback_tier": 1,
         "thinking_levels": []
       }
     ],
@@ -48,6 +52,7 @@
       {
         "id": "gpt-5.6-luna",
         "label": "gpt-5.6-luna",
+        "fallback_tier": 1,
         "thinking_levels": [
           "low",
           "medium",
@@ -60,6 +65,7 @@
       {
         "id": "gpt-5.6-terra",
         "label": "gpt-5.6-terra",
+        "fallback_tier": 2,
         "thinking_levels": [
           "low",
           "medium",
@@ -73,6 +79,7 @@
       {
         "id": "gpt-5.6-sol",
         "label": "gpt-5.6-sol",
+        "fallback_tier": 3,
         "thinking_levels": [
           "low",
           "medium",
@@ -86,6 +93,7 @@
       {
         "id": "gpt-5.5",
         "label": "gpt-5.5",
+        "fallback_tier": 2,
         "thinking_levels": [
           "low",
           "medium",

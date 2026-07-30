@@ -150,6 +150,7 @@ def _parse_catalogue(
             label = entry.get("label")
             levels = entry.get("thinking_levels")
             default = entry.get("default_thinking")
+            fallback_tier = entry.get("fallback_tier")
             if not isinstance(model, str) or not model.strip():
                 raise ConfigError(f"every {provider} model needs an id")
             if model in seen:
@@ -175,6 +176,15 @@ def _parse_catalogue(
                 raise ConfigError(
                     f"{model} cannot have a thinking default without levels"
                 )
+            if (
+                fallback_tier is not None
+                and (
+                    isinstance(fallback_tier, bool)
+                    or not isinstance(fallback_tier, int)
+                    or not 1 <= fallback_tier <= 3
+                )
+            ):
+                raise ConfigError(f"{model} has an invalid fallback tier")
             parsed.append(
                 {
                     "provider": provider,
@@ -182,6 +192,7 @@ def _parse_catalogue(
                     "label": label,
                     "thinking_levels": levels,
                     "default_thinking": default,
+                    "fallback_tier": fallback_tier,
                     "known": True,
                 }
             )
@@ -798,6 +809,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     Saving changes the defaults for <strong>new Orrery processes</strong>;
     running sessions are unaffected. A repository's private
     <code>.orrery.json</code> principal override still wins. Every role may use either provider.
+    Runtime failure automatically ranks the nearest potential model, but never
+    starts it without the user's explicit, candidate-bound approval.
     __CATALOGUE_NOTE__
     Known models expose only the thinking levels reported for that model;
     a custom identifier also requires an explicit provider.

@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from orrery_runtime import (  # noqa: E402
+    Role,
     RuntimeConfigError,
     claude_sandbox_settings,
     codex_home,
@@ -24,6 +25,20 @@ from orrery_runtime import (  # noqa: E402
     load_role,
     provider_environment,
     role_handoff,
+)
+from orrery_fallback import (  # noqa: E402
+    APPROVAL_REQUIRED,
+    Availability,
+    Consent,
+    FailureScope,
+    classify_failure,
+    git_workspace_fingerprint,
+    model_status,
+    nearest_fallback,
+    parse_approval,
+    proposal_for_approval,
+    provider_status,
+    request_fallback_consent,
 )
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
@@ -40,6 +55,46 @@ class UsageError(Exception):
 
 class CleanupError(Exception):
     pass
+
+
+class Invocation:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: int,
+        output_path: Path | None,
+        prompt: str,
+        role_id: str,
+        approval: tuple[str, str] | None,
+        no_fallback: bool,
+    ) -> None:
+        self.timeout_seconds = timeout_seconds
+        self.output_path = output_path
+        self.prompt = prompt
+        self.role_id = role_id
+        self.approval = approval
+        self.no_fallback = no_fallback
+
+
+class DelegationState:
+    def __init__(self, *, configured: Role, role: Role) -> None:
+        self.configured = configured
+        self.role = role
+        self.excluded_providers: set[str] = set()
+        self.excluded_models: set[tuple[str, str]] = set()
+        self.transient_retries: set[tuple[str, str]] = set()
+        self.is_fallback = False
+
+
+class NextAttempt(Exception):
+    def __init__(
+        self,
+        invocation: Invocation,
+        state: DelegationState,
+    ) -> None:
+        super().__init__(state.role)
+        self.invocation = invocation
+        self.state = state
 
 
 class ReviewInterrupted(Exception):
@@ -116,6 +171,7 @@ def usage() -> str:
     return (
         "Usage:\n"
         f"  {PROGRAM_NAME} [--timeout SECONDS] [--output PATH]\n"
+        "                 [--approve-fallback PROVIDER:MODEL] [--no-fallback]\n"
         "                 [--role NAME] -- PROMPT...\n"
         f"  printf '%s\\n' \"PROMPT\" | {PROGRAM_NAME} "
         "[--role NAME] [--timeout SECONDS] [--output PATH]\n\n"
@@ -123,11 +179,13 @@ def usage() -> str:
         "Reviewer roles are read-only and fresh; worker roles are "
         "workspace-write. The compatibility command orrery-review defaults "
         "to reviewer. orrery-agent requires --role. A transient systemd "
-        "service contains the complete process tree where available.\n"
+        "service contains the complete process tree where available. A failed "
+        "provider gets one automatically ranked fallback proposal; "
+        "substitution requires explicit user approval.\n"
     )
 
 
-def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
+def parse_args(argv: list[str]) -> Invocation:
     try:
         timeout_seconds = int(
             os.environ.get(
@@ -143,6 +201,8 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
     role: str | None = "reviewer" if PROGRAM_NAME == "orrery-review" else None
+    approval: tuple[str, str] | None = None
+    no_fallback = False
 
     index = 0
     while index < len(argv):
@@ -185,6 +245,21 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
             if not value:
                 raise UsageError("--output requires a non-empty path")
             output_path = Path(value)
+        elif argument == "--approve-fallback":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --approve-fallback")
+            index += 1
+            try:
+                approval = parse_approval(argv[index])
+            except RuntimeConfigError as exc:
+                raise UsageError(str(exc)) from exc
+        elif argument.startswith("--approve-fallback="):
+            try:
+                approval = parse_approval(argument.split("=", 1)[1])
+            except RuntimeConfigError as exc:
+                raise UsageError(str(exc)) from exc
+        elif argument == "--no-fallback":
+            no_fallback = True
         elif argument in ("--role", "-r"):
             if index + 1 >= len(argv):
                 raise UsageError(f"missing value for {argument}")
@@ -217,8 +292,19 @@ def parse_args(argv: list[str]) -> tuple[int, Path | None, str, str]:
         raise UsageError("--role is required")
     if not role or not re.fullmatch(r"[A-Za-z0-9._-]+", role):
         raise UsageError(f"invalid role name: {role!r}")
+    if no_fallback and approval is not None:
+        raise UsageError(
+            "--no-fallback and --approve-fallback cannot be combined"
+        )
 
-    return timeout_seconds, output_path, prompt, role
+    return Invocation(
+        timeout_seconds=timeout_seconds,
+        output_path=output_path,
+        prompt=prompt,
+        role_id=role,
+        approval=approval,
+        no_fallback=no_fallback,
+    )
 
 
 def report(message: str) -> None:
@@ -729,7 +815,91 @@ def publish_atomically(source: Path, destination: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def main() -> int:
+def handle_failed_attempt(
+    invocation: Invocation,
+    state: DelegationState,
+    *,
+    reason: str,
+    status: int,
+    scope: FailureScope,
+    context_warning: bool,
+    require_rerun_after_inspection: bool = False,
+    approval_required_status: int | None = None,
+) -> int:
+    """Retry one transient failure or request exact fallback consent."""
+    failed = state.role
+    identity = (failed.provider, failed.model)
+    if (
+        scope is FailureScope.TRANSIENT
+        and identity not in state.transient_retries
+        and not require_rerun_after_inspection
+    ):
+        state.transient_retries.add(identity)
+        print(
+            f"{PROGRAM_NAME}: transient failure detected for "
+            f"{failed.provider}/{failed.model}; retrying it once.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise NextAttempt(invocation, state)
+    if (
+        scope is FailureScope.TRANSIENT
+        and identity not in state.transient_retries
+        and require_rerun_after_inspection
+    ):
+        print(
+            f"{PROGRAM_NAME}: transient retry skipped because the failed "
+            "write-capable attempt changed the workspace or its unchanged "
+            "state could not be verified.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    if scope is FailureScope.MODEL:
+        state.excluded_models.add(identity)
+    else:
+        state.excluded_providers.add(failed.provider)
+
+    proposal = nearest_fallback(
+        state.configured,
+        reason,
+        excluded_providers=state.excluded_providers,
+        excluded_models=state.excluded_models,
+    )
+    if proposal is None:
+        print(
+            f"{PROGRAM_NAME}: no authenticated or potentially authenticated "
+            "fallback candidate remains; no substitution was made.",
+            file=sys.stderr,
+        )
+        return status
+
+    consent = request_fallback_consent(
+        proposal,
+        approval=invocation.approval,
+        no_fallback=invocation.no_fallback,
+        program_name=PROGRAM_NAME,
+        original_status=status,
+        context_warning=context_warning,
+        require_rerun_after_inspection=require_rerun_after_inspection,
+    )
+    if consent is Consent.APPROVED:
+        state.role = proposal.candidate
+        state.is_fallback = True
+        raise NextAttempt(invocation, state)
+    if consent is Consent.REQUIRED:
+        return (
+            APPROVAL_REQUIRED
+            if approval_required_status is None
+            else approval_required_status
+        )
+    return status
+
+
+def main(
+    invocation: Invocation | None = None,
+    state: DelegationState | None = None,
+) -> int:
     # Everything this wrapper creates is private session state that it also
     # reads back. A umask can only remove bits, so setting it here makes
     # that private without a restrictive inherited umask being able to make
@@ -738,19 +908,89 @@ def main() -> int:
     os.umask(0o077)
 
     try:
-        timeout_seconds, output_path, prompt, role_id = parse_args(sys.argv[1:])
+        if invocation is None:
+            invocation = parse_args(sys.argv[1:])
     except UsageError as exc:
         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
         print(usage(), file=sys.stderr, end="")
         return 2
 
     try:
-        role_config = load_role(role_id)
+        if state is None:
+            configured = load_role(invocation.role_id)
+            state = DelegationState(configured=configured, role=configured)
+            if invocation.approval is not None:
+                (
+                    proposal,
+                    state.excluded_providers,
+                    state.excluded_models,
+                ) = proposal_for_approval(
+                    configured,
+                    invocation.approval,
+                )
+                if proposal is None:
+                    print(
+                        f"{PROGRAM_NAME}: the approved fallback is no longer "
+                        "a potentially available candidate; no process was "
+                        "started.",
+                        file=sys.stderr,
+                    )
+                    return APPROVAL_REQUIRED
+                consent = request_fallback_consent(
+                    proposal,
+                    approval=invocation.approval,
+                    no_fallback=False,
+                    program_name=PROGRAM_NAME,
+                )
+                if consent is not Consent.APPROVED:
+                    return (
+                        APPROVAL_REQUIRED
+                        if consent is Consent.REQUIRED
+                        else 2
+                    )
+                state.role = proposal.candidate
+                state.is_fallback = True
+        role_config = state.role
         if role_config.provider == "openai":
             codex_home()
     except RuntimeConfigError as exc:
         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
         return 2
+
+    availability = provider_status(role_config.provider)
+    if availability.state is Availability.UNAVAILABLE:
+        return handle_failed_attempt(
+            invocation,
+            state,
+            reason=availability.reason,
+            status=2,
+            scope=FailureScope.PROVIDER,
+            context_warning=False,
+            approval_required_status=APPROVAL_REQUIRED,
+        )
+    if availability.state is Availability.UNKNOWN:
+        print(
+            f"{PROGRAM_NAME}: warning: {availability.reason}; attempting the "
+            "configured process.",
+            file=sys.stderr,
+        )
+    elif availability.state is Availability.READY:
+        visibility, visibility_reason = model_status(role_config, availability)
+        if visibility is Availability.UNAVAILABLE:
+            return handle_failed_attempt(
+                invocation,
+                state,
+                reason=visibility_reason,
+                status=2,
+                scope=FailureScope.MODEL,
+                context_warning=False,
+                approval_required_status=APPROVAL_REQUIRED,
+            )
+
+    timeout_seconds = invocation.timeout_seconds
+    output_path = invocation.output_path
+    prompt = invocation.prompt
+    role_id = invocation.role_id
 
     # systemd gives the run control-group containment and a RuntimeMaxSec
     # backstop. Where it does not exist, such as on macOS, the run degrades
@@ -769,7 +1009,12 @@ def main() -> int:
 
     display, purpose = role_label(role_id)
     print(
-        f"↳ {display} · {role_config.provider} · {role_config.model}"
+        (
+            f"↳ Fallback {display.lower()}"
+            if state.is_fallback
+            else f"↳ {display}"
+        )
+        + f" · {role_config.provider} · {role_config.model}"
         + (
             f" · thinking {role_config.thinking}"
             if role_config.thinking
@@ -872,7 +1117,15 @@ def main() -> int:
             )
         except RuntimeConfigError as exc:
             print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
-            return 127
+            return handle_failed_attempt(
+                invocation,
+                state,
+                reason=str(exc),
+                status=127,
+                scope=FailureScope.PROVIDER,
+                context_warning=False,
+                approval_required_status=APPROVAL_REQUIRED,
+            )
 
         if use_systemd:
             launcher_path, environment_path = write_service_launcher(
@@ -914,6 +1167,21 @@ def main() -> int:
 
         started = time.monotonic()
         deadline = started + timeout_seconds
+        workspace_before = (
+            None
+            if role_config.read_only
+            else git_workspace_fingerprint()
+        )
+
+        def workspace_requires_inspection() -> bool:
+            if role_config.read_only:
+                return False
+            workspace_after = git_workspace_fingerprint()
+            return (
+                workspace_before is None
+                or workspace_after is None
+                or workspace_before != workspace_after
+            )
 
         with (
             log_path.open("wb") as log_handle,
@@ -995,7 +1263,21 @@ def main() -> int:
                     except RuntimeError as exc:
                         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
                 terminate_client(process)
-                return 124
+                return handle_failed_attempt(
+                    invocation,
+                    state,
+                    reason=(
+                        f"{role_config.provider}/{role_config.model} timed out "
+                        f"after {timeout_seconds}s"
+                    ),
+                    status=124,
+                    scope=FailureScope.PROVIDER,
+                    context_warning=not role_config.read_only,
+                    require_rerun_after_inspection=(
+                        workspace_requires_inspection()
+                    ),
+                    approval_required_status=124,
+                )
 
         if return_code != 0:
             print(
@@ -1009,7 +1291,21 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
-            return return_code
+            return handle_failed_attempt(
+                invocation,
+                state,
+                reason=(
+                    f"{role_config.provider}/{role_config.model} exited with "
+                    f"status {return_code}"
+                ),
+                status=return_code,
+                scope=classify_failure(diagnostics),
+                context_warning=not role_config.read_only,
+                require_rerun_after_inspection=(
+                    workspace_requires_inspection()
+                ),
+                approval_required_status=return_code,
+            )
 
         if role_config.provider == "anthropic":
             try:
@@ -1032,7 +1328,21 @@ def main() -> int:
                         file=sys.stderr,
                     )
                     print(diagnostics, file=sys.stderr)
-                return 1
+                return handle_failed_attempt(
+                    invocation,
+                    state,
+                    reason=(
+                        f"{role_config.provider}/{role_config.model} produced "
+                        "no valid final result"
+                    ),
+                    status=1,
+                    scope=classify_failure(diagnostics),
+                    context_warning=not role_config.read_only,
+                    require_rerun_after_inspection=(
+                        workspace_requires_inspection()
+                    ),
+                    approval_required_status=1,
+                )
 
         if (
             not verdict_path.exists()
@@ -1049,7 +1359,21 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
-            return 1
+            return handle_failed_attempt(
+                invocation,
+                state,
+                reason=(
+                    f"{role_config.provider}/{role_config.model} produced no "
+                    "final result"
+                ),
+                status=1,
+                scope=classify_failure(diagnostics),
+                context_warning=not role_config.read_only,
+                require_rerun_after_inspection=(
+                    workspace_requires_inspection()
+                ),
+                approval_required_status=1,
+            )
 
         verdict = verdict_path.read_text(errors="replace")
 
@@ -1138,14 +1462,21 @@ def main() -> int:
 
 
 def entrypoint() -> int:
-    try:
-        return main()
-    except CleanupError as exc:
-        print(
-            f"{PROGRAM_NAME} cleanup failed: {exc}",
-            file=sys.stderr,
-        )
-        return 1
+    invocation: Invocation | None = None
+    state: DelegationState | None = None
+    while True:
+        try:
+            return main(invocation, state)
+        except NextAttempt as next_attempt:
+            invocation = next_attempt.invocation
+            state = next_attempt.state
+            continue
+        except CleanupError as exc:
+            print(
+                f"{PROGRAM_NAME} cleanup failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
 
 
 if __name__ == "__main__":

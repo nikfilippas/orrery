@@ -430,6 +430,13 @@ def _ordered_with_fallback(
         seeded_default = seed.get("default_thinking")
         if seeded_default in entry.get("thinking_levels", []):
             entry["default_thinking"] = seeded_default
+        seeded_tier = seed.get("fallback_tier")
+        if (
+            isinstance(seeded_tier, int)
+            and not isinstance(seeded_tier, bool)
+            and 1 <= seeded_tier <= 3
+        ):
+            entry["fallback_tier"] = seeded_tier
         ordered.append(entry)
     ordered.extend(
         entry for entry in live if entry["id"] in by_id

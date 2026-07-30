@@ -1,45 +1,309 @@
 #!/usr/bin/env python3
-"""Start Orrery's configured principal orchestrator."""
+"""Start and supervise Orrery's configured principal orchestrator."""
 
 from __future__ import annotations
 
-import os
+import signal
+import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from orrery_fallback import (  # noqa: E402
+    APPROVAL_REQUIRED,
+    Availability,
+    Consent,
+    git_workspace_fingerprint,
+    model_status,
+    nearest_fallback,
+    parse_approval,
+    proposal_for_approval,
+    provider_status,
+    request_fallback_consent,
+)
 from orrery_runtime import (  # noqa: E402
+    Role,
     RuntimeConfigError,
     load_role,
     principal_command,
 )
 
 
-def main() -> int:
-    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
-        print(
-            "Usage: orrery [PROVIDER-CLI-ARGUMENTS...]\n\n"
-            "Starts the principal orchestrator configured in "
-            "global/orchestration.json. Use orrery-config to choose any "
-            "supported Anthropic or OpenAI model."
+@dataclass(frozen=True)
+class Invocation:
+    approval: tuple[str, str] | None
+    no_fallback: bool
+    provider_arguments: tuple[str, ...]
+
+
+def usage() -> str:
+    return (
+        "Usage:\n"
+        "  orrery [--approve-fallback PROVIDER:MODEL] [--no-fallback]\n"
+        "          [-- PROVIDER-CLI-ARGUMENTS...]\n\n"
+        "Starts and supervises the configured principal. If that provider or "
+        "model cannot run, Orrery proposes the nearest potentially available "
+        "model and requires explicit approval before substitution. "
+        "Provider-specific arguments are not carried across providers.\n"
+    )
+
+
+def parse_args(argv: list[str]) -> Invocation:
+    approval: tuple[str, str] | None = None
+    no_fallback = False
+    provider_arguments: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in ("--help", "-h"):
+            print(usage(), end="")
+            raise SystemExit(0)
+        if argument == "--":
+            provider_arguments = argv[index + 1 :]
+            break
+        if argument == "--approve-fallback":
+            if index + 1 >= len(argv):
+                raise RuntimeConfigError(
+                    "missing value for --approve-fallback"
+                )
+            index += 1
+            approval = parse_approval(argv[index])
+        elif argument.startswith("--approve-fallback="):
+            approval = parse_approval(argument.split("=", 1)[1])
+        elif argument == "--no-fallback":
+            no_fallback = True
+        else:
+            # Backward compatibility: historically every unrecognised argument
+            # belonged to the selected provider, without a `--` separator.
+            provider_arguments = argv[index:]
+            break
+        index += 1
+    if no_fallback and approval is not None:
+        raise RuntimeConfigError(
+            "--no-fallback and --approve-fallback cannot be combined"
         )
-        return 0
+    return Invocation(
+        approval=approval,
+        no_fallback=no_fallback,
+        provider_arguments=tuple(provider_arguments),
+    )
+
+
+def _proposal_status(
+    configured: Role,
+    *,
+    reason: str,
+    excluded_providers: set[str],
+    excluded_models: set[tuple[str, str]],
+    invocation: Invocation,
+    status: int,
+    context_warning: bool,
+    require_rerun_after_inspection: bool = False,
+    approval_required_status: int | None = None,
+) -> tuple[Role | None, int]:
+    proposal = nearest_fallback(
+        configured,
+        reason,
+        excluded_providers=excluded_providers,
+        excluded_models=excluded_models,
+    )
+    if proposal is None:
+        print(
+            "orrery: no authenticated or potentially authenticated fallback "
+            "candidate remains; no substitution was made.",
+            file=sys.stderr,
+        )
+        return None, status
+    consent = request_fallback_consent(
+        proposal,
+        approval=invocation.approval,
+        no_fallback=invocation.no_fallback,
+        program_name="orrery",
+        original_status=status,
+        context_warning=context_warning,
+        require_rerun_after_inspection=require_rerun_after_inspection,
+    )
+    if consent is Consent.APPROVED:
+        return proposal.candidate, status
+    if consent is Consent.REQUIRED:
+        return None, (
+            APPROVAL_REQUIRED
+            if approval_required_status is None
+            else approval_required_status
+        )
+    return None, status
+
+
+def main() -> int:
     try:
-        role = load_role("orchestrator")
-        command = principal_command(role, sys.argv[1:])
+        invocation = parse_args(sys.argv[1:])
+        configured = load_role("orchestrator")
     except RuntimeConfigError as exc:
         print(f"orrery: {exc}", file=sys.stderr)
         return 2
-    print(
-        f"↳ Principal orchestrator · {role.provider} · {role.model}"
-        + (f" · thinking {role.thinking}" if role.thinking else ""),
-        file=sys.stderr,
-        flush=True,
-    )
-    os.execv(command[0], command)
-    return 127
+
+    role = configured
+    excluded_providers: set[str] = set()
+    excluded_models: set[tuple[str, str]] = set()
+    is_fallback = False
+
+    if invocation.approval is not None:
+        proposal, excluded_providers, excluded_models = proposal_for_approval(
+            configured,
+            invocation.approval,
+        )
+        if proposal is None:
+            print(
+                "orrery: the approved fallback is no longer a potentially "
+                "available candidate; no process was started.",
+                file=sys.stderr,
+            )
+            return APPROVAL_REQUIRED
+        consent = request_fallback_consent(
+            proposal,
+            approval=invocation.approval,
+            no_fallback=False,
+            program_name="orrery",
+        )
+        if consent is not Consent.APPROVED:
+            return APPROVAL_REQUIRED if consent is Consent.REQUIRED else 2
+        role = proposal.candidate
+        is_fallback = True
+
+    while True:
+        availability = provider_status(role.provider)
+        if availability.state is Availability.UNAVAILABLE:
+            excluded_providers.add(role.provider)
+            candidate, status = _proposal_status(
+                configured,
+                reason=availability.reason,
+                excluded_providers=excluded_providers,
+                excluded_models=excluded_models,
+                invocation=invocation,
+                status=2,
+                context_warning=False,
+                approval_required_status=APPROVAL_REQUIRED,
+            )
+            if candidate is None:
+                return status
+            role = candidate
+            is_fallback = True
+            continue
+        if availability.state is Availability.UNKNOWN:
+            print(
+                f"orrery: warning: {availability.reason}; attempting the "
+                "configured process.",
+                file=sys.stderr,
+            )
+        elif availability.state is Availability.READY:
+            visibility, visibility_reason = model_status(role, availability)
+            if visibility is Availability.UNAVAILABLE:
+                excluded_models.add((role.provider, role.model))
+                candidate, status = _proposal_status(
+                    configured,
+                    reason=visibility_reason,
+                    excluded_providers=excluded_providers,
+                    excluded_models=excluded_models,
+                    invocation=invocation,
+                    status=2,
+                    context_warning=False,
+                    approval_required_status=APPROVAL_REQUIRED,
+                )
+                if candidate is None:
+                    return status
+                role = candidate
+                is_fallback = True
+                continue
+
+        extra = (
+            list(invocation.provider_arguments)
+            if role.provider == configured.provider
+            else []
+        )
+        if (
+            is_fallback
+            and role.provider != configured.provider
+            and invocation.provider_arguments
+        ):
+            print(
+                "orrery: provider-specific arguments were omitted from the "
+                "cross-provider fallback.",
+                file=sys.stderr,
+            )
+        try:
+            command = principal_command(role, extra)
+        except RuntimeConfigError as exc:
+            excluded_providers.add(role.provider)
+            candidate, status = _proposal_status(
+                configured,
+                reason=str(exc),
+                excluded_providers=excluded_providers,
+                excluded_models=excluded_models,
+                invocation=invocation,
+                status=2,
+                context_warning=False,
+                approval_required_status=APPROVAL_REQUIRED,
+            )
+            if candidate is None:
+                return status
+            role = candidate
+            is_fallback = True
+            continue
+
+        print(
+            ("↳ Fallback principal" if is_fallback else "↳ Principal orchestrator")
+            + f" · {role.provider} · {role.model}"
+            + (f" · thinking {role.thinking}" if role.thinking else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+        workspace_before = git_workspace_fingerprint()
+        try:
+            result = subprocess.run(command, check=False)
+            return_code = result.returncode
+        except KeyboardInterrupt:
+            return 128 + signal.SIGINT
+        except OSError as exc:
+            print(f"orrery: principal process could not start: {exc}", file=sys.stderr)
+            return_code = 127
+
+        if return_code == 0:
+            return 0
+        if return_code < 0:
+            signum = -return_code
+            if signum in {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}:
+                return 128 + signum
+        if return_code in {128 + signal.SIGINT, 128 + signal.SIGTERM}:
+            return return_code
+
+        excluded_providers.add(role.provider)
+        workspace_after = git_workspace_fingerprint()
+        candidate, status = _proposal_status(
+            configured,
+            reason=(
+                f"{role.provider}/{role.model} exited with status "
+                f"{return_code}; hidden quota, entitlement, model, or service "
+                "failure is possible"
+            ),
+            excluded_providers=excluded_providers,
+            excluded_models=excluded_models,
+            invocation=invocation,
+            status=return_code,
+            context_warning=True,
+            require_rerun_after_inspection=(
+                workspace_before is None
+                or workspace_after is None
+                or workspace_before != workspace_after
+            ),
+            approval_required_status=return_code,
+        )
+        if candidate is None:
+            return status
+        role = candidate
+        is_fallback = True
 
 
 if __name__ == "__main__":

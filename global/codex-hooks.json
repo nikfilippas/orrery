@@ -1,0 +1,18 @@
+{
+  "description": "Orrery principal-surface checks for direct Codex sessions.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/hooks/orrery-session-start.py\" openai",
+            "timeout": 15,
+            "statusMessage": "Checking Orrery principal"
+          }
+        ]
+      }
+    ]
+  }
+}

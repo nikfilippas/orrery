@@ -10,6 +10,16 @@
             "timeout": 60
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/orrery-session-start.py\" anthropic",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PreToolUse": [

@@ -131,6 +131,14 @@ link_file \
     "$KIT_DIR/global/skills/development-orchestrator" \
     "$HOME/.agents/skills/development-orchestrator"
 
+link_file \
+    "$KIT_DIR/scripts/orrery-session-start" \
+    "$HOME/.claude/hooks/orrery-session-start.py"
+
+link_file \
+    "$KIT_DIR/scripts/orrery-session-start" \
+    "$CODEX_HOME/hooks/orrery-session-start.py"
+
 # Role assignments now come from one provider-neutral manifest. Remove only
 # obsolete profile links installed by this checkout; user-owned profiles stay.
 for stale in mechanic implementer plan-reviewer reviewer luna terra vesta sol; do
@@ -210,6 +218,10 @@ link_file \
     --companion \
     --hooks \
     --permissions
+"$KIT_DIR/scripts/apply-claude-settings.py" \
+    --hooks \
+    --source "$KIT_DIR/global/codex-hooks.json" \
+    --target "$CODEX_HOME/hooks.json"
 
 printf "\nInstallation complete.\n"
 

@@ -100,6 +100,7 @@ for provider, entries in providers.items():
         label = entry.get("label")
         levels = entry.get("thinking_levels")
         default = entry.get("default_thinking")
+        fallback_tier = entry.get("fallback_tier")
         if not isinstance(model, str) or not model:
             raise SystemExit("catalogue model has no id")
         if model in seen:
@@ -117,6 +118,12 @@ for provider, entries in providers.items():
             raise SystemExit(f"{model} has invalid thinking levels")
         if default is not None and default not in levels:
             raise SystemExit(f"{model} has an invalid thinking default")
+        if (
+            isinstance(fallback_tier, bool)
+            or not isinstance(fallback_tier, int)
+            or not 1 <= fallback_tier <= 3
+        ):
+            raise SystemExit(f"{model} has an invalid fallback tier")
         seen.add(model)
         known[(provider, model)] = entry
 
@@ -259,7 +266,7 @@ while IFS= read -r provider; do
     if [ "$provider" = "anthropic" ]; then
         if command -v claude >/dev/null 2>&1; then
             pass "Configured provider command available: claude"
-            if claude auth status --json >/dev/null 2>&1; then
+            if claude auth status >/dev/null 2>&1; then
                 pass "Anthropic authentication is active"
             else
                 fail "Anthropic authentication is unavailable"
@@ -270,7 +277,7 @@ while IFS= read -r provider; do
     elif [ "$provider" = "openai" ]; then
         if command -v codex >/dev/null 2>&1; then
             pass "Configured provider command available: codex"
-            if codex login status 2>&1 | grep -q "Logged in"; then
+            if codex login status >/dev/null 2>&1; then
                 pass "OpenAI authentication is active"
             else
                 fail "OpenAI authentication is unavailable"
@@ -280,6 +287,28 @@ while IFS= read -r provider; do
         fi
     fi
 done <<< "$CONFIGURED_PROVIDERS"
+
+printf '\n=== Potential fallback providers ===\n'
+for provider in anthropic openai; do
+    if grep -Fxq "$provider" <<< "$CONFIGURED_PROVIDERS"; then
+        continue
+    fi
+    if [ "$provider" = "anthropic" ]; then
+        if ! command -v claude >/dev/null 2>&1; then
+            skip "Anthropic is not installed as a cross-provider fallback"
+        elif claude auth status >/dev/null 2>&1; then
+            pass "Anthropic is authenticated as a potential fallback"
+        else
+            skip "Anthropic is not authenticated as a cross-provider fallback"
+        fi
+    elif ! command -v codex >/dev/null 2>&1; then
+        skip "OpenAI is not installed as a cross-provider fallback"
+    elif codex login status >/dev/null 2>&1; then
+        pass "OpenAI is authenticated as a potential fallback"
+    else
+        skip "OpenAI is not authenticated as a cross-provider fallback"
+    fi
+done
 
 printf '\n=== Shared instruction chain ===\n'
 check_link "$HOME/.claude/AGENTS.md" "$KIT_DIR/global/AGENTS.md"
@@ -291,6 +320,12 @@ check_link \
 check_link \
     "$HOME/.agents/skills/development-orchestrator" \
     "$KIT_DIR/global/skills/development-orchestrator"
+check_link \
+    "$HOME/.claude/hooks/orrery-session-start.py" \
+    "$KIT_DIR/scripts/orrery-session-start"
+check_link \
+    "$CODEX_HOME/hooks/orrery-session-start.py" \
+    "$KIT_DIR/scripts/orrery-session-start"
 
 if [ "$(tr -d '\r' < "$KIT_DIR/global/CLAUDE.md")" = "@AGENTS.md" ] &&
    [ "$(tr -d '\r' < "$KIT_DIR/project-template/CLAUDE.md")" = "@AGENTS.md" ]
@@ -334,6 +369,8 @@ done
 
 for script in \
     "$KIT_DIR/scripts/orrery" \
+    "$KIT_DIR/scripts/orrery_fallback.py" \
+    "$KIT_DIR/scripts/orrery-session-start" \
     "$KIT_DIR/scripts/orrery_model_catalogue.py" \
     "$KIT_DIR/scripts/orrery_runtime.py" \
     "$KIT_DIR/scripts/orrery-review" \
@@ -440,6 +477,69 @@ then
 else
     fail "Live Claude settings are missing canonical hooks or permissions"
 fi
+
+printf '\n=== Codex principal-surface notification ===\n'
+if python3 - \
+    "$KIT_DIR/global/codex-hooks.json" \
+    "$CODEX_HOME/hooks.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    canonical = json.loads(Path(sys.argv[1]).read_text())
+    live = json.loads(Path(sys.argv[2]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+def handlers(settings):
+    result = set()
+    for event, groups in settings.get("hooks", {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher", "")
+            for hook in group.get("hooks", []):
+                if isinstance(hook, dict):
+                    result.add((
+                        event,
+                        matcher,
+                        hook.get("type"),
+                        hook.get("command"),
+                        hook.get("timeout"),
+                    ))
+    return result
+
+if not handlers(canonical) <= handlers(live):
+    raise SystemExit(1)
+PY
+then
+    pass "Live Codex hooks contain the Orrery SessionStart check"
+else
+    fail "Live Codex hooks are missing the Orrery SessionStart check"
+fi
+
+if python3 - "$CODEX_HOME/config.toml" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(0)
+try:
+    config = tomllib.loads(path.read_text())
+except (OSError, tomllib.TOMLDecodeError):
+    raise SystemExit(1)
+if config.get("features", {}).get("hooks") is False:
+    raise SystemExit(1)
+PY
+then
+    pass "Codex hooks are not disabled in the user configuration"
+else
+    fail "Codex hooks are disabled or the user configuration is unreadable"
+fi
+skip "Codex may require the changed SessionStart hook to be trusted with /hooks"
 
 printf '\n=== Containment support ===\n'
 if [ "$KERNEL" = "Linux" ]; then

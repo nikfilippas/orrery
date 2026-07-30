@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         description=(
-            "Apply selected canonical Claude settings in one atomic update "
+            "Apply selected canonical agent settings in one atomic update "
             "while preserving unrelated live settings."
         )
     )
@@ -259,9 +259,9 @@ def merge_hooks(
     canonical_hooks = canonical.get("hooks", {})
 
     if not isinstance(existing_hooks, dict):
-        raise SystemExit("Live Claude hooks setting must be a JSON object.")
+        raise SystemExit("Live hooks setting must be a JSON object.")
     if not isinstance(canonical_hooks, dict):
-        raise SystemExit("Canonical Claude hooks setting must be a JSON object.")
+        raise SystemExit("Canonical hooks setting must be a JSON object.")
 
     validate_hook_groups(existing_hooks, source_name="live settings")
     validate_hook_groups(canonical_hooks, source_name="canonical settings")
@@ -519,7 +519,7 @@ def install(
     except AtomicExchangeUnavailable as exc:
         temporary.unlink(missing_ok=True)
         raise SystemExit(
-            f"Cannot update Claude settings safely: {exc}."
+            f"Cannot update agent settings safely: {exc}."
         ) from exc
     except BaseException:
         temporary.unlink(missing_ok=True)
@@ -548,11 +548,11 @@ def install(
             f"disk: {exc}. The previous version is at:\n{backup}"
         ) from exc
 
-    print(f"Backed up Claude settings to:\n{backup}")
+    print(f"Backed up agent settings to:\n{backup}")
 
     if not stat.S_ISREG(displaced.st_mode):
         raise SystemExit(
-            "The Claude settings path was replaced by something other than "
+            "The agent settings path was replaced by something other than "
             f"a regular file. It was preserved at:\n{backup}"
         )
 
@@ -617,7 +617,7 @@ def current_snapshot(
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise SystemExit(
-                f"Claude settings path is not a regular file: {path}"
+                f"Agent settings path is not a regular file: {path}"
             )
 
         chunks: list[bytes] = []
@@ -716,7 +716,7 @@ def main() -> int:
             updated = apply_selected_settings(current, canonical, args)
 
             if updated == current and base_is_live:
-                print("Selected Claude settings are already installed.")
+                print("Selected agent settings are already installed.")
                 return 0
 
             payload = render(updated)
@@ -742,7 +742,7 @@ def main() -> int:
 
                 temporary.unlink(missing_ok=True)
                 sync_directory(target_path.parent)
-                print("Applied selected Claude settings atomically.")
+                print("Applied selected agent settings atomically.")
                 return 0
 
             try:
@@ -764,7 +764,7 @@ def main() -> int:
                 continue
 
             if accepted:
-                print("Applied selected Claude settings atomically.")
+                print("Applied selected agent settings atomically.")
                 return 0
 
             # A writer outside the sidecar lock installed the displaced
@@ -815,7 +815,7 @@ def main() -> int:
 
         if restored:
             raise SystemExit(
-                f"Claude settings changed during each of {ATTEMPTS} "
+                f"Agent settings changed during each of {ATTEMPTS} "
                 "attempts. No update was applied and the settings were left "
                 "as they were found."
             )
@@ -828,7 +828,7 @@ def main() -> int:
     # Each is preserved as a backup, and the newest is the most recent of
     # them, so the state is always recoverable by hand.
     raise SystemExit(
-        f"Claude settings changed during each of {ATTEMPTS} attempts and "
+        f"Agent settings changed during each of {ATTEMPTS} attempts and "
         f"again during {ATTEMPTS} attempts to restore them, so another "
         "writer is updating them continuously. No update was applied. Every "
         "version that was displaced is preserved as a "

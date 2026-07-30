@@ -21,6 +21,9 @@ ROLE_IDS = frozenset(
 )
 ACCESS_LEVELS = frozenset({"principal", "workspace-write", "read-only"})
 THINKING_LEVEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+MODEL_ID = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-\[\]]{0,119}$"
+)
 
 
 class RuntimeConfigError(Exception):
@@ -148,6 +151,10 @@ def load_role(
         raise RuntimeConfigError(f"{role_id} has invalid provider: {provider!r}")
     if not isinstance(model, str) or not model.strip():
         raise RuntimeConfigError(f"{role_id} has no model")
+    if not MODEL_ID.fullmatch(model):
+        raise RuntimeConfigError(
+            f"{role_id} has an invalid model identifier"
+        )
     if (
         thinking is not None
         and (

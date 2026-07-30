@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Notify direct Claude/Codex sessions when they bypass Orrery's principal."""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_fallback import nearest_fallback, provider_label  # noqa: E402
+from orrery_runtime import (  # noqa: E402
+    MODEL_ID,
+    PROVIDERS,
+    RuntimeConfigError,
+    load_role,
+)
+
+
+MAX_INPUT_BYTES = 1024 * 1024
+
+
+def same_model(provider: str, configured: str, active: str) -> bool:
+    if configured == active:
+        return True
+    if provider != "anthropic":
+        return False
+    family = configured.lower()
+    if family not in {"fable", "opus", "sonnet", "haiku"}:
+        return False
+    return re.search(
+        rf"(?:^|[-_/]){re.escape(family)}(?:[-_/\[\]]|$)",
+        active.lower(),
+    ) is not None
+
+
+def hook_output(system_message: str, context: str) -> dict[str, Any]:
+    return {
+        "systemMessage": system_message,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        },
+    }
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in PROVIDERS:
+        print(
+            json.dumps(
+                hook_output(
+                    "Orrery could not identify this provider surface.",
+                    "Report that Orrery's principal-surface check was "
+                    "misconfigured before relying on its result.",
+                )
+            )
+        )
+        return 0
+    active_provider = sys.argv[1]
+    try:
+        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+        if len(raw) > MAX_INPUT_BYTES:
+            raise ValueError("hook input is too large")
+        payload = json.loads(raw or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("hook input is not an object")
+        if payload.get("hook_event_name") != "SessionStart":
+            return 0
+        active_model = payload.get("model")
+        cwd = payload.get("cwd")
+        if (
+            not isinstance(active_model, str)
+            or not MODEL_ID.fullmatch(active_model)
+        ):
+            raise ValueError("hook input has no active model")
+        if not isinstance(cwd, str) or not cwd:
+            cwd = str(Path.cwd())
+        configured = load_role("orchestrator", cwd=Path(cwd))
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeConfigError) as exc:
+        detail = re.sub(r"[\r\n]+", " ", str(exc))[:300]
+        print(
+            json.dumps(
+                hook_output(
+                    "Orrery could not verify this session's principal: "
+                    f"{detail}",
+                    "Tell the user that Orrery could not compare this direct "
+                    "session with the configured principal. Do not claim the "
+                    "configured principal or a fallback was verified.",
+                )
+            )
+        )
+        return 0
+
+    if (
+        configured.provider == active_provider
+        and same_model(active_provider, configured.model, active_model)
+    ):
+        return 0
+
+    excluded = set(PROVIDERS) - {active_provider}
+    proposal = nearest_fallback(
+        configured,
+        "the session was opened directly instead of through `orrery`",
+        excluded_providers=excluded,
+        assumed_ready={active_provider},
+        additional_models={active_provider: [active_model]},
+        discover_live=False,
+    )
+    recommended = proposal.candidate if proposal is not None else None
+    active_label = (
+        f"{provider_label(active_provider)} / {active_model}"
+    )
+    configured_label = (
+        f"{provider_label(configured.provider)} / {configured.model}"
+        + (
+            f" / thinking {configured.thinking}"
+            if configured.thinking
+            else ""
+        )
+    )
+    if recommended is None:
+        recommendation = (
+            "No potential fallback could be ranked for this provider surface."
+        )
+        active_is_recommended = False
+    else:
+        recommended_label = (
+            f"{provider_label(recommended.provider)} / {recommended.model}"
+            + (
+                f" / thinking {recommended.thinking}"
+                if recommended.thinking
+                else ""
+            )
+        )
+        active_is_recommended = same_model(
+            active_provider,
+            recommended.model,
+            active_model,
+        )
+        recommendation = (
+            f"This is the nearest potential fallback ({recommended_label})."
+            if active_is_recommended
+            else f"The nearest potential fallback is {recommended_label}."
+        )
+
+    system_message = (
+        f"Orrery principal mismatch: configured {configured_label}; active "
+        f"{active_label}. {recommendation} Explicit approval is required "
+        "before this session acts as Orrery's principal."
+    )
+    context = (
+        "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED\n"
+        f"The configured principal is {configured_label}, but this direct "
+        f"session uses {active_label}. {recommendation} Unless this "
+        "conversation already contains unrevoked, explicit user approval for "
+        "this exact active provider/model, notify the user of the mismatch "
+        "before running tools, editing files, or delegating, and ask whether "
+        "they approve it as the principal fallback. SessionStart does not "
+        "report the active thinking level, so disclose that limitation and "
+        "ask the user to verify the recommended level in the provider UI "
+        "where possible. Do not infer approval from the act of opening the "
+        "IDE or provider CLI. If they decline, make no repository changes "
+        "and direct them to start `orrery` or switch models. Once they "
+        "explicitly approve, continue in this same conversation and report "
+        "the fallback honestly."
+    )
+    print(json.dumps(hook_output(system_message, context)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
