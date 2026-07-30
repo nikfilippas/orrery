@@ -66,12 +66,18 @@ idle timeout. It is generated from:
 
 - `global/orchestration.json` for role assignment, workflow settings, and
   chart geometry;
-- `global/model-catalogue.json` for unique model choices and supported
-  thinking levels.
+- the installed Claude and Codex CLIs for picker-visible models and each
+  model's exact thinking levels;
+- `global/model-catalogue.json` for provider fallbacks and Orrery-specific
+  defaults when a live provider catalogue is unavailable.
 
-Every role sees Anthropic and OpenAI groups. A known model determines its
-provider and available thinking levels. A custom model requires an explicit
-provider and has no inferred thinking selector.
+The two local catalogues are read concurrently without running a model.
+Failure is isolated per provider, equivalent Claude aliases are deduplicated,
+and future picker-visible models appear automatically. Every role sees the
+same Anthropic and OpenAI groups. A known model determines its provider and
+rebuilds the adjacent thinking selector from that model's reported levels. A
+custom model requires an explicit provider and has no inferred thinking
+selector.
 
 Preview computes one unified manifest diff. Apply is accepted only for the
 exact content previously previewed, uses an atomic replacement, and runs the
@@ -254,10 +260,12 @@ orrery-doctor
 
 The suite uses fake provider commands. The doctor makes no model calls.
 
-When adding a known model, update only `global/model-catalogue.json` with one
-canonical UI entry and its exact thinking levels. Pinned identifiers remain
-available through the custom option and must not be duplicated as aliases in
-the ordinary menu.
+Do not add every provider release by hand. `orrery-config` discovers new
+picker-visible models and thinking levels automatically. Update
+`global/model-catalogue.json` only when the offline fallback or an
+Orrery-specific default should change. Pinned identifiers remain available
+through the custom option and must not be duplicated as aliases in the
+fallback menu.
 
 When changing workflow geometry, update `global/orchestration.json`, render the
 configuration page at desktop and narrow widths, inspect screenshots, and
@@ -273,8 +281,8 @@ The maintained artefacts are:
 - `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.
 - `global/claude-settings.json` — Claude-only hooks, permissions, and companion
   state; it intentionally contains no role model.
-- `global/model-catalogue.json` — unique provider/model choices and thinking
-  capabilities.
+- `global/model-catalogue.json` — provider fallback choices and
+  Orrery-specific thinking defaults.
 - `global/orchestration.json` — the role manifest, workflow setting, and
   configuration-chart geometry.
 - `global/hooks/.gitignore` and `global/hooks/leave-no-trace.py` — lifecycle
@@ -284,6 +292,8 @@ The maintained artefacts are:
   instruction templates.
 - `scripts/orrery` and `scripts/orrery_runtime.py` — principal launcher and
   validated provider adapters.
+- `scripts/orrery_model_catalogue.py` — no-inference live model and
+  thinking-capability discovery.
 - `scripts/orrery-review` — the `orrery-agent` runner and compatibility review
   entry point.
 - `scripts/orrery-config`, `scripts/orrery-usage`, `scripts/init-project.sh`,

@@ -164,11 +164,16 @@ dedicated process group and announce the weaker containment.
 orrery-config
 ```
 
-The localhost-only page is generated from the canonical manifest. Every role
-gets the same model menu, grouped into Anthropic and OpenAI with no alias
-duplicates. Selecting a known model reveals only its available thinking
-levels. A custom exact identifier remains possible and requires an explicit
-provider.
+The localhost-only page is generated from the canonical manifest. On launch it
+discovers picker-visible models and each model's exact thinking levels from the
+installed Claude and Codex CLIs, without running a model. Discovery is
+concurrent and provider-independent: if one local interface is unavailable,
+only that provider uses the bundled fallback catalogue. Equivalent Claude
+aliases are collapsed, newly released models appear automatically, and every
+role gets the same deduplicated menu grouped into Anthropic and OpenAI.
+Selecting a known model rebuilds the adjacent thinking menu from that model's
+reported capabilities. A custom exact identifier remains possible and
+requires an explicit provider.
 
 The diagram is the workflow:
 
@@ -306,13 +311,14 @@ availability for configured roles, access contracts, and instruction imports.
 | `global/AGENTS.md` | canonical provider-neutral development policy |
 | `global/CLAUDE.md` | one-line Claude import of `AGENTS.md` |
 | `global/orchestration.json` | role assignments, workflow settings, and configuration-chart geometry |
-| `global/model-catalogue.json` | unique provider models and thinking capabilities |
+| `global/model-catalogue.json` | provider fallback choices and Orrery-specific thinking defaults |
 | `global/claude-settings.json` | Claude-specific hooks and permissions, not role selection |
 | `global/skills/development-orchestrator/` | detailed classification and routing procedure |
 | `global/hooks/leave-no-trace.py` | Claude lifecycle cleanup implementation |
 | `project-template/AGENTS.md` | canonical per-repository project template |
 | `project-template/CLAUDE.md` | one-line project import |
 | `scripts/orrery` | configured principal launcher |
+| `scripts/orrery_model_catalogue.py` | no-inference live model and thinking-capability discovery |
 | `scripts/orrery_runtime.py` | validated role loader and static provider adapters |
 | `scripts/orrery-review` | contained generic role runner; compatibility filename |
 | `scripts/orrery-config` | atomic visual configuration surface |
