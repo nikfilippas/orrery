@@ -75,6 +75,14 @@ def serve_catalogue() -> int:
                 "supportedEffortLevels": ["low", "high"],
             },
         ]
+        hidden = os.environ.get("CLAUDE_FAKE_HIDE_MODEL")
+        if hidden:
+            models = [
+                model
+                for model in models
+                if model.get("value") != hidden
+                and hidden not in str(model.get("resolvedModel", ""))
+            ]
         print(
             json.dumps(
                 {
@@ -95,6 +103,13 @@ def serve_catalogue() -> int:
 def main() -> int:
     mode = os.environ.get("CLAUDE_FAKE_MODE", "success")
 
+    if sys.argv[1:3] == ["auth", "status"]:
+        if os.environ.get("CLAUDE_FAKE_AUTH", "ready") == "logged-out":
+            print(json.dumps({"loggedIn": False}))
+            return 1
+        print(json.dumps({"loggedIn": True, "authMethod": "test"}))
+        return 0
+
     if (
         "--input-format" in sys.argv
         and "stream-json" in sys.argv
@@ -111,6 +126,8 @@ def main() -> int:
     assignment = sys.stdin.read()
     if stdin_path := os.environ.get("CLAUDE_FAKE_STDIN"):
         Path(stdin_path).write_text(assignment)
+    if write_path := os.environ.get("CLAUDE_FAKE_WRITE"):
+        Path(write_path).write_text("partial fake Claude edit\n")
 
     if settings_copy := os.environ.get("CLAUDE_FAKE_SETTINGS"):
         settings = option_value("--settings")
@@ -131,6 +148,24 @@ def main() -> int:
     if mode == "fail":
         print("simulated Claude failure", file=sys.stderr)
         return 8
+    if mode == "quota":
+        print("usage limit reached; no credits remain", file=sys.stderr)
+        return 8
+    if mode == "model-fail":
+        print("model is unavailable or not found", file=sys.stderr)
+        return 8
+    if mode == "transient":
+        print("service unavailable: 503", file=sys.stderr)
+        return 8
+    if mode == "transient-once":
+        attempts_path = os.environ.get("CLAUDE_FAKE_ATTEMPTS")
+        attempts = Path(attempts_path) if attempts_path else None
+        count = int(attempts.read_text()) if attempts and attempts.exists() else 0
+        if attempts:
+            attempts.write_text(str(count + 1))
+        if count == 0:
+            print("service unavailable: 503", file=sys.stderr)
+            return 8
     if mode == "empty":
         print(json.dumps({"result": ""}))
         return 0

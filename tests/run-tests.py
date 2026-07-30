@@ -37,7 +37,10 @@ sys.dont_write_bytecode = True
 KIT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_SCRIPT = KIT_DIR / "scripts" / "apply-claude-settings.py"
 REVIEW_SCRIPT = KIT_DIR / "scripts" / "orrery-review"
+PRINCIPAL_SCRIPT = KIT_DIR / "scripts" / "orrery"
 RUNTIME_SCRIPT = KIT_DIR / "scripts" / "orrery_runtime.py"
+FALLBACK_SCRIPT = KIT_DIR / "scripts" / "orrery_fallback.py"
+SESSION_START_SCRIPT = KIT_DIR / "scripts" / "orrery-session-start"
 CONFIG_SCRIPT = KIT_DIR / "scripts" / "orrery-config"
 INSTALL_SCRIPT = KIT_DIR / "scripts" / "install.sh"
 DOCTOR_SCRIPT = KIT_DIR / "scripts" / "doctor.sh"
@@ -84,6 +87,7 @@ def load_script(path: Path, name: str) -> types.ModuleType:
 settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
 review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
 runtime_module = sys.modules["orrery_runtime"]
+fallback_module = sys.modules["orrery_fallback"]
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +224,36 @@ def review_environment(mode: str, marker: Path | None = None) -> dict[str, str]:
 def start_review(
     environment: dict[str, str],
     *arguments: str,
+    cwd: Path | None = None,
 ) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [sys.executable, str(REVIEW_SCRIPT), *arguments],
         env=environment,
+        cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
     )
+
+
+def run_principal(
+    environment: dict[str, str],
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [sys.executable, str(PRINCIPAL_SCRIPT), *arguments],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 def finish_review(
@@ -2865,6 +2890,265 @@ def test_repository_principal_override() -> None:
         )
 
 
+@test("fallback ranking selects the nearest role tier and thinking position")
+def test_nearest_fallback_ranking() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    cross_provider = fallback_module.nearest_fallback(
+        principal,
+        "test",
+        excluded_providers={"anthropic"},
+        assumed_ready={"openai"},
+        discover_live=False,
+    )
+    require(cross_provider is not None, "no principal fallback was found")
+    require(
+        (
+            cross_provider.candidate.provider,
+            cross_provider.candidate.model,
+            cross_provider.candidate.thinking,
+        )
+        == ("openai", "gpt-5.6-sol", "ultra"),
+        f"Fable did not map to Sol at maximum thinking: {cross_provider}",
+    )
+
+    reviewer = runtime_module.load_role("reviewer")
+    same_provider = fallback_module.nearest_fallback(
+        reviewer,
+        "test",
+        excluded_providers={"anthropic"},
+        excluded_models={("openai", "gpt-5.6-sol")},
+        assumed_ready={"openai"},
+        discover_live=False,
+    )
+    require(same_provider is not None, "no same-provider model fallback was found")
+    require(
+        (
+            same_provider.candidate.provider,
+            same_provider.candidate.model,
+            same_provider.candidate.thinking,
+        )
+        == ("openai", "gpt-5.6-terra", "ultra"),
+        f"a model-only failure did not preserve provider/proximity: {same_provider}",
+    )
+
+    require(
+        fallback_module._picker_tier(0, 6) == 3
+        and fallback_module._picker_tier(5, 6) == 1,
+        "future picker models are not assigned deterministic proximity tiers",
+    )
+
+
+@test("fallback consent is exact, explicit, and non-interactive-safe")
+def test_fallback_consent_contract() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    proposal = fallback_module.nearest_fallback(
+        principal,
+        "authentication unavailable",
+        excluded_providers={"anthropic"},
+        assumed_ready={"openai"},
+        discover_live=False,
+    )
+    require(proposal is not None, "the consent test has no proposal")
+
+    output = io.StringIO()
+    required = fallback_module.request_fallback_consent(
+        proposal,
+        approval=None,
+        no_fallback=False,
+        program_name="orrery",
+        stream=output,
+        tty_opener=lambda: None,
+    )
+    require(
+        required is fallback_module.Consent.REQUIRED
+        and "ORRERY FALLBACK APPROVAL REQUIRED" in output.getvalue()
+        and "--approve-fallback openai:gpt-5.6-sol" in output.getvalue(),
+        f"non-interactive consent was inferred or underspecified: {output.getvalue()}",
+    )
+
+    wrong = fallback_module.request_fallback_consent(
+        proposal,
+        approval=("openai", "gpt-5.6-terra"),
+        no_fallback=False,
+        program_name="orrery",
+        stream=io.StringIO(),
+        tty_opener=lambda: None,
+    )
+    approved = fallback_module.request_fallback_consent(
+        proposal,
+        approval=("openai", "gpt-5.6-sol"),
+        no_fallback=False,
+        program_name="orrery",
+        stream=io.StringIO(),
+        tty_opener=lambda: None,
+    )
+    require(
+        wrong is fallback_module.Consent.REQUIRED
+        and approved is fallback_module.Consent.APPROVED,
+        "approval was not bound to the exact provider/model",
+    )
+
+    changed = io.StringIO()
+    stale_approval = fallback_module.request_fallback_consent(
+        proposal,
+        approval=("openai", "gpt-5.6-sol"),
+        no_fallback=False,
+        program_name="orrery",
+        context_warning=True,
+        require_rerun_after_inspection=True,
+        stream=changed,
+        tty_opener=lambda: None,
+    )
+    require(
+        stale_approval is fallback_module.Consent.REQUIRED
+        and "workspace changed during the failed attempt" in changed.getvalue()
+        and "did not start another write-capable process" in changed.getvalue(),
+        "an approval predating partial writes was incorrectly accepted",
+    )
+
+
+@test("provider failure diagnostics separate model, account, and transient cases")
+def test_failure_classification() -> None:
+    require(
+        fallback_module.classify_failure("model is unavailable or not found")
+        is fallback_module.FailureScope.MODEL,
+        "model unavailability was not isolated to the model",
+    )
+    require(
+        fallback_module.classify_failure(
+            "Model gpt-example is not supported for this account"
+        )
+        is fallback_module.FailureScope.MODEL,
+        "a provider's common model-not-supported wording was misclassified",
+    )
+    require(
+        fallback_module.classify_failure("usage limit reached; no credits remain")
+        is fallback_module.FailureScope.PROVIDER,
+        "credit exhaustion did not exclude the provider",
+    )
+    require(
+        fallback_module.classify_failure("service unavailable: 503")
+        is fallback_module.FailureScope.TRANSIENT,
+        "a transient service failure was not recognized",
+    )
+    require(
+        fallback_module.classify_failure("overloaded_error: ECONNRESET")
+        is fallback_module.FailureScope.TRANSIENT,
+        "a structured transient provider error was not recognized",
+    )
+
+
+@test("the supervised principal requires approval before auth fallback")
+def test_principal_auth_fallback_requires_approval() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        codex_arguments = Path(directory) / "codex-args"
+        environment = review_environment("success")
+        environment["CLAUDE_FAKE_AUTH"] = "logged-out"
+        environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+        result = run_principal(environment)
+
+        require(
+            result.returncode == fallback_module.APPROVAL_REQUIRED,
+            f"an unapproved principal fallback returned {result.returncode}",
+        )
+        require(
+            "ORRERY FALLBACK APPROVAL REQUIRED" in result.stderr
+            and "openai:gpt-5.6-sol" in result.stderr,
+            f"the principal proposal was not reported: {result.stderr}",
+        )
+        require(
+            not codex_arguments.exists(),
+            "the principal fallback started without approval",
+        )
+
+
+@test("the principal detects a missing known model before inference")
+def test_principal_model_visibility_fallback() -> None:
+    environment = review_environment("success")
+    environment["CLAUDE_FAKE_HIDE_MODEL"] = "fable"
+    result = run_principal(environment)
+
+    require(
+        result.returncode == fallback_module.APPROVAL_REQUIRED,
+        f"missing principal model returned {result.returncode}: {result.stderr}",
+    )
+    require(
+        "not picker-visible" in result.stderr
+        and "Nearest candidate: Anthropic / opus / thinking max" in result.stderr
+        and "ORRERY FALLBACK APPROVAL REQUIRED" in result.stderr,
+        f"the same-provider model fallback was not proposed: {result.stderr}",
+    )
+
+
+@test("fallback never re-adds a model omitted by a live provider picker")
+def test_fallback_respects_live_model_visibility() -> None:
+    environment = review_environment("success")
+    environment["CLAUDE_FAKE_AUTH"] = "logged-out"
+    environment["CODEX_FAKE_HIDE_MODEL"] = "gpt-5.6-sol"
+    result = run_principal(environment)
+
+    require(
+        result.returncode == fallback_module.APPROVAL_REQUIRED,
+        f"hidden cross-provider model returned {result.returncode}",
+    )
+    require(
+        "Nearest candidate: OpenAI / gpt-5.6-terra / thinking ultra"
+        in result.stderr,
+        f"a picker-hidden model was reintroduced as a fallback: {result.stderr}",
+    )
+
+
+@test("the supervised principal crosses providers only after exact approval")
+def test_principal_runtime_fallback() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        claude_arguments = Path(directory) / "claude-args"
+        codex_arguments = Path(directory) / "codex-args"
+        failed_environment = review_environment("success")
+        failed_environment["CLAUDE_FAKE_MODE"] = "quota"
+        failed_environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+        failed = run_principal(failed_environment)
+        require(
+            failed.returncode == 8
+            and "ORRERY FALLBACK APPROVAL REQUIRED" in failed.stderr,
+            f"the failed principal did not wait for approval: {failed.stderr}",
+        )
+        original_arguments = claude_arguments.read_text()
+
+        approved_environment = review_environment("success")
+        approved_environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+        approved_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+        result = run_principal(
+            approved_environment,
+            "--approve-fallback",
+            "openai:gpt-5.6-sol",
+            "--",
+            "--claude-only-argument",
+        )
+
+        require(
+            result.returncode == 0,
+            f"approved principal fallback failed: {result.stderr}",
+        )
+        arguments = codex_arguments.read_text().splitlines()
+        require(
+            "--model" in arguments
+            and arguments[arguments.index("--model") + 1] == "gpt-5.6-sol"
+            and any("ultra" in argument for argument in arguments)
+            and "--claude-only-argument" not in arguments,
+            f"cross-provider principal arguments were unsafe: {arguments}",
+        )
+        require(
+            "conversation state and provider-specific CLI arguments cannot migrate"
+            in result.stderr
+            and "Fallback approved for openai:gpt-5.6-sol" in result.stderr,
+            f"principal fallback limitations were not disclosed: {result.stderr}",
+        )
+        require(
+            claude_arguments.read_text() == original_arguments,
+            "the approved rerun retried the failed principal provider",
+        )
+
+
 @test("an unwritable --output destination cannot lose a completed verdict")
 def test_output_failure_preserves_verdict() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -3044,6 +3328,205 @@ def test_failing_run() -> None:
 
     require(process.returncode == 7, f"expected status 7: {process.returncode}")
     require("exit status 7" in stderr, f"failure not reported: {stderr!r}")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("an approved delegated quota fallback crosses providers once")
+def test_delegated_quota_fallback() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        codex_arguments = Path(directory) / "codex-args"
+        failed_environment = review_environment("success")
+        failed_environment["CODEX_FAKE_MODE"] = "quota"
+        failed_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+        failed = start_review(
+            failed_environment,
+            "--timeout",
+            "60",
+            "--",
+            "prompt",
+        )
+        _, failed_stderr = finish_review(failed, failed_environment)
+        require(
+            failed.returncode == 7
+            and "ORRERY FALLBACK APPROVAL REQUIRED" in failed_stderr,
+            f"the failed reviewer did not wait for approval: {failed_stderr}",
+        )
+        original_arguments = codex_arguments.read_text()
+        assert_no_review_residue(f"orrery-review-{failed.pid}-")
+
+        approved_environment = review_environment("success")
+        approved_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+        approved = start_review(
+            approved_environment,
+            "--timeout",
+            "60",
+            "--approve-fallback",
+            "anthropic:fable",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(approved, approved_environment)
+
+        require(
+            approved.returncode == 0 and "fake Claude verdict" in stdout,
+            f"approved delegated fallback failed: {stderr}",
+        )
+        require(
+            "Nearest candidate: Anthropic / fable / thinking max" in stderr
+            and "Fallback approved for anthropic:fable" in stderr
+            and "↳ Fallback reviewer · anthropic · fable" in stderr,
+            f"delegated fallback was not fully announced: {stderr}",
+        )
+        require(
+            codex_arguments.read_text() == original_arguments,
+            "the approved rerun retried the failed reviewer provider",
+        )
+        assert_no_review_residue(f"orrery-review-{approved.pid}-")
+
+
+@test("a model-only failure proposes the nearest same-provider model")
+def test_model_failure_prefers_same_provider() -> None:
+    environment = review_environment("model-fail")
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    _, stderr = finish_review(process, environment)
+
+    require(process.returncode == 7, f"model failure status changed: {stderr}")
+    require(
+        "Nearest candidate: OpenAI / gpt-5.6-terra / thinking ultra" in stderr
+        and "ORRERY FALLBACK APPROVAL REQUIRED" in stderr,
+        f"same-provider fallback was not proposed: {stderr}",
+    )
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a transient delegated failure retries exactly once")
+def test_transient_failure_retries_once() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        attempts = Path(directory) / "attempts"
+        attempts.write_text("0")
+        environment = review_environment("transient-once")
+        environment["CODEX_FAKE_ATTEMPTS"] = str(attempts)
+        process = start_review(environment, "--timeout", "60", "--", "prompt")
+        stdout, stderr = finish_review(process, environment)
+
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"the transient retry did not recover: {stderr}",
+        )
+        require(
+            attempts.read_text() == "2"
+            and stderr.count("retrying it once") == 1
+            and "ORRERY FALLBACK PROPOSED" not in stderr,
+            f"transient retry count or reporting is wrong: {stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a failed writer requires inspection before fallback approval")
+def test_partial_write_blocks_inline_fallback() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        subprocess.run(
+            ["git", "init", "--quiet", str(repository)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        partial_edit = repository / "partial.txt"
+        failed_environment = review_environment("transient")
+        failed_environment["CODEX_FAKE_WRITE"] = str(partial_edit)
+        failed = start_review(
+            failed_environment,
+            "--timeout",
+            "60",
+            "--role",
+            "implementer",
+            "--",
+            "prompt",
+            cwd=repository,
+        )
+        _, stderr = finish_review(failed, failed_environment)
+
+        require(
+            failed.returncode == 7 and partial_edit.exists(),
+            f"the simulated partial writer did not fail as intended: {stderr}",
+        )
+        require(
+            "workspace changed during the failed attempt" in stderr
+            and "did not start another write-capable process" in stderr
+            and "transient retry skipped" in stderr
+            and "--approve-fallback anthropic:sonnet" in stderr,
+            f"partial-write fallback was not gated for inspection: {stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{failed.pid}-")
+
+        approved_environment = review_environment("success")
+        approved = start_review(
+            approved_environment,
+            "--timeout",
+            "60",
+            "--role",
+            "implementer",
+            "--approve-fallback",
+            "anthropic:sonnet",
+            "--",
+            "prompt",
+            cwd=repository,
+        )
+        stdout, approved_stderr = finish_review(
+            approved,
+            approved_environment,
+        )
+        require(
+            approved.returncode == 0 and "fake Claude verdict" in stdout,
+            f"the inspected fallback could not resume: {approved_stderr}",
+        )
+        require(
+            "Fallback approved for anthropic:sonnet" in approved_stderr,
+            f"the resumed writer approval was not explicit: {approved_stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{approved.pid}-")
+
+
+@test("fallback reports when no authenticated provider remains")
+def test_no_fallback_candidate() -> None:
+    environment = review_environment("success")
+    environment["CODEX_FAKE_MODE"] = "quota"
+    environment["CLAUDE_FAKE_AUTH"] = "logged-out"
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    _, stderr = finish_review(process, environment)
+
+    require(process.returncode == 7, f"provider failure status changed: {stderr}")
+    require(
+        "no authenticated or potentially authenticated fallback candidate remains"
+        in stderr
+        and "ORRERY FALLBACK PROPOSED" not in stderr,
+        f"absence of fallback was not explicit: {stderr}",
+    )
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("--no-fallback preserves an explicitly pinned provider")
+def test_no_fallback_option() -> None:
+    environment = review_environment("quota")
+    process = start_review(
+        environment,
+        "--timeout",
+        "60",
+        "--no-fallback",
+        "--",
+        "prompt",
+    )
+    _, stderr = finish_review(process, environment)
+
+    require(process.returncode == 7, f"pinned provider status changed: {stderr}")
+    require(
+        "Fallback is disabled for this invocation" in stderr
+        and "no substitution was made" in stderr,
+        f"the explicit provider pin was not honored: {stderr}",
+    )
     assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
@@ -6147,6 +6630,115 @@ def test_canonical_hook_events() -> None:
     require(not unknown, f"unknown hook events: {unknown}")
 
 
+@test("direct Codex sessions visibly require principal fallback approval")
+def test_codex_session_start_fallback_notice() -> None:
+    payload = {
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": str(KIT_DIR),
+        "model": "gpt-5.6-sol",
+    }
+    result = subprocess.run(
+        [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    require(result.returncode == 0, f"Codex SessionStart failed: {result.stderr}")
+    notice = json.loads(result.stdout)
+    context = notice.get("hookSpecificOutput", {}).get("additionalContext", "")
+    require(
+        "configured Anthropic / fable" in notice.get("systemMessage", "")
+        and "thinking max" in notice.get("systemMessage", "")
+        and "active OpenAI / gpt-5.6-sol" in notice.get("systemMessage", "")
+        and "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED" in context
+        and "Do not infer approval" in context
+        and "does not report the active thinking level" in context,
+        f"the direct-session warning is incomplete: {notice}",
+    )
+
+
+@test("a direct session matching the repository principal emits no warning")
+def test_matching_session_start_is_quiet() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        (repository / ".git").mkdir()
+        write_json(
+            repository / ".orrery.json",
+            {
+                "orchestrator": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "thinking": "ultra",
+                }
+            },
+        )
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+            "model": "gpt-5.6-sol",
+        }
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        require(
+            result.returncode == 0 and result.stdout == "",
+            f"a matching principal produced a fallback warning: {result.stdout}",
+        )
+
+
+@test("direct sessions distinguish the active model from the nearest candidate")
+def test_session_start_recommends_nearest_model() -> None:
+    payload = {
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": str(KIT_DIR),
+        "model": "gpt-5.6-terra",
+    }
+    result = subprocess.run(
+        [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+        input=json.dumps(payload),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    notice = json.loads(result.stdout)
+    require(
+        "active OpenAI / gpt-5.6-terra" in notice["systemMessage"]
+        and "nearest potential fallback is OpenAI / gpt-5.6-sol"
+        in notice["systemMessage"],
+        f"the active extension model was mistaken for the nearest: {notice}",
+    )
+
+
+@test("the canonical Codex hook uses the supported SessionStart contract")
+def test_canonical_codex_hook() -> None:
+    canonical = read_json(KIT_DIR / "global" / "codex-hooks.json")
+    groups = canonical.get("hooks", {}).get("SessionStart", [])
+    require(len(groups) == 1, f"unexpected Codex SessionStart groups: {groups}")
+    handlers = groups[0].get("hooks", [])
+    require(
+        groups[0].get("matcher") == "startup|resume|clear|compact"
+        and len(handlers) == 1
+        and handlers[0].get("type") == "command"
+        and "orrery-session-start.py" in handlers[0].get("command", "")
+        and handlers[0].get("timeout") == 15,
+        f"the Codex SessionStart contract is invalid: {groups}",
+    )
+
+
 @test("the installer links every command the doctor checks")
 def test_installer_covers_doctor_commands() -> None:
     installer = INSTALL_SCRIPT.read_text()
@@ -6222,6 +6814,23 @@ def exercise_green_path_install() -> None:
         codex_home_path.mkdir()
         (home / ".claude" / "AGENTS.md").write_text("claude-owned\n")
         (codex_home_path / "AGENTS.md").write_text("codex-owned\n")
+        write_json(
+            codex_home_path / "hooks.json",
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "user-owned-stop-hook",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
 
         environment = os.environ.copy()
         environment["HOME"] = str(home)
@@ -6258,6 +6867,15 @@ def exercise_green_path_install() -> None:
             and (home / ".agents" / "skills" / "development-orchestrator").is_symlink(),
             "the provider-neutral skill was not installed for both CLIs",
         )
+        require(
+            (home / ".claude" / "hooks" / "orrery-session-start.py").resolve()
+            == (kit / "scripts" / "orrery-session-start").resolve()
+            and (
+                codex_home_path / "hooks" / "orrery-session-start.py"
+            ).resolve()
+            == (kit / "scripts" / "orrery-session-start").resolve(),
+            "the direct-session check was not linked for both providers",
+        )
         for name in (
             "orrery",
             "orrery-agent",
@@ -6282,6 +6900,22 @@ def exercise_green_path_install() -> None:
             and "CLAUDE_CODE_EFFORT_LEVEL"
             not in settings.get("env", {}),
             "installation duplicated role model settings into Claude settings",
+        )
+        codex_hooks = read_json(codex_home_path / "hooks.json")
+        codex_commands = {
+            hook.get("command")
+            for groups in codex_hooks.get("hooks", {}).values()
+            for group in groups
+            for hook in group.get("hooks", [])
+            if isinstance(hook, dict)
+        }
+        require(
+            "user-owned-stop-hook" in codex_commands
+            and any(
+                command and "orrery-session-start.py" in command
+                for command in codex_commands
+            ),
+            f"Codex hook installation lost or omitted handlers: {codex_hooks}",
         )
 
         backups = sorted((home / ".orrery-backups").glob("*"))
