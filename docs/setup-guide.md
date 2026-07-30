@@ -1,292 +1,319 @@
-# Órrery Orchestration Kit
+# Orrery setup and operation
 
-Reusable configuration that makes the active Claude model the principal
-orchestrator of a development session and Codex a specialist worker reached
-directly through its CLI.
+Orrery runs a configurable principal orchestrator plus four bounded roles:
+mechanic, implementer, plan reviewer, and final reviewer. Anthropic and OpenAI
+are adapters, not workflow roles. Every role can use either provider.
 
-This guide describes how the kit is installed, used and maintained. It does
-not reproduce the contents of the files: an earlier version of this document
-pasted every script inline, and every one of those copies had drifted from
-the code by the time anyone read them. Where a file matters, it is named and
-linked, and the file itself is the specification.
+## Requirements
 
-## Design
+- Python 3.11 or newer
+- `git` and `jq`
+- Claude Code when any configured role uses Anthropic
+- Codex CLI when any configured role uses OpenAI
+- systemd user services on Linux for the strongest delegated-process
+  containment
 
-Claude decides and stays accountable. Codex does bounded work Claude has
-scoped, and Claude inspects the result rather than trusting the report.
+Authenticate only the providers you plan to use:
 
-Four Codex profiles, each pinning its own model and thinking level:
+```bash
+claude
+codex login
+```
 
-| Profile | Model | Reasoning | Role |
-| --- | --- | --- | --- |
-| `mechanic` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
-| `implementer` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| `plan-reviewer` | `gpt-5.6-sol` | ultra | challenging a plan before code is written |
-| `reviewer` | `gpt-5.6-sol` | ultra | reviewing finished work, and difficult diagnosis |
-
-Two rules shape everything else:
-
-- **Reviews run through the Codex CLI, never the companion plugin.** The
-  `codex@openai-codex` plugin is disabled with the JSON Boolean `false`, and
-  its broker, `review` and `adversarial-review` paths are not used.
-- **A session leaves no trace.** Processes, sockets, temporary files and
-  browser profiles created by a session are reverted by the session.
-
-For complex and high-risk work, plan review is bounded rather than repeated
-until two models agree. The first round labels objections blocking or
-advisory; later rounds only confirm whether supported blocking objections
-were addressed. The default cap is two rounds, configurable from one through
-four. A repeated blocking objection, or one still open at the cap, stops
-before implementation and escalates to the user.
-
-## Files
-
-| Path | Purpose |
-| --- | --- |
-| `global/CLAUDE.md` | The development policy, installed as `~/.claude/CLAUDE.md` |
-| `global/claude-settings.json` | Canonical model, hooks, companion state and permission rules |
-| `global/claude-models.json` | Friendly model aliases resolved by `orrery-init` |
-| `global/model-catalogue.json` | Models offered in the configuration dropdowns |
-| `global/skills/development-orchestrator/SKILL.md` | Task classification and model routing |
-| `global/hooks/leave-no-trace.py` | Session lifecycle hook and `claude-lnt-*` implementation |
-| `global/codex/mechanic.config.toml` | Low-effort profile for mechanical edits |
-| `global/codex/implementer.config.toml` | Medium-effort profile for implementation |
-| `global/codex/plan-reviewer.config.toml` | Ultra-thinking profile for plan review |
-| `global/codex/reviewer.config.toml` | Ultra-thinking profile for final review |
-| `project-template/CLAUDE.md` | Shared per-repository template |
-| `project-template/CLAUDE.local.md` | Private per-repository workflow block |
-| `scripts/install.sh` | Installs every link and applies the canonical settings |
-| `scripts/apply-claude-settings.py` | Atomic, locked settings updater |
-| `scripts/set-claude-model.sh` | Compatibility wrapper for `--model` |
-| `scripts/set-codex-companion-state.sh` | Compatibility wrapper for `--companion` |
-| `scripts/install-lnt-hooks.sh` | Installs the Leave No Trace links and hooks |
-| `scripts/orrery-review` | Synchronous independent review through the reviewer profile |
-| `scripts/orrery-usage` | Aggregates Claude and Codex token usage from local session logs |
-| `scripts/orrery-config` | Local web page for viewing and changing each step's model |
-| `global/orchestration.json` | Declarative manifest of the orchestration steps and their config files |
-| `scripts/claude-lnt-start` | Runs a process under a lease that outlives the tool call |
-| `scripts/claude-lnt-register` | Registers a rollback command |
-| `scripts/claude-lnt-cleanup` | Runs cleanup for a session on demand |
-| `scripts/claude-lnt-status` | Reports owned processes and registered cleanups |
-| `scripts/init-project.sh` | Migrates a repository without rewriting its instructions |
-| `scripts/doctor.sh` | Validates the installation without model calls |
-| `tests/run-tests.py` | Deterministic regression suite |
-| `LICENSE` | MIT terms for the kit |
-| `logo.png` | The Órrery mark shown in the README |
-| `tests/fake-codex` | Stand-in Codex CLI used by the suite |
-
-## Installation
-
-Requires Claude Code, Codex CLI, Python 3.11 or newer, `git` and `jq`.
-Linux with systemd is the primary platform. macOS is supported with reduced
-containment: reviews run in a plain process group instead of a transient
-systemd service, and without procfs the hygiene hooks degrade conservatively
-(they never kill what they cannot attribute). The macOS code paths follow
-the platform documentation but have been validated on Linux only.
+## Install
 
 ```bash
 git clone <remote> ~/src/orrery
 cd ~/src/orrery
 ./scripts/install.sh
-codex login      # once per machine; the doctor checks authentication
 orrery-doctor
 ```
 
-The installed commands live in `~/.local/bin`, which must be on `PATH`.
-The installer warns when it is not, and the doctor fails until it is. On
-Ubuntu, `~/.profile` adds it automatically at the next login once the
-directory exists.
+The installer:
 
-`install.sh` is idempotent: a link that is already correct is left alone, and
-nothing is backed up on a rerun. It refuses to run if a target resolves to
-its own source, which is what happens when `CODEX_HOME` points inside the
-kit.
+- links `global/AGENTS.md` to `~/.claude/AGENTS.md` and
+  `$CODEX_HOME/AGENTS.md`;
+- links the one-line Claude importer to `~/.claude/CLAUDE.md`;
+- installs the orchestration skill at
+  `~/.claude/skills/development-orchestrator` and
+  `~/.agents/skills/development-orchestrator`;
+- installs the Claude lifecycle hook and its helper commands;
+- installs `orrery`, `orrery-agent`, `orrery-review`, `orrery-config`,
+  `orrery-init`, `orrery-doctor`, and `orrery-usage` in `~/.local/bin`;
+- applies only the Claude-specific hook and permission settings; and
+- removes obsolete profile links only when this checkout owns them.
 
-`CODEX_HOME` defaults to `~/.codex`. An explicitly empty value is rejected
-rather than silently treated as the home directory.
+Existing targets are backed up under a timestamped `~/.orrery-backups`
+directory with their home-relative paths preserved, so two files named
+`AGENTS.md` cannot collide.
 
-The installer creates:
+`CODEX_HOME` defaults to `~/.codex`. An explicit empty value is rejected. A
+pre-existing `$CODEX_HOME/AGENTS.override.md` is preserved and produces a
+warning because Codex loads it instead of `AGENTS.md`.
 
-- `~/.claude/CLAUDE.md`, `~/.claude/skills/development-orchestrator`,
-  `~/.claude/hooks/leave-no-trace.py`
-- `$CODEX_HOME/{mechanic,implementer,plan-reviewer,reviewer}.config.toml`
-- `~/.local/bin/orrery-{init,doctor,review,usage,config}` and
-  `~/.local/bin/claude-lnt-{start,register,cleanup,status}`
+Make sure `~/.local/bin` is on `PATH`.
 
-and then applies the canonical settings into `~/.claude/settings.json` in one
-locked transaction, preserving everything the kit does not own.
+## Configure roles
 
-## Routine use
-
-```bash
-orrery-init /path/to/repository   # migrate a repository
-orrery-init fable                 # migrate and set the repository model
-orrery-doctor                     # validate, no model calls
-orrery-config                     # models, thinking and plan-review rounds
-./tests/run-tests.py                    # full regression suite
-./tests/run-tests.py CODEX_HOME         # only matching tests
-```
-
-Independent review:
+Run:
 
 ```bash
-orrery-review --timeout 600 --output verdict.txt -- "REVIEW PROMPT"
+orrery-config
 ```
 
-The wrapper runs `codex --profile reviewer exec` read-only inside a transient
-systemd user service. A timeout, an interruption, or an uncatchable death of
-the wrapper stops the whole control group. It refuses to run if the `reviewer`
-profile is missing, because Codex exits zero on an unknown `--profile` and
-silently substitutes its default model.
+The page binds only to `127.0.0.1`, uses a random URL token, and exits after an
+idle timeout. It is generated from:
 
-Token usage across both providers, read from the local session logs and
-never from the network:
+- `global/orchestration.json` for role assignment, workflow settings, and
+  chart geometry;
+- `global/model-catalogue.json` for unique model choices and supported
+  thinking levels.
+
+Every role sees Anthropic and OpenAI groups. A known model determines its
+provider and available thinking levels. A custom model requires an explicit
+provider and has no inferred thinking selector.
+
+Preview computes one unified manifest diff. Apply is accepted only for the
+exact content previously previewed, uses an atomic replacement, and runs the
+doctor.
+
+Default assignments:
+
+| Role | Provider | Model | Thinking |
+| --- | --- | --- | --- |
+| principal | Anthropic | `fable` | `max` |
+| mechanic | OpenAI | `gpt-5.6-luna` | `low` |
+| implementer | OpenAI | `gpt-5.6-terra` | `medium` |
+| plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` |
+| final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` |
+
+These are defaults only. All five may use Anthropic, all five may use OpenAI,
+or they may be mixed in either direction.
+
+The plan-review cap is also in the manifest. It accepts one through four
+rounds and defaults to two.
+
+## Start and delegate
+
+Start the configured principal in the current repository:
 
 ```bash
-orrery-usage --since 7        # last seven days, per provider and model
-orrery-usage --json           # machine-readable
+orrery
 ```
 
-Non-interactive sessions should run at moderate effort:
+The launcher also reads an ignored `.orrery.json` in the repository root when
+present. It passes provider/model/thinking explicitly:
+
+- Claude: interactive `claude --model … --effort …`
+- Codex: interactive `codex --model … -c model_reasoning_effort=…`
+
+Run supporting roles:
 
 ```bash
-claude -p --effort medium "..."
+orrery-agent --role mechanic -- "PROMPT"
+orrery-agent --role implementer -- "PROMPT"
+orrery-agent --role plan-reviewer -- "PROMPT"
+orrery-agent --role reviewer -- "PROMPT"
 ```
 
-Maximum effort is paid on every turn of an agentic loop. Measured on this
-kit, the same delegated task at `xhigh` never reached the delegation step in
-eight minutes, and completed in under three at `medium`.
-
-## Changing models
-
-- **One Codex profile:** edit `global/codex/<profile>.config.toml`. The
-  installed paths are symlinks, so the change is live immediately.
-- **The Claude orchestrator, globally:** edit its model and thinking in
-  `global/claude-settings.json`, then run
-  `./scripts/apply-claude-settings.py --model --effort`. Fable 5 at `max`
-  uses the owned `CLAUDE_CODE_EFFORT_LEVEL` environment setting because
-  Claude Code does not persist `max` in `effortLevel`.
-- **For one session:** `claude --model <name>`.
-- **For one repository:** `orrery-init <alias> [repository]`, for
-  example `orrery-init fable`. The alias is resolved through
-  `global/claude-models.json` and written into that repository's
-  `.claude/settings.local.json`, which the migration keeps out of Git, so
-  the choice is personal and unrelated personal settings survive.
-  Instruction files such as `CLAUDE.local.md` cannot change the model;
-  Claude Code selects it from settings before any instructions are read.
-- **When a new model is released:** add it to `global/model-catalogue.json`
-  so it appears in the dropdowns, and, for Claude, add or repoint its alias
-  in `global/claude-models.json`. Keep each entry's thinking levels aligned
-  with the current CLI catalogue and provider documentation; anything absent
-  can still be typed through the custom option, but its thinking level remains
-  a manual setting. The installed paths are symlinks, so
-  changes are live immediately; repositories that named an updated alias
-  pick it up by rerunning `orrery-init <alias>` there.
-
-- **Visually:** `orrery-config` serves a local page that draws the
-  pipeline as a flowchart from the orchestration manifest and the live
-  files, with adjacent model and model-dependent thinking dropdowns inside
-  each model-backed node. An 🛈 appears only when a model or workflow
-  setting has details to explain. The plan-review node also offers the bounded
-  round cap; the SessionStart hook reads it for every new session. Changes
-  are previewed as exact unified diffs before an Apply that
-  writes only through the kit's own paths and then runs the doctor inline.
-  It binds to 127.0.0.1 behind a random URL token and exits after ten
-  minutes idle. Known models expose only their supported thinking levels;
-  an unknown custom model leaves thinking to manual configuration.
-
-  `orrery-config --print` reports the same model assignments and the
-  active plan-review cap without starting the server.
-
-Run `orrery-doctor` afterwards. It validates that each profile sets a
-supported model/thinking pair, that the alias map is well formed,
-that the orchestration manifest matches the live files, and that the
-default Claude model matches the canonical settings. Until the edit is
-committed, the doctor also reports the kit repository as dirty; that single
-failure is expected and clears with the commit.
-
-## Validation
+Useful options:
 
 ```bash
-cd ~/src/orrery
-./tests/run-tests.py          # deterministic, no credits spent
-orrery-doctor           # installation state, no model calls
-git diff --check
+orrery-agent --role reviewer --timeout 600 --output verdict.txt -- "PROMPT"
+printf '%s\n' "PROMPT" | orrery-agent --role reviewer
 ```
 
-The suite uses a stand-in Codex CLI, never calls a model, and never touches
-the live Claude or Codex configuration. `doctor.sh` reports
-`ORRERY_READY` when everything passes, including a clean
-repository.
+`orrery-review` is a compatibility link to the same runner and defaults to the
+`reviewer` role.
 
-## Browsers
+The runner prepends a stable role header that makes the process non-principal
+and prevents recursive orchestration. Prompts enter over stdin and are held in
+a private `0600` runtime file, never in process arguments.
 
-Browser work uses the Playwright-bundled Chrome for Testing only, pinned, and
-never a system browser. The snap Chromium is the failure mode this policy
-exists to prevent: it runs in a private mount namespace whose profiles are
-invisible to ordinary `du`, excluded from tmpfiles ageing, and backed by RAM.
+OpenAI receives an explicit model and reasoning override rather than a profile.
+Anthropic receives an explicit model and effort plus
+`--exclude-dynamic-system-prompt-sections`; noninteractive sessions are not
+persisted. Reviews use read-only/plan permissions. Worker roles use
+workspace-write.
 
-For a screenshot, prefer the driver's own command, which needs no script and
-closes its browser itself:
+On systemd systems the delegated process runs in a transient service with:
+
+- `KillMode=control-group`
+- a `RuntimeMaxSec` backstop
+- a private umask
+- a fixed working directory
+
+The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
+stops the whole control group and removes the private prompt, settings, log,
+and result. Without systemd the runner uses a new process group and announces
+that a detached descendant cannot receive the same uncatchable-death
+guarantee.
+
+## Adopt a repository
 
 ```bash
-npx --yes playwright@1.62.0 screenshot \
-    --viewport-size 1280,720 "file://$PWD/page.html" shot.png
+orrery-init [model] /path/to/repository
 ```
 
-Abandoned automation profiles are swept by the Leave No Trace hook, matching
-the drivers' exact profile prefixes so a directory such as
-`playwright_test-results` is never touched.
+When no usable Git worktree exists and no malformed `.git` marker is present,
+the command runs `git init` automatically.
+
+Instruction migration:
+
+- neither file exists: create `AGENTS.md` and one-line `CLAUDE.md`;
+- `AGENTS.md` exists alone: preserve it and create the Claude import;
+- arbitrary `CLAUDE.md` exists alone: preserve it, copy it to `AGENTS.md` for
+  Codex, and warn that manual deduplication is needed;
+- both exist: preserve both and warn when Claude does not import AGENTS;
+- a wrapper exists without its target: restore the project AGENTS template.
+
+The command never replaces arbitrary existing instructions. It removes only
+recognised retired Orrery-managed blocks from `CLAUDE.local.md`, preserving
+surrounding personal text.
+
+A known model argument writes:
+
+```json
+{
+  "orchestrator": {
+    "provider": "anthropic",
+    "model": "fable",
+    "thinking": "max"
+  }
+}
+```
+
+to `.orrery.json`. The file and `CLAUDE.local.md` are added to the repository’s
+local exclude file when untracked. Existing unrelated JSON keys survive.
+
+## Instruction and caching design
+
+`AGENTS.md` is canonical because Codex discovers it natively. Claude Code does
+not read it directly, so `CLAUDE.md` imports `@AGENTS.md`. Project templates use
+the same structure.
+
+Keep the global policy stable and project instructions concise. Provider CLIs
+manage server-side prompt caching automatically. Orrery puts static
+instructions before the changing assignment, avoids model/effort switches
+inside a session, and keeps reviewer contexts fresh. There is no cache shared
+between providers or models.
+
+Do not add empty `.mcp.json`, Gemini, Cursor, or Copilot instruction files.
+Tool-specific MCP, hook, permission, and execution settings belong in their
+native configuration only when actually used.
+
+## Leave No Trace
+
+Claude sessions receive lifecycle hooks from
+`global/hooks/leave-no-trace.py`. The hook:
+
+- rejects unregistered detached work before it starts;
+- attributes session-owned processes conservatively;
+- supports bounded leases through `claude-lnt-start`;
+- runs registered rollback commands;
+- sweeps abandoned automation browser profiles; and
+- cleans state at stop, compaction, session end, or watchdog detection.
+
+Use only the Playwright-bundled Chromium, pinned to the version in
+`global/AGENTS.md`. Never fall back to snap or system Chromium. Close the
+browser and inspect for residue after visual work.
+
+Delegated Anthropic and OpenAI processes have a separate containment and
+runtime-state cleanup path in `orrery-agent`. Automatic principal lifecycle
+hook installation is currently Claude-specific; a Codex principal still
+receives the same cleanup requirements through `AGENTS.md`.
+
+## Provider exhaustion and failures
+
+- Account, subscription, quota, billing, and authentication failures are not
+  retried on the same provider.
+- A model-specific failure may use one suitable configured alternative.
+- A transient failure gets one retry.
+- A partial write-capable failure requires working-tree inspection before
+  another writer starts.
+- A missing independent review must be reported.
+
+The simplest deliberate fallback is to assign every role to the available
+provider in `orrery-config`.
+
+## Token usage
+
+```bash
+orrery-usage --since 7
+orrery-usage --json
+```
+
+The command reads local provider session logs and never contacts a provider.
+
+## Verification and maintenance
+
+```bash
+./tests/run-tests.py
+orrery-doctor
+```
+
+The suite uses fake provider commands. The doctor makes no model calls.
+
+When adding a known model, update only `global/model-catalogue.json` with one
+canonical UI entry and its exact thinking levels. Pinned identifiers remain
+available through the custom option and must not be duplicated as aliases in
+the ordinary menu.
+
+When changing workflow geometry, update `global/orchestration.json`, render the
+configuration page at desktop and narrow widths, inspect screenshots, and
+verify that paths and labels do not intersect unrelated nodes.
+
+## Repository map
+
+The maintained artefacts are:
+
+- `README.md`, `LICENSE`, and `logo.png` — project overview, licence, and logo.
+- `docs/setup-guide.md` — this operational reference.
+- `global/AGENTS.md` — canonical shared policy.
+- `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.
+- `global/claude-settings.json` — Claude-only hooks, permissions, and companion
+  state; it intentionally contains no role model.
+- `global/model-catalogue.json` — unique provider/model choices and thinking
+  capabilities.
+- `global/orchestration.json` — the role manifest, workflow setting, and
+  configuration-chart geometry.
+- `global/hooks/.gitignore` and `global/hooks/leave-no-trace.py` — lifecycle
+  state exclusion and implementation.
+- `global/skills/development-orchestrator/SKILL.md` — shared detailed workflow.
+- `project-template/AGENTS.md` and `project-template/CLAUDE.md` — repository
+  instruction templates.
+- `scripts/orrery` and `scripts/orrery_runtime.py` — principal launcher and
+  validated provider adapters.
+- `scripts/orrery-review` — the `orrery-agent` runner and compatibility review
+  entry point.
+- `scripts/orrery-config`, `scripts/orrery-usage`, `scripts/init-project.sh`,
+  `scripts/doctor.sh`, and `scripts/install.sh` — configuration, accounting,
+  adoption, diagnostics, and installation.
+- `scripts/apply-claude-settings.py` and `scripts/install-lnt-hooks.sh` —
+  atomic Claude-settings application and lifecycle-link installation.
+- `scripts/claude-lnt-start`, `scripts/claude-lnt-register`,
+  `scripts/claude-lnt-cleanup`, and `scripts/claude-lnt-status` — explicit
+  lifecycle helpers.
+- `tests/run-tests.py`, `tests/fake-codex`, and `tests/fake-claude` — offline
+  regression suite and provider stand-ins.
 
 ## Troubleshooting
 
-**`orrery-init: command not found`** — `~/.local/bin` is not on `PATH`.
-Add it to the shell profile and start a new shell.
+**`orrery` says a provider command is unavailable** — install or authenticate
+the CLI selected for the principal, or choose an available provider in
+`orrery-config`.
 
-`orrery-init` automatically runs `git init` when its target is an ordinary
-directory outside any Git worktree. Existing repositories, linked
-worktrees and submodules are reused; bare or malformed repositories are
-refused rather than overwritten.
+**Codex ignores the installed policy** — inspect
+`$CODEX_HOME/AGENTS.override.md`; it shadows `$CODEX_HOME/AGENTS.md`.
 
-**A Codex profile appears ignored** — confirm
-`$CODEX_HOME/<profile>.config.toml` exists and is a link into the kit. An
-unknown `--profile` does not fail; Codex falls back to the default model, so
-a typo produces work from a model you did not choose.
+**Claude and Codex receive different project instructions** — make
+`AGENTS.md` canonical and reduce `CLAUDE.md` to `@AGENTS.md`.
 
-**The active model does not match the kit** — `~/.claude/settings.json` is
-authoritative for the default. Run `./scripts/apply-claude-settings.py
---model`, and check for a per-repository override in that repository's
-`.claude/settings.local.json` or `.claude/settings.json`.
+**A delegated run times out** — the runner returns status 124 after stopping
+the process tree. Inspect the provider diagnostics printed before cleanup.
 
-**The doctor fails on Codex authentication** — run `codex login` once on the
-machine and rerun the doctor.
+**The configuration page refuses Apply** — an external writer changed the
+manifest after Preview. Reload and preview the new exact diff.
 
-**`CLAUDE.local.md` appears in Git status** — `init-project.sh` adds it to
-`.git/info/exclude`. If it was committed before migration, remove it from the
-index deliberately; the script will not do that for you.
-
-**The doctor fails only on a dirty repository** — that is the intended
-result while work is uncommitted.
-
-**A headless browser survives `timeout`** — a snap browser reparents to
-systemd and outlives its launcher, and `kill` from a VS Code shell is denied
-by AppArmor. Stop its `snap.chromium.chromium-*.scope` instead, and never
-stop a scope whose root process lacks `--headless=new`, which would be the
-interactive browser. The bundled-browser policy avoids this entirely.
-
-**VS Code freezes during a large agentic run** — reduce effort for
-non-interactive work as above, and prefer `claude -p` outside the editor for
-long runs.
-
-## Maintenance
-
-- Update Claude Code and Codex CLI through their own updaters; the kit pins
-  neither.
-- After changing kit policy or scripts, run `./tests/run-tests.py` and
-  `orrery-doctor`, then commit. Installed paths are symlinks, so a
-  change is live without reinstalling.
-- Refresh migrated repositories by rerunning `orrery-init` in them,
-  which replaces only the managed block in `CLAUDE.local.md`.
-- Roll back a settings change from the timestamped
-  `~/.claude/settings.json.backup-orrery-*` file written before each
-  update.
+**The doctor reports stale links** — rerun `./scripts/install.sh`; it is
+idempotent and preserves displaced files in a namespaced backup.
