@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import html
 import json
 import os
 import re
@@ -27,11 +28,23 @@ from typing import Any
 
 
 KIT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_model_catalogue import (  # noqa: E402
+    EFFORT_NAME,
+    DiscoveryResult,
+    discover_catalogue,
+)
 
 # A request carries only a few short model names.
 MAX_BODY_BYTES = 64 * 1024
-THINKING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
 PROVIDERS = ("anthropic", "openai")
+ACTIVE_CATALOGUE: dict[str, list[dict[str, Any]]] | None = None
+CATALOGUE_DISCOVERY = DiscoveryResult(
+    providers={},
+    sources={provider: "fallback" for provider in PROVIDERS},
+    warnings=(),
+)
 
 
 class ConfigError(Exception):
@@ -113,29 +126,20 @@ def settings_snapshot(
     return states
 
 
-def load_catalogue() -> dict[str, list[dict[str, Any]]]:
-    """Models offered in the dropdowns, per provider.
-
-    The choices and their current thinking capabilities are curated rather
-    than inferred from a model name. Anything absent can still be typed in,
-    and the current value is represented even when the catalogue does not
-    mention it.
-    """
-    path = KIT_DIR / "global" / "model-catalogue.json"
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"the model catalogue is unreadable: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ConfigError("the model catalogue root must be an object")
-    providers = data.get("providers", {})
-
+def _parse_catalogue(
+    providers: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Validate provider entries from either discovery or the fallback."""
     if not isinstance(providers, dict):
         raise ConfigError("the model catalogue providers must be an object")
+    if set(providers) != set(PROVIDERS):
+        raise ConfigError(
+            f"the model catalogue must contain: {', '.join(PROVIDERS)}"
+        )
 
     catalogue: dict[str, list[dict[str, Any]]] = {}
     for provider, entries in providers.items():
-        if not isinstance(entries, list):
+        if not isinstance(entries, list) or not entries:
             raise ConfigError(f"the {provider} model catalogue must be a list")
         seen: set[str] = set()
         parsed: list[dict[str, Any]] = []
@@ -150,10 +154,12 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
                 raise ConfigError(f"every {provider} model needs an id")
             if model in seen:
                 raise ConfigError(f"duplicate {provider} model: {model}")
-            if not isinstance(label, str) or not label.strip():
-                raise ConfigError(f"{model} needs a plain dropdown label")
+            if label != model:
+                raise ConfigError(
+                    f"{model} needs an exact, uncharacterised dropdown label"
+                )
             if not isinstance(levels, list) or any(
-                not isinstance(level, str) or level not in THINKING_LEVELS
+                not isinstance(level, str) or not EFFORT_NAME.fullmatch(level)
                 for level in levels
             ):
                 raise ConfigError(
@@ -161,14 +167,6 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
                 )
             if len(levels) != len(set(levels)):
                 raise ConfigError(f"{model} repeats a thinking level")
-            expected_order = [
-                level for level in THINKING_LEVELS if level in levels
-            ]
-            if levels != expected_order:
-                raise ConfigError(
-                    f"{model} thinking levels must follow "
-                    f"{', '.join(THINKING_LEVELS)}"
-                )
             if default is not None and default not in levels:
                 raise ConfigError(
                     f"{model} default_thinking is not available for that model"
@@ -192,11 +190,36 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
     return catalogue
 
 
+def bundled_catalogue() -> dict[str, list[dict[str, Any]]]:
+    """Validate and return the provider catalogue bundled as a fallback."""
+    path = KIT_DIR / "global" / "model-catalogue.json"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"the model catalogue is unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError("the model catalogue root must be an object")
+    return _parse_catalogue(data.get("providers"))
+
+
+def activate_discovered_catalogue() -> None:
+    """Refresh picker choices from both installed CLIs once per process."""
+    global ACTIVE_CATALOGUE, CATALOGUE_DISCOVERY
+    fallback = bundled_catalogue()
+    CATALOGUE_DISCOVERY = discover_catalogue(fallback)
+    ACTIVE_CATALOGUE = _parse_catalogue(CATALOGUE_DISCOVERY.providers)
+
+
+def load_catalogue() -> dict[str, list[dict[str, Any]]]:
+    """Models offered per provider, live when config runs, bundled otherwise."""
+    return ACTIVE_CATALOGUE if ACTIVE_CATALOGUE is not None else bundled_catalogue()
+
+
 def model_choices(
     current_provider: str,
     current_model: str,
 ) -> list[dict[str, Any]]:
-    """Every curated provider/model pair plus the current custom pair."""
+    """Every discovered provider/model pair plus the current custom pair."""
     choices: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -231,7 +254,13 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError(f"{step.get('id', 'step')} has invalid provider")
     if not isinstance(model, str) or not model:
         raise ConfigError(f"{step.get('id', 'step')} has no model")
-    if thinking is not None and thinking not in THINKING_LEVELS:
+    if (
+        thinking is not None
+        and (
+            not isinstance(thinking, str)
+            or not EFFORT_NAME.fullmatch(thinking)
+        )
+    ):
         raise ConfigError(f"{step.get('id', 'step')} has invalid thinking")
     state: dict[str, Any] = {
         "id": step["id"],
@@ -668,7 +697,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
   .canvas svg.marks { position: absolute; inset: 0; overflow: visible;
     z-index: 40; pointer-events: none; }
-  .wires path { fill: none; stroke: var(--wire); stroke-width: 1.3; }
+  .wires > path.edge { fill: none; stroke: var(--wire); stroke-width: 1.3; }
+  .wires marker path { fill: var(--wire); stroke: none; }
   .canvas svg text {
     font-family: system-ui, sans-serif; font-size: 11px; fill: var(--soft);
     text-anchor: middle; dominant-baseline: middle;
@@ -768,7 +798,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     Saving changes the defaults for <strong>new Orrery processes</strong>;
     running sessions are unaffected. A repository's private
     <code>.orrery.json</code> principal override still wins. Every role may use either provider.
-    Known models expose only the thinking levels supported by their CLI;
+    __CATALOGUE_NOTE__
+    Known models expose only the thinking levels reported for that model;
     a custom identifier also requires an explicit provider.
   </div>
   <div class="actions">
@@ -795,6 +826,8 @@ const host = document.getElementById("chart");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
 const SVGNS = "http://www.w3.org/2000/svg";
+const ARROW_SIZE = 12;
+const ARROW_CLEARANCE = 20;
 
 const FILL = {
   orchestrator: ["#38617f", "#ffffff"], mechanic: ["#8891a8", "#ffffff"],
@@ -913,10 +946,13 @@ function render() {
   });
   const defs = element("defs", {});
   const marker = element("marker", {
-    id: "arrow", viewBox: "0 0 8 8", refX: "7", refY: "4",
-    markerWidth: "6", markerHeight: "6", orient: "auto-start-reverse",
+    id: "arrow", viewBox: "0 0 12 12", refX: "11.5", refY: "6",
+    markerWidth: String(ARROW_SIZE), markerHeight: String(ARROW_SIZE),
+    markerUnits: "userSpaceOnUse", orient: "auto",
   });
-  marker.appendChild(element("path", { d: "M0,0 L8,4 L0,8 z", fill: "context-stroke" }));
+  marker.appendChild(element("path", {
+    d: "M0.5,0.5 L11.5,6 L0.5,11.5 z", fill: "context-stroke",
+  }));
   defs.appendChild(marker);
   svg.appendChild(defs);
   canvas.appendChild(svg);
@@ -991,13 +1027,70 @@ function drawWires(svg, marks, canvas) {
     return { x: node.x + dx * scale, y: node.y + dy * scale };
   };
 
+  const distanceToSegment = (point, start, end) => {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const lengthSquared = dx * dx + dy * dy;
+    const along = lengthSquared
+      ? Math.max(0, Math.min(1,
+          ((point.x - start.x) * dx + (point.y - start.y) * dy) /
+          lengthSquared))
+      : 0;
+    return Math.hypot(
+      point.x - (start.x + along * dx),
+      point.y - (start.y + along * dy),
+    );
+  };
+
+  const shapeDistance = (point, node) => {
+    if (!node.diamond) {
+      return Math.hypot(
+        Math.max(Math.abs(point.x - node.x) - node.w / 2, 0),
+        Math.max(Math.abs(point.y - node.y) - node.h / 2, 0),
+      );
+    }
+    const corners = [
+      { x: node.x, y: node.y - node.h / 2 },
+      { x: node.x + node.w / 2, y: node.y },
+      { x: node.x, y: node.y + node.h / 2 },
+      { x: node.x - node.w / 2, y: node.y },
+    ];
+    return Math.min(...corners.map((corner, index) =>
+      distanceToSegment(
+        point,
+        corner,
+        corners[(index + 1) % corners.length],
+      )
+    ));
+  };
+
+  const moveAway = (point, node, minimumGap) => {
+    const dx = point.x - node.x;
+    const dy = point.y - node.y;
+    const length = Math.hypot(dx, dy);
+    if (!length) return point;
+    let travel = minimumGap;
+    let moved;
+    do {
+      moved = {
+        x: point.x + dx / length * travel,
+        y: point.y + dy / length * travel,
+      };
+      travel *= 1.5;
+    } while (shapeDistance(moved, node) < minimumGap);
+    return moved;
+  };
+
   const labels = [];
   for (const link of CHART.edges) {
     const a = rect(link.from);
     const b = rect(link.to);
     if (!a || !b) continue;
     const start = edge(a, b);
-    const end = edge(b, a);
+    // The marker extends backwards from the path endpoint. Stop the path
+    // outside the target by more than one complete marker, so neither its
+    // tip nor its shoulders can disappear beneath an opaque node.
+    const end = moveAway(edge(b, a), b, ARROW_CLEARANCE);
     const lift = Math.max(26, Math.abs(end.y - start.y) * 0.4);
     const way = end.y >= start.y ? 1 : -1;
     // A reverse edge would otherwise be painted directly over its forward
@@ -1008,6 +1101,7 @@ function drawWires(svg, marks, canvas) {
     const c2 = { x: end.x + offset, y: end.y - lift * way };
     svg.appendChild(element("path", {
       class: "edge", "marker-end": "url(#arrow)",
+      "data-from": link.from, "data-to": link.to,
       d: `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${end.x} ${end.y}`,
     }));
     if (link.label) {
@@ -1277,12 +1371,33 @@ def script_json(value: Any) -> str:
 
 def render_page(token: str) -> str:
     manifest = load_manifest()
+    live = [
+        provider
+        for provider, source in CATALOGUE_DISCOVERY.sources.items()
+        if source == "installed CLI"
+    ]
+    if len(live) == len(PROVIDERS):
+        catalogue_note = (
+            "Models and thinking levels were discovered from the installed "
+            "Claude and Codex CLIs."
+        )
+    else:
+        fallback = [
+            provider
+            for provider in PROVIDERS
+            if provider not in live
+        ]
+        catalogue_note = (
+            "Live model discovery is using the bundled fallback for "
+            f"{', '.join(fallback)}."
+        )
     return (
         PAGE_TEMPLATE
         .replace("__STATE__", script_json(snapshot(manifest)))
         .replace("__SETTINGS__", script_json(settings_snapshot(manifest)))
         .replace("__CHART__", script_json(manifest.get("chart", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
+        .replace("__CATALOGUE_NOTE__", html.escape(catalogue_note))
     )
 
 
@@ -1441,6 +1556,9 @@ def main() -> int:
     arguments = parser.parse_args()
 
     try:
+        activate_discovered_catalogue()
+        for warning in CATALOGUE_DISCOVERY.warnings:
+            print(f"Model discovery: {warning}", file=sys.stderr, flush=True)
         if arguments.print_state:
             return print_state()
         return serve(

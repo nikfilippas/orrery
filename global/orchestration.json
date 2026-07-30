@@ -368,7 +368,7 @@
         "from": "correct",
         "to": "verify",
         "label": "rerun affected checks",
-        "offset": -430
+        "offset": -470
       }
     ]
   },

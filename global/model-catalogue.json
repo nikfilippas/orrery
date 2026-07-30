@@ -1,5 +1,5 @@
 {
-  "note": "Canonical aliases and exact thinking levels offered by the installed Claude Code and Codex CLIs. Pinned or newly released model identifiers remain available through the custom option, where the provider must be selected explicitly.",
+  "note": "Bundled fallback choices and Orrery-specific thinking defaults. orrery-config replaces each provider's entries with picker-visible models and exact effort capabilities discovered from the installed CLI; a provider falls back to these entries only when live discovery is unavailable.",
   "providers": {
     "anthropic": [
       {

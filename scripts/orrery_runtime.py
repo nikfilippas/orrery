@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,9 +20,7 @@ ROLE_IDS = frozenset(
     {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"}
 )
 ACCESS_LEVELS = frozenset({"principal", "workspace-write", "read-only"})
-THINKING_LEVELS = frozenset(
-    {"low", "medium", "high", "xhigh", "max", "ultra"}
-)
+THINKING_LEVEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class RuntimeConfigError(Exception):
@@ -149,7 +148,13 @@ def load_role(
         raise RuntimeConfigError(f"{role_id} has invalid provider: {provider!r}")
     if not isinstance(model, str) or not model.strip():
         raise RuntimeConfigError(f"{role_id} has no model")
-    if thinking is not None and thinking not in THINKING_LEVELS:
+    if (
+        thinking is not None
+        and (
+            not isinstance(thinking, str)
+            or not THINKING_LEVEL.fullmatch(thinking)
+        )
+    ):
         raise RuntimeConfigError(
             f"{role_id} has invalid thinking level: {thinking!r}"
         )
@@ -159,9 +164,6 @@ def load_role(
         raise RuntimeConfigError("the orchestrator must use principal access")
     if role_id != "orchestrator" and access == "principal":
         raise RuntimeConfigError(f"{role_id} cannot use principal access")
-    if provider == "anthropic" and thinking == "ultra":
-        raise RuntimeConfigError("Anthropic roles do not support ultra thinking")
-
     catalogue = load_catalogue()
     known_providers = [
         known_provider

@@ -76,6 +76,7 @@ fi
 printf '\n=== Canonical manifest and catalogue ===\n'
 if python3 - "$KIT_DIR" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -86,7 +87,7 @@ providers = catalogue.get("providers")
 if not isinstance(providers, dict) or set(providers) != {"anthropic", "openai"}:
     raise SystemExit("catalogue providers must be anthropic and openai")
 
-thinking_order = ("low", "medium", "high", "xhigh", "max", "ultra")
+effort_name = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 known = {}
 for provider, entries in providers.items():
     if not isinstance(entries, list) or not entries:
@@ -107,8 +108,11 @@ for provider, entries in providers.items():
             raise SystemExit(f"{model} has no label")
         if (
             not isinstance(levels, list)
-            or levels != [level for level in thinking_order if level in levels]
             or len(levels) != len(set(levels))
+            or any(
+                not isinstance(level, str) or not effort_name.fullmatch(level)
+                for level in levels
+            )
         ):
             raise SystemExit(f"{model} has invalid thinking levels")
         if default is not None and default not in levels:
@@ -146,7 +150,13 @@ for step in steps:
             raise SystemExit(f"{role} thinking is unsupported")
         if not levels and thinking is not None:
             raise SystemExit(f"{role} should have no thinking level")
-    elif thinking is not None and thinking not in thinking_order:
+    elif (
+        thinking is not None
+        and (
+            not isinstance(thinking, str)
+            or not effort_name.fullmatch(thinking)
+        )
+    ):
         raise SystemExit(f"{role} has invalid custom thinking")
 
 settings = manifest.get("settings", {})
@@ -324,6 +334,7 @@ done
 
 for script in \
     "$KIT_DIR/scripts/orrery" \
+    "$KIT_DIR/scripts/orrery_model_catalogue.py" \
     "$KIT_DIR/scripts/orrery_runtime.py" \
     "$KIT_DIR/scripts/orrery-review" \
     "$KIT_DIR/scripts/orrery-config" \
