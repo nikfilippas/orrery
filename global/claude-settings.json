@@ -1,5 +1,8 @@
 {
-  "model": "opus",
+  "model": "fable",
+  "env": {
+    "CLAUDE_CODE_EFFORT_LEVEL": "max"
+  },
   "hooks": {
     "SessionStart": [
       {
@@ -104,8 +107,8 @@
   "permissions": {
     "allow": [
       "Bash(codex:*)",
-      "Bash(claude-codex-review:*)",
-      "Bash(claude-codex-doctor:*)",
+      "Bash(orrery-review:*)",
+      "Bash(orrery-doctor:*)",
       "Bash(claude-lnt-status:*)",
       "Bash(npx --yes playwright@1.62.0 screenshot:*)",
       "Bash(npx --yes playwright@1.62.0 install chromium:*)",

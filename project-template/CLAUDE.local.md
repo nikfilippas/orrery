@@ -1,7 +1,7 @@
 # Personal Repository Instructions
 
-<!-- claude-codex-kit:start -->
-## Claude-Codex workflow
+<!-- orrery:start -->
+## Órrery workflow
 
 The user-level policy in `~/.claude/CLAUDE.md` and the global
 `development-orchestrator` skill apply in this repository.
@@ -29,4 +29,4 @@ For personal workflow and delegation:
   and safety requirement, and ask before delegating.
 
 Project-specific correctness and safety constraints always remain in force.
-<!-- claude-codex-kit:end -->
+<!-- orrery:end -->

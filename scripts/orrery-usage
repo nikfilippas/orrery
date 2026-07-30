@@ -30,7 +30,7 @@ def codex_home() -> Path:
         raw = str(Path.home() / ".codex")
 
     if not raw.strip():
-        print("claude-codex-usage: CODEX_HOME cannot be empty", file=sys.stderr)
+        print("orrery-usage: CODEX_HOME cannot be empty", file=sys.stderr)
         raise SystemExit(2)
 
     return Path(raw).expanduser().resolve(strict=False)
@@ -45,7 +45,7 @@ def parse_since(value: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise SystemExit(
-            f"claude-codex-usage: --since must be a day count or a date: {value}"
+            f"orrery-usage: --since must be a day count or a date: {value}"
         ) from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)

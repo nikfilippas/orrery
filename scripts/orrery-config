@@ -16,8 +16,6 @@ import json
 import os
 import re
 import secrets
-import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -34,6 +32,8 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 
 # A request carries only a few short model names.
 MAX_BODY_BYTES = 64 * 1024
+THINKING_LEVELS = ("low", "medium", "high", "xhigh", "max", "ultra")
+CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
 
 
 class ConfigError(Exception):
@@ -47,6 +47,72 @@ def load_manifest() -> dict[str, Any]:
     if not isinstance(steps, list) or not steps:
         raise ConfigError(f"no steps defined in {path}")
     return manifest
+
+
+def integer_setting_state(
+    setting_id: str,
+    definition: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and expose one bounded integer orchestration setting."""
+    value = definition.get("value")
+    minimum = definition.get("minimum")
+    maximum = definition.get("maximum")
+    if any(isinstance(item, bool) or not isinstance(item, int)
+           for item in (value, minimum, maximum)):
+        raise ConfigError(f"{setting_id} must define integer value/minimum/maximum")
+    if minimum > maximum or not minimum <= value <= maximum:
+        raise ConfigError(
+            f"{setting_id} must be between {minimum} and {maximum}, got {value}"
+        )
+    if setting_id == "plan_review_rounds" and (minimum, maximum) != (1, 4):
+        raise ConfigError("plan_review_rounds must remain bounded from 1 to 4")
+    node = definition.get("node")
+    label = definition.get("label")
+    description = definition.get("description")
+    if not all(isinstance(item, str) and item.strip()
+               for item in (node, label, description)):
+        raise ConfigError(
+            f"{setting_id} must name a node, label and description"
+        )
+    return {
+        "id": setting_id,
+        "kind": "integer",
+        "value": value,
+        "minimum": minimum,
+        "maximum": maximum,
+        "node": node,
+        "label": label,
+        "description": description,
+        "choices": list(range(minimum, maximum + 1)),
+    }
+
+
+def settings_snapshot(
+    manifest: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if manifest is None:
+        manifest = load_manifest()
+    settings = manifest.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ConfigError("the manifest settings must be an object")
+    if "plan_review_rounds" not in settings:
+        raise ConfigError("the manifest must define plan_review_rounds")
+    node_ids = {
+        node.get("id")
+        for node in manifest.get("chart", {}).get("nodes", [])
+        if isinstance(node, dict)
+    }
+    states: list[dict[str, Any]] = []
+    for setting_id, definition in settings.items():
+        if not isinstance(setting_id, str) or not isinstance(definition, dict):
+            raise ConfigError("every orchestration setting must be a named object")
+        state = integer_setting_state(setting_id, definition)
+        if state["node"] not in node_ids:
+            raise ConfigError(
+                f"{setting_id} names missing chart node {state['node']}"
+            )
+        states.append(state)
+    return states
 
 
 def read_toml(path: Path) -> dict[str, Any]:
@@ -82,69 +148,149 @@ def toml_key(key: str) -> str:
     return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
 
 
-def load_catalogue() -> dict[str, list[dict[str, str]]]:
+def load_catalogue() -> dict[str, list[dict[str, Any]]]:
     """Models offered in the dropdowns, per provider.
 
-    Neither CLI can enumerate its available models locally, so the choices
-    are curated here rather than invented. Anything absent can still be
-    typed in, and the current value is always offered even when the
-    catalogue does not mention it.
+    The choices and their current thinking capabilities are curated rather
+    than inferred from a model name. Anything absent can still be typed in,
+    and the current value is represented even when the catalogue does not
+    mention it.
     """
     path = KIT_DIR / "global" / "model-catalogue.json"
     try:
-        providers = json.loads(path.read_text()).get("providers", {})
+        data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"the model catalogue is unreadable: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ConfigError("the model catalogue root must be an object")
+    providers = data.get("providers", {})
 
-    catalogue: dict[str, list[dict[str, str]]] = {}
+    if not isinstance(providers, dict):
+        raise ConfigError("the model catalogue providers must be an object")
+
+    catalogue: dict[str, list[dict[str, Any]]] = {}
     for provider, entries in providers.items():
         if not isinstance(entries, list):
-            continue
-        catalogue[provider] = [
-            {
-                "id": entry["id"],
-                "label": str(entry.get("label") or entry["id"]),
-            }
-            for entry in entries
-            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
-        ]
+            raise ConfigError(f"the {provider} model catalogue must be a list")
+        seen: set[str] = set()
+        parsed: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ConfigError(f"every {provider} model must be an object")
+            model = entry.get("id")
+            label = entry.get("label")
+            levels = entry.get("thinking_levels")
+            default = entry.get("default_thinking")
+            if not isinstance(model, str) or not model.strip():
+                raise ConfigError(f"every {provider} model needs an id")
+            if model in seen:
+                raise ConfigError(f"duplicate {provider} model: {model}")
+            if not isinstance(label, str) or not label.strip():
+                raise ConfigError(f"{model} needs a plain dropdown label")
+            if not isinstance(levels, list) or any(
+                not isinstance(level, str) or level not in THINKING_LEVELS
+                for level in levels
+            ):
+                raise ConfigError(
+                    f"{model} has invalid thinking_levels"
+                )
+            if len(levels) != len(set(levels)):
+                raise ConfigError(f"{model} repeats a thinking level")
+            expected_order = [
+                level for level in THINKING_LEVELS if level in levels
+            ]
+            if levels != expected_order:
+                raise ConfigError(
+                    f"{model} thinking levels must follow "
+                    f"{', '.join(THINKING_LEVELS)}"
+                )
+            if default is not None and default not in levels:
+                raise ConfigError(
+                    f"{model} default_thinking is not available for that model"
+                )
+            if not levels and default is not None:
+                raise ConfigError(
+                    f"{model} cannot have a thinking default without levels"
+                )
+            parsed.append(
+                {
+                    "id": model,
+                    "label": label,
+                    "thinking_levels": levels,
+                    "default_thinking": default,
+                    "known": True,
+                }
+            )
+            seen.add(model)
+        catalogue[provider] = parsed
     return catalogue
 
 
-def model_choices(step: dict[str, Any], current: str) -> list[dict[str, str]]:
-    """The dropdown entries for one step, newest intent first.
-
-    Claude aliases come first where they exist, because an alias that
-    follows a provider's newest model is usually the better default than
-    any pinned identifier.
-    """
-    choices: list[dict[str, str]] = []
+def model_choices(step: dict[str, Any], current: str) -> list[dict[str, Any]]:
+    """The exact curated choices plus a safe representation of a custom one."""
+    choices: list[dict[str, Any]] = []
     seen: set[str] = set()
-
-    aliases_file = step.get("aliases")
-    if aliases_file:
-        try:
-            aliases = json.loads((KIT_DIR / aliases_file).read_text())
-        except (OSError, json.JSONDecodeError):
-            aliases = {}
-        for alias, value in sorted(aliases.items()):
-            if isinstance(value, str) and value not in seen:
-                label = (
-                    f"{alias} · moving alias" if alias == value
-                    else f"{alias} → {value}"
-                )
-                choices.append({"id": value, "label": label})
-                seen.add(value)
 
     for entry in load_catalogue().get(step.get("provider", ""), []):
         if entry["id"] not in seen:
-            choices.append({"id": entry["id"], "label": entry["label"]})
+            choices.append(dict(entry))
             seen.add(entry["id"])
 
     if current and current not in seen:
-        choices.append({"id": current, "label": f"{current} · currently set"})
+        choices.append(
+            {
+                "id": current,
+                "label": current,
+                "thinking_levels": [],
+                "default_thinking": None,
+                "known": False,
+            }
+        )
 
     return choices
+
+
+def claude_thinking(settings: dict[str, Any]) -> str:
+    environment = settings.get("env", {})
+    if environment is not None and not isinstance(environment, dict):
+        raise ConfigError("Claude env must be an object")
+    persisted = settings.get("effortLevel")
+    if persisted is not None and not isinstance(persisted, str):
+        raise ConfigError("Claude effortLevel must be a string")
+    override = None
+    if isinstance(environment, dict):
+        override = environment.get(CLAUDE_EFFORT_ENV)
+        if override is not None and not isinstance(override, str):
+            raise ConfigError(f"Claude {CLAUDE_EFFORT_ENV} must be a string")
+    if persisted is not None and override is not None:
+        raise ConfigError(
+            "Claude thinking uses both effortLevel and "
+            f"{CLAUDE_EFFORT_ENV}; keep only the effective representation"
+        )
+    return override or persisted or ""
+
+
+def set_claude_thinking(
+    settings: dict[str, Any],
+    thinking: str | None,
+) -> None:
+    """Store a Claude thinking choice in the representation it supports."""
+    settings.pop("effortLevel", None)
+    environment = settings.get("env", {})
+    if not isinstance(environment, dict):
+        raise ConfigError("Claude env must be an object")
+    environment = dict(environment)
+    environment.pop(CLAUDE_EFFORT_ENV, None)
+
+    if thinking == "max":
+        environment[CLAUDE_EFFORT_ENV] = thinking
+    elif thinking:
+        settings["effortLevel"] = thinking
+
+    if environment:
+        settings["env"] = environment
+    else:
+        settings.pop("env", None)
 
 
 def step_state(step: dict[str, Any]) -> dict[str, Any]:
@@ -163,16 +309,19 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
     if step["kind"] == "claude-settings":
         settings = json.loads(path.read_text())
         state["model"] = settings.get("model", "")
+        state["thinking"] = claude_thinking(settings)
         live = Path.home() / ".claude" / "settings.json"
         try:
-            state["live_model"] = json.loads(live.read_text()).get("model", "")
+            live_settings = json.loads(live.read_text())
+            state["live_model"] = live_settings.get("model", "")
+            state["live_thinking"] = claude_thinking(live_settings)
         except (OSError, json.JSONDecodeError):
             state["live_model"] = ""
+            state["live_thinking"] = ""
     elif step["kind"] == "codex-profile":
         profile = read_toml(path)
         state["model"] = profile.get("model", "")
-        state["effort"] = profile.get("model_reasoning_effort", "")
-        state["expected_effort"] = step.get("expected_effort", "")
+        state["thinking"] = profile.get("model_reasoning_effort", "")
     else:
         raise ConfigError(f"unknown step kind: {step['kind']}")
 
@@ -180,8 +329,12 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def snapshot() -> list[dict[str, Any]]:
-    return [step_state(step) for step in load_manifest()["steps"]]
+def snapshot(
+    manifest: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if manifest is None:
+        manifest = load_manifest()
+    return [step_state(step) for step in manifest["steps"]]
 
 
 MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+-]*(\[[A-Za-z0-9.]+\])?$")
@@ -207,22 +360,78 @@ def validate_model(value: Any) -> str:
     return candidate
 
 
-def planned_edit(step: dict[str, Any], model: str) -> dict[str, Any] | None:
+def catalogue_choice(
+    step: dict[str, Any],
+    model: str,
+) -> dict[str, Any] | None:
+    return next(
+        (
+            entry
+            for entry in load_catalogue().get(step.get("provider", ""), [])
+            if entry["id"] == model
+        ),
+        None,
+    )
+
+
+def resolved_thinking(
+    step: dict[str, Any],
+    model: str,
+    requested: Any,
+    *,
+    supplied: bool,
+) -> str | None:
+    """Validate a model/thinking pair and choose a deterministic fallback."""
+    current = step_state(step)
+    choice = catalogue_choice(step, model)
+    if choice is None:
+        if supplied and requested not in (None, ""):
+            raise ConfigError(
+                f"{model} is a custom model, so its available thinking "
+                "levels are unknown; configure that level manually"
+            )
+        return current.get("thinking") or None
+
+    levels = choice["thinking_levels"]
+    if not levels:
+        if supplied and requested not in (None, ""):
+            raise ConfigError(f"{model} does not offer a thinking selector")
+        return None
+
+    if supplied:
+        if not isinstance(requested, str) or requested not in levels:
+            raise ConfigError(
+                f"{model} thinking must be one of: {', '.join(levels)}"
+            )
+        return requested
+
+    current_thinking = current.get("thinking")
+    if current_thinking in levels:
+        return current_thinking
+    return choice.get("default_thinking") or levels[0]
+
+
+def planned_edit(
+    step: dict[str, Any],
+    model: str,
+    thinking: str | None,
+) -> dict[str, Any] | None:
     """The new content one step change produces, or None when unchanged."""
     path = KIT_DIR / step["file"]
     before = path.read_text()
 
     if step["kind"] == "claude-settings":
         settings = json.loads(before)
-        if settings.get("model") == model:
-            return None
         settings["model"] = model
+        set_claude_thinking(settings, thinking)
         after = json.dumps(settings, indent=2) + "\n"
     else:
         profile = read_toml(path)
-        if profile.get("model") == model:
-            return None
         profile["model"] = model
+        if thinking is None:
+            profile.pop("model_reasoning_effort", None)
+        else:
+            profile["model_reasoning_effort"] = thinking
         lines = [f"model = {toml_value(profile.pop('model'))}"]
         effort = profile.pop("model_reasoning_effort", None)
         if effort is not None:
@@ -230,6 +439,9 @@ def planned_edit(step: dict[str, Any], model: str) -> dict[str, Any] | None:
         for key in sorted(profile):
             lines.append(f"{toml_key(key)} = {toml_value(profile[key])}")
         after = "\n".join(lines) + "\n"
+
+    if after == before:
+        return None
 
     diff = "".join(
         difflib.unified_diff(
@@ -247,27 +459,110 @@ def planned_edit(step: dict[str, Any], model: str) -> dict[str, Any] | None:
     }
 
 
+def validate_setting_change(
+    setting_id: str,
+    requested: Any,
+    definition: dict[str, Any],
+) -> int:
+    if not isinstance(requested, dict):
+        raise ConfigError(f"invalid change for setting {setting_id}")
+    unknown = set(requested) - {"value"}
+    if unknown:
+        raise ConfigError(
+            f"only the value can be changed for {setting_id}, "
+            f"not: {sorted(unknown)}"
+        )
+    value = requested.get("value")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{setting_id} must be an integer")
+    state = integer_setting_state(setting_id, definition)
+    if not state["minimum"] <= value <= state["maximum"]:
+        raise ConfigError(
+            f"{setting_id} must be between "
+            f"{state['minimum']} and {state['maximum']}"
+        )
+    return value
+
+
+def planned_settings_edit(
+    requested: dict[str, Any],
+) -> dict[str, Any] | None:
+    """One atomic manifest edit for every requested runtime setting."""
+    path = KIT_DIR / "global" / "orchestration.json"
+    before = path.read_text()
+    manifest = json.loads(before)
+    definitions = manifest.get("settings", {})
+    if not isinstance(definitions, dict):
+        raise ConfigError("the manifest settings must be an object")
+
+    changed: list[str] = []
+    for setting_id, change in requested.items():
+        definition = definitions.get(setting_id)
+        if not isinstance(definition, dict):
+            raise ConfigError(f"unknown setting: {setting_id}")
+        value = validate_setting_change(setting_id, change, definition)
+        if definition.get("value") != value:
+            definition["value"] = value
+            changed.append(setting_id)
+
+    if not changed:
+        return None
+    after = json.dumps(manifest, indent=2) + "\n"
+    diff = "".join(
+        difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile="a/global/orchestration.json",
+            tofile="b/global/orchestration.json",
+        )
+    )
+    return {
+        "file": "global/orchestration.json",
+        "before": before,
+        "after": after,
+        "diff": diff,
+        "settings": sorted(changed),
+    }
+
+
 def plan(changes: dict[str, Any]) -> list[dict[str, Any]]:
-    steps = {step["id"]: step for step in load_manifest()["steps"]}
+    manifest = load_manifest()
+    steps = {step["id"]: step for step in manifest["steps"]}
+    settings = manifest.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ConfigError("the manifest settings must be an object")
+    settings_snapshot(manifest)
     edits: list[dict[str, Any]] = []
+    requested_settings: dict[str, Any] = {}
     for step_id, requested in changes.items():
+        if step_id in settings:
+            requested_settings[step_id] = requested
+            continue
         if step_id not in steps:
-            raise ConfigError(f"unknown step: {step_id}")
+            raise ConfigError(f"unknown step or setting: {step_id}")
         if not isinstance(requested, dict):
             raise ConfigError(f"invalid change for step {step_id}")
-        unknown = set(requested) - {"model"}
+        unknown = set(requested) - {"model", "thinking"}
         if unknown:
-            # Efforts define the roles and the manifest is not mutable
-            # state, so only the model may change here.
             raise ConfigError(
-                f"only the model can be changed for {step_id}, "
+                f"only model and thinking can be changed for {step_id}, "
                 f"not: {sorted(unknown)}"
             )
-        model = validate_model(requested.get("model"))
-        edit = planned_edit(steps[step_id], model)
+        current = step_state(steps[step_id])
+        model = validate_model(requested.get("model", current["model"]))
+        thinking = resolved_thinking(
+            steps[step_id],
+            model,
+            requested.get("thinking"),
+            supplied="thinking" in requested,
+        )
+        edit = planned_edit(steps[step_id], model, thinking)
         if edit is not None:
             edit["step"] = step_id
             edits.append(edit)
+    settings_edit = planned_settings_edit(requested_settings)
+    if settings_edit is not None:
+        edits.append(settings_edit)
     return edits
 
 
@@ -413,7 +708,7 @@ def apply_edits(
         "doctor_tail": "",
     }
 
-    if any(edit["step"] == "orchestrator" for edit in edits):
+    if any(edit.get("step") == "orchestrator" for edit in edits):
         # The canonical settings changed; the kit's own applier carries the
         # model into the live settings atomically, with a backup.
         status, output = run_kit(
@@ -421,6 +716,7 @@ def apply_edits(
                 sys.executable,
                 str(KIT_DIR / "scripts" / "apply-claude-settings.py"),
                 "--model",
+                "--effort",
             ],
             timeout=60,
         )
@@ -460,14 +756,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     }
   }
   * { box-sizing: border-box; }
+  html { scroll-padding-bottom: 92px; }
   body {
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 1240px; margin: 0 auto; padding: 28px 20px 60px; }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
-  .chartwrap { overflow-x: auto; overflow-y: visible; padding: 4px 0 56px; }
+  .chartwrap { overflow-x: auto; overflow-y: visible; padding: 4px 0 92px; }
   .canvas { position: relative; margin: 0 auto; }
   .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
   .canvas svg.marks { position: absolute; inset: 0; overflow: visible;
@@ -482,18 +779,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .cnode {
     position: absolute; box-sizing: border-box; border-radius: 9px;
     padding: 9px 11px; z-index: 1; transition: box-shadow .16s, opacity .16s;
-    display: flex; flex-direction: column; gap: 7px;
+    display: flex; flex-direction: column; gap: 7px; scroll-margin-block: 92px;
   }
   .cnode.diamond { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
   .cnode.dim { opacity: 0.26; }
   .cnode.self { box-shadow: 0 0 0 2.5px var(--ink), 0 10px 28px rgba(0,0,0,.34); }
-  .cnode.kin { box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 45%, transparent); }
   .cnode:hover, .cnode:focus-within { z-index: 90; opacity: 1; }
-  .cnode:hover { box-shadow: 0 4px 16px rgba(0,0,0,.26); }
   .cnode .title {
     font-size: 12px; font-weight: 600; line-height: 1.32;
-    padding-right: 16px; white-space: pre-line;
+    white-space: pre-line;
   }
+  .cnode.has-info .title { padding-right: 16px; }
   .cnode.diamond .title { padding: 0; text-align: center; margin: auto; }
   .cnode .info {
     position: absolute; top: 5px; right: 6px; width: 17px; height: 17px;
@@ -513,7 +809,16 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .info:hover + .tip, .info:focus-visible + .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
   .tip .meta { color: var(--soft); margin-top: 6px; font-family: ui-monospace, monospace; font-size: 10.5px; }
-  .pick { display: flex; flex-direction: column; gap: 2px; }
+  .role-controls { display: flex; flex-direction: column; gap: 3px; }
+  .role-label {
+    font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase;
+    opacity: .82; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .control-row {
+    display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(72px, 1fr);
+    gap: 5px; align-items: start;
+  }
+  .pick { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
   .pick label { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; opacity: .8; }
   .cnode select, .cnode input[type=text] {
     width: 100%; box-sizing: border-box; border: 0; border-radius: 5px;
@@ -525,10 +830,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     outline: 2px solid #ffffff; outline-offset: 1px;
   }
   .actions {
-    position: sticky; bottom: 0; z-index: 80; display: flex; gap: 10px;
+    display: flex; gap: 10px;
     align-items: center; padding: 12px 0; margin-top: 8px;
-    background: color-mix(in srgb, var(--ground) 86%, transparent);
-    backdrop-filter: blur(8px); border-top: 1px solid var(--edge);
+    border-top: 1px solid var(--edge);
   }
   .btn {
     appearance: none; border: 1px solid transparent; border-radius: 8px;
@@ -557,14 +861,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>Órrery configuration</h1>
-  <p class="sub">The pipeline as it actually runs, generated from the live files under __KIT_DIR__.
-     Steps sharing a role share one model, and say so; steps that run no model say that too.</p>
+  <p class="sub">The pipeline as it actually runs, generated from this checkout's canonical files.
+     Steps sharing a role share one model, and bounded workflow controls sit at
+     the stage they govern.</p>
   <div class="chartwrap" id="chart"></div>
   <div class="scopenote">
     Saving changes the system-wide default for <strong>new sessions</strong>.
-    Repositories pinned with <code>claude-codex-init &lt;alias&gt;</code> keep
-    their pins, and running sessions are unaffected. Worker reasoning efforts
-    define the roles and are shown, not editable.
+    Repositories pinned with <code>orrery-init &lt;alias&gt;</code> keep
+    their pins, and running sessions are unaffected. Each known model exposes
+    only the thinking levels supported by its current CLI catalogue.
   </div>
   <div class="actions">
     <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
@@ -576,10 +881,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 </div>
 <script>
 const STATE = __STATE__;
+const SETTINGS = __SETTINGS__;
 const CHART = __CHART__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
-const original = Object.fromEntries(STATE.map(s => [s.id, s.model]));
+const original = Object.fromEntries(
+  STATE.map(s => [s.id, {model: s.model, thinking: s.thinking || ""}])
+);
+const originalSettings = Object.fromEntries(SETTINGS.map(s => [s.id, s.value]));
 const host = document.getElementById("chart");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
@@ -611,26 +920,49 @@ function stepsUsing(roleId) {
   return CHART.nodes.filter(n => n.roles.includes(roleId)).length;
 }
 
+function settingsForNode(nodeId) {
+  return SETTINGS.filter(setting => setting.node === nodeId);
+}
+
 function picker(step) {
   const id = esc(step.id);
-  const options = (step.choices || []).map(c =>
+  const knownChoices = (step.choices || []).filter(c => c.known);
+  const selectedKnown = knownChoices.some(c => c.id === step.model);
+  const options = knownChoices.map(c =>
     `<option value="${esc(c.id)}" ${c.id === step.model ? "selected" : ""}>` +
     `${esc(c.label)}</option>`).join("");
-  const known = (step.choices || []).some(c => c.id === step.model);
-  return `<div class="pick"><label>${esc(step.title)}</label>` +
-    `<select data-step="${id}" data-kind="select">${options}` +
-    `<option value="__custom__" ${known ? "" : "selected"}>custom…</option></select>` +
+  const choice = knownChoices.find(c => c.id === step.model);
+  const levels = choice ? choice.thinking_levels : [];
+  const thinkingOptions = levels.length
+    ? levels.map(level =>
+        `<option value="${esc(level)}" ${level === step.thinking ? "selected" : ""}>` +
+        `${esc(level)}</option>`).join("")
+    : `<option value="">${choice ? "unavailable" : "manual setup"}</option>`;
+  return `<div class="role-controls" data-role="${id}">` +
+    `<div class="role-label">${esc(step.title)}</div><div class="control-row">` +
+    `<div class="pick"><label>model</label>` +
+    `<select data-step="${id}" data-kind="model">${options}` +
+    `<option value="__custom__" ${selectedKnown ? "" : "selected"}>custom…</option></select>` +
     `<input type="text" data-step="${id}" data-kind="custom" ` +
-    `value="${known ? "" : esc(step.model)}" ` +
-    `style="display:${known ? "none" : "block"}" ` +
-    `placeholder="exact model identifier"></div>`;
+    `value="${selectedKnown ? "" : esc(step.model)}" ` +
+    `style="display:${selectedKnown ? "none" : "block"}" ` +
+    `placeholder="exact identifier"></div>` +
+    `<div class="pick"><label>thinking</label>` +
+    `<select data-step="${id}" data-kind="thinking" ` +
+    `${levels.length ? "" : "disabled"}>${thinkingOptions}</select></div>` +
+    `</div></div>`;
+}
+
+function settingPicker(setting) {
+  const options = setting.choices.map(value =>
+    `<option value="${value}" ${value === setting.value ? "selected" : ""}>` +
+    `${value} round${value === 1 ? "" : "s"}</option>`).join("");
+  return `<div class="pick"><label>${esc(setting.label)}</label>` +
+    `<select data-setting="${esc(setting.id)}">${options}</select></div>`;
 }
 
 function tip(node) {
-  if (!node.roles.length) {
-    return `<b>No model runs here.</b>${esc(node.note || "")}`;
-  }
-  return node.roles.map(id => {
+  const roleText = node.roles.map(id => {
     const step = roles[id];
     const count = stepsUsing(id);
     const shared = count > 1
@@ -640,9 +972,17 @@ function tip(node) {
     return `<b>${esc(step.title)}</b>${esc(step.summary)} ${shared}` +
       `<div class="meta">${step.profile ? "codex profile: " + esc(step.profile)
         : "claude code session model"}` +
-      (step.effort ? ` · effort ${esc(step.effort)}, fixed` : "") +
+      (step.thinking ? ` · thinking ${esc(step.thinking)}` :
+        " · thinking unavailable") +
       `<br>${esc(step.file)}</div>`;
   }).join('<div style="height:8px"></div>');
+  const settingText = settingsForNode(node.id).map(setting =>
+    `<div style="height:8px"></div><b>${esc(setting.label)}</b>` +
+    `${esc(setting.description)}` +
+    `<div class="meta">global/orchestration.json · ${setting.minimum}–` +
+    `${setting.maximum}, loaded ${originalSettings[setting.id]}</div>`
+  ).join("");
+  return roleText + settingText;
 }
 
 function render() {
@@ -673,26 +1013,37 @@ function render() {
 
   for (const node of CHART.nodes) {
     const [fill, ink] = nodeInk(node);
+    const detail = tip(node);
     const box = document.createElement("div");
-    box.className = "cnode" + (node.shape === "diamond" ? " diamond" : "");
+    box.className = "cnode" +
+      (node.shape === "diamond" ? " diamond" : "") +
+      (detail ? " has-info" : "");
     box.dataset.node = node.id;
     box.style.cssText =
       `left:${node.x - node.w / 2}px;top:${node.y - node.h / 2}px;` +
       `width:${node.w}px;min-height:${node.h}px;background:${fill};color:${ink}`;
     box.innerHTML =
       `<div class="title">${esc(node.label)}</div>` +
-      (node.shape === "diamond" ? "" :
+      (detail ?
         `<button class="info" type="button" aria-label="About this step">&#128712;</button>` +
-        `<div class="tip">${tip(node)}</div>`) +
-      node.roles.map(id => picker(roles[id])).join("");
+        `<div class="tip">${detail}</div>` : "") +
+      node.roles.map(id => picker(roles[id])).join("") +
+      settingsForNode(node.id).map(settingPicker).join("");
     box.addEventListener("mouseenter", () => highlight(node.id, node.roles));
     box.addEventListener("mouseleave", () => highlight(null, null));
+    box.addEventListener("focusin", () => highlight(node.id, node.roles));
+    box.addEventListener("focusout", event => {
+      if (!box.contains(event.relatedTarget)) highlight(null, null);
+    });
     canvas.appendChild(box);
   }
 
   host.appendChild(canvas);
   drawWires(svg, marks, canvas);
   window.addEventListener("resize", () => drawWires(svg, marks, canvas));
+  requestAnimationFrame(() => {
+    host.scrollLeft = Math.max(0, (CHART.width - host.clientWidth) / 2);
+  });
 }
 
 function drawWires(svg, marks, canvas) {
@@ -733,8 +1084,12 @@ function drawWires(svg, marks, canvas) {
     const end = edge(b, a);
     const lift = Math.max(26, Math.abs(end.y - start.y) * 0.4);
     const way = end.y >= start.y ? 1 : -1;
-    const c1 = { x: start.x, y: start.y + lift * way };
-    const c2 = { x: end.x, y: end.y - lift * way };
+    // A reverse edge would otherwise be painted directly over its forward
+    // partner. The manifest can bow one direction sideways so both arrows
+    // remain independently legible as a cycle.
+    const offset = Number(link.offset || 0);
+    const c1 = { x: start.x + offset, y: start.y + lift * way };
+    const c2 = { x: end.x + offset, y: end.y - lift * way };
     svg.appendChild(element("path", {
       class: "edge", "marker-end": "url(#arrow)",
       d: `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${end.x} ${end.y}`,
@@ -744,10 +1099,18 @@ function drawWires(svg, marks, canvas) {
       const at = (p0, p1, p2, p3) =>
         (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 +
         3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3;
-      const text = element("text", {
-        x: at(start.x, c1.x, c2.x, end.x), y: at(start.y, c1.y, c2.y, end.y),
+      const labelX = at(start.x, c1.x, c2.x, end.x);
+      const labelY = at(start.y, c1.y, c2.y, end.y);
+      const text = element("text", { x: labelX, y: labelY });
+      const lines = String(link.label).split("\\n");
+      lines.forEach((line, index) => {
+        const part = element("tspan", {
+          x: labelX,
+          y: labelY + (index - (lines.length - 1) / 2) * 13,
+        });
+        part.textContent = line;
+        text.appendChild(part);
       });
-      text.textContent = link.label;
       labels.push(text);
     }
   }
@@ -755,49 +1118,115 @@ function drawWires(svg, marks, canvas) {
 }
 
 function highlight(sourceId, active) {
-  // An empty list of roles is still truthy, so a step that runs no model
-  // must not be read as a request to highlight nothing at all.
   const chosen = active && active.length ? active : null;
+  const engaged = sourceId !== null;
   document.querySelectorAll(".cnode").forEach(box => {
     const node = CHART.nodes.find(n => n.id === box.dataset.node);
     const self = sourceId === node.id;
     const kin = Boolean(chosen && !self && node.roles.some(r => chosen.includes(r)));
     box.classList.toggle("self", self);
     box.classList.toggle("kin", kin);
-    box.classList.toggle("dim", Boolean(chosen) && !self && !kin);
+    box.classList.toggle("dim", engaged && !self && !kin);
   });
 }
 
 // Several steps run one role, so every control for that role moves
 // together; the change is visible rather than hidden.
-function syncRole(roleId, value, source) {
-  document.querySelectorAll(`select[data-step="${roleId}"]`).forEach(select => {
-    if (select === source) return;
-    const known = Array.from(select.options).some(o => o.value === value);
-    select.value = known ? value : "__custom__";
+function choiceFor(roleId, model) {
+  return (roles[roleId].choices || []).find(
+    choice => choice.known && choice.id === model
+  );
+}
+
+function selectThinking(select, roleId, model, preferred) {
+  const choice = choiceFor(roleId, model);
+  const levels = choice ? choice.thinking_levels : [];
+  select.replaceChildren();
+  if (!levels.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = choice ? "unavailable" : "manual setup";
+    select.appendChild(option);
+    select.disabled = true;
+    return null;
+  }
+  const remembered = preferred ||
+    (model === roles[roleId].model ? roles[roleId].thinking : "");
+  const chosen = levels.includes(remembered)
+    ? remembered
+    : (choice.default_thinking || levels[0]);
+  for (const level of levels) {
+    const option = document.createElement("option");
+    option.value = level;
+    option.textContent = level;
+    option.selected = level === chosen;
+    select.appendChild(option);
+  }
+  select.disabled = false;
+  return chosen;
+}
+
+function syncRole(roleId, model, preferredThinking) {
+  const known = Boolean(choiceFor(roleId, model));
+  document.querySelectorAll(
+    `select[data-step="${roleId}"][data-kind="model"]`
+  ).forEach(select => {
+    select.value = known ? model : "__custom__";
     const custom = select.parentNode.querySelector('input[data-kind="custom"]');
-    if (custom) {
-      custom.style.display = known ? "none" : "block";
-      if (!known) custom.value = value;
-    }
+    if (custom) custom.style.display = known ? "none" : "block";
   });
   document.querySelectorAll(`input[data-step="${roleId}"][data-kind="custom"]`)
-    .forEach(input => { if (input !== source) input.value = value; });
+    .forEach(input => {
+      if (!known && input.value !== model) input.value = model;
+    });
+  document.querySelectorAll(
+    `select[data-step="${roleId}"][data-kind="thinking"]`
+  ).forEach(select => selectThinking(
+    select, roleId, model, preferredThinking
+  ));
 }
 
 function currentModel(id) {
-  const select = document.querySelector(`select[data-step="${id}"]`);
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="model"]`
+  );
   if (!select) return "";
   if (select.value !== "__custom__") return select.value;
   const custom = select.parentNode.querySelector('input[data-kind="custom"]');
   return custom ? custom.value.trim() : "";
 }
 
+function currentThinking(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="thinking"]`
+  );
+  return !select || select.disabled ? null : select.value;
+}
+
+function currentSetting(id) {
+  const select = document.querySelector(`select[data-setting="${id}"]`);
+  return select ? Number(select.value) : null;
+}
+
 function changes() {
   const out = {};
   for (const id of Object.keys(original)) {
-    const value = currentModel(id);
-    if (value && value !== original[id]) out[id] = { model: value };
+    const model = currentModel(id);
+    const thinking = currentThinking(id);
+    if (
+      model &&
+      (model !== original[id].model ||
+       (thinking !== null && thinking !== original[id].thinking))
+    ) {
+      out[id] = {model};
+      if (thinking !== null) out[id].thinking = thinking;
+    }
+  }
+  for (const setting of SETTINGS) {
+    const value = currentSetting(setting.id);
+    if (value !== null && value !== originalSettings[setting.id]) {
+      out[setting.id] = { value };
+    }
   }
   return out;
 }
@@ -811,18 +1240,22 @@ async function post(endpoint, body) {
 }
 
 document.addEventListener("input", event => {
-  const step = event.target.dataset && event.target.dataset.step;
-  if (step) syncRole(step, currentModel(step), event.target);
+  const data = event.target.dataset || {};
+  if (data.step && data.kind === "custom") {
+    syncRole(data.step, currentModel(data.step), currentThinking(data.step));
+  }
   applyButton.disabled = true;
 });
 
 document.addEventListener("change", event => {
   const data = event.target.dataset || {};
-  if (data.kind === "select") {
+  if (data.kind === "model") {
     const custom = event.target.parentNode.querySelector('input[data-kind="custom"]');
     if (custom) custom.style.display = event.target.value === "__custom__" ? "block" : "none";
   }
-  if (data.step) syncRole(data.step, currentModel(data.step), event.target);
+  if (data.step) {
+    syncRole(data.step, currentModel(data.step), currentThinking(data.step));
+  }
   applyButton.disabled = true;
 });
 
@@ -886,39 +1319,34 @@ def script_json(value: Any) -> str:
     )
 
 
-def escape_html(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
-
-
-def display_path(path: Path) -> str:
-    """A path as its owner would write it, home abbreviated."""
-    try:
-        return "~/" + str(path.relative_to(Path.home()))
-    except ValueError:
-        return str(path)
-
-
 def render_page(token: str) -> str:
+    manifest = load_manifest()
     return (
         PAGE_TEMPLATE
-        .replace("__STATE__", script_json(snapshot()))
-        .replace("__FLOW__", script_json(load_manifest().get("flow", [])))
-        .replace("__CHART__", script_json(load_manifest().get("chart", {})))
+        .replace("__STATE__", script_json(snapshot(manifest)))
+        .replace("__SETTINGS__", script_json(settings_snapshot(manifest)))
+        .replace("__CHART__", script_json(manifest.get("chart", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
-        .replace("__KIT_DIR__", escape_html(display_path(KIT_DIR)))
     )
 
 
 def print_state() -> int:
-    for state in snapshot():
-        effort = f" · effort {state['effort']}" if state.get("effort") else ""
+    manifest = load_manifest()
+    for state in snapshot(manifest):
+        thinking = (
+            f" · thinking {state['thinking']}"
+            if state.get("thinking")
+            else " · thinking unavailable"
+        )
         print(f"{state['title']:24} {state['provider']:10} "
-              f"{state['model']}{effort}   [{state['file']}]")
+              f"{state['model']}{thinking}   [{state['file']}]")
+    for setting in settings_snapshot(manifest):
+        print(
+            f"{setting['label']:24} {'workflow':10} "
+            f"{setting['value']} "
+            f"[{setting['minimum']}–{setting['maximum']}; "
+            "global/orchestration.json]"
+        )
     return 0
 
 
@@ -1065,7 +1493,7 @@ def main() -> int:
             open_browser=not arguments.no_browser,
         )
     except ConfigError as exc:
-        print(f"claude-codex-config: {exc}", file=sys.stderr)
+        print(f"orrery-config: {exc}", file=sys.stderr)
         return 2
 
 

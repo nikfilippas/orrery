@@ -28,6 +28,12 @@ POLL_SECONDS = 3
 TERM_GRACE_SECONDS = 2.0
 MAX_WATCH_SECONDS = 24 * 60 * 60
 LNT_MARKER = "claude-lnt"
+DEFAULT_PLAN_REVIEW_ROUNDS = 2
+MIN_PLAN_REVIEW_ROUNDS = 1
+MAX_PLAN_REVIEW_ROUNDS = 4
+ORCHESTRATION_MANIFEST = (
+    Path(__file__).resolve().parents[2] / "global" / "orchestration.json"
+)
 
 # Ephemeral profile directories created by browser automation. These are the
 # exact prefixes the drivers use, not a wildcard over the tool name: a glob
@@ -143,6 +149,57 @@ def current_session(data: dict[str, Any] | None = None) -> str:
     if not value:
         raise RuntimeError("CLAUDE_CODE_SESSION_ID is unavailable")
     return value
+
+
+def configured_plan_review_rounds() -> int:
+    """Read the plan-review cap without making SessionStart depend on it.
+
+    The doctor and configurator reject malformed values. The lifecycle hook
+    still has to initialise Leave No Trace when the manifest is missing or
+    being edited, so an invalid value falls back to the safe default rather
+    than aborting the whole SessionStart hook.
+    """
+    try:
+        manifest = json.loads(ORCHESTRATION_MANIFEST.read_text())
+        value = manifest["settings"]["plan_review_rounds"]["value"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return DEFAULT_PLAN_REVIEW_ROUNDS
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not MIN_PLAN_REVIEW_ROUNDS <= value <= MAX_PLAN_REVIEW_ROUNDS
+    ):
+        return DEFAULT_PLAN_REVIEW_ROUNDS
+    return value
+
+
+def plan_review_context(rounds: int) -> str:
+    """Session instructions that make the manifest's round cap operational."""
+    context = (
+        f"For complex or high-risk work, bounded plan review allows at most "
+        f"{rounds} reviewer round{'s' if rounds != 1 else ''}. Round one asks "
+        "a fresh plan reviewer to classify every objection as blocking or "
+        "advisory. Verify each objection independently; advisory objections "
+        "never force another round. Revise the plan only for supported "
+        "findings and stop early when no blocking objection remains. "
+    )
+    if rounds > 1:
+        context += (
+            "In later rounds, give a fresh plan reviewer the revised plan, "
+            "the original blocking objections, and how each was addressed; "
+            "ask only which blocking objections remain. "
+        )
+    else:
+        context += (
+            "Because the cap is one round, a supported blocking objection "
+            "cannot receive an independent confirmation round. "
+        )
+    return context + (
+        "If the same blocking objection survives a revision, or a blocking "
+        "objection cannot be cleared within the cap, stop before implementation "
+        "and ask the user to decide. Do not iterate merely to obtain agreement "
+        "or describe an unconfirmed plan as approved."
+    )
 
 
 # The procfs root, patchable in tests. On systems without /proc, such as
@@ -1106,6 +1163,7 @@ def hook_start() -> int:
             handle.write(f"export TMPDIR={shlex.quote(str(state / 'tmp'))}\n")
     if not same_process:
         start_watchdog(session_id, claude_pid, meta["claude_start"])
+    plan_context = plan_review_context(configured_plan_review_rounds())
     print(
         json.dumps(
             {
@@ -1118,7 +1176,8 @@ def hook_start() -> int:
                         "Open the first reply of this session with one discreet line "
                         "naming the active model, in the form: "
                         "↳ Principal orchestrator · <model>. Surfaces such as "
-                        "the VS Code extension show no model header of their own."
+                        "the VS Code extension show no model header of their own. "
+                        + plan_context
                     ),
                 }
             }

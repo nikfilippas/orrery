@@ -25,7 +25,7 @@ PY
 fi
 export CODEX_HOME
 # Nanoseconds via Python: BSD date on macOS prints a literal N for %N.
-BACKUP_DIR="$HOME/.claude-codex-kit-backups/$(date +%Y%m%d-%H%M%S)-$$-$(
+BACKUP_DIR="$HOME/.orrery-backups/$(date +%Y%m%d-%H%M%S)-$$-$(
     python3 -c 'import time; print(time.time_ns())'
 )"
 
@@ -110,25 +110,58 @@ for stale in luna terra vesta sol; do
 done
 
 mkdir -p "$HOME/.local/bin"
+
+# Remove only command links installed by this checkout under the retired
+# namespace. A same-named user file or a link into another checkout is left
+# untouched. The legacy spelling is assembled so it cannot leak back into
+# current help text or documentation.
+legacy_prefix="claude"
+legacy_prefix="${legacy_prefix}-codex"
+for suffix in init doctor review usage config; do
+    retired="$HOME/.local/bin/${legacy_prefix}-${suffix}"
+    if python3 - "$retired" "$KIT_DIR" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+link = Path(sys.argv[1])
+kit = Path(sys.argv[2]).resolve(strict=False)
+if not link.is_symlink():
+    raise SystemExit(1)
+raw = Path(os.readlink(link))
+candidate = (
+    raw if raw.is_absolute() else link.parent / raw
+).resolve(strict=False)
+try:
+    candidate.relative_to(kit)
+except ValueError:
+    raise SystemExit(1)
+PY
+    then
+        rm -f -- "$retired"
+        printf 'Removed retired command link: %s\n' "$retired"
+    fi
+done
+
 link_file \
     "$KIT_DIR/scripts/init-project.sh" \
-    "$HOME/.local/bin/claude-codex-init"
+    "$HOME/.local/bin/orrery-init"
 
 link_file \
     "$KIT_DIR/scripts/doctor.sh" \
-    "$HOME/.local/bin/claude-codex-doctor"
+    "$HOME/.local/bin/orrery-doctor"
 
 link_file \
-    "$KIT_DIR/scripts/claude-codex-review" \
-    "$HOME/.local/bin/claude-codex-review"
+    "$KIT_DIR/scripts/orrery-review" \
+    "$HOME/.local/bin/orrery-review"
 
 link_file \
-    "$KIT_DIR/scripts/claude-codex-usage" \
-    "$HOME/.local/bin/claude-codex-usage"
+    "$KIT_DIR/scripts/orrery-usage" \
+    "$HOME/.local/bin/orrery-usage"
 
 link_file \
-    "$KIT_DIR/scripts/claude-codex-config" \
-    "$HOME/.local/bin/claude-codex-config"
+    "$KIT_DIR/scripts/orrery-config" \
+    "$HOME/.local/bin/orrery-config"
 
 "$KIT_DIR/scripts/install-lnt-hooks.sh" --links-only
 "$KIT_DIR/scripts/apply-claude-settings.py" --all

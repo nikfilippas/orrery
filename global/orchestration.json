@@ -6,9 +6,8 @@
       "provider": "anthropic",
       "kind": "claude-settings",
       "file": "global/claude-settings.json",
-      "aliases": "global/claude-models.json",
       "summary": "Classifies every request, plans, delegates bounded work, inspects each diff itself, runs verification, and owns the outcome.",
-      "selects": "The default Claude Code model for new sessions. Repositories can override it with claude-codex-init <alias>, and a running session with /model.",
+      "selects": "The default Claude Code model and thinking level for new sessions. Repositories can override the model with orrery-init <alias>, and a running session with /model.",
       "shared_note": "One continuous session runs every orchestrator step, so they necessarily share a model."
     },
     {
@@ -17,9 +16,8 @@
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/mechanic.config.toml",
-      "expected_effort": "low",
       "summary": "The mechanical worker: narrow, repetitive, well-specified edits and boilerplate.",
-      "selects": "The Codex model behind the luna profile. Its low reasoning effort defines the role and is not configurable.",
+      "selects": "The Codex model and thinking level behind the mechanic profile.",
       "profile": "mechanic"
     },
     {
@@ -28,9 +26,8 @@
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/implementer.config.toml",
-      "expected_effort": "medium",
       "summary": "The implementation worker: contained features, real bug fixes, multi-file changes, one bounded task per run.",
-      "selects": "The Codex model behind the terra profile. Its medium reasoning effort defines the role and is not configurable.",
+      "selects": "The Codex model and thinking level behind the implementer profile.",
       "profile": "implementer"
     },
     {
@@ -39,9 +36,8 @@
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/plan-reviewer.config.toml",
-      "expected_effort": "high",
       "summary": "The plan reviewer: challenges a plan before any code is written, when the work is complex or high-risk.",
-      "selects": "The Codex model behind the vesta profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer.",
+      "selects": "The Codex model and thinking level behind the plan-reviewer profile. Reviewing foundations is cheaper than reviewing consequences, so this may be set independently of the final reviewer.",
       "profile": "plan-reviewer"
     },
     {
@@ -50,22 +46,21 @@
       "provider": "openai",
       "kind": "codex-profile",
       "file": "global/codex/reviewer.config.toml",
-      "expected_effort": "high",
       "summary": "The final reviewer: fresh read-only sessions that review completed work, and difficult diagnosis.",
-      "selects": "The Codex model behind the sol profile, used for the review that gates completion.",
+      "selects": "The Codex model and thinking level behind the reviewer profile, used for the review that gates completion.",
       "profile": "reviewer"
     }
   ],
   "chart": {
-    "width": 1120,
-    "height": 1400,
+    "width": 1400,
+    "height": 1980,
     "nodes": [
       {
         "id": "request",
         "label": "ordinary request:\n'add a --top flag with tests'",
-        "x": 500,
-        "y": 78,
-        "w": 210,
+        "x": 700,
+        "y": 75,
+        "w": 230,
         "h": 56,
         "shape": "rect",
         "roles": []
@@ -73,9 +68,9 @@
       {
         "id": "classify",
         "label": "classify",
-        "x": 500,
-        "y": 226,
-        "w": 215,
+        "x": 700,
+        "y": 230,
+        "w": 230,
         "h": 100,
         "shape": "rect",
         "roles": [
@@ -83,25 +78,46 @@
         ]
       },
       {
-        "id": "complex",
-        "label": "Claude plans,\nthe plan reviewer challenges it",
-        "x": 140,
-        "y": 400,
-        "w": 225,
+        "id": "plan",
+        "label": "Claude writes the plan",
+        "x": 1220,
+        "y": 560,
+        "w": 260,
         "h": 132,
         "shape": "rect",
         "roles": [
-          "orchestrator",
+          "orchestrator"
+        ]
+      },
+      {
+        "id": "plan-review-step",
+        "label": "the plan reviewer challenges it,\nblocking versus advisory",
+        "x": 1220,
+        "y": 810,
+        "w": 260,
+        "h": 206,
+        "shape": "rect",
+        "roles": [
           "plan-reviewer"
         ]
       },
       {
+        "id": "plan-escalation",
+        "label": "stop before implementation\nand ask the user",
+        "x": 1280,
+        "y": 1060,
+        "w": 210,
+        "h": 76,
+        "shape": "rect",
+        "roles": []
+      },
+      {
         "id": "investigation",
         "label": "read-only sandboxes only",
-        "x": 985,
-        "y": 300,
-        "w": 200,
-        "h": 100,
+        "x": 120,
+        "y": 560,
+        "w": 210,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -110,10 +126,10 @@
       {
         "id": "standard",
         "label": "implementer writes it\nworkspace-write",
-        "x": 300,
-        "y": 566,
-        "w": 215,
-        "h": 104,
+        "x": 930,
+        "y": 560,
+        "w": 240,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "implementer"
@@ -122,10 +138,10 @@
       {
         "id": "mechanical",
         "label": "mechanical worker edits\nworkspace-write",
-        "x": 610,
-        "y": 566,
-        "w": 215,
-        "h": 104,
+        "x": 660,
+        "y": 560,
+        "w": 240,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "mechanic"
@@ -134,22 +150,34 @@
       {
         "id": "trivial",
         "label": "Claude implements directly",
-        "x": 900,
-        "y": 726,
-        "w": 215,
-        "h": 100,
+        "x": 390,
+        "y": 560,
+        "w": 220,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "orchestrator"
         ]
       },
       {
+        "id": "complex-implementation",
+        "label": "implementer writes it\nworkspace-write",
+        "x": 1020,
+        "y": 1060,
+        "w": 240,
+        "h": 132,
+        "shape": "rect",
+        "roles": [
+          "implementer"
+        ]
+      },
+      {
         "id": "inspect",
         "label": "Claude inspects the real diff,\nnever the worker's summary",
-        "x": 400,
-        "y": 726,
-        "w": 225,
-        "h": 104,
+        "x": 820,
+        "y": 1250,
+        "w": 250,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -158,20 +186,20 @@
       {
         "id": "verify",
         "label": "tests, lint, type checks, build",
-        "x": 520,
-        "y": 884,
-        "w": 210,
-        "h": 50,
+        "x": 600,
+        "y": 1420,
+        "w": 230,
+        "h": 56,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "review",
         "label": "final reviewer, fresh session,\nread-only, ephemeral",
-        "x": 590,
-        "y": 998,
-        "w": 225,
-        "h": 104,
+        "x": 600,
+        "y": 1560,
+        "w": 250,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "reviewer"
@@ -180,20 +208,20 @@
       {
         "id": "findings",
         "label": "findings",
-        "x": 590,
-        "y": 1136,
-        "w": 92,
-        "h": 84,
+        "x": 600,
+        "y": 1705,
+        "w": 104,
+        "h": 92,
         "shape": "diamond",
         "roles": []
       },
       {
         "id": "correct",
         "label": "Claude reproduces, fixes,\nadds regression tests",
-        "x": 390,
-        "y": 1284,
-        "w": 215,
-        "h": 104,
+        "x": 300,
+        "y": 1870,
+        "w": 240,
+        "h": 132,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -202,10 +230,10 @@
       {
         "id": "done",
         "label": "done: nothing committed\nwithout explicit approval",
-        "x": 690,
-        "y": 1284,
-        "w": 205,
-        "h": 62,
+        "x": 900,
+        "y": 1870,
+        "w": 220,
+        "h": 70,
         "shape": "rect",
         "roles": []
       }
@@ -217,18 +245,13 @@
       },
       {
         "from": "classify",
-        "to": "complex",
-        "label": "complex"
-      },
-      {
-        "from": "classify",
         "to": "investigation",
         "label": "investigation"
       },
       {
         "from": "classify",
-        "to": "standard",
-        "label": "standard"
+        "to": "trivial",
+        "label": "trivial"
       },
       {
         "from": "classify",
@@ -237,12 +260,33 @@
       },
       {
         "from": "classify",
-        "to": "trivial",
-        "label": "trivial"
+        "to": "standard",
+        "label": "standard"
       },
       {
-        "from": "complex",
-        "to": "standard"
+        "from": "classify",
+        "to": "plan",
+        "label": "complex"
+      },
+      {
+        "from": "plan",
+        "to": "plan-review-step"
+      },
+      {
+        "from": "plan-review-step",
+        "to": "plan",
+        "label": "supported blocking\nobjections \u00b7 within cap",
+        "offset": -110
+      },
+      {
+        "from": "plan-review-step",
+        "to": "complex-implementation",
+        "label": "none remain"
+      },
+      {
+        "from": "plan-review-step",
+        "to": "plan-escalation",
+        "label": "repeated objection\nor round cap"
       },
       {
         "from": "mechanical",
@@ -250,6 +294,10 @@
       },
       {
         "from": "standard",
+        "to": "inspect"
+      },
+      {
+        "from": "complex-implementation",
         "to": "inspect"
       },
       {
@@ -280,8 +328,19 @@
       },
       {
         "from": "correct",
-        "to": "verify"
+        "to": "verify",
+        "offset": -425
       }
     ]
+  },
+  "settings": {
+    "plan_review_rounds": {
+      "value": 2,
+      "minimum": 1,
+      "maximum": 4,
+      "node": "plan-review-step",
+      "label": "review rounds",
+      "description": "How many plan-review rounds complex work may use. Round one challenges the plan; later rounds only confirm that blocking objections were addressed. A blocking objection repeated after revision, or still open at the cap, escalates to you rather than looping."
+    }
   }
 }

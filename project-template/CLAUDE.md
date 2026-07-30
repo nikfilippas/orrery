@@ -1,6 +1,6 @@
 # Project Instructions
 
-The global development and Claude-Codex orchestration policy in
+The global development and Órrery orchestration policy in
 `~/.claude/CLAUDE.md` applies to this repository.
 
 This file contains only project-specific facts and constraints.

@@ -11,7 +11,7 @@ description: >
 user-invocable: false
 ---
 
-# Automatic Claude-Codex Development Orchestration
+# Automatic Órrery Development Orchestration
 
 Apply this workflow automatically when the user requests software-development
 work.
@@ -46,29 +46,44 @@ Do not make the principal orchestrator and Codex duplicate the same work without
 
 ## Model role configuration
 
-Automated reviews must use direct Codex CLI execution, preferably `claude-codex-review`. Do not use the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
+Automated reviews must use direct Codex CLI execution, preferably `orrery-review`. Do not use the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
 
 The orchestration system is role-based.
 
 - Principal orchestrator: the active Claude model selected in Claude Code.
 - Mechanical worker: the Codex `mechanic` profile.
 - Implementation worker: the Codex `implementer` profile.
+- Plan reviewer: the Codex `plan-reviewer` profile.
 - Independent reviewer: the Codex `reviewer` profile.
 
 Do not depend on concrete model names in workflow logic.
 
 The current Codex models and reasoning levels are defined only in:
 
-- `~/.codex/luna.config.toml`
-- `~/.codex/terra.config.toml`
-- `~/.codex/sol.config.toml`
+- `~/.codex/mechanic.config.toml`
+- `~/.codex/implementer.config.toml`
+- `~/.codex/plan-reviewer.config.toml`
+- `~/.codex/reviewer.config.toml`
 
 Changing a worker model should require updating its profile file, not rewriting
 the orchestration workflow.
 
 ## Task classification
 
-Classify every development request internally before acting.
+Classify every development request internally before acting. Choose exactly
+one result, in this order: investigation, trivial, mechanical, standard,
+complex. High-risk work belongs to complex.
+
+### Investigation
+
+When the user asks for diagnosis, research, or explanation without requesting
+changes:
+
+- Do not modify files.
+- Use a read-only sandbox.
+- Use Codex as an independent second opinion only where it materially improves
+  the result.
+- Separate observed facts, inferences, and unresolved questions.
 
 ### Trivial work
 
@@ -86,7 +101,7 @@ Workflow:
 3. Run the smallest relevant verification.
 4. Do not invoke Codex unless uncertainty materially justifies it.
 
-### Clear and mechanical work
+### Mechanical work
 
 Examples:
 
@@ -129,26 +144,16 @@ Workflow:
 
 1. The principal orchestrator investigates the repository.
 2. The principal orchestrator produces an explicit plan with acceptance criteria.
-3. A fresh `plan-reviewer` profile run challenges the plan in read-only mode.
-4. The principal orchestrator evaluates the criticism and revises the plan where justified.
-5. The `implementer` profile implements the approved plan unless the review
-   profile is materially justified as the implementer.
+3. Run the bounded plan-review procedure below.
+4. The principal orchestrator owns the final plan and any escalation.
+5. The `implementer` profile implements the reviewed plan after the bounded
+   procedure permits implementation, unless the review profile is materially
+   justified as the implementer.
 6. The principal orchestrator inspects all changed files and the complete diff.
 7. Run the complete relevant verification suite.
 8. A fresh reviewer session reviews the completed uncommitted changes.
 9. The principal orchestrator verifies each finding and corrects legitimate problems.
 10. Rerun affected verification.
-
-### Investigation only
-
-When the user asks for diagnosis, research, or explanation without requesting
-changes:
-
-- Do not modify files.
-- Use a read-only sandbox.
-- Use Codex as an independent second opinion only where it materially improves
-  the result.
-- Separate observed facts, inferences, and unresolved questions.
 
 ## Model routing
 
@@ -197,7 +202,7 @@ Use the plan-reviewer profile for:
 
 - Independent review of a plan, before any code is written.
 
-Default reasoning effort: high.
+Default reasoning effort: ultra.
 
 Example invocation:
 
@@ -209,7 +214,7 @@ Example invocation:
 
 Or, with the same containment and cleanup as any other review:
 
-    claude-codex-review --profile plan-reviewer --timeout 600 -- "<PROMPT>"
+    orrery-review --profile plan-reviewer --timeout 600 -- "<PROMPT>"
 
 The plan-reviewer and reviewer are separate profiles so that challenging a plan and
 reviewing finished work can use different models. They ship configured
@@ -225,7 +230,7 @@ Use the reviewer profile for:
 - Architectural analysis.
 - Exceptionally difficult implementation where the implementer is insufficient.
 
-Default reasoning effort: high.
+Default reasoning effort: ultra.
 
 Example invocation:
 
@@ -235,9 +240,56 @@ Example invocation:
       --color never \
       "<PROMPT>"
 
-Do not use the independent-review profile for routine work merely because its current model is the strongest Codex option.
+Do not use the independent-review profile for routine implementation work
+merely because it has a more capable model.
 
-Do not use maximum reasoning effort by default.
+## Bounded plan review
+
+The SessionStart hook injects the configured round cap from
+`global/orchestration.json`. It defaults to two and is constrained to one
+through four. The cap is a backstop, not a goal: stop as soon as no blocking
+objection remains.
+
+### Round one: challenge
+
+Give a fresh plan-reviewer session the repository context, the proposed plan
+and its acceptance criteria. Require a concise table in which every objection
+is classified as:
+
+- **BLOCKING** only when implementing the plan as written would create a
+  material correctness, safety, security, compatibility, or delivery risk.
+- **ADVISORY** for preferences, optional improvements, and trade-offs that do
+  not prevent safe implementation.
+
+The principal orchestrator verifies every objection against the repository.
+Reject unsupported findings. Revise the plan only where criticism is
+supported. Advisory findings may inform that judgement but never force
+another review round.
+
+### Later rounds: confirm
+
+When supported blocking objections existed and another round is available,
+give a fresh plan-reviewer session:
+
+- the revised plan;
+- the original blocking objections;
+- a short mapping from each objection to the revision or reason it was
+  rejected.
+
+Ask only whether any listed blocking objection remains unaddressed. Do not ask
+for general approval, invite new advisory suggestions, or reopen resolved
+questions. Stop early when none remain.
+
+If the same blocking objection survives a revision, treat it as a cross-model
+deadlock rather than an invitation to keep debating. If that happens, or if a
+blocking objection cannot be cleared within the configured cap, stop before
+implementation and ask the user to decide, presenting the objection, the
+reviewer's position, the orchestrator's position, and the consequence of each
+choice. Never describe an unconfirmed plan as approved.
+
+With a one-round cap, a supported blocking objection cannot receive an
+independent confirmation round and therefore escalates before implementation.
+The plan-review cap is separate from the final code-review correction cap.
 
 ## Progress visibility
 
@@ -260,7 +312,7 @@ orchestration legible there by narrating stage boundaries discreetly:
   planning, plan review, implementation, diff inspection, verification,
   independent review, correction.
 
-`claude-codex-review` prints its own handover and heartbeat lines; do not
+`orrery-review` prints its own handover and heartbeat lines; do not
 duplicate them around it. Keep the narration to single lines: it is a
 surface, not a report.
 
@@ -359,16 +411,19 @@ For complex or high-risk work:
 1. Inspect architecture, implementation, tests, and relevant history.
 2. Define explicit acceptance criteria and failure conditions.
 3. Write an implementation plan.
-4. Ask a fresh the plan reviewer session to challenge the plan.
-5. Evaluate the review independently.
-6. Revise the plan only where criticism is supported.
-7. Delegate implementation to the implementer in one coherent run where practical.
-8. Split implementation into batches only when necessary for correctness,
+4. Run round one of bounded plan review with a fresh plan-reviewer session.
+5. Evaluate every objection independently and revise supported findings.
+6. Run only the confirmation rounds required by the configured cap, stopping
+   early or escalating under the bounded plan-review rules.
+7. Delegate implementation to the implementer only after the plan-review
+   procedure permits implementation.
+8. Use one coherent implementation run where practical. Split into batches
+   only when necessary for correctness,
    context management, or verification.
 9. Inspect every changed file and the complete diff.
 10. Run the complete relevant verification suite.
-11. Ask a fresh reviewer session to review the final uncommitted changes against the
-    approved plan and acceptance criteria.
+11. Ask a fresh reviewer session to review the final uncommitted changes
+    against the reviewed plan and acceptance criteria.
 12. Verify every finding.
 13. Correct legitimate defects without expanding scope.
 14. Rerun verification.
@@ -468,8 +523,8 @@ Never assume that partial Codex output represents a valid implementation.
 
 When the reviewer profile or another independent Codex reviewer is unavailable:
 
-- The principal orchestrator must review the complete diff against the approved plan and acceptance
-  criteria.
+- The principal orchestrator must review the complete diff against the
+  implementation plan and acceptance criteria.
 - The principal orchestrator must actively search for regressions, boundary failures, missing tests,
   security issues, and unrelated changes.
 - Tests and direct inspection remain mandatory.

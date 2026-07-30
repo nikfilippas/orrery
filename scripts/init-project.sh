@@ -7,7 +7,7 @@ KIT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 MODELS_FILE="$KIT_DIR/global/claude-models.json"
 
 usage() {
-    printf 'Usage: claude-codex-init [model] [directory]\n' >&2
+    printf 'Usage: orrery-init [model] [directory]\n' >&2
     printf 'A bare argument that names a known model alias selects the\n' >&2
     printf 'principal orchestrator for the repository; anything else must\n' >&2
     printf 'be an existing directory. Known model aliases:\n' >&2
@@ -65,11 +65,79 @@ if [ ! -d "$REQUESTED_DIR" ]; then
     exit 1
 fi
 
-if ! PROJECT_ROOT="$(
-    git -C "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null
-)"; then
-    printf "Not inside a Git repository: %s\n" "$REQUESTED_DIR" >&2
-    exit 1
+git_at() (
+    # Repository discovery must describe the directory argument, not an
+    # inherited repository selected by a caller's Git plumbing variables.
+    unset \
+        GIT_DIR \
+        GIT_WORK_TREE \
+        GIT_COMMON_DIR \
+        GIT_INDEX_FILE \
+        GIT_OBJECT_DIRECTORY \
+        GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        GIT_CEILING_DIRECTORIES
+    directory="$1"
+    shift
+    git -C "$directory" "$@"
+)
+
+PROJECT_ROOT=""
+if INSIDE_WORKTREE="$(git_at \
+        "$REQUESTED_DIR" rev-parse --is-inside-work-tree 2>/dev/null)" &&
+   [ "$INSIDE_WORKTREE" = "true" ] &&
+   PROJECT_ROOT="$(git_at \
+        "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null)"
+then
+    :
+else
+    # A bare repository is already a repository, but it has no working tree
+    # in which the project templates can be installed.
+    if [ "$(git_at \
+            "$REQUESTED_DIR" rev-parse --is-bare-repository 2>/dev/null ||
+            true)" = "true" ]
+    then
+        printf "Cannot initialize project files in a bare Git repository: %s\n" \
+            "$REQUESTED_DIR" >&2
+        exit 1
+    fi
+
+    # If Git could not open an existing marker, do not paper over a
+    # malformed, inaccessible, or ownership-blocked repository by nesting a
+    # fresh one inside it.
+    if EXISTING_MARKER="$(
+        python3 - "$REQUESTED_DIR" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+current = Path(sys.argv[1]).resolve(strict=False)
+for directory in (current, *current.parents):
+    marker = directory / ".git"
+    if os.path.lexists(marker):
+        print(marker)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    )"
+    then
+        printf "Git metadata exists but is not a usable worktree: %s\n" \
+            "$EXISTING_MARKER" >&2
+        exit 1
+    fi
+
+    if ! git_at "$REQUESTED_DIR" init --quiet; then
+        printf "Could not initialize a Git repository: %s\n" \
+            "$REQUESTED_DIR" >&2
+        exit 1
+    fi
+    if ! PROJECT_ROOT="$(
+        git_at "$REQUESTED_DIR" rev-parse --show-toplevel 2>/dev/null
+    )"; then
+        printf "Git initialized but its worktree could not be resolved: %s\n" \
+            "$REQUESTED_DIR" >&2
+        exit 1
+    fi
+    printf "Initialized Git repository: %s\n" "$PROJECT_ROOT"
 fi
 
 SHARED_TEMPLATE="$KIT_DIR/project-template/CLAUDE.md"
@@ -78,7 +146,7 @@ LOCAL_TEMPLATE="$KIT_DIR/project-template/CLAUDE.local.md"
 SHARED_TARGET="$PROJECT_ROOT/CLAUDE.md"
 LOCAL_TARGET="$PROJECT_ROOT/CLAUDE.local.md"
 
-printf "\n=== Claude-Codex project migration ===\n"
+printf "\n=== Órrery project migration ===\n"
 printf "Repository: %s\n\n" "$PROJECT_ROOT"
 
 if [ -e "$SHARED_TARGET" ] || [ -L "$SHARED_TARGET" ]; then
@@ -96,8 +164,11 @@ template_path = Path(sys.argv[1])
 target_path = Path(sys.argv[2])
 
 template = template_path.read_text()
-start_marker = "<!-- claude-codex-kit:start -->"
-end_marker = "<!-- claude-codex-kit:end -->"
+start_marker = "<!-- orrery:start -->"
+end_marker = "<!-- orrery:end -->"
+legacy_name = "claude" + "-codex"
+legacy_start = f"<!-- {legacy_name}-kit:start -->"
+legacy_end = f"<!-- {legacy_name}-kit:end -->"
 
 if start_marker not in template or end_marker not in template:
     raise SystemExit("Managed-block markers are missing from the local template.")
@@ -113,9 +184,37 @@ if not target_path.exists():
 
 existing = target_path.read_text()
 
-if start_marker in existing and end_marker in existing:
-    existing_start = existing.index(start_marker)
-    existing_end = existing.index(end_marker) + len(end_marker)
+marker_pairs = (
+    (start_marker, end_marker),
+    (legacy_start, legacy_end),
+)
+present = [
+    (start, end)
+    for start, end in marker_pairs
+    if start in existing or end in existing
+]
+if any((start in existing) != (end in existing) for start, end in present):
+    raise SystemExit(
+        "A managed workflow marker is incomplete; repair it before rerunning."
+    )
+
+complete = [
+    (start, end)
+    for start, end in marker_pairs
+    if start in existing and end in existing
+]
+if len(complete) > 1:
+    raise SystemExit(
+        "Both current and legacy managed workflow blocks exist; "
+        "remove one before rerunning."
+    )
+
+if complete:
+    existing_start_marker, existing_end_marker = complete[0]
+    existing_start = existing.index(existing_start_marker)
+    existing_end = (
+        existing.index(existing_end_marker) + len(existing_end_marker)
+    )
 
     prefix = existing[:existing_start].rstrip()
     suffix = existing[existing_end:].lstrip()
@@ -149,7 +248,7 @@ PYCODE
 # be simpler but only exists from Git 2.31, and older rev-parse echoes an
 # unknown option instead of failing.
 EXCLUDE_FILE="$(
-    git -C "$PROJECT_ROOT" rev-parse --git-path info/exclude
+    git_at "$PROJECT_ROOT" rev-parse --git-path info/exclude
 )"
 case "$EXCLUDE_FILE" in
     /*) ;;
@@ -159,7 +258,7 @@ esac
 mkdir -p "$(dirname "$EXCLUDE_FILE")"
 touch "$EXCLUDE_FILE"
 
-if git -C "$PROJECT_ROOT" \
+if git_at "$PROJECT_ROOT" \
     ls-files --error-unmatch -- CLAUDE.local.md \
     >/dev/null 2>&1
 then
@@ -197,7 +296,7 @@ PY
     # The model is a personal choice, so it goes into the repository's
     # settings.local.json rather than the shared settings, through the
     # atomic updater so that unrelated personal settings survive.
-    MODEL_SOURCE="$(mktemp "${TMPDIR:-/tmp}/claude-codex-model.XXXXXX")"
+    MODEL_SOURCE="$(mktemp "${TMPDIR:-/tmp}/orrery-model.XXXXXX")"
     trap 'rm -f "$MODEL_SOURCE"' EXIT
     python3 - "$MODEL_VALUE" > "$MODEL_SOURCE" <<'PY'
 import json
@@ -233,7 +332,7 @@ PY
     # `:(literal)` because brackets and asterisks are glob syntax in a Git
     # pathspec, and the referent's name is a literal file name.
     if [ -n "$RELATIVE_TARGET" ] &&
-       git -C "$PROJECT_ROOT" \
+       git_at "$PROJECT_ROOT" \
            ls-files --error-unmatch -- ":(literal)$RELATIVE_TARGET" \
            >/dev/null 2>&1
     then
@@ -276,8 +375,8 @@ if relative:
     else:
         prefix, name = "", parts[0]
     stem = escape(name)
-    patterns.append(f"/{prefix}{stem}.backup-claude-codex-*")
-    patterns.append(f"/{prefix}.{stem}.claude-codex.lock")
+    patterns.append(f"/{prefix}{stem}.backup-orrery-*")
+    patterns.append(f"/{prefix}.{stem}.orrery.lock")
 
 print("\n".join(patterns))
 PY

@@ -66,9 +66,16 @@ The user should describe the desired result in ordinary language.
 
 Do not require the user to remember or manually invoke workflow skills.
 
-The active Claude model is the principal orchestrator. For each development request,
-classify the work internally as trivial, standard, complex or high-risk, or
-investigation only.
+The active Claude model is the principal orchestrator. For each development
+request, choose exactly one internal class: investigation, trivial,
+mechanical, standard, or complex. High-risk work belongs to complex.
+
+### Investigation
+
+- Do not modify files.
+- Use Codex as an independent second opinion where it materially improves the
+  diagnosis.
+- Distinguish confirmed findings from hypotheses.
 
 ### Trivial work
 
@@ -79,6 +86,16 @@ corrections.
 - Inspect the diff.
 - Run the smallest relevant verification.
 - Do not invoke Codex unless uncertainty makes it useful.
+
+### Mechanical work
+
+Examples include repetitive transformations, well-specified boilerplate,
+narrow test generation, and straightforward edits with explicit acceptance
+criteria.
+
+- Delegate to the mechanic profile when delegation is worthwhile.
+- Inspect the actual diff rather than trusting the worker's summary.
+- Run the smallest relevant verification.
 
 ### Standard work
 
@@ -101,20 +118,40 @@ major architecture changes, large refactors, and multi-system changes.
 
 - Investigate the repository before proposing changes.
 - Produce an explicit plan with acceptance criteria.
-- Obtain an independent Codex review of the plan.
-- Revise the plan where criticism is justified.
+- Run the bounded plan-review procedure below.
 - Delegate implementation to Codex in coherent batches.
 - Inspect each batch and its actual diff.
 - Run the complete relevant verification suite.
 - Use a separate Codex thread for independent final code review.
 - Resolve legitimate findings and rerun verification.
 
-### Investigation only
+#### Bounded plan review
 
-- Do not modify files.
-- Use Codex as an independent second opinion where it materially improves the
-  diagnosis.
-- Distinguish confirmed findings from hypotheses.
+The SessionStart context supplies the configured plan-review cap from
+`global/orchestration.json`. Treat it as a maximum, not a target. If that
+context is unavailable, use the default of two rounds and never exceed four.
+
+For complex or high-risk work:
+
+1. Give a fresh plan reviewer the plan and acceptance criteria. Require every
+   objection to be classified as **blocking** or **advisory**. Blocking means
+   that implementing the plan as written would create a material correctness,
+   safety, security, compatibility, or delivery risk; preference and optional
+   improvements are advisory.
+2. Verify each objection against the repository. Reject unsupported findings
+   and revise only where criticism is supported. Advisory findings may inform
+   the plan but never force another review round.
+3. Stop early when no blocking objection remains. Otherwise, if another round
+   is available, give a fresh plan reviewer the revised plan, the original
+   blocking objections, and how each was addressed. Ask only which blocking
+   objections remain; do not invite another open-ended review.
+4. If the same blocking objection survives a revision, or a blocking objection
+   cannot be cleared within the configured cap, stop before implementation and
+   ask the user to decide, presenting both positions. Do not loop merely to
+   obtain agreement and do not describe an unconfirmed plan as approved.
+
+The bounded plan-review cap is separate from final code-review correction
+cycles.
 
 ## Orchestrator Responsibility
 
@@ -139,22 +176,22 @@ relevant files, diff, commands, and results directly.
 
 - Use direct Codex CLI profiles for automated work. Do not invoke the `codex@openai-codex` companion plugin, its broker, or its `review` and `adversarial-review` paths.
 
-Four Codex profiles are installed, distinguished by reasoning effort and
+Four Codex profiles are installed, distinguished by thinking level and
 by the stage they serve:
 
 | Profile | Reasoning | Use for |
 | --- | --- | --- |
 | `mechanic` | low | narrow, mechanical, well-specified edits |
 | `implementer` | medium | the default worker for substantial implementation |
-| `plan-reviewer` | high | challenging a plan before any code is written |
-| `reviewer` | high | reviewing finished work, and difficult diagnosis |
+| `plan-reviewer` | ultra | challenging a plan before any code is written |
+| `reviewer` | ultra | reviewing finished work, and difficult diagnosis |
 
 Invoke them as `codex --profile <name> exec`. An unknown profile name is not
 an error to Codex: it silently falls back to the default model and effort, so
 a mistyped profile produces work from a model you did not choose. Confirm the
 profile exists rather than assuming the run used it.
 
-For an independent review, prefer the `claude-codex-review` wrapper over a
+For an independent review, prefer the `orrery-review` wrapper over a
 bare `codex --profile reviewer exec`. It runs the reviewer read-only inside a transient
 systemd user service, so a timeout or an interruption stops the whole control
 group, and it refuses to run at all if the `reviewer` profile is missing.
@@ -288,8 +325,11 @@ why.
 
 ## Efficiency
 
-- Match reasoning effort to the shape of the work, not to its importance. Maximum effort suits a single hard judgement; it does not suit an agentic loop, where the cost is paid again on every turn. Measured on this toolkit, the same delegated task at `xhigh` spent eight minutes deliberating and never reached the delegation step at all, while at `medium` it delegated, verified and reported in under three minutes.
-- Run non-interactive sessions at moderate effort: `claude -p --effort medium`. Reserve the highest effort for interactive work, where the deliberation is visible and can be interrupted.
+- Honor each configured role's thinking level; do not silently substitute a
+  cheaper or more expensive level. The principal orchestrator intentionally
+  defaults to Fable 5 at max, and both Sol reviewer profiles to ultra.
+- For an additional non-interactive Claude loop that is not one of these
+  configured roles, choose its effort deliberately and report any override.
 - Do not invoke Codex for trivial tasks.
 - Do not require plan review for straightforward, low-risk work.
 - Keep plans and agent reports concise.

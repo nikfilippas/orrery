@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic regression tests for the Claude-Codex orchestration kit.
+"""Deterministic regression tests for the Órrery orchestration kit.
 
 Covers the settings updater's atomicity, locking and ownership rules, and the
 direct review wrapper's systemd cleanup, signal handling and CODEX_HOME
@@ -36,12 +36,12 @@ sys.dont_write_bytecode = True
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 SETTINGS_SCRIPT = KIT_DIR / "scripts" / "apply-claude-settings.py"
-REVIEW_SCRIPT = KIT_DIR / "scripts" / "claude-codex-review"
+REVIEW_SCRIPT = KIT_DIR / "scripts" / "orrery-review"
 INSTALL_SCRIPT = KIT_DIR / "scripts" / "install.sh"
 DOCTOR_SCRIPT = KIT_DIR / "scripts" / "doctor.sh"
 FAKE_CODEX = Path(__file__).resolve().parent / "fake-codex"
 
-UNIT_GLOB = "claude-codex-review-*"
+UNIT_GLOB = "orrery-review-*"
 
 TESTS: list[tuple[str, Callable[[], None]]] = []
 
@@ -79,7 +79,7 @@ def load_script(path: Path, name: str) -> types.ModuleType:
 
 
 settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
-review_module = load_script(REVIEW_SCRIPT, "kit_claude_codex_review")
+review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ def sidecar_residue(directory: Path, target_name: str) -> list[str]:
         entry.name
         for entry in directory.iterdir()
         if entry.name.startswith(f".{target_name}.")
-        and not entry.name.endswith(".claude-codex.lock")
+        and not entry.name.endswith(".orrery.lock")
     )
 
 
@@ -186,7 +186,7 @@ def list_review_units() -> list[str]:
 
 def review_runtime_root() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR") or str(Path.home() / ".cache")
-    return Path(base) / "claude-codex-review"
+    return Path(base) / "orrery-review"
 
 
 def runtime_residue() -> list[str]:
@@ -243,14 +243,14 @@ def finish_review(
                 os.killpg(process.pid, signal.SIGKILL)
             with contextlib.suppress(Exception):
                 process.communicate(timeout=20)
-        stop_stray_units(f"claude-codex-review-{process.pid}-")
+        stop_stray_units(f"orrery-review-{process.pid}-")
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 def wait_for_unit(process: subprocess.Popen[str], timeout: float = 20.0) -> str:
     """Return the transient unit name once systemd has registered it."""
     deadline = time.monotonic() + timeout
-    prefix = f"claude-codex-review-{process.pid}-"
+    prefix = f"orrery-review-{process.pid}-"
 
     while time.monotonic() < deadline:
         for line in list_review_units():
@@ -428,7 +428,7 @@ def test_permissions_merged() -> None:
             source,
             {
                 "permissions": {
-                    "allow": ["Bash(codex:*)", "Bash(claude-codex-review:*)"]
+                    "allow": ["Bash(codex:*)", "Bash(orrery-review:*)"]
                 }
             },
         )
@@ -436,7 +436,12 @@ def test_permissions_merged() -> None:
             target,
             {
                 "permissions": {
-                    "allow": ["Bash(npm test:*)", "Bash(codex:*)"],
+                    "allow": [
+                        "Bash(npm test:*)",
+                        "Bash(codex:*)",
+                        f"Bash({'claude' + '-codex'}-review:*)",
+                        f"Bash({'claude' + '-codex'}-doctor:*)",
+                    ],
                     "deny": ["Bash(rm:*)"],
                     "defaultMode": "acceptEdits",
                 }
@@ -453,7 +458,7 @@ def test_permissions_merged() -> None:
         permissions = read_json(target)["permissions"]
 
         require(
-            "Bash(claude-codex-review:*)" in permissions["allow"],
+            "Bash(orrery-review:*)" in permissions["allow"],
             "the toolkit rule was not added",
         )
         require(
@@ -469,6 +474,11 @@ def test_permissions_merged() -> None:
             permissions["defaultMode"] == "acceptEdits",
             "the default permission mode was lost",
         )
+        retired = "claude" + "-codex"
+        require(
+            all(retired not in rule for rule in permissions["allow"]),
+            f"retired permission rules survived: {permissions['allow']}",
+        )
 
         result = run_settings(
             "--permissions",
@@ -481,6 +491,101 @@ def test_permissions_merged() -> None:
             "already installed" in result.stdout,
             f"a second run was not a no-op: {result.stdout.strip()}",
         )
+
+
+@test("Claude thinking uses the supported persisted and max representations")
+def test_claude_thinking_merge() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source.json"
+        target = root / "settings.json"
+
+        write_json(
+            source,
+            {
+                "model": "fable",
+                "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"},
+            },
+        )
+        write_json(
+            target,
+            {
+                "model": "sonnet",
+                "effortLevel": "high",
+                "env": {
+                    "CLAUDE_CODE_EFFORT_LEVEL": "low",
+                    "UNRELATED": "keep",
+                },
+            },
+        )
+        run_settings(
+            "--effort",
+            "--source",
+            str(source),
+            "--target",
+            str(target),
+        )
+        data = read_json(target)
+        require(
+            data.get("model") == "sonnet"
+            and "effortLevel" not in data
+            and data.get("env", {}).get("CLAUDE_CODE_EFFORT_LEVEL") == "max"
+            and data["env"].get("UNRELATED") == "keep",
+            f"max thinking merge was wrong: {data}",
+        )
+
+        write_json(source, {"model": "fable", "effortLevel": "xhigh"})
+        run_settings(
+            "--effort",
+            "--source",
+            str(source),
+            "--target",
+            str(target),
+        )
+        data = read_json(target)
+        require(
+            data.get("effortLevel") == "xhigh"
+            and "CLAUDE_CODE_EFFORT_LEVEL" not in data.get("env", {})
+            and data.get("env", {}).get("UNRELATED") == "keep",
+            f"persisted thinking merge was wrong: {data}",
+        )
+
+        # Repository initialization uses model-only application; it must
+        # preserve a personal thinking choice already in that repository.
+        write_json(source, {"model": "opus"})
+        run_settings(
+            "--model",
+            "--source",
+            str(source),
+            "--target",
+            str(target),
+        )
+        require(
+            read_json(target).get("effortLevel") == "xhigh",
+            "--model changed a personal thinking choice",
+        )
+
+        before = target.read_text()
+        for invalid in (
+            {"effortLevel": "max"},
+            {
+                "effortLevel": "high",
+                "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"},
+            },
+        ):
+            write_json(source, invalid)
+            result = run_settings(
+                "--effort",
+                "--source",
+                str(source),
+                "--target",
+                str(target),
+                expect_success=False,
+            )
+            require(
+                result.returncode != 0 and target.read_text() == before,
+                f"invalid Claude thinking changed live state: {invalid}",
+            )
 
 
 @test("the canonical permissions unblock Codex delegation")
@@ -576,7 +681,7 @@ def test_mode_and_no_residue() -> None:
         backups = sorted(
             entry.name
             for entry in root.iterdir()
-            if entry.name.startswith("settings.json.backup-claude-codex-")
+            if entry.name.startswith("settings.json.backup-orrery-")
         )
         require(len(backups) == 1, f"expected one backup, found {backups}")
         require(
@@ -613,7 +718,7 @@ def test_idempotent() -> None:
         backups = [
             entry
             for entry in root.iterdir()
-            if entry.name.startswith("settings.json.backup-claude-codex-")
+            if entry.name.startswith("settings.json.backup-orrery-")
         ]
         require(len(backups) == 1, "a no-op created an extra backup")
 
@@ -929,7 +1034,7 @@ def test_unreadable_displaced_preserved() -> None:
         survivors = [
             entry
             for entry in root.iterdir()
-            if entry.name.startswith("settings.json.backup-claude-codex-")
+            if entry.name.startswith("settings.json.backup-orrery-")
             and entry.stat().st_ino == original_inode
         ]
         require(
@@ -1020,7 +1125,7 @@ def test_displaced_symlink_preserved() -> None:
         backups = [
             entry
             for entry in root.iterdir()
-            if entry.name.startswith("settings.json.backup-claude-codex-")
+            if entry.name.startswith("settings.json.backup-orrery-")
         ]
         require(
             any(entry.is_symlink() for entry in backups),
@@ -1193,7 +1298,7 @@ def test_backup_precedes_flush() -> None:
         backups = [
             entry
             for entry in root.iterdir()
-            if entry.name.startswith("settings.json.backup-claude-codex-")
+            if entry.name.startswith("settings.json.backup-orrery-")
         ]
         require(
             backups,
@@ -1247,7 +1352,7 @@ def test_long_target_name_backup() -> None:
             backups = [
                 entry
                 for entry in root.iterdir()
-                if ".backup-claude-codex-" in entry.name
+                if ".backup-orrery-" in entry.name
                 and entry.name.startswith(name[:20])
             ]
             require(backups, f"a long {filler!r} name produced no backup")
@@ -1314,7 +1419,7 @@ def test_unbounded_contention_preserves_every_version() -> None:
             settings_module.write_temporary = original_write
 
         backups = sorted(
-            root.glob("settings.json.backup-claude-codex-*"),
+            root.glob("settings.json.backup-orrery-*"),
             key=lambda path: path.stat().st_mtime,
         )
         preserved = {read_json(path).get("foreign") for path in backups}
@@ -1860,7 +1965,7 @@ def test_sweep_stops_orphaned_unit() -> None:
     root = review_runtime_root()
     root.mkdir(parents=True, exist_ok=True)
 
-    unit_base = f"claude-codex-review-sweep-test-{os.getpid()}"
+    unit_base = f"orrery-review-sweep-test-{os.getpid()}"
     unit = f"{unit_base}.service"
     subprocess.run(
         [
@@ -1997,7 +2102,7 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
         os.environ["PATH"] = environment["PATH"]
         os.environ["CODEX_FAKE_MODE"] = "success"
         review_module.stop_unit = refuse
-        sys.argv = ["claude-codex-review", "--timeout", "60", "--", "prompt"]
+        sys.argv = ["orrery-review", "--timeout", "60", "--", "prompt"]
 
         reported = False
         try:
@@ -2026,7 +2131,7 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
         for entry in root.glob(pattern):
             if entry.name not in before:
                 shutil.rmtree(entry, ignore_errors=True)
-        stop_stray_units(f"claude-codex-review-{os.getpid()}-")
+        stop_stray_units(f"orrery-review-{os.getpid()}-")
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
@@ -2319,13 +2424,13 @@ def test_fallback_completion() -> None:
             if line.strip()
             .lstrip("● ")
             .split()[0]
-            .startswith(f"claude-codex-review-{process.pid}-")
+            .startswith(f"orrery-review-{process.pid}-")
         ]
         require(
             not own_units,
             "a transient unit appeared despite systemd being unavailable",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("without systemd a timeout still kills the run and leaves no residue")
@@ -2346,7 +2451,7 @@ def test_fallback_timeout() -> None:
         check=False,
     ).stdout.strip()
     require(not survivors, f"the fake codex survived the timeout: {survivors}")
-    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("without systemd a same-group descendant dies with the run")
@@ -2459,7 +2564,7 @@ def test_codex_invocation_contract() -> None:
             arguments[-1] == "-p the prompt",
             f"the prompt was mangled: {arguments[-1]!r}",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("an unwritable --output destination cannot lose a completed verdict")
@@ -2492,7 +2597,7 @@ def test_output_failure_preserves_verdict() -> None:
             "could not be written" in stderr,
             f"the publication failure was not reported: {stderr!r}",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a closed stdout still publishes and never loses the verdict")
@@ -2524,7 +2629,7 @@ def test_closed_stdout_still_publishes() -> None:
             output.exists() and "# PASS" in output.read_text(),
             "a closed stdout prevented publication of the verdict",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 # ---------------------------------------------------------------------------
@@ -2567,7 +2672,7 @@ def test_normal_completion() -> None:
             ],
             "publication left a temporary file behind",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a restrictive umask breaks neither the run nor its diagnostics")
@@ -2628,7 +2733,7 @@ def test_restrictive_umask() -> None:
                     "the Codex log was not readable for diagnostics",
                 )
 
-            assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a failing Codex run is reported and leaves no residue")
@@ -2639,7 +2744,7 @@ def test_failing_run() -> None:
 
     require(process.returncode == 7, f"expected status 7: {process.returncode}")
     require("exit status 7" in stderr, f"failure not reported: {stderr!r}")
-    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a successful run with no verdict is reported and leaves no residue")
@@ -2650,7 +2755,7 @@ def test_empty_verdict() -> None:
 
     require(process.returncode == 1, f"expected status 1: {process.returncode}")
     require("no final verdict" in stderr, f"not reported: {stderr!r}")
-    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a timeout stops the control group and leaves no residue")
@@ -2663,7 +2768,7 @@ def test_timeout() -> None:
         process.returncode == 124,
         f"expected status 124, got {process.returncode}: {stderr}",
     )
-    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("detached SIGTERM-resistant descendants are killed with the cgroup")
@@ -2675,7 +2780,7 @@ def test_detached_descendant() -> None:
     finally:
         finish_review(process, environment, timeout=180)
 
-    assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
 
     survivors = subprocess.run(
         ["pgrep", "-af", "signal.SIG_IGN"],
@@ -2726,7 +2831,7 @@ def test_signals_clean_up() -> None:
             f"interrupted by signal {signal_number}" in stderr,
             f"signal {signal_number} was not reported: {stderr!r}",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("interruption during service registration leaves no residue")
@@ -2741,7 +2846,7 @@ def test_immediate_interruption() -> None:
         finally:
             shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("systemd bounds the unit even when the wrapper is killed uncatchably")
@@ -2772,7 +2877,7 @@ def test_runtime_max_backstop() -> None:
     finally:
         os.kill(process.pid, signal.SIGKILL)
         process.communicate(timeout=60)
-        stop_stray_units(f"claude-codex-review-{process.pid}-")
+        stop_stray_units(f"orrery-review-{process.pid}-")
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
         shutil.rmtree(marker.parent, ignore_errors=True)
         # Only this wrapper's own directory. A broader glob would delete the
@@ -2956,7 +3061,7 @@ def test_service_umask() -> None:
             "the transient unit did not run with a private umask; it is "
             "started by the user manager and does not inherit one",
         )
-        assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("an unexpired lease survives a turn boundary but not the session end")
@@ -4144,8 +4249,72 @@ def test_hook_start_survives_sweep_failure() -> None:
                 "Leave No Trace automation is active" in captured.getvalue(),
                 "the hook context was not printed before the sweep",
             )
+            context = json.loads(captured.getvalue())["hookSpecificOutput"][
+                "additionalContext"
+            ]
+            require(
+                "at most 2 reviewer rounds" in context
+                and "ask the user to decide" in context,
+                f"SessionStart omitted the live plan-review cap: {context}",
+            )
         finally:
             shutil.rmtree(state, ignore_errors=True)
+
+
+@test("SessionStart injects the bounded plan-review contract")
+def test_plan_review_session_context() -> None:
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_plan_review_context",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        manifest_path = Path(directory) / "orchestration.json"
+        hook.ORCHESTRATION_MANIFEST = manifest_path
+
+        def configure(value: Any) -> None:
+            write_json(
+                manifest_path,
+                {"settings": {"plan_review_rounds": {"value": value}}},
+            )
+
+        for value in (1, 2, 4):
+            configure(value)
+            require(
+                hook.configured_plan_review_rounds() == value,
+                f"the hook did not read a {value}-round cap",
+            )
+            context = hook.plan_review_context(value)
+            require(
+                f"at most {value} reviewer round" in context
+                and "blocking or advisory" in context
+                and "stop before implementation" in context
+                and "Do not iterate merely to obtain agreement" in context,
+                f"the {value}-round context omits its safety contract: {context}",
+            )
+            if value == 1:
+                require(
+                    "cannot receive an independent confirmation round" in context,
+                    "the one-round escalation rule is absent",
+                )
+            else:
+                require(
+                    "the original blocking objections" in context,
+                    "confirmation rounds are not narrowly scoped",
+                )
+
+        for invalid in (0, 5, True, "2", None):
+            configure(invalid)
+            require(
+                hook.configured_plan_review_rounds()
+                == hook.DEFAULT_PLAN_REVIEW_ROUNDS,
+                f"invalid cap did not fall back safely: {invalid!r}",
+            )
+        manifest_path.write_text("{broken")
+        require(
+            hook.configured_plan_review_rounds()
+            == hook.DEFAULT_PLAN_REVIEW_ROUNDS,
+            "malformed JSON disabled the safe plan-review default",
+        )
 
 
 @test("an aged state directory without metadata is reclaimed")
@@ -4325,7 +4494,7 @@ def test_usage_tracker() -> None:
         result = subprocess.run(
             [
                 sys.executable,
-                str(KIT_DIR / "scripts" / "claude-codex-usage"),
+                str(KIT_DIR / "scripts" / "orrery-usage"),
                 "--since",
                 "2026-07-28",
                 "--json",
@@ -4365,6 +4534,14 @@ def test_usage_tracker() -> None:
 @test("the orchestration manifest matches the live configuration")
 def test_orchestration_manifest() -> None:
     manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    catalogue = read_json(KIT_DIR / "global" / "model-catalogue.json")
+    known = {
+        provider: {
+            entry["id"]: entry
+            for entry in entries
+        }
+        for provider, entries in catalogue["providers"].items()
+    }
     steps = {step["id"]: step for step in manifest["steps"]}
     require(
         {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"} <= set(steps),
@@ -4380,11 +4557,49 @@ def test_orchestration_manifest() -> None:
         if step["kind"] == "codex-profile":
             with path.open("rb") as handle:
                 profile = __import__("tomllib").load(handle)
+            model = profile.get("model")
+            thinking = profile.get("model_reasoning_effort")
+        else:
+            settings_data = read_json(path)
+            model = settings_data.get("model")
+            environment = settings_data.get("env", {})
+            thinking = (
+                environment.get("CLAUDE_CODE_EFFORT_LEVEL")
+                if isinstance(environment, dict)
+                else None
+            ) or settings_data.get("effortLevel")
+        choice = known.get(step["provider"], {}).get(model)
+        if choice is not None:
+            levels = choice["thinking_levels"]
             require(
-                profile.get("model_reasoning_effort")
-                == step.get("expected_effort"),
-                f"manifest effort drifted from the profile for {step['id']}",
+                (thinking in levels) if levels else thinking is None,
+                f"{step['id']} has unsupported thinking {thinking!r} "
+                f"for {model!r}",
             )
+
+    settings = manifest.get("settings")
+    require(isinstance(settings, dict), "manifest settings are not an object")
+    plan_rounds = settings.get("plan_review_rounds", {})
+    require(
+        isinstance(plan_rounds, dict)
+        and all(
+            not isinstance(plan_rounds.get(key), bool)
+            and isinstance(plan_rounds.get(key), int)
+            for key in ("value", "minimum", "maximum")
+        )
+        and plan_rounds.get("minimum") == 1
+        and plan_rounds.get("maximum") == 4
+        and 1 <= plan_rounds["value"] <= 4,
+        f"invalid plan-review round setting: {plan_rounds}",
+    )
+    require(
+        all(
+            isinstance(plan_rounds.get(key), str)
+            and bool(plan_rounds[key].strip())
+            for key in ("node", "label", "description")
+        ),
+        f"plan-review setting lacks explanatory metadata: {plan_rounds}",
+    )
 
 
 @test("every step offers a dropdown covering its provider's models")
@@ -4396,22 +4611,71 @@ def test_model_catalogue() -> None:
         {"anthropic", "openai"} <= set(providers),
         f"the catalogue omits a provider in use: {sorted(providers)}",
     )
+    expected = {
+        "anthropic": {
+            "fable": ["low", "medium", "high", "xhigh", "max"],
+            "opus": ["low", "medium", "high", "xhigh", "max"],
+            "sonnet": ["low", "medium", "high", "xhigh", "max"],
+            "haiku": [],
+            "claude-fable-5[1m]": [
+                "low", "medium", "high", "xhigh", "max"
+            ],
+            "claude-fable-5": ["low", "medium", "high", "xhigh", "max"],
+            "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+            "claude-sonnet-5": ["low", "medium", "high", "xhigh", "max"],
+            "claude-haiku-4-5-20251001": [],
+        },
+        "openai": {
+            "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+            "gpt-5.6-terra": [
+                "low", "medium", "high", "xhigh", "max", "ultra"
+            ],
+            "gpt-5.6-sol": [
+                "low", "medium", "high", "xhigh", "max", "ultra"
+            ],
+            "gpt-5.5": ["low", "medium", "high", "xhigh"],
+        },
+    }
     for provider, entries in providers.items():
         require(bool(entries), f"{provider} has no models to offer")
+        actual: dict[str, list[str]] = {}
         for entry in entries:
             require(
                 isinstance(entry.get("id"), str) and entry["id"].strip(),
                 f"{provider} has an entry with no identifier: {entry}",
             )
             require(
-                isinstance(entry.get("label"), str) and entry["label"].strip(),
-                f"{provider} entry {entry['id']} has no label",
+                entry.get("label") == entry["id"],
+                f"{provider} entry {entry['id']} has a characterised label",
             )
+            levels = entry.get("thinking_levels")
+            require(
+                isinstance(levels, list)
+                and len(levels) == len(set(levels)),
+                f"{provider} entry {entry['id']} has invalid thinking levels",
+            )
+            default = entry.get("default_thinking")
+            require(
+                default is None or default in levels,
+                f"{provider} entry {entry['id']} has an invalid default",
+            )
+            actual[entry["id"]] = levels
+        require(
+            actual == expected[provider],
+            f"{provider} capabilities drifted: {actual}",
+        )
+
+    serialised = json.dumps(catalogue).lower()
+    for characterisation in ("fast", "balanced", "strongest"):
+        require(
+            characterisation not in serialised,
+            f"catalogue still characterises a model as {characterisation}",
+        )
 
     # Every configured model must be selectable, so that opening the page
     # and saving cannot silently change anything.
     module = load_script(
-        KIT_DIR / "scripts" / "claude-codex-config", "kit_config_choices"
+        KIT_DIR / "scripts" / "orrery-config", "kit_config_choices"
     )
     for state in module.snapshot():
         offered = {choice["id"] for choice in state["choices"]}
@@ -4423,6 +4687,69 @@ def test_model_catalogue() -> None:
             len(offered) > 1,
             f"{state['id']} has nothing to choose between",
         )
+        current = next(
+            choice
+            for choice in state["choices"]
+            if choice["id"] == state["model"]
+        )
+        if current["known"]:
+            levels = current["thinking_levels"]
+            require(
+                (state["thinking"] in levels)
+                if levels
+                else not state["thinking"],
+                f"{state['id']} exposes an impossible thinking choice",
+            )
+
+    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+    require(
+        canonical.get("model") == "fable"
+        and canonical.get("env", {}).get("CLAUDE_CODE_EFFORT_LEVEL") == "max",
+        "the orchestrator does not default to Fable 5 at max",
+    )
+    with (
+        KIT_DIR / "global" / "codex" / "plan-reviewer.config.toml"
+    ).open("rb") as handle:
+        plan_reviewer = __import__("tomllib").load(handle)
+    require(
+        plan_reviewer == {
+            "model": "gpt-5.6-sol",
+            "model_reasoning_effort": "ultra",
+        },
+        f"the plan reviewer does not default to maximum Sol thinking: {plan_reviewer}",
+    )
+    with (
+        KIT_DIR / "global" / "codex" / "reviewer.config.toml"
+    ).open("rb") as handle:
+        reviewer = __import__("tomllib").load(handle)
+    require(
+        reviewer == {
+            "model": "gpt-5.6-sol",
+            "model_reasoning_effort": "ultra",
+        },
+        f"the final reviewer does not default to maximum Sol thinking: {reviewer}",
+    )
+
+    defaults = {
+        entry["id"]: entry.get("default_thinking")
+        for provider in catalogue["providers"].values()
+        for entry in provider
+    }
+    for model in (
+        "fable",
+        "sonnet",
+        "claude-fable-5[1m]",
+        "claude-fable-5",
+        "claude-sonnet-5",
+    ):
+        require(
+            defaults.get(model) == "max",
+            f"{model} does not default to maximum thinking: {defaults.get(model)!r}",
+        )
+    require(
+        defaults.get("gpt-5.6-sol") == "ultra",
+        "gpt-5.6-sol does not default to its maximum thinking level, ultra",
+    )
 
 
 @test("the chart reproduces the documented pipeline and names real roles")
@@ -4436,8 +4763,13 @@ def test_manifest_chart() -> None:
         require(bool(node.get("label")), f"node {node['id']} has no label")
         for role in node["roles"]:
             require(role in roles, f"node {node['id']} names an unknown role: {role}")
+        left = node["x"] - node["w"] / 2
+        right = node["x"] + node["w"] / 2
+        top = node["y"] - node["h"] / 2
+        bottom = node["y"] + node["h"] / 2
         require(
-            0 < node["x"] < chart["width"] and 0 < node["y"] < chart["height"],
+            0 <= left < right <= chart["width"]
+            and 0 <= top < bottom <= chart["height"],
             f"node {node['id']} sits outside the canvas",
         )
 
@@ -4459,17 +4791,266 @@ def test_manifest_chart() -> None:
         f"unreachable chart nodes: {set(nodes) - reached - {entry}}",
     )
 
+    edge_pairs = {(edge["from"], edge["to"]) for edge in chart["edges"]}
+    require(
+        ("plan", "plan-review-step") in edge_pairs
+        and ("plan-review-step", "plan") in edge_pairs,
+        "the chart does not show the bounded plan-review cycle",
+    )
+    return_edge = next(
+        edge
+        for edge in chart["edges"]
+        if edge["from"] == "plan-review-step" and edge["to"] == "plan"
+    )
+    require(
+        not isinstance(return_edge.get("offset"), bool)
+        and isinstance(return_edge.get("offset"), (int, float))
+        and return_edge["offset"] != 0,
+        "the chart paints both directions of the plan-review cycle together",
+    )
+    require(
+        ("plan-review-step", "plan-escalation") in edge_pairs,
+        "the chart hides plan-review deadlock escalation",
+    )
+    require(
+        ("plan-review-step", "complex-implementation") in edge_pairs
+        and nodes["complex-implementation"]["roles"] == ["implementer"],
+        "complex work does not continue downward through the implementer",
+    )
+
+    classifier = [
+        edge for edge in chart["edges"] if edge["from"] == "classify"
+    ]
+    expected_branches = [
+        ("investigation", "investigation"),
+        ("trivial", "trivial"),
+        ("mechanical", "mechanical"),
+        ("standard", "standard"),
+        ("complex", "plan"),
+    ]
+    require(
+        [(edge.get("label"), edge["to"]) for edge in classifier]
+        == expected_branches,
+        f"classifier branches are not in the required order: {classifier}",
+    )
+    targets = [nodes[target] for _label, target in expected_branches]
+    require(
+        [target["x"] for target in targets]
+        == sorted(target["x"] for target in targets)
+        and all(target["y"] > nodes["classify"]["y"] for target in targets),
+        "classifier results are not a left-to-right downward rank",
+    )
+    for first, second in zip(targets, targets[1:]):
+        gap = (
+            second["x"] - second["w"] / 2
+            - (first["x"] + first["w"] / 2)
+        )
+        require(gap >= 24, f"classifier nodes are only {gap}px apart")
+
+    # Sample the same cubic geometry the browser uses and ensure no wire
+    # travels through an unrelated node. A generous eight-pixel moat keeps
+    # arrowheads and labels from reading as tangled with a box.
+    def boundary(node: dict[str, Any], towards: dict[str, Any]) -> tuple[float, float]:
+        dx = towards["x"] - node["x"]
+        dy = towards["y"] - node["y"]
+        a = node["w"] / 2
+        b = node["h"] / 2
+        if node.get("shape") == "diamond":
+            scale = 1 / (abs(dx) / a + abs(dy) / b)
+        else:
+            scale = min(
+                a / abs(dx) if abs(dx) > 1e-6 else float("inf"),
+                b / abs(dy) if abs(dy) > 1e-6 else float("inf"),
+            )
+        return node["x"] + dx * scale, node["y"] + dy * scale
+
+    for edge in chart["edges"]:
+        source = nodes[edge["from"]]
+        target = nodes[edge["to"]]
+        start = boundary(source, target)
+        end = boundary(target, source)
+        lift = max(26, abs(end[1] - start[1]) * 0.4)
+        way = 1 if end[1] >= start[1] else -1
+        offset = edge.get("offset", 0)
+        c1 = (start[0] + offset, start[1] + lift * way)
+        c2 = (end[0] + offset, end[1] - lift * way)
+        for index in range(1, 500):
+            t = index / 500
+            point = tuple(
+                (1 - t) ** 3 * start[axis]
+                + 3 * (1 - t) ** 2 * t * c1[axis]
+                + 3 * (1 - t) * t ** 2 * c2[axis]
+                + t ** 3 * end[axis]
+                for axis in (0, 1)
+            )
+            for node_id, node in nodes.items():
+                if node_id in (edge["from"], edge["to"]):
+                    continue
+                if (
+                    node["x"] - node["w"] / 2 - 8 < point[0]
+                    < node["x"] + node["w"] / 2 + 8
+                    and node["y"] - node["h"] / 2 - 8 < point[1]
+                    < node["y"] + node["h"] / 2 + 8
+                ):
+                    raise Failure(
+                        f"{edge['from']} → {edge['to']} tangles with {node_id}"
+                    )
+    plan_rounds = manifest["settings"]["plan_review_rounds"]
+    require(
+        plan_rounds["node"] == "plan-review-step",
+        "the round control is not attached to the plan-review node",
+    )
+
     # The chart is the README's flowchart, so its shape must not drift
     # from the documented one.
     readme = (KIT_DIR / "README.md").read_text()
-    diagram = readme[readme.index("flowchart TD"):readme.index("```", readme.index("flowchart TD"))]
-    for token in ("classify", "findings", "investigation", "mechanical", "trivial"):
+    diagram_start = readme.index("flowchart TB")
+    diagram = readme[diagram_start:readme.index("```", diagram_start)]
+    for token in (
+        "classify",
+        "findings",
+        "investigation",
+        "mechanical",
+        "trivial",
+        "blocking",
+        "round cap",
+    ):
         require(token in diagram, f"the README flowchart no longer mentions {token}")
         require(
             any(token in node["label"] or token in node["id"] for node in nodes.values())
-            or any(edge.get("label") == token for edge in chart["edges"]),
+            or any(token in edge.get("label", "") for edge in chart["edges"]),
             f"the chart omits {token}, which the README documents",
         )
+    require(
+        "direction LR" in diagram and "R[read-only sandboxes only] ~~~ K" in diagram,
+        "the README does not constrain the classifier results left to right",
+    )
+    readme_branch_positions = [
+        diagram.index(f"C -->|{label}|")
+        for label, _target in expected_branches
+    ]
+    require(
+        readme_branch_positions == sorted(readme_branch_positions),
+        "the README classifier branches are not declared in the required order",
+    )
+
+
+@test("the plan-review cap accepts only bounded integer rounds")
+def test_plan_review_setting_validation() -> None:
+    module = load_script(
+        KIT_DIR / "scripts" / "orrery-config",
+        "kit_config_plan_rounds",
+    )
+    settings = {state["id"]: state for state in module.settings_snapshot()}
+    state = settings["plan_review_rounds"]
+    require(
+        state["value"] == 2
+        and state["choices"] == [1, 2, 3, 4]
+        and state["node"] == "plan-review-step",
+        f"the plan-review setting state is wrong: {state}",
+    )
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        require(module.print_state() == 0, "--print state failed")
+    require(
+        "review rounds" in printed.getvalue()
+        and "1–4; global/orchestration.json" in printed.getvalue(),
+        f"--print hid the plan-review cap: {printed.getvalue()!r}",
+    )
+
+    for value in (1, 4):
+        edits = module.plan({"plan_review_rounds": {"value": value}})
+        require(len(edits) == 1, f"{value} rounds did not produce one edit")
+        after = json.loads(edits[0]["after"])
+        require(
+            after["settings"]["plan_review_rounds"]["value"] == value,
+            f"{value} rounds was not planned correctly",
+        )
+
+    def refused(change: Any, expected: str) -> None:
+        try:
+            module.plan({"plan_review_rounds": change})
+        except module.ConfigError as exc:
+            require(
+                expected in str(exc),
+                f"wrong refusal for {change!r}: {exc}",
+            )
+        else:
+            raise Failure(f"invalid plan-review change was accepted: {change!r}")
+
+    for value in (0, 5):
+        refused({"value": value}, "between 1 and 4")
+    for value in (True, False, "2", 2.0, None):
+        refused({"value": value}, "must be an integer")
+    refused({"value": 2, "maximum": 99}, "only the value")
+    refused([], "invalid change")
+
+    with tempfile.TemporaryDirectory() as directory:
+        kit = Path(directory) / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        manifest["settings"]["plan_review_rounds"]["maximum"] = 99
+        write_json(manifest_path, manifest)
+        module.KIT_DIR = kit
+        try:
+            module.settings_snapshot()
+        except module.ConfigError as exc:
+            require(
+                "bounded from 1 to 4" in str(exc),
+                f"a mutated bound gave the wrong error: {exc}",
+            )
+        else:
+            raise Failure("a mutable 99-round cap was accepted")
+
+        manifest["settings"]["plan_review_rounds"]["maximum"] = 4
+        manifest["settings"]["plan_review_rounds"]["node"] = "missing"
+        write_json(manifest_path, manifest)
+        try:
+            module.settings_snapshot()
+        except module.ConfigError as exc:
+            require(
+                "missing chart node" in str(exc),
+                f"a missing setting node gave the wrong error: {exc}",
+            )
+        else:
+            raise Failure("a setting attached to a missing node was accepted")
+
+
+@test("policy, skill and SessionStart agree on bounded plan review")
+def test_plan_review_contract_alignment() -> None:
+    policy = (KIT_DIR / "global" / "CLAUDE.md").read_text()
+    skill = (
+        KIT_DIR / "global" / "skills" / "development-orchestrator" / "SKILL.md"
+    ).read_text()
+    hook = (KIT_DIR / "global" / "hooks" / "leave-no-trace.py").read_text()
+    for name, text in (("policy", policy), ("skill", skill)):
+        text_lower = " ".join(text.lower().split())
+        for phrase in (
+            "blocking",
+            "advisory",
+            "stop early",
+            "stop before implementation",
+            "ask the user to decide",
+        ):
+            require(
+                phrase in text_lower,
+                f"the {name} omits the plan-review rule {phrase!r}",
+            )
+    require(
+        "With a one-round cap" in skill,
+        "the skill leaves one-round blocking objections ambiguous",
+    )
+    require(
+        "configured_plan_review_rounds()" in hook
+        and "plan_review_context" in hook
+        and "plan_context" in hook,
+        "SessionStart does not inject the manifest cap",
+    )
 
 
 @test("the review wrapper accepts a profile and refuses an unsafe one")
@@ -4503,7 +5084,7 @@ def test_review_profile_option() -> None:
                 arguments[arguments.index("--profile") + 1] == "plan-reviewer",
                 "codex was not invoked with the requested profile",
             )
-            assert_no_review_residue(f"claude-codex-review-{process.pid}-")
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
 
             # A profile name becomes a filename and must not escape.
             for hostile in ("../reviewer", "a/b", ""):
@@ -4559,7 +5140,7 @@ def test_config_surface() -> None:
         process = subprocess.Popen(
             [
                 sys.executable,
-                str(kit / "scripts" / "claude-codex-config"),
+                str(kit / "scripts" / "orrery-config"),
                 "--port",
                 "0",
                 "--timeout",
@@ -4587,8 +5168,28 @@ def test_config_surface() -> None:
 
             page = urllib.request.urlopen(url, timeout=10).read().decode()
             require(
-                "gpt-5.6-terra" in page and "Principal orchestrator" in page,
+                "gpt-5.6-terra" in page
+                and "Principal orchestrator" in page
+                and "plan_review_rounds" in page
+                and "review rounds" in page
+                and "const offset = Number(link.offset || 0);" in page,
                 "the page was not generated from the live configuration",
+            )
+            for forbidden in (
+                "No model runs here",
+                "· fast",
+                "· balanced",
+                "· strongest",
+            ):
+                require(
+                    forbidden not in page,
+                    f"the configuration page still contains {forbidden!r}",
+                )
+            require(
+                'data-kind="thinking"' in page
+                and "function syncRole(" in page
+                and "selectThinking(" in page,
+                "the page lacks dependent, tandem thinking controls",
             )
 
             bad = url.replace("/t/", "/t/deadbeef")
@@ -4623,10 +5224,76 @@ def test_config_surface() -> None:
                 "a preview must not modify anything",
             )
 
-            rejected = post("preview", {"implementer": {"effort": "xhigh"}})
+            rounds_preview = post(
+                "preview", {"plan_review_rounds": {"value": 4}}
+            )
             require(
-                "only the model" in rejected.get("error", ""),
-                "changing a role's effort was not refused",
+                len(rounds_preview["edits"]) == 1
+                and '"value": 2' in rounds_preview["edits"][0]["diff"]
+                and '"value": 4' in rounds_preview["edits"][0]["diff"],
+                f"the plan-review preview is wrong: {rounds_preview}",
+            )
+            require(
+                read_json(kit / "global" / "orchestration.json")["settings"]
+                ["plan_review_rounds"]["value"]
+                == 2,
+                "previewing the round cap modified the manifest",
+            )
+
+            thinking_preview = post(
+                "preview",
+                {
+                    "implementer": {
+                        "model": "gpt-5.6-terra",
+                        "thinking": "high",
+                    }
+                },
+            )
+            require(
+                len(thinking_preview.get("edits", [])) == 1
+                and '-model_reasoning_effort = "medium"'
+                in thinking_preview["edits"][0]["diff"]
+                and '+model_reasoning_effort = "high"'
+                in thinking_preview["edits"][0]["diff"],
+                f"thinking-only preview is wrong: {thinking_preview}",
+            )
+            unsupported = (
+                ("gpt-5.5", "max"),
+                ("gpt-5.6-luna", "ultra"),
+            )
+            for model, thinking in unsupported:
+                rejected = post(
+                    "preview",
+                    {
+                        "implementer": {
+                            "model": model,
+                            "thinking": thinking,
+                        }
+                    },
+                )
+                require(
+                    "error" in rejected,
+                    f"unsupported {model} + {thinking} was accepted",
+                )
+            rejected = post(
+                "preview",
+                {
+                    "orchestrator": {
+                        "model": "haiku",
+                        "thinking": "high",
+                    }
+                },
+            )
+            require(
+                "does not offer a thinking selector" in rejected.get("error", ""),
+                "Haiku accepted a thinking level",
+            )
+            rejected = post(
+                "preview", {"implementer": {"effort": "xhigh"}}
+            )
+            require(
+                "only model and thinking" in rejected.get("error", ""),
+                "the retired effort request field was accepted",
             )
 
             # Nothing resembling markup, a quote or a newline may pass.
@@ -4641,6 +5308,14 @@ def test_config_surface() -> None:
                 require(
                     "error" in refused,
                     f"a hostile model name was accepted: {hostile!r}",
+                )
+            for invalid in (0, 5, True, "2", 2.5):
+                refused = post(
+                    "preview", {"plan_review_rounds": {"value": invalid}}
+                )
+                require(
+                    "error" in refused,
+                    f"an invalid plan-review cap was accepted: {invalid!r}",
                 )
 
             require(
@@ -4659,7 +5334,11 @@ def test_config_surface() -> None:
 
             both = {
                 "implementer": {"model": "gpt-7-terra"},
-                "orchestrator": {"model": "claude-fable-5[1m]"},
+                "orchestrator": {
+                    "model": "claude-fable-5[1m]",
+                    "thinking": "max",
+                },
+                "plan_review_rounds": {"value": 4},
             }
             post("preview", both)
             applied = post("apply", both)
@@ -4668,6 +5347,7 @@ def test_config_surface() -> None:
                 == [
                     "global/claude-settings.json",
                     "global/codex/implementer.config.toml",
+                    "global/orchestration.json",
                 ],
                 f"unexpected apply result: {applied}",
             )
@@ -4734,6 +5414,90 @@ def test_config_surface() -> None:
             require(
                 live.get("model") == "claude-fable-5[1m]",
                 "the applier did not propagate the model to live settings",
+            )
+            require(
+                canonical.get("env", {}).get(
+                    "CLAUDE_CODE_EFFORT_LEVEL"
+                ) == "max"
+                and live.get("env", {}).get(
+                    "CLAUDE_CODE_EFFORT_LEVEL"
+                ) == "max"
+                and "effortLevel" not in canonical
+                and "effortLevel" not in live,
+                "Fable max was not represented and propagated correctly",
+            )
+            require(
+                read_json(kit / "global" / "orchestration.json")["settings"]
+                ["plan_review_rounds"]["value"]
+                == 4,
+                "the plan-review cap was not applied",
+            )
+
+            # A settings-only apply must not assume that every edit is a
+            # model/profile edit, nor trigger model propagation.
+            post("preview", {"plan_review_rounds": {"value": 3}})
+            settings_only = post(
+                "apply", {"plan_review_rounds": {"value": 3}}
+            )
+            require(
+                settings_only.get("applied") == ["global/orchestration.json"]
+                and settings_only.get("propagated") is None
+                and read_json(kit / "global" / "orchestration.json")["settings"]
+                ["plan_review_rounds"]["value"]
+                == 3,
+                f"a settings-only apply failed: {settings_only}",
+            )
+
+            # The manifest setting has the same preview contract as model
+            # files: an external edit after preview must survive a refusal.
+            post("preview", {"plan_review_rounds": {"value": 4}})
+            manifest_path = kit / "global" / "orchestration.json"
+            manifest = read_json(manifest_path)
+            manifest["external"] = "preserve"
+            write_json(manifest_path, manifest)
+            stale_rounds = post(
+                "apply", {"plan_review_rounds": {"value": 4}}
+            )
+            require(
+                "changed since" in stale_rounds.get("error", ""),
+                f"a concurrent manifest edit was overwritten: {stale_rounds}",
+            )
+            require(
+                read_json(manifest_path).get("external") == "preserve",
+                "the refused settings apply lost the external manifest edit",
+            )
+
+            # Ordinary Claude levels use its persisted setting; the max-only
+            # environment override must disappear from canonical and live
+            # state without disturbing unrelated environment entries.
+            live = read_json(home / ".claude" / "settings.json")
+            live.setdefault("env", {})["UNRELATED"] = "keep"
+            write_json(home / ".claude" / "settings.json", live)
+            claude_xhigh = {
+                "orchestrator": {
+                    "model": "claude-fable-5[1m]",
+                    "thinking": "xhigh",
+                }
+            }
+            post("preview", claude_xhigh)
+            applied_xhigh = post("apply", claude_xhigh)
+            require(
+                "global/claude-settings.json"
+                in applied_xhigh.get("applied", []),
+                f"Claude xhigh was not applied: {applied_xhigh}",
+            )
+            canonical = read_json(
+                kit / "global" / "claude-settings.json"
+            )
+            live = read_json(home / ".claude" / "settings.json")
+            require(
+                canonical.get("effortLevel") == "xhigh"
+                and live.get("effortLevel") == "xhigh"
+                and "CLAUDE_CODE_EFFORT_LEVEL"
+                not in canonical.get("env", {})
+                and "CLAUDE_CODE_EFFORT_LEVEL" not in live.get("env", {})
+                and live.get("env", {}).get("UNRELATED") == "keep",
+                "Claude xhigh or unrelated live environment was mishandled",
             )
         finally:
             with contextlib.suppress(ProcessLookupError):
@@ -4855,11 +5619,11 @@ def test_canonical_hook_events() -> None:
 def test_installer_covers_doctor_commands() -> None:
     installer = INSTALL_SCRIPT.read_text()
     for command in (
-        "claude-codex-init",
-        "claude-codex-doctor",
-        "claude-codex-review",
-        "claude-codex-usage",
-        "claude-codex-config",
+        "orrery-init",
+        "orrery-doctor",
+        "orrery-review",
+        "orrery-usage",
+        "orrery-config",
     ):
         require(
             f"$HOME/.local/bin/{command}" in installer,
@@ -4923,6 +5687,15 @@ def test_green_path_install() -> None:
         )
         home = root / "home"
         home.mkdir()
+        bin_directory = home / ".local" / "bin"
+        bin_directory.mkdir(parents=True)
+        retired = "claude" + "-codex"
+        (bin_directory / f"{retired}-init").symlink_to(
+            kit / "scripts" / "init-project.sh"
+        )
+        (bin_directory / f"{retired}-review").symlink_to(
+            kit / "scripts" / "orrery-review"
+        )
 
         environment = os.environ.copy()
         environment["HOME"] = str(home)
@@ -4955,10 +5728,22 @@ def test_green_path_install() -> None:
             "SessionStart" in settings.get("hooks", {}),
             "the canonical hooks were not applied",
         )
+        require(
+            settings.get("model") == "fable"
+            and settings.get("env", {}).get(
+                "CLAUDE_CODE_EFFORT_LEVEL"
+            ) == "max",
+            "the Fable max default was not installed",
+        )
+        require(
+            not (bin_directory / f"{retired}-init").exists()
+            and not (bin_directory / f"{retired}-review").exists(),
+            "retired command links into the kit were not removed",
+        )
         for name in (
-            "claude-codex-init",
-            "claude-codex-doctor",
-            "claude-codex-review",
+            "orrery-init",
+            "orrery-doctor",
+            "orrery-review",
             "claude-lnt-start",
             "claude-lnt-register",
             "claude-lnt-cleanup",
@@ -4975,20 +5760,12 @@ def test_green_path_install() -> None:
             f"an idempotent rerun failed: {second.stderr}",
         )
         require(
-            not (home / ".claude-codex-kit-backups").exists(),
+            not (home / ".orrery-backups").exists(),
             "an idempotent rerun created backups",
         )
 
         repository = root / "repo"
         repository.mkdir()
-        subprocess.run(
-            ["git", "init", "-q", str(repository)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=60,
-            check=True,
-        )
 
         def run_init(*extra: str) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -5009,7 +5786,12 @@ def test_green_path_install() -> None:
         migrated = run_init()
         require(
             migrated.returncode == 0,
-            f"claude-codex-init failed on a new repository: {migrated.stderr}",
+            f"orrery-init failed on a new repository: {migrated.stderr}",
+        )
+        require(
+            (repository / ".git").is_dir()
+            and "Initialized Git repository" in migrated.stdout,
+            "orrery-init did not initialize the plain directory",
         )
         require(
             (repository / "CLAUDE.md").exists()
@@ -5030,7 +5812,7 @@ def test_green_path_install() -> None:
         require(
             (repository / "CLAUDE.local.md")
             .read_text()
-            .count("claude-codex-kit:start")
+            .count("orrery:start")
             == 1,
             "remigration duplicated the managed block",
         )
@@ -5050,8 +5832,8 @@ def test_green_path_install() -> None:
         exclude = (repository / ".git" / "info" / "exclude").read_text()
         for pattern in (
             "/.claude/settings.local.json",
-            "/.claude/settings.local.json.backup-claude-codex-*",
-            "/.claude/.settings.local.json.claude-codex.lock",
+            "/.claude/settings.local.json.backup-orrery-*",
+            "/.claude/.settings.local.json.orrery.lock",
         ):
             require(
                 pattern in exclude,
@@ -5179,8 +5961,181 @@ def test_green_path_install() -> None:
             check=True,
         ).stdout
         require(
-            "claude-codex" not in status,
+            "orrery" not in status,
             f"artefacts of the update are visible to Git: {status!r}",
+        )
+
+
+@test("project initialization respects Git worktree boundaries")
+def test_initializer_git_boundaries() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        environment = os.environ.copy()
+
+        def invoke(
+            target: Path,
+            *,
+            env: dict[str, str] | None = None,
+            explicit: bool = True,
+        ) -> subprocess.CompletedProcess[str]:
+            command = ["bash", str(kit / "scripts" / "init-project.sh")]
+            if explicit:
+                command.append(str(target))
+            return subprocess.run(
+                command,
+                cwd=target,
+                env=env or environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+
+        # With no directory argument, the current plain directory becomes a
+        # repository before any templates are installed.
+        plain = root / "plain"
+        plain.mkdir()
+        initialized = invoke(plain, explicit=False)
+        require(
+            initialized.returncode == 0
+            and (plain / ".git").is_dir()
+            and (plain / "CLAUDE.md").is_file(),
+            f"default-directory initialization failed: {initialized.stderr}",
+        )
+
+        # A nested target reuses its enclosing worktree and must never grow a
+        # nested .git directory.
+        parent = root / "parent"
+        nested = parent / "a" / "b"
+        nested.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-q", str(parent)],
+            timeout=60,
+            check=True,
+        )
+        nested_result = invoke(nested)
+        require(
+            nested_result.returncode == 0
+            and (parent / "CLAUDE.md").is_file()
+            and not (nested / ".git").exists(),
+            f"nested worktree handling failed: {nested_result.stderr}",
+        )
+
+        # Linked worktrees are already valid repositories even though .git
+        # is a file rather than a directory.
+        seed = root / "seed"
+        linked = root / "linked"
+        seed.mkdir()
+        subprocess.run(["git", "init", "-q", str(seed)], check=True)
+        (seed / "seed.txt").write_text("seed\n")
+        subprocess.run(["git", "-C", str(seed), "add", "seed.txt"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(seed),
+                "-c",
+                "user.name=kit",
+                "-c",
+                "user.email=kit@example.invalid",
+                "commit",
+                "-qm",
+                "seed",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(seed),
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-test",
+                str(linked),
+            ],
+            check=True,
+        )
+        linked_marker = (linked / ".git").read_text()
+        linked_result = invoke(linked)
+        require(
+            linked_result.returncode == 0
+            and (linked / ".git").is_file()
+            and (linked / ".git").read_text() == linked_marker
+            and (linked / "CLAUDE.md").is_file(),
+            f"linked worktree was reinitialized: {linked_result.stderr}",
+        )
+
+        # Git plumbing inherited from a caller must not redirect discovery
+        # or installation into some other repository.
+        foreign = root / "foreign"
+        foreign.mkdir()
+        subprocess.run(["git", "init", "-q", str(foreign)], check=True)
+        isolated = root / "isolated"
+        isolated.mkdir()
+        poisoned = environment.copy()
+        poisoned["GIT_DIR"] = str(foreign / ".git")
+        poisoned["GIT_WORK_TREE"] = str(foreign)
+        isolated_result = invoke(isolated, env=poisoned)
+        require(
+            isolated_result.returncode == 0
+            and (isolated / ".git").is_dir()
+            and not (foreign / "CLAUDE.md").exists(),
+            "inherited Git plumbing redirected initialization",
+        )
+
+        # Existing unusable metadata is never overwritten by a nested fresh
+        # repository.
+        malformed = root / "malformed"
+        malformed.mkdir()
+        (malformed / ".git").write_text("not a gitdir\n")
+        malformed_result = invoke(malformed)
+        require(
+            malformed_result.returncode != 0
+            and (malformed / ".git").read_text() == "not a gitdir\n"
+            and not (malformed / "CLAUDE.md").exists(),
+            "malformed Git metadata was overwritten",
+        )
+
+        bare = root / "bare.git"
+        subprocess.run(["git", "init", "--bare", "-q", str(bare)], check=True)
+        bare_result = invoke(bare)
+        require(
+            bare_result.returncode != 0
+            and "bare Git repository" in bare_result.stderr
+            and not (bare / "CLAUDE.md").exists(),
+            "a bare repository was treated as a worktree",
+        )
+
+        # One release-compatibility pass upgrades the old managed markers
+        # without leaving the retired namespace in the migrated file.
+        legacy = root / "legacy"
+        legacy.mkdir()
+        subprocess.run(["git", "init", "-q", str(legacy)], check=True)
+        retired = "claude" + "-codex"
+        (legacy / "CLAUDE.local.md").write_text(
+            "personal prefix\n\n"
+            f"<!-- {retired}-kit:start -->\nold block\n"
+            f"<!-- {retired}-kit:end -->\n\npersonal suffix\n"
+        )
+        legacy_result = invoke(legacy)
+        migrated = (legacy / "CLAUDE.local.md").read_text()
+        require(
+            legacy_result.returncode == 0
+            and "<!-- orrery:start -->" in migrated
+            and retired not in migrated
+            and "personal prefix" in migrated
+            and "personal suffix" in migrated,
+            f"legacy managed block migration failed: {legacy_result.stderr}",
         )
 
 
@@ -5270,6 +6225,10 @@ def test_setup_guide_current() -> None:
     undocumented: list[str] = []
 
     for relative in sorted(tracked):
+        if not (KIT_DIR / relative).exists():
+            # A renamed path remains in the index until the final logical
+            # commit; document the live path, not a deleted index entry.
+            continue
         if Path(relative).name in (".gitignore", "README.md"):
             continue
         if KIT_DIR / relative == guide_path:
@@ -5284,8 +6243,33 @@ def test_setup_guide_current() -> None:
     require(len(documented) > 15, f"the guide covers too little: {documented}")
 
     # Anything the guide names must still exist.
-    for claim in ("scripts/claude-codex-review", "tests/run-tests.py"):
+    for claim in ("scripts/orrery-review", "tests/run-tests.py"):
         require((KIT_DIR / claim).exists(), f"the guide names a missing {claim}")
+
+
+@test("the retired namespace is absent from current files and paths")
+def test_orrery_namespace_complete() -> None:
+    retired = "claude" + "-codex"
+    offenders: list[str] = []
+    for path in KIT_DIR.rglob("*"):
+        if ".git" in path.parts or "__pycache__" in path.parts:
+            continue
+        relative = str(path.relative_to(KIT_DIR))
+        if retired in relative.lower():
+            offenders.append(relative)
+            continue
+        if not path.is_file() or path.suffix in {".png", ".pyc"}:
+            continue
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if retired in text.lower():
+            offenders.append(relative)
+    require(
+        not offenders,
+        f"retired namespace remains in current artefacts: {sorted(offenders)}",
+    )
 
 
 @test("every command the policy names is pre-approved")
@@ -5301,7 +6285,7 @@ def test_policy_commands_allowed() -> None:
 
     policy = (KIT_DIR / "global" / "CLAUDE.md").read_text()
 
-    commands = re.findall(r"`((?:npx|codex|claude-codex-review)[^`]*)`", policy)
+    commands = re.findall(r"`((?:npx|codex|orrery-review)[^`]*)`", policy)
 
     # Fenced blocks too. The screenshot command lives in one, and shell line
     # continuations have to be folded before it can be matched. The
@@ -5314,7 +6298,7 @@ def test_policy_commands_allowed() -> None:
                 (
                     "npx ",
                     "codex ",
-                    "claude-codex-review ",
+                    "orrery-review ",
                     "pgrep ",
                     "ss ",
                     "ps ",

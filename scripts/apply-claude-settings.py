@@ -19,6 +19,9 @@ from typing import Any
 
 
 PLUGIN = "codex@openai-codex"
+CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+CLAUDE_PERSISTED_EFFORTS = {"low", "medium", "high", "xhigh"}
+CLAUDE_ENV_EFFORTS = CLAUDE_PERSISTED_EFFORTS | {"max"}
 
 # How many times the update is recomputed on top of a version installed by a
 # writer that does not take the sidecar lock.
@@ -140,6 +143,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model", action="store_true")
+    parser.add_argument("--effort", action="store_true")
     parser.add_argument("--companion", action="store_true")
     parser.add_argument("--hooks", action="store_true")
     parser.add_argument("--permissions", action="store_true")
@@ -159,13 +163,21 @@ def parse_args() -> argparse.Namespace:
 
     if args.all:
         args.model = True
+        args.effort = True
         args.companion = True
         args.hooks = True
         args.permissions = True
 
-    if not (args.model or args.companion or args.hooks or args.permissions):
+    if not (
+        args.model
+        or args.effort
+        or args.companion
+        or args.hooks
+        or args.permissions
+    ):
         parser.error(
-            "select --model, --companion, --hooks, --permissions, or --all"
+            "select --model, --effort, --companion, --hooks, "
+            "--permissions, or --all"
         )
 
     return args
@@ -296,13 +308,13 @@ def merge_permissions(
     current: dict[str, Any],
     canonical: dict[str, Any],
 ) -> None:
-    """Add the toolkit's permission rules without touching anything else.
+    """Install toolkit permission rules without touching user-owned rules.
 
     Delegation is unusable without these: Claude Code otherwise stops to ask
     before every `codex` call, which blocks any non-interactive run. Rules
-    are only ever added, so a rule the user removed on purpose comes back,
-    but nothing they added is lost and `deny`, `ask` and the default mode
-    are left alone.
+    Canonical rules are added, and the two exact rules owned by the retired
+    command namespace are removed during migration. Nothing else is lost;
+    `deny`, `ask` and the default mode are left alone.
     """
     canonical_permissions = canonical.get("permissions", {})
     if not isinstance(canonical_permissions, dict):
@@ -320,9 +332,69 @@ def merge_permissions(
     if not isinstance(allow, list):
         raise SystemExit("Live permissions.allow must be a JSON array.")
 
+    # Releases before the Órrery rename installed two command rules under
+    # the former namespace. Remove only those exact toolkit-owned entries;
+    # constructing the legacy spelling keeps the retired name out of the
+    # current source and generated documentation.
+    legacy_prefix = "claude" + "-codex"
+    retired_rules = {
+        f"Bash({legacy_prefix}-review:*)",
+        f"Bash({legacy_prefix}-doctor:*)",
+    }
+    allow[:] = [rule for rule in allow if rule not in retired_rules]
+
     for rule in canonical_allow:
         if rule not in allow:
             allow.append(rule)
+
+
+def merge_effort(
+    current: dict[str, Any],
+    canonical: dict[str, Any],
+) -> None:
+    """Install Claude's effective thinking level without losing other env.
+
+    Claude persists low through xhigh in ``effortLevel``. ``max`` is
+    session-only there, but is valid through CLAUDE_CODE_EFFORT_LEVEL, so
+    the canonical file uses that owned environment key for max. Exactly one
+    representation may be present to avoid a hidden precedence conflict.
+    """
+    persisted = canonical.get("effortLevel")
+    canonical_env = canonical.get("env", {})
+    if not isinstance(canonical_env, dict):
+        raise SystemExit("Canonical env setting must be a JSON object.")
+    environment = canonical_env.get(CLAUDE_EFFORT_ENV)
+
+    if persisted is not None and persisted not in CLAUDE_PERSISTED_EFFORTS:
+        raise SystemExit(
+            "Canonical effortLevel must be low, medium, high, or xhigh."
+        )
+    if environment is not None and environment not in CLAUDE_ENV_EFFORTS:
+        raise SystemExit(
+            f"Canonical {CLAUDE_EFFORT_ENV} must be low, medium, high, "
+            "xhigh, or max."
+        )
+    if persisted is not None and environment is not None:
+        raise SystemExit(
+            "Canonical Claude thinking must use either effortLevel or "
+            f"{CLAUDE_EFFORT_ENV}, not both."
+        )
+
+    current.pop("effortLevel", None)
+    if persisted is not None:
+        current["effortLevel"] = persisted
+
+    live_env = current.get("env", {})
+    if not isinstance(live_env, dict):
+        raise SystemExit("Live env setting must be a JSON object.")
+    live_env = copy.deepcopy(live_env)
+    live_env.pop(CLAUDE_EFFORT_ENV, None)
+    if environment is not None:
+        live_env[CLAUDE_EFFORT_ENV] = environment
+    if live_env:
+        current["env"] = live_env
+    else:
+        current.pop("env", None)
 
 
 def sync_directory(path: Path) -> None:
@@ -395,14 +467,14 @@ def backup_path(target: Path) -> Path:
     return target.with_name(
         sibling_name(
             target,
-            f".backup-claude-codex-{time.time_ns()}-{os.getpid()}",
+            f".backup-orrery-{time.time_ns()}-{os.getpid()}",
         )
     )
 
 
 def lock_path(target: Path) -> Path:
     return target.with_name(
-        sibling_name(target, ".claude-codex.lock", prefix=".")
+        sibling_name(target, ".orrery.lock", prefix=".")
     )
 
 
@@ -579,6 +651,9 @@ def apply_selected_settings(
                 "Canonical model must be a non-empty JSON string."
             )
         updated["model"] = model
+
+    if args.effort:
+        merge_effort(updated, canonical)
 
     if args.companion:
         companion = canonical.get("enabledPlugins", {}).get(PLUGIN)
@@ -757,7 +832,7 @@ def main() -> int:
         f"again during {ATTEMPTS} attempts to restore them, so another "
         "writer is updating them continuously. No update was applied. Every "
         "version that was displaced is preserved as a "
-        f"{target_path.name}.backup-claude-codex-* file, newest last by "
+        f"{target_path.name}.backup-orrery-* file, newest last by "
         "modification time, and one of those is more recent than what is "
         "currently live. Rerun once the other writer has stopped."
     )

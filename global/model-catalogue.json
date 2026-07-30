@@ -1,56 +1,151 @@
 {
-  "note": "Models offered in the configuration dropdowns. Neither CLI can list its available models locally, so this is a curated catalogue: add an entry when a provider ships a model you want to use. Anything not listed can still be typed in through the custom option, and nothing here is validated against a provider.",
+  "note": "Models and exact thinking levels offered by the configuration surface. This curated list follows the capabilities exposed by the installed Claude Code and Codex CLIs. Unknown custom identifiers remain usable, but their thinking capabilities cannot be inferred.",
   "providers": {
     "anthropic": [
       {
+        "id": "fable",
+        "label": "fable",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
+      },
+      {
         "id": "opus",
-        "label": "opus \u00b7 newest Opus (alias)"
+        "label": "opus",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "high"
       },
       {
         "id": "sonnet",
-        "label": "sonnet \u00b7 newest Sonnet (alias)"
+        "label": "sonnet",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
       },
       {
         "id": "haiku",
-        "label": "haiku \u00b7 newest Haiku (alias)"
+        "label": "haiku",
+        "thinking_levels": []
       },
       {
         "id": "claude-fable-5[1m]",
-        "label": "claude-fable-5[1m] \u00b7 1M context"
+        "label": "claude-fable-5[1m]",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
       },
       {
         "id": "claude-fable-5",
-        "label": "claude-fable-5"
+        "label": "claude-fable-5",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
       },
       {
         "id": "claude-opus-5",
-        "label": "claude-opus-5 \u00b7 pinned"
+        "label": "claude-opus-5",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "high"
       },
       {
         "id": "claude-sonnet-5",
-        "label": "claude-sonnet-5 \u00b7 pinned"
+        "label": "claude-sonnet-5",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
       },
       {
         "id": "claude-haiku-4-5-20251001",
-        "label": "claude-haiku-4-5 \u00b7 pinned"
+        "label": "claude-haiku-4-5-20251001",
+        "thinking_levels": []
       }
     ],
     "openai": [
       {
         "id": "gpt-5.6-luna",
-        "label": "gpt-5.6-luna \u00b7 fast"
+        "label": "gpt-5.6-luna",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "medium"
       },
       {
         "id": "gpt-5.6-terra",
-        "label": "gpt-5.6-terra \u00b7 balanced"
+        "label": "gpt-5.6-terra",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ],
+        "default_thinking": "medium"
       },
       {
         "id": "gpt-5.6-sol",
-        "label": "gpt-5.6-sol \u00b7 strongest"
+        "label": "gpt-5.6-sol",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ],
+        "default_thinking": "ultra"
       },
       {
         "id": "gpt-5.5",
-        "label": "gpt-5.5 \u00b7 previous generation"
+        "label": "gpt-5.5",
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh"
+        ],
+        "default_thinking": "medium"
       }
     ]
   }

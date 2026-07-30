@@ -106,30 +106,44 @@ printf "\n=== Codex profiles ===\n"
 
 validate_codex_profile() {
     local profile_name="$1"
-    local expected_effort="$2"
     local profile_path="$CODEX_HOME/${profile_name}.config.toml"
 
-    if python3 - "$profile_path" "$expected_effort" <<'PYPROFILE'
+    if python3 - \
+        "$profile_path" \
+        "$KIT_DIR/global/model-catalogue.json" <<'PYPROFILE'
+import json
 from pathlib import Path
 import sys
 import tomllib
 
 path = Path(sys.argv[1])
-expected_effort = sys.argv[2]
+catalogue_path = Path(sys.argv[2])
 
 try:
     with path.open("rb") as handle:
         config = tomllib.load(handle)
-except (OSError, tomllib.TOMLDecodeError):
+    catalogue = json.loads(catalogue_path.read_text())
+except (OSError, json.JSONDecodeError, tomllib.TOMLDecodeError):
     raise SystemExit(1)
 
 model = config.get("model")
 effort = config.get("model_reasoning_effort")
 
-if not isinstance(model, str) or not model.strip():
+if (
+    not isinstance(model, str)
+    or not model.strip()
+    or not isinstance(effort, str)
+    or not effort.strip()
+):
     raise SystemExit(1)
 
-if effort != expected_effort:
+known = {
+    entry.get("id"): entry
+    for entry in catalogue.get("providers", {}).get("openai", [])
+    if isinstance(entry, dict)
+}
+entry = known.get(model)
+if entry is not None and effort not in entry.get("thinking_levels", []):
     raise SystemExit(1)
 PYPROFILE
     then
@@ -139,10 +153,10 @@ PYPROFILE
     fi
 }
 
-validate_codex_profile "mechanic" "low"
-validate_codex_profile "implementer" "medium"
-validate_codex_profile "plan-reviewer" "high"
-validate_codex_profile "reviewer" "high"
+validate_codex_profile "mechanic"
+validate_codex_profile "implementer"
+validate_codex_profile "plan-reviewer"
+validate_codex_profile "reviewer"
 
 printf "\n=== Claude model aliases ===\n"
 if python3 - "$KIT_DIR/global/claude-models.json" <<'PY'
@@ -164,13 +178,13 @@ for alias, model in table.items():
     if not isinstance(model, str) or not model.strip():
         raise SystemExit(1)
 
-if "opus" not in table:
+if not {"fable", "opus"} <= table.keys():
     raise SystemExit(1)
 PY
 then
     pass "Model alias map is valid"
 else
-    fail "Model alias map is missing, invalid, or lacks the opus default"
+    fail "Model alias map is missing, invalid, or lacks required aliases"
 fi
 
 printf "\n=== Authentication ===\n"
@@ -180,7 +194,7 @@ else
     fail "Codex authentication is unavailable"
 fi
 
-printf "\n=== Claude Codex companion ===\n"
+printf "\n=== Órrery companion ===\n"
 if python3 - \
     "$KIT_DIR/global/claude-settings.json" \
     "$HOME/.claude/settings.json" <<'PY'
@@ -221,7 +235,7 @@ do
 done
 
 printf "\n=== Direct review syntax ===\n"
-if python3 - "$KIT_DIR/scripts/claude-codex-review" <<'PY'
+if python3 - "$KIT_DIR/scripts/orrery-review" <<'PY'
 from pathlib import Path
 import sys
 
@@ -232,15 +246,15 @@ except (OSError, SyntaxError):
     raise SystemExit(1)
 PY
 then
-    pass "Valid Python syntax: claude-codex-review"
+    pass "Valid Python syntax: orrery-review"
 else
-    fail "Invalid Python syntax: claude-codex-review"
+    fail "Invalid Python syntax: orrery-review"
 fi
 
 for python_script in \
     "$KIT_DIR/scripts/apply-claude-settings.py" \
-    "$KIT_DIR/scripts/claude-codex-usage" \
-    "$KIT_DIR/scripts/claude-codex-config" \
+    "$KIT_DIR/scripts/orrery-usage" \
+    "$KIT_DIR/scripts/orrery-config" \
     "$KIT_DIR/global/hooks/leave-no-trace.py" \
     "$KIT_DIR/tests/run-tests.py" \
     "$KIT_DIR/tests/fake-codex"
@@ -336,7 +350,7 @@ import sys
 import uuid
 
 python_path = sys.argv[1]
-unit = f"claude-codex-doctor-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+unit = f"orrery-doctor-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 command = [
     "systemd-run",
     "--user",
@@ -389,6 +403,7 @@ if SETTINGS_TEST_DIR="$(mktemp -d 2>/dev/null)"; then
     cat > "$SETTINGS_TEST_DIR/source.json" <<'JSON'
 {
   "model": "opus",
+  "effortLevel": "high",
   "enabledPlugins": {
     "codex@openai-codex": false
   },
@@ -476,6 +491,9 @@ if not link.is_symlink():
 if data.get("model") != "opus":
     raise SystemExit(1)
 
+if data.get("effortLevel") != "high":
+    raise SystemExit(1)
+
 plugins = data.get("enabledPlugins", {})
 value = plugins.get("codex@openai-codex")
 
@@ -527,32 +545,32 @@ else
 fi
 
 printf "\n=== Installed commands ===\n"
-if [ "$(readlink -f "$HOME/.local/bin/claude-codex-init")" = \
+if [ "$(readlink -f "$HOME/.local/bin/orrery-init")" = \
      "$(readlink -f "$KIT_DIR/scripts/init-project.sh")" ]; then
-    pass "claude-codex-init is correctly installed"
+    pass "orrery-init is correctly installed"
 else
-    fail "claude-codex-init is not correctly installed"
+    fail "orrery-init is not correctly installed"
 fi
 
-if [ "$(readlink -f "$HOME/.local/bin/claude-codex-doctor")" = \
+if [ "$(readlink -f "$HOME/.local/bin/orrery-doctor")" = \
      "$(readlink -f "$KIT_DIR/scripts/doctor.sh")" ]; then
-    pass "claude-codex-doctor is correctly installed"
+    pass "orrery-doctor is correctly installed"
 else
-    fail "claude-codex-doctor is not correctly installed"
+    fail "orrery-doctor is not correctly installed"
 fi
 
-if [ "$(readlink -f "$HOME/.local/bin/claude-codex-usage")" = \
-     "$(readlink -f "$KIT_DIR/scripts/claude-codex-usage")" ]; then
-    pass "claude-codex-usage is correctly installed"
+if [ "$(readlink -f "$HOME/.local/bin/orrery-usage")" = \
+     "$(readlink -f "$KIT_DIR/scripts/orrery-usage")" ]; then
+    pass "orrery-usage is correctly installed"
 else
-    fail "claude-codex-usage is not correctly installed"
+    fail "orrery-usage is not correctly installed"
 fi
 
-if [ "$(readlink -f "$HOME/.local/bin/claude-codex-config")" = \
-     "$(readlink -f "$KIT_DIR/scripts/claude-codex-config")" ]; then
-    pass "claude-codex-config is correctly installed"
+if [ "$(readlink -f "$HOME/.local/bin/orrery-config")" = \
+     "$(readlink -f "$KIT_DIR/scripts/orrery-config")" ]; then
+    pass "orrery-config is correctly installed"
 else
-    fail "claude-codex-config is not correctly installed"
+    fail "orrery-config is not correctly installed"
 fi
 
 if python3 - "$KIT_DIR" <<'PY'
@@ -563,6 +581,7 @@ from pathlib import Path
 
 kit = Path(sys.argv[1])
 manifest = json.loads((kit / "global" / "orchestration.json").read_text())
+catalogue = json.loads((kit / "global" / "model-catalogue.json").read_text())
 steps = manifest.get("steps")
 
 if not isinstance(steps, list) or not steps:
@@ -572,6 +591,32 @@ identifiers = {step.get("id") for step in steps}
 if not {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"} <= identifiers:
     raise SystemExit(1)
 
+known = {
+    provider: {
+        entry.get("id"): entry
+        for entry in entries
+        if isinstance(entry, dict)
+    }
+    for provider, entries in catalogue.get("providers", {}).items()
+    if isinstance(entries, list)
+}
+
+
+def claude_thinking(settings):
+    environment = settings.get("env", {})
+    if not isinstance(environment, dict):
+        raise SystemExit(1)
+    override = environment.get("CLAUDE_CODE_EFFORT_LEVEL")
+    persisted = settings.get("effortLevel")
+    if override is not None and not isinstance(override, str):
+        raise SystemExit(1)
+    if persisted is not None and not isinstance(persisted, str):
+        raise SystemExit(1)
+    if override is not None and persisted is not None:
+        raise SystemExit(1)
+    return override or persisted
+
+
 for step in steps:
     path = kit / step["file"]
     if not path.is_file():
@@ -580,15 +625,62 @@ for step in steps:
     if step["kind"] == "codex-profile":
         with path.open("rb") as handle:
             profile = tomllib.load(handle)
-        if profile.get("model_reasoning_effort") != step.get("expected_effort"):
-            print(f"effort drift: {step['id']}", file=sys.stderr)
-            raise SystemExit(1)
+        model = profile.get("model")
+        thinking = profile.get("model_reasoning_effort")
     elif step["kind"] == "claude-settings":
-        model = json.loads(path.read_text()).get("model")
-        if not isinstance(model, str) or not model.strip():
-            raise SystemExit(1)
+        claude_settings = json.loads(path.read_text())
+        model = claude_settings.get("model")
+        thinking = claude_thinking(claude_settings)
     else:
         raise SystemExit(1)
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit(1)
+    entry = known.get(step["provider"], {}).get(model)
+    if entry is not None:
+        levels = entry.get("thinking_levels")
+        if not isinstance(levels, list):
+            raise SystemExit(1)
+        if levels and thinking not in levels:
+            print(f"thinking drift: {step['id']}", file=sys.stderr)
+            raise SystemExit(1)
+        if not levels and thinking is not None:
+            print(f"unsupported thinking: {step['id']}", file=sys.stderr)
+            raise SystemExit(1)
+    elif thinking is not None and not isinstance(thinking, str):
+        raise SystemExit(1)
+
+settings = manifest.get("settings")
+if not isinstance(settings, dict):
+    raise SystemExit(1)
+plan_rounds = settings.get("plan_review_rounds")
+if not isinstance(plan_rounds, dict):
+    raise SystemExit(1)
+value = plan_rounds.get("value")
+minimum = plan_rounds.get("minimum")
+maximum = plan_rounds.get("maximum")
+if (
+    any(
+        isinstance(item, bool) or not isinstance(item, int)
+        for item in (value, minimum, maximum)
+    )
+    or (minimum, maximum) != (1, 4)
+    or not minimum <= value <= maximum
+):
+    print("invalid plan-review round cap", file=sys.stderr)
+    raise SystemExit(1)
+nodes = {
+    node.get("id")
+    for node in manifest.get("chart", {}).get("nodes", [])
+    if isinstance(node, dict)
+}
+if plan_rounds.get("node") not in nodes:
+    print("plan-review setting names a missing chart node", file=sys.stderr)
+    raise SystemExit(1)
+if not all(
+    isinstance(plan_rounds.get(key), str) and plan_rounds[key].strip()
+    for key in ("label", "description")
+):
+    raise SystemExit(1)
 PY
 then
     pass "Orchestration manifest matches the live configuration files"
@@ -597,12 +689,12 @@ else
 fi
 
 printf "\n=== Direct Codex review ===\n"
-if [ -x "$HOME/.local/bin/claude-codex-review" ] &&
-   [ "$(readlink -f "$HOME/.local/bin/claude-codex-review")" = \
-     "$(readlink -f "$KIT_DIR/scripts/claude-codex-review")" ]; then
-    pass "claude-codex-review is correctly installed"
+if [ -x "$HOME/.local/bin/orrery-review" ] &&
+   [ "$(readlink -f "$HOME/.local/bin/orrery-review")" = \
+     "$(readlink -f "$KIT_DIR/scripts/orrery-review")" ]; then
+    pass "orrery-review is correctly installed"
 else
-    fail "claude-codex-review is not correctly installed"
+    fail "orrery-review is not correctly installed"
 fi
 
 case ":$PATH:" in
@@ -691,21 +783,47 @@ else
     fail "Live settings are missing canonical Leave No Trace hooks"
 fi
 
-printf "\n=== Claude default model ===\n"
+printf "\n=== Claude default model and thinking ===\n"
 # Compared against the canonical settings, not a hard-coded name: changing
 # the model is a documented flow, and the doctor validates consistency.
-CANONICAL_MODEL="$(
-    jq -r '.model // empty' "$KIT_DIR/global/claude-settings.json" 2>/dev/null
-)"
-if [ -z "$CANONICAL_MODEL" ]; then
-    fail "Canonical settings do not define a model"
-elif [ -r "$HOME/.claude/settings.json" ] &&
-     jq -e --arg model "$CANONICAL_MODEL" '.model == $model' \
-         "$HOME/.claude/settings.json" >/dev/null 2>&1
+if python3 - \
+    "$KIT_DIR/global/claude-settings.json" \
+    "$HOME/.claude/settings.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    canonical = json.loads(Path(sys.argv[1]).read_text())
+    live = json.loads(Path(sys.argv[2]).read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+
+def thinking(settings):
+    environment = settings.get("env", {})
+    if not isinstance(environment, dict):
+        raise SystemExit(1)
+    override = environment.get("CLAUDE_CODE_EFFORT_LEVEL")
+    persisted = settings.get("effortLevel")
+    if override is not None and not isinstance(override, str):
+        raise SystemExit(1)
+    if persisted is not None and not isinstance(persisted, str):
+        raise SystemExit(1)
+    if override is not None and persisted is not None:
+        raise SystemExit(1)
+    return override or persisted
+
+
+if canonical.get("model") != live.get("model"):
+    raise SystemExit(1)
+if thinking(canonical) != thinking(live):
+    raise SystemExit(1)
+PY
 then
-    pass "Claude default model matches the canonical settings ($CANONICAL_MODEL)"
+    pass "Claude default model and thinking match the canonical settings"
 else
-    fail "Claude default model does not match the canonical settings ($CANONICAL_MODEL)"
+    fail "Claude default model or thinking does not match the canonical settings"
 fi
 
 printf "\n=== Kit repository ===\n"
@@ -718,9 +836,9 @@ fi
 
 printf "\n"
 if [ "$FAILURES" -eq 0 ]; then
-    echo "CLAUDE_CODEX_KIT_READY"
+    echo "ORRERY_READY"
     exit 0
 fi
 
-printf "CLAUDE_CODEX_KIT_FAILED: %d check(s) failed\n" "$FAILURES" >&2
+printf "ORRERY_FAILED: %d check(s) failed\n" "$FAILURES" >&2
 exit 1

@@ -102,9 +102,9 @@ def profile_label(profile: str) -> tuple[str, str]:
 def usage() -> str:
     return (
         "Usage:\n"
-        "  claude-codex-review [--timeout SECONDS] [--output PATH]\n"
+        "  orrery-review [--timeout SECONDS] [--output PATH]\n"
         "                      [--profile NAME] -- PROMPT...\n"
-        "  printf '%s\\n' \"PROMPT\" | claude-codex-review "
+        "  printf '%s\\n' \"PROMPT\" | orrery-review "
         "[--timeout SECONDS] [--output PATH]\n\n"
         "Runs a synchronous independent review through a read-only Codex "
         "profile, `reviewer` by default and `plan-reviewer` for plan review. The run is "
@@ -211,7 +211,7 @@ def codex_home() -> Path:
 
     if not raw.strip():
         print(
-            "claude-codex-review: CODEX_HOME cannot be empty",
+            "orrery-review: CODEX_HOME cannot be empty",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -261,7 +261,7 @@ def report(message: str) -> None:
     try:
         if sys.stderr is None:
             return
-        print(f"claude-codex-review: {message}", file=sys.stderr)
+        print(f"orrery-review: {message}", file=sys.stderr)
     except (OSError, ValueError, AttributeError):
         pass
 
@@ -746,7 +746,7 @@ def sweep_stale_runtime(root: Path) -> None:
 
         if not force_remove(entry):
             print(
-                f"claude-codex-review: could not reclaim {entry}",
+                f"orrery-review: could not reclaim {entry}",
                 file=sys.stderr,
             )
 
@@ -816,14 +816,14 @@ def main() -> int:
     try:
         timeout_seconds, output_path, prompt, profile = parse_args(sys.argv[1:])
     except UsageError as exc:
-        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        print(f"orrery-review: {exc}", file=sys.stderr)
         print(usage(), file=sys.stderr, end="")
         return 2
 
     codex_path = shutil.which("codex")
     if codex_path is None:
         print(
-            "claude-codex-review: required command unavailable: codex",
+            "orrery-review: required command unavailable: codex",
             file=sys.stderr,
         )
         return 127
@@ -838,7 +838,7 @@ def main() -> int:
     )
     if not use_systemd:
         print(
-            "claude-codex-review: systemd is unavailable; running without "
+            "orrery-review: systemd is unavailable; running without "
             "control-group containment.",
             file=sys.stderr,
         )
@@ -846,7 +846,7 @@ def main() -> int:
     try:
         model = profile_model(profile)
     except UsageError as exc:
-        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        print(f"orrery-review: {exc}", file=sys.stderr)
         return 2
     display, role = profile_label(profile)
     print(
@@ -858,12 +858,12 @@ def main() -> int:
     runtime_base = Path(
         os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache"))
     )
-    runtime_root = runtime_base / "claude-codex-review"
+    runtime_root = runtime_base / "orrery-review"
     runtime_root.mkdir(parents=True, exist_ok=True)
     runtime_root.chmod(0o700)
 
     unit_base = (
-        f"claude-codex-review-{os.getpid()}-"
+        f"orrery-review-{os.getpid()}-"
         f"{uuid.uuid4().hex[:10]}"
     )
     unit = f"{unit_base}.service"
@@ -1054,7 +1054,7 @@ def main() -> int:
                     try:
                         stop_unit(unit)
                     except RuntimeError as exc:
-                        print(f"claude-codex-review: {exc}", file=sys.stderr)
+                        print(f"orrery-review: {exc}", file=sys.stderr)
                 terminate_client(process)
                 return 124
 
@@ -1135,7 +1135,7 @@ def main() -> int:
         )
         return 128 + exc.signum
     except RuntimeError as exc:
-        print(f"claude-codex-review: {exc}", file=sys.stderr)
+        print(f"orrery-review: {exc}", file=sys.stderr)
         return 1
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
@@ -1180,7 +1180,7 @@ def entrypoint() -> int:
         return main()
     except CleanupError as exc:
         print(
-            f"claude-codex-review cleanup failed: {exc}",
+            f"orrery-review cleanup failed: {exc}",
             file=sys.stderr,
         )
         return 1
