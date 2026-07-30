@@ -18,8 +18,92 @@ def option_value(name: str) -> str | None:
     return sys.argv[index + 1] if index + 1 < len(sys.argv) else None
 
 
+def serve_catalogue() -> int:
+    """Speak the initialization subset used by the Agent SDK."""
+    for line in sys.stdin:
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        request = message.get("request", {})
+        if (
+            message.get("type") != "control_request"
+            or request.get("subtype") != "initialize"
+        ):
+            continue
+        models = [
+            {
+                "value": "default",
+                "resolvedModel": "claude-opus-5[1m]",
+                "supportsEffort": True,
+                "supportedEffortLevels": [
+                    "low", "medium", "high", "xhigh", "max",
+                ],
+            },
+            {
+                "value": "opus[1m]",
+                "resolvedModel": "claude-opus-5[1m]",
+                "supportsEffort": True,
+                "supportedEffortLevels": [
+                    "low", "medium", "high", "xhigh", "max",
+                ],
+            },
+            {
+                "value": "claude-fable-5[1m]",
+                "resolvedModel": "claude-fable-5",
+                "supportsEffort": True,
+                "supportedEffortLevels": [
+                    "low", "medium", "high", "xhigh", "max",
+                ],
+            },
+            {
+                "value": "sonnet",
+                "resolvedModel": "claude-sonnet-5",
+                "supportsEffort": True,
+                "supportedEffortLevels": [
+                    "low", "medium", "high", "xhigh", "max",
+                ],
+            },
+            {
+                "value": "haiku",
+                "resolvedModel": "claude-haiku-4-5",
+            },
+            {
+                "value": "nova",
+                "resolvedModel": "claude-nova-1",
+                "supportsEffort": True,
+                "supportedEffortLevels": ["low", "high"],
+            },
+        ]
+        print(
+            json.dumps(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": message.get("request_id"),
+                        "response": {"models": models},
+                    },
+                }
+            ),
+            flush=True,
+        )
+        return 0
+    return 0
+
+
 def main() -> int:
     mode = os.environ.get("CLAUDE_FAKE_MODE", "success")
+
+    if (
+        "--input-format" in sys.argv
+        and "stream-json" in sys.argv
+        and mode == "fail"
+    ):
+        print("simulated Claude discovery failure", file=sys.stderr)
+        return 8
+    if "--input-format" in sys.argv and "stream-json" in sys.argv:
+        return serve_catalogue()
 
     if arguments_path := os.environ.get("CLAUDE_FAKE_ARGS"):
         Path(arguments_path).write_text("\n".join(sys.argv[1:]) + "\n")

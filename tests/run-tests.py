@@ -5088,6 +5088,88 @@ def test_model_catalogue() -> None:
     )
 
 
+@test("model thinking levels are discovered per model from both CLIs")
+def test_live_model_catalogue_discovery() -> None:
+    config = load_script(
+        CONFIG_SCRIPT,
+        f"kit_config_discovery_{time.time_ns()}",
+    )
+    discovery = sys.modules["orrery_model_catalogue"]
+    environment = review_environment("success")
+    try:
+        result = discovery.discover_catalogue(
+            config.bundled_catalogue(),
+            timeout=5,
+            environment=environment,
+        )
+        broken_environment = dict(environment)
+        broken_environment["CLAUDE_FAKE_MODE"] = "fail"
+        partial = discovery.discover_catalogue(
+            config.bundled_catalogue(),
+            timeout=5,
+            environment=broken_environment,
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+    require(
+        result.sources
+        == {"anthropic": "installed CLI", "openai": "installed CLI"},
+        f"live provider catalogues were not used: {result}",
+    )
+    require(not result.warnings, f"model discovery warned: {result.warnings}")
+    anthropic = {
+        entry["id"]: entry for entry in result.providers["anthropic"]
+    }
+    openai = {
+        entry["id"]: entry for entry in result.providers["openai"]
+    }
+    require(
+        set(anthropic)
+        == {"fable", "opus", "sonnet", "haiku", "nova"},
+        f"Claude aliases were duplicated or future models vanished: {anthropic}",
+    )
+    require(
+        "default" not in anthropic
+        and "opus[1m]" not in anthropic
+        and "claude-fable-5[1m]" not in anthropic,
+        f"Claude's equivalent rows were not collapsed: {anthropic}",
+    )
+    require(
+        anthropic["fable"]["thinking_levels"]
+        == ["low", "medium", "high", "xhigh", "max"]
+        and anthropic["haiku"]["thinking_levels"] == []
+        and anthropic["nova"]["thinking_levels"] == ["low", "high"],
+        f"Claude thinking choices were flattened across models: {anthropic}",
+    )
+    require(
+        "gpt-6-future" in openai
+        and "gpt-hidden" not in openai
+        and openai["gpt-6-future"]["thinking_levels"]
+        == ["minimal", "standard", "deep"]
+        and openai["gpt-6-future"]["default_thinking"] == "standard",
+        f"Codex pagination or future effort discovery failed: {openai}",
+    )
+    require(
+        openai["gpt-5.6-sol"]["default_thinking"] == "ultra",
+        "Orrery's maxed-out Sol default was replaced by the CLI suggestion",
+    )
+    require(
+        partial.sources
+        == {"anthropic": "fallback", "openai": "installed CLI"}
+        and "gpt-6-future"
+        in {
+            entry["id"] for entry in partial.providers["openai"]
+        }
+        and {
+            entry["id"] for entry in partial.providers["anthropic"]
+        }
+        == {"fable", "opus", "sonnet", "haiku"}
+        and any("anthropic:" in warning for warning in partial.warnings),
+        f"one provider failure discarded the other live catalogue: {partial}",
+    )
+
+
 @test("the chart reproduces the documented pipeline and names real roles")
 def test_manifest_chart() -> None:
     manifest = read_json(KIT_DIR / "global" / "orchestration.json")
@@ -5200,11 +5282,82 @@ def test_manifest_chart() -> None:
             )
         return node["x"] + dx * scale, node["y"] + dy * scale
 
+    def segment_distance(
+        point: tuple[float, float],
+        start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> float:
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        squared = dx * dx + dy * dy
+        along = (
+            max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        (point[0] - start[0]) * dx
+                        + (point[1] - start[1]) * dy
+                    )
+                    / squared,
+                ),
+            )
+            if squared
+            else 0.0
+        )
+        return (
+            (point[0] - start[0] - along * dx) ** 2
+            + (point[1] - start[1] - along * dy) ** 2
+        ) ** 0.5
+
+    def shape_distance(
+        point: tuple[float, float],
+        node: dict[str, Any],
+    ) -> float:
+        dx = abs(point[0] - node["x"])
+        dy = abs(point[1] - node["y"])
+        half_width, half_height = node["w"] / 2, node["h"] / 2
+        if node.get("shape") != "diamond":
+            if dx <= half_width and dy <= half_height:
+                return 0.0
+            return (
+                max(dx - half_width, 0) ** 2
+                + max(dy - half_height, 0) ** 2
+            ) ** 0.5
+        if dx / half_width + dy / half_height <= 1:
+            return 0.0
+        corners = (
+            (node["x"], node["y"] - half_height),
+            (node["x"] + half_width, node["y"]),
+            (node["x"], node["y"] + half_height),
+            (node["x"] - half_width, node["y"]),
+        )
+        return min(
+            segment_distance(point, corner, corners[(index + 1) % 4])
+            for index, corner in enumerate(corners)
+        )
+
+    def move_away(
+        point: tuple[float, float],
+        node: dict[str, Any],
+        minimum: float,
+    ) -> tuple[float, float]:
+        dx, dy = point[0] - node["x"], point[1] - node["y"]
+        length = (dx * dx + dy * dy) ** 0.5
+        travel = minimum
+        while True:
+            moved = (
+                point[0] + dx / length * travel,
+                point[1] + dy / length * travel,
+            )
+            if shape_distance(moved, node) >= minimum:
+                return moved
+            travel *= 1.5
+
     for edge in chart["edges"]:
         source = nodes[edge["from"]]
         target = nodes[edge["to"]]
         start = boundary(source, target)
-        end = boundary(target, source)
+        end = move_away(boundary(target, source), target, 20)
         lift = max(26, abs(end[1] - start[1]) * 0.4)
         way = 1 if end[1] >= start[1] else -1
         offset = edge.get("offset", 0)
@@ -5231,6 +5384,58 @@ def test_manifest_chart() -> None:
                     raise Failure(
                         f"{edge['from']} → {edge['to']} tangles with {node_id}"
                     )
+
+        # The complete fixed-size arrow marker, not merely its tip, must
+        # remain visibly outside the opaque target node.
+        tangent = (end[0] - c2[0], end[1] - c2[1])
+        tangent_length = (tangent[0] ** 2 + tangent[1] ** 2) ** 0.5
+        along = (
+            tangent[0] / tangent_length,
+            tangent[1] / tangent_length,
+        )
+        across = (-along[1], along[0])
+        triangle = (
+            end,
+            (
+                end[0] - 11 * along[0] - 5.5 * across[0],
+                end[1] - 11 * along[1] - 5.5 * across[1],
+            ),
+            (
+                end[0] - 11 * along[0] + 5.5 * across[0],
+                end[1] - 11 * along[1] + 5.5 * across[1],
+            ),
+        )
+        marker_gap = min(
+            shape_distance(
+                (
+                    a * triangle[0][0]
+                    + b * triangle[1][0]
+                    + (1 - a - b) * triangle[2][0],
+                    a * triangle[0][1]
+                    + b * triangle[1][1]
+                    + (1 - a - b) * triangle[2][1],
+                ),
+                target,
+            )
+            for row in range(11)
+            for column in range(11 - row)
+            for a, b in ((row / 10, column / 10),)
+        )
+        require(
+            marker_gap >= 8,
+            f"{edge['from']} → {edge['to']} hides its arrowhead "
+            f"{marker_gap:.1f}px from the target",
+        )
+
+    config_source = CONFIG_SCRIPT.read_text()
+    require(
+        'const ARROW_CLEARANCE = 20;' in config_source
+        and 'markerUnits: "userSpaceOnUse"' in config_source
+        and 'class: "edge", "marker-end": "url(#arrow)"' in config_source
+        and ".wires marker path { fill: var(--wire); stroke: none; }"
+        in config_source,
+        "the config no longer renders fixed-size, fully visible arrowheads",
+    )
     plan_rounds = manifest["settings"]["plan_review_rounds"]
     require(
         plan_rounds["node"] == "plan-review-step",
@@ -5474,7 +5679,7 @@ def exercise_provider_neutral_config_surface() -> None:
         )
         home = root / "home"
         home.mkdir()
-        environment = os.environ.copy()
+        environment = review_environment("success")
         environment["HOME"] = str(home)
         environment["CODEX_HOME"] = str(home / ".codex")
 
@@ -5530,22 +5735,33 @@ def exercise_provider_neutral_config_surface() -> None:
                 "the page lacks provider-neutral controls or tandem hover logic",
             )
             require(
+                "Models and thinking levels were discovered from the installed "
+                "Claude and Codex CLIs." in page,
+                "the page did not report its live capability source",
+            )
+            require(
                 ".cnode.self { box-shadow:" in page
                 and ".cnode.kin { box-shadow:" not in page,
                 "a tandem node receives the hovered node's outline",
             )
 
-            catalogue = read_json(kit / "global" / "model-catalogue.json")
-            identities = {
-                f"{provider}::{entry['id']}"
-                for provider, entries in catalogue["providers"].items()
-                for entry in entries
-            }
-            module = load_script(
-                kit / "scripts" / "orrery-config",
-                f"kit_config_isolated_{time.time_ns()}",
+            state_match = re.search(
+                r"const STATE = (.*);\nconst SETTINGS =",
+                page,
             )
-            for state in module.snapshot():
+            require(state_match is not None, "the page omitted its role state")
+            live_states = json.loads(state_match.group(1))
+            identities = {
+                f"{choice['provider']}::{choice['id']}"
+                for choice in live_states[0]["choices"]
+                if choice["known"]
+            }
+            require(
+                "anthropic::nova" in identities
+                and "openai::gpt-6-future" in identities,
+                f"future CLI models were not added automatically: {identities}",
+            )
+            for state in live_states:
                 values = [
                     f"{choice['provider']}::{choice['id']}"
                     for choice in state["choices"]
@@ -5575,6 +5791,39 @@ def exercise_provider_neutral_config_surface() -> None:
                         return json.loads(reply.read())
                 except urllib.error.HTTPError as error:
                     return json.loads(error.read())
+
+            future = {
+                "reviewer": {
+                    "provider": "openai",
+                    "model": "gpt-6-future",
+                    "thinking": "deep",
+                }
+            }
+            future_preview = post("preview", future)
+            require(
+                len(future_preview.get("edits", [])) == 1
+                and '"model": "gpt-6-future"'
+                in future_preview["edits"][0]["diff"]
+                and '"thinking": "deep"'
+                in future_preview["edits"][0]["diff"],
+                f"a newly discovered model was not configurable: {future_preview}",
+            )
+            wrong_future_level = post(
+                "preview",
+                {
+                    "reviewer": {
+                        "provider": "openai",
+                        "model": "gpt-6-future",
+                        "thinking": "ultra",
+                    }
+                },
+            )
+            require(
+                "thinking must be one of: minimal, standard, deep"
+                in wrong_future_level.get("error", ""),
+                f"a future model inherited another model's levels: "
+                f"{wrong_future_level}",
+            )
 
             all_anthropic = {
                 "mechanic": {
@@ -5772,6 +6021,7 @@ def exercise_provider_neutral_config_surface() -> None:
             with contextlib.suppress(Exception):
                 process.stdout.close()
             process.wait(timeout=20)
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 @test("the configuration surface previews and applies model changes")
