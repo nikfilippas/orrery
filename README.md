@@ -20,22 +20,36 @@ hygiene layer that reverts everything a session creates.
 You describe outcomes in ordinary language. The orchestration decides who
 does what, inspects everything itself, and owns the result.
 
-| 98 | 53 | 4 | 2 |
+| 104 | 53 | 4 | 2 |
 | :---: | :---: | :---: | :---: |
 | deterministic regression tests | doctor checks, no model calls | Codex worker profiles | commands to adopt a repository |
 
 ## How a request flows
 
 ```mermaid
-flowchart TD
+flowchart TB
     U["ordinary request:<br/>'add a --top flag with tests'"] --> C{classify}
+    subgraph ROUTES[" "]
+      direction LR
+      R[read-only sandboxes only] ~~~ K[Claude implements directly]
+      K ~~~ L[mechanical worker edits<br/>workspace-write]
+      L ~~~ T[implementer writes it<br/>workspace-write]
+      T ~~~ P[Claude writes the plan]
+    end
+    style ROUTES fill:none,stroke:none
+
+    C -->|investigation| R
     C -->|trivial| K[Claude implements directly]
     C -->|mechanical| L[mechanical worker edits<br/>workspace-write]
     C -->|standard| T[implementer writes it<br/>workspace-write]
-    C -->|complex| P[Claude plans,<br/>the plan reviewer challenges it] --> T
-    C -->|investigation| R[read-only sandboxes only]
+    C -->|complex| P[Claude writes the plan]
+    P --> Q[plan reviewer labels objections<br/>blocking or advisory]
+    Q -->|supported blocking,<br/>rounds remain| P
+    Q -->|none remain| J[implementer writes it<br/>workspace-write]
+    Q -->|repeated objection<br/>or round cap| E[stop before implementation<br/>and ask the user]
     L --> I[Claude inspects the real diff,<br/>never the worker's summary]
     T --> I
+    J --> I
     K --> V
     I --> V[tests, lint, type checks, build]
     V --> S[final reviewer, fresh session,<br/>read-only, ephemeral]
@@ -49,23 +63,23 @@ flowchart TD
     classDef planreviewer fill:#8a6a9c,stroke:#6d5279,color:#ffffff
     classDef reviewer fill:#b07e28,stroke:#8c641f,color:#ffffff
     classDef quiet fill:#e8ebee,stroke:#b8c0c7,color:#1b2226
-    class U,C,K,I,X claude
+    class U,C,R,K,I,X,P claude
     class L mechanic
-    class T implementer
-    class P planreviewer
+    class T,J implementer
+    class Q planreviewer
     class S reviewer
-    class R,V,F,D quiet
+    class V,F,D,E quiet
 ```
 
 What each class sounds like, and who touches it:
 
 | Class | Sounds like | Implements | Reviews |
 | --- | --- | --- | --- |
+| Investigation | "why does this leak?" | nobody: read-only sandboxes only | the final reviewer as a second opinion when it materially helps |
 | Trivial | "fix this typo", "bump the timeout" | Claude directly, smallest relevant check | diff inspection only |
 | Mechanical | "rename this across the repo" | the mechanical worker, workspace-write | diff inspection |
 | Standard | "add a `--top` flag with tests" | the implementer, workspace-write, one bounded task per run | the final reviewer, when logic or regression risk warrants it |
-| Complex | auth, migrations, concurrency | Claude plans, the plan reviewer challenges it, then the implementer in batches | the final reviewer, fresh session, findings verified before any fix |
-| Investigation | "why does this leak?" | nobody: read-only sandboxes only | the final reviewer as a second opinion when it materially helps |
+| Complex | auth, migrations, concurrency | Claude plans, bounded plan review clears blocking objections, then the implementer works in batches | the final reviewer, fresh session, findings verified before any fix |
 
 Delegation never transfers responsibility. Codex failure never strands a
 task: account-level errors (quota, billing, authentication) fall back to
@@ -74,18 +88,26 @@ exactly one retry, a worker that dies mid-change has its partial diff
 inspected and repaired rather than trusted, and a missing independent
 review is reported as a limitation rather than papered over.
 
+Plan review is a bounded challenge, not a search for model agreement. Round
+one classifies objections as blocking or advisory; advisory findings never
+prolong the loop. Later rounds narrowly confirm whether the original blocking
+objections were addressed. The default cap is two rounds, configurable from
+one through four. A repeated blocking objection, or one still open at the cap,
+stops before implementation and puts both positions to the user.
+
 ## The cast
 
-| Role | Codex profile | Model | Effort | Used for |
+| Role | Codex profile | Model | Thinking | Used for |
 | --- | --- | --- | --- | --- |
-| Principal orchestrator | — | the active Claude Code model (default `opus`) | session setting | classification, planning, inspection, verification, ownership |
+| Principal orchestrator | — | the active Claude Code model (default Fable 5 through `fable`) | max | classification, planning, inspection, verification, ownership |
 | Mechanical worker | `mechanic` | `gpt-5.6-luna` | low | narrow, mechanical, well-specified edits |
 | Implementer | `implementer` | `gpt-5.6-terra` | medium | the default worker for substantial implementation |
-| Plan reviewer | `plan-reviewer` | `gpt-5.6-sol` | high | challenging a plan before any code is written |
-| Final reviewer | `reviewer` | `gpt-5.6-sol` | high | reviewing finished work, and difficult diagnosis |
+| Plan reviewer | `plan-reviewer` | `gpt-5.6-sol` | ultra | challenging a plan before any code is written |
+| Final reviewer | `reviewer` | `gpt-5.6-sol` | ultra | reviewing finished work, and difficult diagnosis |
 
-Roles are named for what they do. The celestial names are the Codex profile
-identifiers you pass to `--profile`, and they keep the orrery's own
+Roles and their profile identifiers are named for what they do, so the
+configuration remains legible without requiring knowledge of an internal
+metaphor.
 
 The plan reviewer and the final reviewer ship with the same model, so
 behaviour is unchanged out of the box, but they are separate profiles:
@@ -104,7 +126,7 @@ settings. Swapping any of them is an edit, not a rewrite.
 
 ## Independent review, engineered
 
-Reviews run through `claude-codex-review`, which places
+Reviews run through `orrery-review`, which places
 `codex --profile reviewer exec` inside a transient systemd user service. That
 single decision buys hard guarantees:
 
@@ -132,7 +154,7 @@ single decision buys hard guarantees:
     'sequenceNumberColor': '#ffffff'}}}%%
 sequenceDiagram
     participant O as Orchestrator
-    participant W as claude-codex-review
+    participant W as orrery-review
     participant M as systemd user manager
     participant X as Codex reviewer
     O->>W: review prompt
@@ -219,25 +241,31 @@ below is live immediately.
 
 | To change | Edit | Then |
 | --- | --- | --- |
-| A new Claude model | its alias in `global/claude-models.json` | rerun `claude-codex-init <alias>` where pinned |
-| The global default orchestrator | `model` in `global/claude-settings.json` | `./scripts/apply-claude-settings.py --model` |
-| One repository's orchestrator | nothing: run `claude-codex-init <alias>` there | writes `.claude/settings.local.json`, kept out of Git |
+| A new Claude model | its alias in `global/claude-models.json` | rerun `orrery-init <alias>` where pinned |
+| The global default orchestrator | `model` and thinking in `global/claude-settings.json` | `./scripts/apply-claude-settings.py --model --effort` |
+| One repository's orchestrator | nothing: run `orrery-init <alias>` there | writes `.claude/settings.local.json`, kept out of Git |
 | One session | nothing: `claude --model <name>` or `/model` | ephemeral |
-| A Codex worker | `global/codex/<profile>.config.toml` | `claude-codex-doctor` |
+| A Codex worker | `global/codex/<profile>.config.toml` | `orrery-doctor` |
+| Plan-review rounds | the plan-review node in `orrery-config`, or `plan_review_rounds.value` in `global/orchestration.json` | new sessions receive the cap at SessionStart |
 
-**Or configure it visually.** `claude-codex-config` serves a local page
-that draws this same flowchart with the model for each step in a dropdown
-inside its node, built from `global/model-catalogue.json`. An 🛈 on each
-node explains on hover what runs there, which profile and file it comes
-from, and how many other steps share it. Several steps run on one model,
+**Or configure it visually.** `orrery-config` serves a local page
+that draws this same flowchart with adjacent model and thinking dropdowns
+inside each model-backed node, built from `global/model-catalogue.json`.
+An 🛈 appears only where a model or workflow setting has something to
+explain: it shows what runs there, which profile and file it comes from,
+and how many other steps share it. Several steps run on one model,
 so changing any one of them visibly moves the others rather than hiding
-the fact. Saving shows the exact unified diff of every file it would
+the fact. The plan-review node also carries the bounded round control; the
+SessionStart hook injects that value into every new orchestrator session, so
+it changes behaviour rather than merely changing the drawing. Saving shows
+the exact unified diff of every file it would
 touch, applies only through the kit's own atomic write paths, and runs the
 doctor inline so the result is validated before your eyes. The page is
 generated from `global/orchestration.json` and the live files at load, so
 it can never drift from reality; it binds to localhost behind a random URL
-token and exits when idle. Reasoning efforts are shown but fixed: they
-define the roles.
+token and exits when idle. The thinking dropdown is model-dependent and
+offers only the levels listed for the selected model; unknown custom models
+remain usable but require manual thinking configuration.
 
 **Running on a single provider.** If Codex is unavailable (quota, billing,
 network), the orchestrator continues alone automatically, under the same
@@ -251,7 +279,7 @@ the harness this kit drives.
 **Adding a provider.** The pattern that admits a third provider (a Gemini
 CLI, a local model server) is the same one Codex uses: a CLI the
 orchestrator can call with a bounded prompt, a per-role profile file that
-pins model and effort, a permission rule for the CLI, and a routing entry
+pins model and thinking, a permission rule for the CLI, and a routing entry
 in the orchestration skill. The files to touch are
 `global/skills/development-orchestrator/SKILL.md` (routing),
 `global/CLAUDE.md` (policy), a profile directory alongside `global/codex/`,
@@ -261,8 +289,8 @@ in the orchestration skill. The files to touch are
 ## Token usage
 
 ```bash
-claude-codex-usage --since 7    # last week, per provider and model
-claude-codex-usage --json       # machine-readable
+orrery-usage --since 7    # last week, per provider and model
+orrery-usage --json       # machine-readable
 ```
 
 Reads the providers' own local session logs (`~/.claude/projects`,
@@ -280,11 +308,11 @@ and paid access to both model providers.
 ### Linux (primary platform)
 
 ```bash
-git clone <remote> ~/src/claude-codex-kit
-cd ~/src/claude-codex-kit
+git clone <remote> ~/src/orrery
+cd ~/src/orrery
 ./scripts/install.sh     # symlinks, hooks, one atomic settings merge
 codex login              # once per machine
-claude-codex-doctor      # 53 checks, no model calls
+orrery-doctor      # 53 checks, no model calls
 ```
 
 `~/.local/bin` must be on `PATH`; the installer warns and the doctor fails
@@ -308,10 +336,12 @@ validated on Linux only; treat the first macOS install as a supervised one.
 ### Adopting an existing repository
 
 ```bash
-claude-codex-init [model] /path/to/repository
+orrery-init [model] /path/to/repository
 ```
 
-Additive and idempotent: an existing `CLAUDE.md` is preserved untouched,
+If the target is not already inside a Git worktree, `orrery-init`
+initializes one first. It is otherwise additive and idempotent: an existing
+`CLAUDE.md` is preserved untouched,
 the private workflow block is managed between markers in `CLAUDE.local.md`
 so reruns refresh rather than duplicate, both stay out of Git via
 `.git/info/exclude`, and a conflict scan flags any existing instruction
@@ -320,8 +350,8 @@ that contradicts delegation before it can misfire.
 ## Proving it works
 
 ```bash
-./tests/run-tests.py     # 98 deterministic tests, stand-in Codex, no credits
-claude-codex-doctor      # CLAUDE_CODEX_KIT_READY when everything holds
+./tests/run-tests.py     # 104 deterministic tests, stand-in Codex, no credits
+orrery-doctor      # ORRERY_READY when everything holds
 ```
 
 The suite covers the settings updater's compare-and-swap under contention,
@@ -336,19 +366,19 @@ configuration and spends no credits.
 | --- | --- |
 | `global/CLAUDE.md` | The development policy, installed as `~/.claude/CLAUDE.md` |
 | `global/claude-settings.json` | Canonical model, hooks, companion state, permissions |
-| `global/claude-models.json` | Friendly model aliases for `claude-codex-init` |
+| `global/claude-models.json` | Friendly model aliases for `orrery-init` |
 | `global/model-catalogue.json` | Models offered in the configuration dropdowns |
-| `global/codex/*.toml` | Worker profiles: model and reasoning effort per role |
+| `global/codex/*.toml` | Worker profiles: model and thinking level per role |
 | `global/skills/development-orchestrator/` | Task classification and routing |
 | `global/hooks/leave-no-trace.py` | Session hygiene: guard, leases, sweeps, watchdog |
 | `scripts/install.sh` | Installs every link and applies canonical settings |
-| `scripts/init-project.sh` | `claude-codex-init`: migrates a repository |
-| `scripts/claude-codex-review` | Synchronous independent review |
-| `scripts/claude-codex-usage` | Token usage across both providers |
-| `scripts/claude-codex-config` | Visual configuration: schematic, diffs, doctor |
+| `scripts/init-project.sh` | `orrery-init`: migrates a repository |
+| `scripts/orrery-review` | Synchronous independent review |
+| `scripts/orrery-usage` | Token usage across both providers |
+| `scripts/orrery-config` | Visual configuration: schematic, diffs, doctor |
 | `global/orchestration.json` | Declarative manifest of steps and their config |
 | `scripts/apply-claude-settings.py` | Atomic, locked settings updater |
-| `scripts/doctor.sh` | `claude-codex-doctor`: validates the installation |
+| `scripts/doctor.sh` | `orrery-doctor`: validates the installation |
 | `tests/run-tests.py` | The deterministic regression suite |
 | `docs/setup-guide.md` | Installation, routine use, maintenance |
 
