@@ -131,6 +131,11 @@ Start the configured principal:
 orrery
 ```
 
+`orrery` supervises the provider process instead of replacing itself with it.
+It checks command presence and login without running a model, observes the
+principal's exit status, and can therefore propose a fallback after startup or
+runtime failure.
+
 Run a bounded supporting role:
 
 ```bash
@@ -142,6 +147,21 @@ orrery-agent --role reviewer -- "review the final diff; remain read-only"
 
 `orrery-review` remains a compatibility alias that defaults to the final
 reviewer.
+
+Fallback approval is exact and temporary:
+
+```bash
+orrery --approve-fallback openai:gpt-5.6-sol
+orrery-agent --role reviewer \
+  --approve-fallback anthropic:fable -- "review the final diff"
+orrery --no-fallback
+```
+
+Normally Orrery supplies the candidate and asks `[y/N]`. The approval flag is
+for rerunning a non-interactive command after the user accepts that exact
+provider/model. That rerun starts the approved candidate directly instead of
+retrying the failed configured process. It never changes the saved role
+configuration.
 
 The launcher builds provider commands from static adapters:
 
@@ -190,6 +210,12 @@ that preview and runs the doctor. Running sessions are never mutated. A
 repository-local `.orrery.json` principal override, created by `orrery-init`,
 wins over the global principal for that repository.
 
+The same live catalogues support fallback ranking. Orrery first preserves the
+provider for a model-only failure, then minimizes internal role/model distance,
+prefers models already assigned to comparable roles, and maps the configured
+thinking position onto the candidate's exact levels. Unknown future models use
+their provider-picker position until explicitly seeded.
+
 ## Shared instructions and prompt caching
 
 `global/AGENTS.md` is canonical. The installer links it to both
@@ -205,6 +231,15 @@ This follows Claude Code’s documented
 while using Codex’s native
 [`AGENTS.md` discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
 The same provider-neutral orchestration skill is installed for both CLIs.
+SessionStart hooks also compare directly opened Claude and Codex sessions with
+the configured principal. A mismatch is shown to the user and injected into the
+agent context as `ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED`; the direct
+session must ask before acting as principal. The check refreshes on startup,
+resume, clear, and compaction; approval already present in that conversation
+remains valid unless revoked. SessionStart exposes the active model but not its
+thinking level, so use `orrery` when effort must be mechanically enforced.
+Codex requires new or changed non-managed hooks to be reviewed through
+`/hooks`.
 
 Both providers cache eligible prompt prefixes automatically. Orrery keeps the
 shared policy stable, appends only the bounded task delta, selects model and
@@ -216,18 +251,29 @@ cache controls. See the official
 
 ## Provider failure
 
-An exhausted provider does not strand ordinary work:
+Orrery automatically finds a fallback candidate but never automatically grants
+permission to use it:
 
-- account, quota, billing, or authentication failure is not retried on that
-  provider;
-- a model-specific failure may use one deliberate suitable alternative;
-- a transient failure gets one retry;
-- partial write-capable work is inspected before another writer runs; and
+- a missing CLI or inactive login is detected before inference;
+- account, quota, billing, authentication, or unknown provider failure excludes
+  that provider from the next candidate;
+- model-specific failure prefers the nearest model on the same provider;
+- a recognized transient failure is retried once before fallback is proposed,
+  except when a failed writer changed the workspace;
+- a terminal asks `[y/N]`; an IDE or other non-interactive caller receives
+  `ORRERY FALLBACK APPROVAL REQUIRED` and must ask the user;
+- candidate approval is bound to the exact `PROVIDER:MODEL`;
+- an approved rerun skips the provider/model that produced its proposal;
+- if a failed writer changed the Git workspace, Orrery refuses an inline
+  handoff and requires inspection plus a separately approved rerun; and
 - unavailable independent review is reported rather than falsely claimed.
 
-Users can avoid fallback entirely by assigning all roles to the provider they
-still have available. Orrery never claims that an already-running interactive
-conversation can transparently migrate between providers.
+Candidate availability is intentionally described as potential. Login and
+picker discovery spend no model tokens and cannot prove remaining credits; an
+approved candidate may still fail, in which case Orrery reports it and ranks
+the next remaining candidate. If no authenticated candidate remains, Orrery
+says so. Cross-provider fallback starts a fresh context and omits
+provider-specific principal arguments; it never claims conversation migration.
 
 ## Installation
 
@@ -313,11 +359,14 @@ availability for configured roles, access contracts, and instruction imports.
 | `global/orchestration.json` | role assignments, workflow settings, and configuration-chart geometry |
 | `global/model-catalogue.json` | provider fallback choices and Orrery-specific thinking defaults |
 | `global/claude-settings.json` | Claude-specific hooks and permissions, not role selection |
+| `global/codex-hooks.json` | Codex SessionStart principal-mismatch notification |
 | `global/skills/development-orchestrator/` | detailed classification and routing procedure |
 | `global/hooks/leave-no-trace.py` | Claude lifecycle cleanup implementation |
 | `project-template/AGENTS.md` | canonical per-repository project template |
 | `project-template/CLAUDE.md` | one-line project import |
-| `scripts/orrery` | configured principal launcher |
+| `scripts/orrery` | supervised configured-principal launcher |
+| `scripts/orrery_fallback.py` | provider checks, nearest-model ranking, failure classification, and consent |
+| `scripts/orrery-session-start` | direct Claude/Codex principal-mismatch hook |
 | `scripts/orrery_model_catalogue.py` | no-inference live model and thinking-capability discovery |
 | `scripts/orrery_runtime.py` | validated role loader and static provider adapters |
 | `scripts/orrery-review` | contained generic role runner; compatibility filename |

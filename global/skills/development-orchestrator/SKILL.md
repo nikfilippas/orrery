@@ -15,8 +15,15 @@ reviewer makes the current session non-principal. Perform only that assignment.
 Do not classify it again, delegate, spawn an agent, or invoke this workflow
 recursively.
 
-Without such a handoff, the active session is the principal orchestrator and
-owns every decision and verification result.
+Without such a handoff, a session started through `orrery` is the principal
+orchestrator and owns every decision and verification result. A direct Claude
+or Codex session that receives
+`ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED` remains only a candidate until
+the user explicitly approves it. Ask before any tool call, edit, or delegation;
+opening the provider surface does not itself count as approval. An unrevoked
+approval in a resumed or compacted conversation remains valid. Because
+SessionStart does not report active thinking, disclose that limitation and ask
+the user to verify the recommended level where possible.
 
 ## Runtime roles
 
@@ -220,16 +227,32 @@ data, or unrelated conversation history.
 
 Always check exit status and usable final output.
 
+- Let `orrery` and `orrery-agent` produce the nearest fallback proposal. Do not
+  improvise a substitution or invoke the proposed model directly.
+- In an interactive terminal, the wrapper asks `[y/N]`. When a tool-driven run
+  prints `ORRERY FALLBACK APPROVAL REQUIRED`, stop, tell the user the reason and
+  exact candidate, and wait. Only after explicit approval rerun the same command
+  with `--approve-fallback PROVIDER:MODEL` before `--`. The rerun starts that
+  exact candidate directly; it does not retry the failed configured process.
+- Use `--no-fallback` when the user explicitly pins a provider or model.
 - Account, quota, billing, authentication, or entitlement failure: do not retry
-  that provider. Use another deliberately configured provider or continue with
-  the principal.
-- Model-specific failure: try at most one suitable configured alternative.
-- Transient failure: retry once.
+  that provider. Propose a candidate on another authenticated provider.
+- Model-specific failure: propose the nearest potential model, preferring the
+  same provider when usable.
+- Transient failure: the wrapper retries once, then proposes a fallback, unless
+  a write-capable attempt changed the Git workspace or its unchanged state
+  could not be verified.
 - Timeout or interruption: confirm the complete process tree stopped before
   continuing.
 - Missing or malformed final output: treat the run as failed.
 - Partial write-capable failure: inspect the full working tree before another
-  writer runs. Keep only understood, relevant, verifiable changes.
+  writer runs. Keep only understood, relevant, verifiable changes. Orrery
+  refuses an inline writer handoff when its Git fingerprint changed or could
+  not be established.
+- Cross-provider fallback starts a fresh context and drops provider-specific
+  principal CLI arguments. Never claim that conversation context migrated.
+- If no authenticated candidate remains, report that fact; do not describe a
+  merely installed or catalogued model as available.
 
 If independent review is unavailable, the principal performs an explicit
 self-review and reports that limitation. Pause complex work when the missing

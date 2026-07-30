@@ -7,7 +7,19 @@ a more specific requirement. Claude receives this same policy through
 ## Session role
 
 Unless an Orrery handoff explicitly assigns this session a worker or reviewer
-role, this session is the principal orchestrator.
+role, a session started through `orrery` is the principal orchestrator.
+
+A session opened directly in Claude Code, Codex CLI, or the Codex IDE extension
+may bypass the configured principal. The installed SessionStart check compares
+the active provider/model with Orrery's configuration. When it emits
+`ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED`, do not run tools, edit files, or
+delegate until the user explicitly approves this active session as the
+principal fallback. On resume or compaction, an unrevoked approval already in
+that conversation remains sufficient. Opening an IDE or provider CLI is not
+approval. SessionStart cannot verify the active thinking level, so disclose
+that limitation and ask the user to verify the recommended level where
+possible. If the check cannot run, disclose that the principal match was not
+verified.
 
 An explicit role handoff overrides that default. A non-principal session:
 
@@ -146,28 +158,56 @@ files, complete diff, commands, and results directly.
 ## Provider failure and fallback
 
 A provider is optional supporting infrastructure. Its failure must not leave
-an ordinary task incomplete.
+an ordinary task incomplete when another usable route exists. A fallback is a
+proposal, never an implicit substitution.
 
-For each delegated run, inspect the exit status and usable output. Missing,
-malformed, or partial output is failure.
+`orrery` supervises the interactive principal. `orrery-agent` supervises every
+delegated run. Both check command presence and authentication without spending
+model tokens, inspect provider exit status, rank the nearest potential model,
+notify the user, and require explicit approval bound to that exact
+provider/model before starting it.
+
+In a terminal, answer the `[y/N]` prompt. In a non-interactive or IDE-driven
+run, `ORRERY FALLBACK APPROVAL REQUIRED` means stop and ask the user. After
+approval, rerun the same command with
+`--approve-fallback PROVIDER:MODEL` before `--`. Never add that flag without
+the user's go-ahead. Use `--no-fallback` when the user requires the exact
+configured provider or model. An approved rerun starts the exact candidate
+directly and must not retry the failed configured process first.
+
+Candidate distance is based on the failed role, internal model tiers, models
+the user already assigned to comparable roles, live picker-visible catalogues,
+and the nearest supported thinking position. Future picker-visible models are
+ranked automatically. “Potential” is deliberate: login and catalogue checks
+cannot prove remaining credits without running inference.
+
+For each run, inspect the exit status and usable output. Missing, malformed, or
+partial output is failure.
 
 - Authentication, subscription, quota, billing, or entitlement failure: do
-  not retry that provider or cycle its models. Use another configured provider
-  if deliberately available, otherwise let the principal continue.
-- Model-specific unavailability: try at most one suitable configured
-  alternative when quality and role constraints are preserved.
-- Transient process, network, or service failure: retry once, then continue
-  without that delegation.
+  not retry that provider or cycle its models. Propose the nearest candidate on
+  another authenticated provider.
+- Model-specific unavailability: propose the nearest candidate, preferring the
+  same provider when its authentication remains usable.
+- Transient process, network, or service failure: retry once, then propose the
+  nearest candidate. Do not retry a writer whose Git state changed or could
+  not be verified.
 - Partial write-capable work: stop the process tree, inspect `git status` and
   the complete diff, retain only understood and verifiable changes, repair or
-  revert unsafe fragments, then continue and run the full relevant checks.
+  revert unsafe fragments, and only then seek approval for another writer.
+  Orrery refuses an inline writer handoff when its Git fingerprint changed or
+  could not be verified; use the separately approved rerun after inspection.
 - Unavailable review: perform a deliberate principal self-review and report
   that the result was not independently reviewed.
+- No remaining authenticated candidate: report that fallback is unavailable
+  and continue only where the principal can safely complete the role itself.
 
 For security-sensitive, architectural, migration, concurrency, authentication,
 or production-critical work, pause when missing independent review leaves
 material unresolved risk. If the user explicitly requires a provider or model,
-do not silently substitute another.
+do not propose it as satisfied by another. Cross-provider fallback always
+starts fresh context; conversation state and provider-specific CLI arguments do
+not migrate.
 
 ## Verification
 

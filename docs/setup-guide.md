@@ -38,9 +38,11 @@ The installer:
   `~/.claude/skills/development-orchestrator` and
   `~/.agents/skills/development-orchestrator`;
 - installs the Claude lifecycle hook and its helper commands;
+- merges the Orrery SessionStart check into both Claude and Codex hook
+  configuration without removing unrelated hooks;
 - installs `orrery`, `orrery-agent`, `orrery-review`, `orrery-config`,
   `orrery-init`, `orrery-doctor`, and `orrery-usage` in `~/.local/bin`;
-- applies only the Claude-specific hook and permission settings; and
+- applies Claude-specific permissions plus the provider-neutral startup check;
 - removes obsolete profile links only when this checkout owns them.
 
 Existing targets are backed up under a timestamped `~/.orrery-backups`
@@ -50,6 +52,11 @@ directory with their home-relative paths preserved, so two files named
 `CODEX_HOME` defaults to `~/.codex`. An explicit empty value is rejected. A
 pre-existing `$CODEX_HOME/AGENTS.override.md` is preserved and produces a
 warning because Codex loads it instead of `AGENTS.md`.
+
+Codex treats changed non-managed hooks as untrusted until they are reviewed.
+After installation, open `/hooks`, inspect the Orrery SessionStart command, and
+trust it. `orrery-doctor` reports a disabled or missing hook but cannot grant
+trust on the user's behalf.
 
 Make sure `~/.local/bin` is on `PATH`.
 
@@ -113,6 +120,10 @@ present. It passes provider/model/thinking explicitly:
 - Claude: interactive `claude --model … --effort …`
 - Codex: interactive `codex --model … -c model_reasoning_effort=…`
 
+The launcher supervises that interactive process. Command presence and login
+are checked without inference. A non-zero provider exit can therefore produce
+a fallback proposal instead of silently returning to the shell.
+
 Run supporting roles:
 
 ```bash
@@ -127,7 +138,32 @@ Useful options:
 ```bash
 orrery-agent --role reviewer --timeout 600 --output verdict.txt -- "PROMPT"
 printf '%s\n' "PROMPT" | orrery-agent --role reviewer
+orrery-agent --role reviewer --no-fallback -- "PROMPT"
 ```
+
+When a provider fails, Orrery displays the nearest potential candidate. In a
+terminal, approve it at the `[y/N]` prompt. A non-interactive caller does not
+start the candidate; it prints `ORRERY FALLBACK APPROVAL REQUIRED`. After the
+user agrees, repeat the same command with the exact approval before `--`:
+
+```bash
+orrery-agent --role reviewer \
+  --approve-fallback anthropic:fable -- "PROMPT"
+```
+
+The flag approves only that provider/model for that invocation, starts it
+directly rather than retrying the process that produced the proposal, and
+never changes `global/orchestration.json`.
+
+Direct Claude, Codex CLI, and Codex IDE sessions do not pass through the
+launcher. Their SessionStart hook compares the active provider/model with the
+configured principal. On mismatch it visibly warns the user and tells the
+active agent to request explicit approval before tools, edits, or delegation.
+Opening the provider surface is not approval. The check refreshes on startup,
+resume, clear, and compaction while honoring an unrevoked approval already in
+the conversation. SessionStart identifies the model but does not expose the
+active thinking level; start through `orrery` when that setting must be
+enforced rather than user-verified.
 
 `orrery-review` is a compatibility link to the same runner and defaults to the
 `reviewer` role.
@@ -225,22 +261,45 @@ Use only the Playwright-bundled Chromium, pinned to the version in
 browser and inspect for residue after visual work.
 
 Delegated Anthropic and OpenAI processes have a separate containment and
-runtime-state cleanup path in `orrery-agent`. Automatic principal lifecycle
-hook installation is currently Claude-specific; a Codex principal still
-receives the same cleanup requirements through `AGENTS.md`.
+runtime-state cleanup path in `orrery-agent`. Claude lifecycle cleanup remains
+Claude-specific. Principal-mismatch notification is installed for both Claude
+and Codex, while both receive the same cleanup requirements through
+`AGENTS.md`.
 
 ## Provider exhaustion and failures
 
-- Account, subscription, quota, billing, and authentication failures are not
-  retried on the same provider.
-- A model-specific failure may use one suitable configured alternative.
-- A transient failure gets one retry.
-- A partial write-capable failure requires working-tree inspection before
-  another writer starts.
+Fallback has two separate phases: Orrery automatically resolves the candidate;
+the user explicitly authorizes whether it runs.
+
+- Missing commands and inactive authentication are detected before inference.
+- Account, subscription, quota, billing, entitlement, and unknown provider
+  failures exclude that provider.
+- Model-specific failures prefer another model on the same authenticated
+  provider.
+- Recognized transient failures retry once unless a write-capable attempt
+  changed the workspace or its unchanged state cannot be verified.
+- Candidate ranking minimizes internal role/model distance, prefers models
+  already assigned to comparable roles, uses live picker-visible catalogues
+  when available, and maps thinking by relative position in each model's exact
+  supported levels.
+- A model newly exposed by a provider picker participates automatically. The
+  bundled catalogue supplies offline seeds and internal distance anchors.
+- An approved rerun skips the failed provider/model instead of spending
+  another attempt on it.
+- If a failed writer changes the Git workspace, Orrery mechanically refuses
+  an inline handoff. Inspect the complete working tree before approving the
+  separately rerun candidate.
 - A missing independent review must be reported.
 
-The simplest deliberate fallback is to assign every role to the available
-provider in `orrery-config`.
+Authentication and catalogue checks do not spend model tokens, but they cannot
+prove remaining credits. This is why the interface says “potential” candidate.
+If an approved candidate also fails, Orrery reports it and considers the next
+remaining candidate. With neither provider authenticated, no automatic
+fallback is possible and that limitation is explicit.
+
+Cross-provider fallback starts fresh context and drops provider-specific
+principal CLI arguments. Use `--no-fallback` when the exact configured provider
+or model is required.
 
 ## Token usage
 
@@ -281,6 +340,7 @@ The maintained artefacts are:
 - `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.
 - `global/claude-settings.json` — Claude-only hooks, permissions, and companion
   state; it intentionally contains no role model.
+- `global/codex-hooks.json` — the Codex SessionStart principal-mismatch hook.
 - `global/model-catalogue.json` — provider fallback choices and
   Orrery-specific thinking defaults.
 - `global/orchestration.json` — the role manifest, workflow setting, and
@@ -290,8 +350,11 @@ The maintained artefacts are:
 - `global/skills/development-orchestrator/SKILL.md` — shared detailed workflow.
 - `project-template/AGENTS.md` and `project-template/CLAUDE.md` — repository
   instruction templates.
-- `scripts/orrery` and `scripts/orrery_runtime.py` — principal launcher and
-  validated provider adapters.
+- `scripts/orrery`, `scripts/orrery_runtime.py`, and
+  `scripts/orrery_fallback.py` — supervised principal launch, validated
+  provider adapters, availability checks, ranking, and consent.
+- `scripts/orrery-session-start` — direct Claude/Codex surface comparison and
+  approval notification.
 - `scripts/orrery_model_catalogue.py` — no-inference live model and
   thinking-capability discovery.
 - `scripts/orrery-review` — the `orrery-agent` runner and compatibility review
@@ -310,8 +373,12 @@ The maintained artefacts are:
 ## Troubleshooting
 
 **`orrery` says a provider command is unavailable** — install or authenticate
-the CLI selected for the principal, or choose an available provider in
-`orrery-config`.
+the CLI selected for the principal, approve the proposed candidate, or choose
+an available provider in `orrery-config`.
+
+**A direct Codex session does not show the principal mismatch** — restart the
+session, inspect `/hooks`, trust the Orrery SessionStart hook, and confirm
+`features.hooks` is not disabled in `$CODEX_HOME/config.toml`.
 
 **Codex ignores the installed policy** — inspect
 `$CODEX_HOME/AGENTS.override.md`; it shadows `$CODEX_HOME/AGENTS.md`.
