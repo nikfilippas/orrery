@@ -725,6 +725,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     paint-order: stroke; stroke: var(--ground); stroke-width: 4px;
     stroke-linejoin: round;
   }
+  .cluster {
+    position: absolute; border: 1.5px solid var(--edge);
+    border-radius: 14px;
+  }
   .cnode {
     position: absolute; box-sizing: border-box; border-radius: 9px;
     padding: 8px 10px; z-index: 1; transition: box-shadow .16s, opacity .16s;
@@ -1035,6 +1039,26 @@ function render() {
   canvas.style.width = CHART.width + "px";
   canvas.style.height = CHART.height + "px";
 
+  // A decorative frame around the bounded plan loop, painted underneath
+  // the wires and nodes.
+  if (CHART.cluster && Array.isArray(CHART.cluster.nodes)) {
+    const members = CHART.nodes.filter(
+      node => CHART.cluster.nodes.includes(node.id),
+    );
+    if (members.length) {
+      const pad = Number(CHART.cluster.pad || 12);
+      const left = Math.min(...members.map(n => n.x - n.w / 2)) - pad;
+      const top = Math.min(...members.map(n => n.y - n.h / 2)) - pad;
+      const right = Math.max(...members.map(n => n.x + n.w / 2)) + pad;
+      const bottom = Math.max(...members.map(n => n.y + n.h / 2)) + pad;
+      const frame = document.createElement("div");
+      frame.className = "cluster";
+      frame.style.cssText = `left:${left}px;top:${top}px;` +
+        `width:${right - left}px;height:${bottom - top}px`;
+      canvas.appendChild(frame);
+    }
+  }
+
   const svg = element("svg", {
     class: "wires", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
     width: CHART.width, height: CHART.height,
@@ -1230,15 +1254,28 @@ function drawWires(svg, marks, canvas) {
       y: start.y + alongY * lift + (horizontal ? offset : 0),
     };
     // The end control point carries only a quarter of the bow, so the
-    // arrowhead's final direction points at the node it lands on.
+    // arrowhead's final direction points at the node it lands on; the
+    // entry approach is capped so a hook cannot dive through a
+    // neighbouring node on its way in.
     const c2 = face
-      ? { x: end.x + face.nx * lift, y: end.y + face.ny * lift }
+      ? {
+          x: end.x + face.nx * Math.min(lift, 44),
+          y: end.y + face.ny * Math.min(lift, 44),
+        }
       : {
           x: end.x - alongX * lift + (horizontal ? 0 : offset * 0.25),
           y: end.y - alongY * lift + (horizontal ? offset * 0.25 : 0),
         };
     let d = `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ` +
       `${c2.x} ${c2.y}, ${end.x} ${end.y}`;
+    // An aligned, unbowed pair gets a straight arrow; no curve for its
+    // own sake.
+    const aligned = horizontal
+      ? Math.abs(end.y - start.y) <= 14
+      : Math.abs(end.x - start.x) <= 14;
+    if (!offset && aligned) {
+      d = `M ${start.x} ${start.y} L ${end.x} ${end.y}`;
+    }
     if (vias.length) {
       // A routed elbow: chained curves through the waypoints, for the
       // rare path that no single bow can keep clear of every node.
@@ -1273,13 +1310,30 @@ function drawWires(svg, marks, canvas) {
       const at = (p0, p1, p2, p3) =>
         (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 +
         3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3;
-      const labelX = vias.length
-        ? vias[0].x
+      let labelX = vias.length
+        ? vias[Math.floor(vias.length / 2)].x
         : at(start.x, c1.x, c2.x, end.x);
-      const labelY = vias.length
-        ? vias[0].y
+      let labelY = vias.length
+        ? vias[Math.floor(vias.length / 2)].y
         : at(start.y, c1.y, c2.y, end.y);
+      let anchor = null;
+      if (!vias.length && !offset && aligned) {
+        // A straight edge wears its label beside the line, not on it; a
+        // vertical one carries it high, clear of anything mid-line.
+        if (horizontal) {
+          labelY -= 12;
+        } else {
+          labelX -= 8;
+          labelY = start.y + 0.28 * (end.y - start.y);
+          anchor = "end";
+        }
+      }
+      if (Array.isArray(link.labelAt)) {
+        [labelX, labelY] = link.labelAt;
+        anchor = null;
+      }
       const text = element("text", { x: labelX, y: labelY });
+      if (anchor) text.setAttribute("style", `text-anchor: ${anchor}`);
       const lines = String(link.label).split("\\n");
       lines.forEach((line, index) => {
         const part = element("tspan", {

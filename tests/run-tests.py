@@ -5740,9 +5740,9 @@ def test_manifest_chart() -> None:
         "the chart hides plan-review deadlock escalation",
     )
     require(
-        ("plan-review-step", "complex-implementation") in edge_pairs
-        and nodes["complex-implementation"]["roles"] == ["implementer"],
-        "complex work does not continue downward through the implementer",
+        ("plan-review-step", "standard") in edge_pairs
+        and nodes["standard"]["roles"] == ["implementer"],
+        "complex work does not continue through the shared implementer node",
     )
 
     classifier = [
@@ -5908,7 +5908,8 @@ def test_manifest_chart() -> None:
         )
         if entry_face is not None:
             nx, ny = entry_face
-            c2 = (end[0] + nx * lift, end[1] + ny * lift)
+            reach = min(lift, 44)
+            c2 = (end[0] + nx * reach, end[1] + ny * reach)
         else:
             c2 = (
                 end[0] - along_x * lift
@@ -5916,6 +5917,21 @@ def test_manifest_chart() -> None:
                 end[1] - along_y * lift
                 + (offset * 0.25 if is_horizontal else 0),
             )
+        aligned = (
+            abs(end[1] - start[1]) <= 14
+            if is_horizontal
+            else abs(end[0] - start[0]) <= 14
+        )
+        if not offset and aligned:
+            third = (
+                start[0] + (end[0] - start[0]) / 3,
+                start[1] + (end[1] - start[1]) / 3,
+            )
+            two_thirds = (
+                start[0] + 2 * (end[0] - start[0]) / 3,
+                start[1] + 2 * (end[1] - start[1]) / 3,
+            )
+            c1, c2 = third, two_thirds
         segments = [(start, c1, c2, end)]
         if vias:
             def bend(seg_from, seg_to):
