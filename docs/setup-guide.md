@@ -142,18 +142,38 @@ orrery-agent --role reviewer --no-fallback -- "PROMPT"
 ```
 
 When a provider fails, Orrery displays the nearest potential candidate. In a
-terminal, approve it at the `[y/N]` prompt. A non-interactive caller does not
-start the candidate; it prints `ORRERY FALLBACK APPROVAL REQUIRED`. After the
+terminal, choose from a numbered menu: fall back for this run only, for
+every project in this login session, for every project until the
+provider-stated reset time (offered only when that time appears in this
+failure's diagnostics), or stop. Enter and any unrecognised input stop; `y`
+remains an alias for the run-only choice. A non-interactive caller does not
+start the candidate; it prints `ORRERY FALLBACK APPROVAL REQUIRED` together
+with the candidate, the offerable scopes, and the rerun flags. After the
 user agrees, repeat the same command with the exact approval before `--`:
 
 ```bash
 orrery-agent --role reviewer \
   --approve-fallback anthropic:fable -- "PROMPT"
+orrery-agent --role reviewer --approve-fallback anthropic:fable \
+  --approval-scope until:2026-08-05T16:49 -- "PROMPT"
 ```
 
-The flag approves only that provider/model for that invocation, starts it
-directly rather than retrying the process that produced the proposal, and
-never changes `global/orchestration.json`.
+The flag approves only that provider/model, starts it directly rather than
+retrying the process that produced the proposal, and never changes
+`global/orchestration.json`. `--approval-scope` defaults to `run`; `session`
+and `until:<ISO8601>` record a standing approval, which is prior recorded
+consent. A later invocation whose configured role still matches starts the
+recorded candidate directly, never re-ranked, and prints a disclosure line
+on every use. Session-scope records live under
+`$XDG_RUNTIME_DIR/orrery/standing.json` and die with the login session
+(stamped with the boot id, or capped at 24 hours where none is readable);
+until-scope records live under `${XDG_STATE_HOME:-~/.local/state}/orrery/
+standing.json` and expire at their recorded time. Standing approvals are
+listed by `orrery-doctor` and on the configuration page, are removed by
+`orrery --revoke-fallbacks` (or the page's revoke control), are skipped
+when the role's configured identity changes, and are always overridden by
+`--no-fallback`, an explicit `--approve-fallback`, and the
+changed-workspace inspection rule.
 
 Direct Claude, Codex CLI, and Codex IDE sessions do not pass through the
 launcher. Their SessionStart hook compares the active provider/model with the
@@ -353,6 +373,8 @@ The maintained artefacts are:
 - `scripts/orrery`, `scripts/orrery_runtime.py`, and
   `scripts/orrery_fallback.py` — supervised principal launch, validated
   provider adapters, availability checks, ranking, and consent.
+- `scripts/orrery_standing.py` — standing fallback approvals: scoped,
+  revocable prior consent recorded outside the repository.
 - `scripts/orrery-session-start` — direct Claude/Codex surface comparison and
   approval notification.
 - `scripts/orrery_model_catalogue.py` — no-inference live model and

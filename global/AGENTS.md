@@ -167,13 +167,24 @@ model tokens, inspect provider exit status, rank the nearest potential model,
 notify the user, and require explicit approval bound to that exact
 provider/model before starting it.
 
-In a terminal, answer the `[y/N]` prompt. In a non-interactive or IDE-driven
-run, `ORRERY FALLBACK APPROVAL REQUIRED` means stop and ask the user. After
-approval, rerun the same command with
-`--approve-fallback PROVIDER:MODEL` before `--`. Never add that flag without
-the user's go-ahead. Use `--no-fallback` when the user requires the exact
-configured provider or model. An approved rerun starts the exact candidate
-directly and must not retry the failed configured process first.
+In a terminal, choose from the numbered fallback menu: this run only, every
+project in this login session, every project until the provider-stated
+reset time when one is offered, or stop. In a non-interactive or IDE-driven
+run, `ORRERY FALLBACK APPROVAL REQUIRED` means stop and ask the user,
+relaying the listed candidate and scopes as a multiple-choice question.
+After approval, rerun the same command with
+`--approve-fallback PROVIDER:MODEL` before `--`, adding
+`--approval-scope session` or `--approval-scope until:<ISO8601>` only when
+the user chose that standing lifetime. Never add those flags without the
+user's go-ahead. A standing approval is prior recorded consent: it starts
+its recorded candidate directly with a disclosure line on every use,
+expires by itself, is listed by the doctor and the configuration page, is
+removed by `--revoke-fallbacks`, and is always overridden by
+`--no-fallback`, an explicit `--approve-fallback`, and the
+changed-workspace inspection rule. Use `--no-fallback` when the user
+requires the exact configured provider or model. An approved rerun starts
+the exact candidate directly and must not retry the failed configured
+process first.
 
 Candidate distance is based on the failed role, internal model tiers, models
 the user already assigned to comparable roles, live picker-visible catalogues,

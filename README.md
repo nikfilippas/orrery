@@ -148,20 +148,28 @@ orrery-agent --role reviewer -- "review the final diff; remain read-only"
 `orrery-review` remains a compatibility alias that defaults to the final
 reviewer.
 
-Fallback approval is exact and temporary:
+Fallback approval is exact, and any standing lifetime is explicit:
 
 ```bash
 orrery --approve-fallback openai:gpt-5.6-sol
 orrery-agent --role reviewer \
   --approve-fallback anthropic:fable -- "review the final diff"
+orrery-agent --role reviewer --approve-fallback anthropic:fable \
+  --approval-scope until:2026-08-05T16:49 -- "review the final diff"
+orrery --revoke-fallbacks
 orrery --no-fallback
 ```
 
-Normally Orrery supplies the candidate and asks `[y/N]`. The approval flag is
-for rerunning a non-interactive command after the user accepts that exact
-provider/model. That rerun starts the approved candidate directly instead of
-retrying the failed configured process. It never changes the saved role
-configuration.
+Normally Orrery supplies the candidate and shows a numbered menu: this run
+only, every project in this login session, every project until the
+provider-stated reset time (offered only when the failure diagnostics state
+one), or stop. The approval flag is for rerunning a non-interactive command
+after the user accepts that exact provider/model; `--approval-scope`
+defaults to `run`. A session or until choice records a standing approval
+that later invocations start directly, disclosed on every use and
+revocable at any time. The rerun starts the approved candidate directly
+instead of retrying the failed configured process. It never changes the
+saved role configuration.
 
 The launcher builds provider commands from static adapters:
 
@@ -260,9 +268,21 @@ permission to use it:
 - model-specific failure prefers the nearest model on the same provider;
 - a recognized transient failure is retried once before fallback is proposed,
   except when a failed writer changed the workspace;
-- a terminal asks `[y/N]`; an IDE or other non-interactive caller receives
-  `ORRERY FALLBACK APPROVAL REQUIRED` and must ask the user;
-- candidate approval is bound to the exact `PROVIDER:MODEL`;
+- a terminal shows a numbered menu (this run, this login session, until the
+  provider-stated reset time when the diagnostics state one, or stop);
+  Enter and any unrecognised input stop;
+- an IDE or other non-interactive caller receives
+  `ORRERY FALLBACK APPROVAL REQUIRED` with the candidate, the offerable
+  scopes, and the exact rerun flags, and must ask the user;
+- candidate approval is bound to the exact `PROVIDER:MODEL`; a lifetime
+  beyond the run additionally requires `--approval-scope session` or
+  `--approval-scope until:<ISO8601>`;
+- a session or until choice records a standing approval: prior consent
+  stored outside the repository, disclosed on every use, listed by the
+  doctor and the configuration page, self-expiring, revocable with
+  `orrery --revoke-fallbacks`, skipped when the role is reconfigured, and
+  always overridden by `--no-fallback`, an explicit `--approve-fallback`,
+  and the changed-workspace writer refusal;
 - an approved rerun skips the provider/model that produced its proposal;
 - if a failed writer changed the Git workspace, Orrery refuses an inline
   handoff and requires inspection plus a separately approved rerun; and

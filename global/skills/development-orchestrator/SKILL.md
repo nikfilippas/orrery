@@ -229,11 +229,19 @@ Always check exit status and usable final output.
 
 - Let `orrery` and `orrery-agent` produce the nearest fallback proposal. Do not
   improvise a substitution or invoke the proposed model directly.
-- In an interactive terminal, the wrapper asks `[y/N]`. When a tool-driven run
-  prints `ORRERY FALLBACK APPROVAL REQUIRED`, stop, tell the user the reason and
-  exact candidate, and wait. Only after explicit approval rerun the same command
-  with `--approve-fallback PROVIDER:MODEL` before `--`. The rerun starts that
-  exact candidate directly; it does not retry the failed configured process.
+- In an interactive terminal, choose from the wrapper's numbered fallback
+  menu: this run only, this login session, until the provider-stated reset
+  time when one is offered, or stop. When a tool-driven run prints
+  `ORRERY FALLBACK APPROVAL REQUIRED`, stop, relay the listed candidate and
+  scopes to the user as a multiple-choice question, and wait. Only after
+  explicit approval rerun the same command with
+  `--approve-fallback PROVIDER:MODEL` before `--`, adding
+  `--approval-scope session` or `--approval-scope until:<ISO8601>` only
+  when the user chose that standing lifetime. The rerun starts that exact
+  candidate directly; it does not retry the failed configured process. A
+  live standing approval is prior recorded consent: it starts its recorded
+  candidate with a disclosure line on every use and is removed with
+  `--revoke-fallbacks`.
 - Use `--no-fallback` when the user explicitly pins a provider or model.
 - Account, quota, billing, authentication, or entitlement failure: do not retry
   that provider. Propose a candidate on another authenticated provider.
