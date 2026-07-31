@@ -8302,6 +8302,89 @@ def test_adopt_standing_helper() -> None:
             raise Failure("--approval-scope without approval was accepted")
 
 
+@test("the consent menu renders on a real controlling terminal")
+def test_consent_menu_real_tty() -> None:
+    """No injected tty_opener: this exercises _open_tty itself.
+
+    The original opener used open("/dev/tty", "r+", buffering=1), whose
+    BufferedRandom demands a seekable file; a terminal never is, the
+    resulting UnsupportedOperation subclasses OSError, and every real
+    terminal silently fell through to the non-interactive branch.
+    """
+    import pty
+    import select
+
+    child_body = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(KIT_DIR / 'scripts')!r})\n"
+        "from orrery_runtime import load_role\n"
+        "import orrery_fallback as fallback\n"
+        "principal = load_role('orchestrator')\n"
+        "proposal = fallback.nearest_fallback(\n"
+        "    principal,\n"
+        "    'authentication unavailable',\n"
+        "    excluded_providers={'anthropic'},\n"
+        "    assumed_ready={'openai'},\n"
+        "    discover_live=False,\n"
+        ")\n"
+        "decision = fallback.request_fallback_decision(\n"
+        "    proposal,\n"
+        "    approval=None,\n"
+        "    no_fallback=False,\n"
+        "    program_name='pty-test',\n"
+        "    stream=sys.stderr,\n"
+        ")\n"
+        "print('DECISION', decision.consent.value, decision.scope,\n"
+        "      flush=True)\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False
+    ) as handle:
+        handle.write(child_body)
+        child_script = handle.name
+
+    try:
+        pid, master = pty.fork()
+        if pid == 0:  # pragma: no cover - replaced by exec
+            os.execv(sys.executable, [sys.executable, child_script])
+
+        transcript = ""
+        answered = False
+        deadline = time.monotonic() + 20
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([master], [], [], 0.5)
+                if ready:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    transcript += chunk.decode(errors="replace")
+                if not answered and "Choose how to continue" in transcript:
+                    os.write(master, b"1\n")
+                    answered = True
+                if "DECISION" in transcript:
+                    break
+        finally:
+            os.close(master)
+            os.waitpid(pid, 0)
+
+        require(
+            "Choose how to continue" in transcript
+            and "for this run only" in transcript
+            and "Stop here" in transcript,
+            f"the menu did not render on a real tty: {transcript[-600:]}",
+        )
+        require(
+            "DECISION approved run" in transcript,
+            f"the tty answer was not honoured: {transcript[-600:]}",
+        )
+    finally:
+        os.unlink(child_script)
+
+
 @test("the doctor lists standing approvals as warnings, never failures")
 def test_doctor_lists_standing() -> None:
     with until_store_only():

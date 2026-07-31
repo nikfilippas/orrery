@@ -13,6 +13,7 @@ offline ranking half to explain direct-provider principal mismatches.
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import shutil
@@ -733,9 +734,25 @@ def _safe_print(message: str, *, stream: IO[str] | None = None) -> None:
 
 
 def _open_tty() -> IO[str] | None:
+    """The controlling terminal, opened the way getpass does.
+
+    open("/dev/tty", "r+") builds a BufferedRandom, which requires a
+    seekable file; a terminal never is, and the UnsupportedOperation it
+    raises subclasses OSError, so the failure is silent. Wrapping the raw
+    descriptor directly avoids the seekability requirement entirely.
+    """
     try:
-        return open("/dev/tty", "r+", encoding="utf-8", buffering=1)
+        descriptor = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
     except OSError:
+        return None
+    try:
+        return io.TextIOWrapper(
+            io.FileIO(descriptor, "w+"),
+            encoding="utf-8",
+            line_buffering=True,
+        )
+    except (OSError, ValueError):
+        os.close(descriptor)
         return None
 
 
