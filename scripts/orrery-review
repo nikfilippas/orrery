@@ -820,6 +820,33 @@ def sweep_stale_runtime(root: Path) -> None:
             )
 
 
+def claude_verdict(log_path: Path) -> str:
+    """The final result string from a delegated Claude JSON log.
+
+    The provider's stderr is merged into the log, and the CLI can prepend
+    diagnostics there (for example the subprocess-scrub hardening
+    warning), so when the whole text is not pure JSON the result object
+    is recovered from the last parseable JSON line instead.
+    """
+    text = log_path.read_text(errors="replace")
+    candidates = [text]
+    candidates.extend(
+        line
+        for line in reversed(text.splitlines())
+        if line.lstrip().startswith("{")
+    )
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            verdict = payload.get("result")
+            if isinstance(verdict, str) and verdict.strip():
+                return verdict
+    raise ValueError("the log holds no JSON result object")
+
+
 def bounded_prefix(destination: Path, reserve: int = 8) -> str:
     """A same-directory temporary prefix that leaves room within NAME_MAX.
 
@@ -1502,13 +1529,10 @@ def main(
 
         if role_config.provider == "anthropic":
             try:
-                payload = json.loads(log_path.read_text())
-                verdict = payload.get("result")
-                if not isinstance(verdict, str) or not verdict.strip():
-                    raise ValueError("the JSON result is empty")
+                verdict = claude_verdict(log_path)
                 verdict_path.write_text(verdict)
                 verdict_path.chmod(0o600)
-            except (OSError, json.JSONDecodeError, ValueError) as exc:
+            except (OSError, ValueError) as exc:
                 print(
                     "Claude exited successfully but produced no valid final "
                     f"result: {exc}",

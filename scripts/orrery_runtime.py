@@ -301,6 +301,16 @@ def delegated_command(
 
     if settings_path is None:
         raise RuntimeConfigError("Claude roles require a sandbox settings file")
+    # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces the default permission mode
+    # unless the allowed tools are declared explicitly; without this list a
+    # non-interactive delegated run aborts before its first real turn. One
+    # comma-joined token, because the variadic flag would swallow whatever
+    # argument follows it.
+    allowed_tools = (
+        "Read,Grep,Glob,Bash"
+        if role.read_only
+        else "Edit,Write,NotebookEdit,Read,Grep,Glob,Bash"
+    )
     command = [
         executable,
         "--print",
@@ -312,6 +322,8 @@ def delegated_command(
         "json",
         "--settings",
         str(settings_path),
+        "--allowedTools",
+        allowed_tools,
         "--permission-mode",
         "plan" if role.read_only else "acceptEdits",
     ]
@@ -398,6 +410,19 @@ def provider_environment(provider: str, tmp_dir: Path) -> dict[str, str]:
         environment["CODEX_HOME"] = str(codex_home())
     else:
         environment["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+    # A delegated role is an independent context contained by this runner,
+    # not a child of the invoking Claude Code session. Forwarding the
+    # parent's identity markers makes the parent's lifecycle tooling treat
+    # the delegated process tree as its own unregistered residue and reap
+    # it mid-run, and invites nested-session behaviour in the provider CLI.
+    for marker in (
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_SSE_PORT",
+    ):
+        environment.pop(marker, None)
     return environment
 
 

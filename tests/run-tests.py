@@ -205,7 +205,11 @@ def runtime_residue() -> list[str]:
     return sorted(entry.name for entry in root.iterdir())
 
 
-def review_environment(mode: str, marker: Path | None = None) -> dict[str, str]:
+def review_environment(
+    mode: str,
+    marker: Path | None = None,
+    standing_state: Path | None = None,
+) -> dict[str, str]:
     bin_dir = Path(tempfile.mkdtemp(prefix="kit-fake-bin."))
     shutil.copy2(FAKE_CODEX, bin_dir / "codex")
     shutil.copy2(FAKE_CLAUDE, bin_dir / "claude")
@@ -219,6 +223,14 @@ def review_environment(mode: str, marker: Path | None = None) -> dict[str, str]:
     environment["KIT_FAKE_BIN"] = str(bin_dir)
     if marker is not None:
         environment["CODEX_FAKE_MARKER"] = str(marker)
+    # A live standing approval on the host must not steer wrapper tests,
+    # so the persistent until store is isolated per environment; tests
+    # that seed approvals pass their own state directory. A session-scope
+    # approval could still leak, because XDG_RUNTIME_DIR carries the
+    # systemd user bus and cannot be relocated safely.
+    if standing_state is None:
+        standing_state = Path(tempfile.mkdtemp(prefix="kit-standing."))
+    environment["XDG_STATE_HOME"] = str(standing_state)
     return environment
 
 
@@ -2851,6 +2863,17 @@ def test_every_role_is_provider_neutral() -> None:
                                 else "acceptEdits"
                             ),
                             f"{role_id} lost its Claude permission mode",
+                        )
+                        allowed = command[
+                            command.index("--allowedTools") + 1
+                        ]
+                        require(
+                            ("Edit" in allowed)
+                            == (expected_access == "workspace-write")
+                            and "Read" in allowed
+                            and " " not in allowed,
+                            f"{role_id} has the wrong delegated tool "
+                            f"declaration: {allowed}",
                         )
     finally:
         runtime_module.shutil.which = original_which
@@ -8049,11 +8072,13 @@ def seed_standing_reviewer(
 
 @test("a standing approval starts the recorded candidate without codex")
 def test_standing_adoption_end_to_end() -> None:
-    with until_store_only():
+    with until_store_only() as state_dir:
         seed_standing_reviewer()
         with tempfile.TemporaryDirectory() as directory:
             codex_arguments = Path(directory) / "codex-args"
-            environment = review_environment("success")
+            environment = review_environment(
+                "success", standing_state=state_dir
+            )
             environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
             process = start_review(
                 environment, "--timeout", "60", "--", "prompt"
@@ -8084,9 +8109,9 @@ def test_standing_adoption_end_to_end() -> None:
 
 @test("an explicit approval wins over a conflicting standing record")
 def test_explicit_approval_beats_standing() -> None:
-    with until_store_only():
+    with until_store_only() as state_dir:
         seed_standing_reviewer(candidate_model="opus")
-        environment = review_environment("success")
+        environment = review_environment("success", standing_state=state_dir)
         environment["CODEX_FAKE_MODE"] = "quota"
         process = start_review(
             environment,
@@ -8116,9 +8141,9 @@ def test_explicit_approval_beats_standing() -> None:
 
 @test("no-fallback ignores standing approvals and says so")
 def test_no_fallback_ignores_standing() -> None:
-    with until_store_only():
+    with until_store_only() as state_dir:
         seed_standing_reviewer()
-        environment = review_environment("success")
+        environment = review_environment("success", standing_state=state_dir)
         process = start_review(
             environment,
             "--timeout",
@@ -8144,7 +8169,9 @@ def test_no_fallback_ignores_standing() -> None:
 @test("an until approval records from the flag and is honoured next run")
 def test_until_scope_records_and_replays() -> None:
     with until_store_only() as state_dir:
-        failed_environment = review_environment("success")
+        failed_environment = review_environment(
+            "success", standing_state=state_dir
+        )
         failed_environment["CODEX_FAKE_MODE"] = "quota"
         failed = start_review(
             failed_environment, "--timeout", "60", "--", "prompt"
@@ -8157,7 +8184,9 @@ def test_until_scope_records_and_replays() -> None:
             f"the REQUIRED block lost its scope lines: {failed_stderr}",
         )
 
-        approved_environment = review_environment("success")
+        approved_environment = review_environment(
+            "success", standing_state=state_dir
+        )
         approved_environment["CODEX_FAKE_MODE"] = "quota"
         approved = start_review(
             approved_environment,
@@ -8190,7 +8219,9 @@ def test_until_scope_records_and_replays() -> None:
 
         with tempfile.TemporaryDirectory() as directory:
             codex_arguments = Path(directory) / "codex-args"
-            replay_environment = review_environment("success")
+            replay_environment = review_environment(
+                "success", standing_state=state_dir
+            )
             replay_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
             replay = start_review(
                 replay_environment, "--timeout", "60", "--", "prompt"
@@ -8207,9 +8238,9 @@ def test_until_scope_records_and_replays() -> None:
 
 @test("revocation clears standing approvals from both binaries")
 def test_revoke_fallbacks_cli() -> None:
-    with standing_stores():
+    with standing_stores() as (_runtime_dir, state_dir):
         seed_standing_reviewer()
-        environment = review_environment("success")
+        environment = review_environment("success", standing_state=state_dir)
         revoke = start_review(environment, "--revoke-fallbacks")
         stdout, stderr = finish_review(revoke, environment)
         require(
@@ -8385,10 +8416,80 @@ def test_consent_menu_real_tty() -> None:
         os.unlink(child_script)
 
 
+@test("delegated environments never carry the parent session identity")
+def test_delegated_environment_drops_session_markers() -> None:
+    """The parent's lifecycle tooling reaps processes marked as its own
+    children, so a delegated unit carrying these markers is terminated
+    mid-run by the very session that delegated it."""
+    markers = {
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE_CHILD_SESSION": "1",
+        "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "CLAUDE_CODE_SESSION_ID": "parent-session",
+        "CLAUDE_CODE_SSE_PORT": "12345",
+        "CLAUDE_CONFIG_DIR": str(Path.home() / ".claude"),
+    }
+    saved = {name: os.environ.get(name) for name in markers}
+    os.environ.update(markers)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            for provider in ("anthropic", "openai"):
+                environment = runtime_module.provider_environment(
+                    provider, Path(directory)
+                )
+                leaked = {
+                    name
+                    for name in markers
+                    if name != "CLAUDE_CONFIG_DIR" and name in environment
+                }
+                require(
+                    not leaked,
+                    f"{provider} still carries session markers: {leaked}",
+                )
+            require(
+                runtime_module.provider_environment(
+                    "anthropic", Path(directory)
+                ).get("CLAUDE_CONFIG_DIR") == markers["CLAUDE_CONFIG_DIR"],
+                "the configuration directory must keep flowing to Claude",
+            )
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@test("a delegated Claude verdict survives stderr noise in the log")
+def test_claude_verdict_noisy_log() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        log = Path(directory) / "agent.log"
+        log.write_text(
+            "⚠ Permission mode forced to default — scrub hardening\n"
+            '{"is_error":false,"result":"NOISY-OK","type":"result"}\n'
+        )
+        require(
+            review_module.claude_verdict(log) == "NOISY-OK",
+            "a prepended warning line broke verdict recovery",
+        )
+        log.write_text('{"result":"PURE-OK"}')
+        require(
+            review_module.claude_verdict(log) == "PURE-OK",
+            "a pure JSON log no longer parses",
+        )
+        log.write_text("no json here\n{broken\n")
+        try:
+            review_module.claude_verdict(log)
+        except ValueError:
+            pass
+        else:
+            raise Failure("a log without a result object was accepted")
+
+
 @test("the doctor lists standing approvals as warnings, never failures")
 def test_doctor_lists_standing() -> None:
-    with until_store_only():
-        environment = review_environment("success")
+    with until_store_only() as state_dir:
+        environment = review_environment("success", standing_state=state_dir)
         empty = subprocess.run(
             ["bash", str(DOCTOR_SCRIPT)],
             env=environment,
@@ -8426,9 +8527,9 @@ def test_config_standing_revoke() -> None:
     import urllib.error
     import urllib.request
 
-    with until_store_only():
+    with until_store_only() as state_dir:
         seed_standing_reviewer()
-        environment = review_environment("success")
+        environment = review_environment("success", standing_state=state_dir)
         process = subprocess.Popen(
             [
                 sys.executable,
