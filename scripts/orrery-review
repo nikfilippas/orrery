@@ -30,15 +30,26 @@ from orrery_fallback import (  # noqa: E402
     APPROVAL_REQUIRED,
     Availability,
     Consent,
+    ConsentDecision,
     FailureScope,
     classify_failure,
     git_workspace_fingerprint,
     model_status,
     nearest_fallback,
     parse_approval,
+    parse_reset_time,
     proposal_for_approval,
     provider_status,
-    request_fallback_consent,
+    request_fallback_decision,
+)
+from orrery_standing import (  # noqa: E402
+    RUN_SCOPE,
+    candidate_role,
+    describe,
+    match,
+    parse_approval_scope,
+    record_approval,
+    revoke_all,
 )
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
@@ -67,6 +78,8 @@ class Invocation:
         role_id: str,
         approval: tuple[str, str] | None,
         no_fallback: bool,
+        approval_scope: tuple[str, float | None] | None = None,
+        revoke: bool = False,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.output_path = output_path
@@ -74,6 +87,8 @@ class Invocation:
         self.role_id = role_id
         self.approval = approval
         self.no_fallback = no_fallback
+        self.approval_scope = approval_scope
+        self.revoke = revoke
 
 
 class DelegationState:
@@ -171,8 +186,10 @@ def usage() -> str:
     return (
         "Usage:\n"
         f"  {PROGRAM_NAME} [--timeout SECONDS] [--output PATH]\n"
-        "                 [--approve-fallback PROVIDER:MODEL] [--no-fallback]\n"
-        "                 [--role NAME] -- PROMPT...\n"
+        "                 [--approve-fallback PROVIDER:MODEL]\n"
+        "                 [--approval-scope run|session|until:ISO8601]\n"
+        "                 [--no-fallback] [--role NAME] -- PROMPT...\n"
+        f"  {PROGRAM_NAME} --revoke-fallbacks\n"
         f"  printf '%s\\n' \"PROMPT\" | {PROGRAM_NAME} "
         "[--role NAME] [--timeout SECONDS] [--output PATH]\n\n"
         "Runs one configured Orrery role in a separate provider process. "
@@ -203,6 +220,8 @@ def parse_args(argv: list[str]) -> Invocation:
     role: str | None = "reviewer" if PROGRAM_NAME == "orrery-review" else None
     approval: tuple[str, str] | None = None
     no_fallback = False
+    approval_scope_raw: str | None = None
+    revoke = False
 
     index = 0
     while index < len(argv):
@@ -258,6 +277,15 @@ def parse_args(argv: list[str]) -> Invocation:
                 approval = parse_approval(argument.split("=", 1)[1])
             except RuntimeConfigError as exc:
                 raise UsageError(str(exc)) from exc
+        elif argument == "--approval-scope":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --approval-scope")
+            index += 1
+            approval_scope_raw = argv[index]
+        elif argument.startswith("--approval-scope="):
+            approval_scope_raw = argument.split("=", 1)[1]
+        elif argument == "--revoke-fallbacks":
+            revoke = True
         elif argument == "--no-fallback":
             no_fallback = True
         elif argument in ("--role", "-r"):
@@ -278,6 +306,28 @@ def parse_args(argv: list[str]) -> Invocation:
     if timeout_seconds <= 0:
         raise UsageError("--timeout must be a positive integer")
 
+    if revoke:
+        if (
+            approval is not None
+            or approval_scope_raw is not None
+            or no_fallback
+            or output_path is not None
+            or prompt_parts
+        ):
+            raise UsageError(
+                "--revoke-fallbacks stands alone and cannot be combined "
+                "with other options"
+            )
+        return Invocation(
+            timeout_seconds=timeout_seconds,
+            output_path=None,
+            prompt="",
+            role_id=role or "reviewer",
+            approval=None,
+            no_fallback=False,
+            revoke=True,
+        )
+
     if prompt_parts is not None and prompt_parts:
         prompt = " ".join(prompt_parts)
     elif not sys.stdin.isatty():
@@ -296,6 +346,14 @@ def parse_args(argv: list[str]) -> Invocation:
         raise UsageError(
             "--no-fallback and --approve-fallback cannot be combined"
         )
+    approval_scope: tuple[str, float | None] | None = None
+    if approval_scope_raw is not None:
+        if approval is None:
+            raise UsageError("--approval-scope requires --approve-fallback")
+        try:
+            approval_scope = parse_approval_scope(approval_scope_raw)
+        except RuntimeConfigError as exc:
+            raise UsageError(str(exc)) from exc
 
     return Invocation(
         timeout_seconds=timeout_seconds,
@@ -304,6 +362,7 @@ def parse_args(argv: list[str]) -> Invocation:
         role_id=role,
         approval=approval,
         no_fallback=no_fallback,
+        approval_scope=approval_scope,
     )
 
 
@@ -815,6 +874,74 @@ def publish_atomically(source: Path, destination: Path) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def record_standing(
+    configured: Role,
+    candidate: Role,
+    decision: ConsentDecision,
+    *,
+    reason: str,
+    failure_scope: str,
+) -> None:
+    """Persist an approved standing scope, tolerating storage failure."""
+    if decision.scope == RUN_SCOPE:
+        return
+    try:
+        record = record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope=decision.scope,
+            expires_at=decision.expires_at,
+            reason=reason,
+            failure_scope=failure_scope,
+        )
+    except (RuntimeConfigError, OSError) as exc:
+        print(
+            f"{PROGRAM_NAME}: the standing approval could not be recorded "
+            f"({exc}); it applies to this run only.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"{PROGRAM_NAME}: standing fallback recorded · {describe(record)}",
+        file=sys.stderr,
+    )
+
+
+def adopt_standing_approval(state: DelegationState) -> dict | None:
+    """Adopt a live standing approval, or leave the state untouched.
+
+    The recorded candidate is started exactly as approved, never
+    re-ranked. An unavailable candidate keeps the record and lets the
+    configured role be attempted normally.
+    """
+    record = match(state.configured)
+    if record is None:
+        return None
+    candidate = candidate_role(state.configured, record)
+    availability = provider_status(candidate.provider)
+    if availability.state is Availability.UNAVAILABLE:
+        print(
+            f"{PROGRAM_NAME}: the standing fallback candidate is "
+            f"unavailable ({availability.reason}); the configured role "
+            "will be attempted.",
+            file=sys.stderr,
+        )
+        return None
+    if record["failure_scope"] == "model":
+        state.excluded_models.add(
+            (record["failed_provider"], record["failed_model"])
+        )
+    elif record["failure_scope"] == "provider":
+        state.excluded_providers.add(record["failed_provider"])
+    state.role = candidate
+    state.is_fallback = True
+    print(
+        f"{PROGRAM_NAME}: standing fallback active · {describe(record)}",
+        file=sys.stderr,
+    )
+    return record
+
+
 def handle_failed_attempt(
     invocation: Invocation,
     state: DelegationState,
@@ -825,6 +952,7 @@ def handle_failed_attempt(
     context_warning: bool,
     require_rerun_after_inspection: bool = False,
     approval_required_status: int | None = None,
+    diagnostics: str = "",
 ) -> int:
     """Retry one transient failure or request exact fallback consent."""
     failed = state.role
@@ -874,7 +1002,22 @@ def handle_failed_attempt(
         )
         return status
 
-    consent = request_fallback_consent(
+    disclosures: tuple[str, ...] = ()
+    if state.configured.read_only:
+        try:
+            principal = load_role("orchestrator")
+        except RuntimeConfigError:
+            principal = None
+        if principal is not None and (
+            principal.provider == proposal.candidate.provider
+            or principal.model == proposal.candidate.model
+        ):
+            disclosures = (
+                "The candidate shares the configured principal's provider "
+                "or model; this review would be session-independent, not "
+                "cross-provider.",
+            )
+    decision = request_fallback_decision(
         proposal,
         approval=invocation.approval,
         no_fallback=invocation.no_fallback,
@@ -882,12 +1025,22 @@ def handle_failed_attempt(
         original_status=status,
         context_warning=context_warning,
         require_rerun_after_inspection=require_rerun_after_inspection,
+        reset_time=parse_reset_time(diagnostics),
+        approval_scope=invocation.approval_scope,
+        extra_disclosures=disclosures,
     )
-    if consent is Consent.APPROVED:
+    if decision.consent is Consent.APPROVED:
+        record_standing(
+            state.configured,
+            proposal.candidate,
+            decision,
+            reason=reason,
+            failure_scope=scope.value,
+        )
         state.role = proposal.candidate
         state.is_fallback = True
         raise NextAttempt(invocation, state)
-    if consent is Consent.REQUIRED:
+    if decision.consent is Consent.REQUIRED:
         return (
             APPROVAL_REQUIRED
             if approval_required_status is None
@@ -915,6 +1068,23 @@ def main(
         print(usage(), file=sys.stderr, end="")
         return 2
 
+    if invocation.revoke:
+        try:
+            removed = revoke_all()
+        except OSError as exc:
+            print(
+                f"{PROGRAM_NAME}: the standing-approval store could not be "
+                f"cleared: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        if removed:
+            for record in removed:
+                print(f"revoked standing fallback · {describe(record)}")
+        else:
+            print("No standing fallback approvals.")
+        return 0
+
     try:
         if state is None:
             configured = load_role(invocation.role_id)
@@ -936,20 +1106,41 @@ def main(
                         file=sys.stderr,
                     )
                     return APPROVAL_REQUIRED
-                consent = request_fallback_consent(
+                decision = request_fallback_decision(
                     proposal,
                     approval=invocation.approval,
                     no_fallback=False,
                     program_name=PROGRAM_NAME,
+                    approval_scope=invocation.approval_scope,
                 )
-                if consent is not Consent.APPROVED:
+                if decision.consent is not Consent.APPROVED:
                     return (
                         APPROVAL_REQUIRED
-                        if consent is Consent.REQUIRED
+                        if decision.consent is Consent.REQUIRED
                         else 2
                     )
+                record_standing(
+                    configured,
+                    proposal.candidate,
+                    decision,
+                    reason=proposal.reason,
+                    failure_scope=(
+                        "model"
+                        if invocation.approval[0] == configured.provider
+                        else "provider"
+                    ),
+                )
                 state.role = proposal.candidate
                 state.is_fallback = True
+            elif invocation.no_fallback:
+                if match(configured) is not None:
+                    print(
+                        f"{PROGRAM_NAME}: standing fallback approvals are "
+                        "ignored under --no-fallback.",
+                        file=sys.stderr,
+                    )
+            else:
+                adopt_standing_approval(state)
         role_config = state.role
         if role_config.provider == "openai":
             codex_home()
@@ -1272,6 +1463,7 @@ def main(
                     ),
                     status=124,
                     scope=FailureScope.PROVIDER,
+                    diagnostics=diagnostics,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
@@ -1300,6 +1492,7 @@ def main(
                 ),
                 status=return_code,
                 scope=classify_failure(diagnostics),
+                diagnostics=diagnostics,
                 context_warning=not role_config.read_only,
                 require_rerun_after_inspection=(
                     workspace_requires_inspection()
@@ -1337,6 +1530,7 @@ def main(
                     ),
                     status=1,
                     scope=classify_failure(diagnostics),
+                    diagnostics=diagnostics,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
@@ -1368,6 +1562,7 @@ def main(
                 ),
                 status=1,
                 scope=classify_failure(diagnostics),
+                diagnostics=diagnostics,
                 context_warning=not role_config.read_only,
                 require_rerun_after_inspection=(
                     workspace_requires_inspection()

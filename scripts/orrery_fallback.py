@@ -20,6 +20,7 @@ import subprocess
 import sys
 from hashlib import sha256
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import IO, Any, Callable, Iterable
@@ -39,6 +40,12 @@ from orrery_runtime import (  # noqa: E402
     RuntimeConfigError,
     load_catalogue,
     load_manifest,
+)
+from orrery_standing import (  # noqa: E402
+    RUN_SCOPE,
+    SESSION_SCOPE,
+    UNTIL_SCOPE,
+    available_scopes,
 )
 
 
@@ -621,6 +628,78 @@ TRANSIENT_FAILURE_PATTERNS = (
 )
 
 
+# A reset time is only trusted when it follows wording that announces one,
+# so an arbitrary date elsewhere in the diagnostics can never become an
+# approval lifetime.
+_RESET_CONTEXT = r"(?:try again|resets?|renews?|available(?: again)?)"
+_RESET_ISO_PATTERN = re.compile(
+    _RESET_CONTEXT
+    + r"[^\n]{0,40}?"
+    + r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?"
+    + r"(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+_RESET_PROSE_PATTERN = re.compile(
+    _RESET_CONTEXT
+    + r"[^\n]{0,40}?"
+    + r"([A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4},?\s*"
+    + r"(?:at\s+)?\d{1,2}:\d{2}\s*(?:[APap]\.?[Mm]\.?)?)",
+    re.IGNORECASE,
+)
+_RESET_PROSE_FORMATS = (
+    "%b %d %Y %I:%M %p",
+    "%B %d %Y %I:%M %p",
+    "%b %d %Y %H:%M",
+    "%B %d %Y %H:%M",
+)
+
+
+def parse_reset_time(diagnostics: str) -> datetime | None:
+    """The provider-stated reset moment in the diagnostics, if any.
+
+    Returns an aware datetime, treating naive provider wording as local
+    time. A moment that is not in the future returns None: it could not
+    bound a standing approval.
+    """
+    if not diagnostics:
+        return None
+
+    parsed: datetime | None = None
+    iso_match = _RESET_ISO_PATTERN.search(diagnostics)
+    if iso_match is not None:
+        raw = iso_match.group(1).replace("Z", "+00:00")
+        if "T" not in raw:
+            raw = raw.replace(" ", "T", 1)
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            parsed = None
+
+    if parsed is None:
+        prose_match = _RESET_PROSE_PATTERN.search(diagnostics)
+        if prose_match is None:
+            return None
+        text = prose_match.group(1)
+        text = re.sub(r"(\d{1,2})(?:st|nd|rd|th)", r"\1", text)
+        text = text.replace(",", " ").replace(".", "")
+        text = re.sub(r"\bat\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
+        for format_string in _RESET_PROSE_FORMATS:
+            try:
+                parsed = datetime.strptime(text, format_string)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    if parsed.timestamp() <= datetime.now().astimezone().timestamp():
+        return None
+    return parsed
+
+
 def classify_failure(
     diagnostics: str,
     *,
@@ -660,6 +739,30 @@ def _open_tty() -> IO[str] | None:
         return None
 
 
+@dataclass(frozen=True)
+class ConsentDecision:
+    """A consent outcome together with the approved lifetime, if any."""
+
+    consent: Consent
+    scope: str = RUN_SCOPE
+    expires_at: float | None = None
+
+
+def _scope_phrase(scope: str, expires_at: float | None) -> str:
+    if scope == SESSION_SCOPE:
+        return "for every project in this login session"
+    if scope == UNTIL_SCOPE and expires_at is not None:
+        moment = datetime.fromtimestamp(expires_at).astimezone()
+        return f"for every project until {moment:%Y-%m-%d %H:%M %Z}"
+    return "for this run only"
+
+
+def _candidate_label(candidate: Role) -> str:
+    return f"{candidate.provider}:{candidate.model}" + (
+        f" (thinking {candidate.thinking})" if candidate.thinking else ""
+    )
+
+
 def request_fallback_consent(
     proposal: FallbackProposal,
     *,
@@ -672,6 +775,35 @@ def request_fallback_consent(
     stream: IO[str] | None = None,
     tty_opener: Callable[[], IO[str] | None] = _open_tty,
 ) -> Consent:
+    """Compatibility entry point preserving the Consent-only contract."""
+    return request_fallback_decision(
+        proposal,
+        approval=approval,
+        no_fallback=no_fallback,
+        program_name=program_name,
+        original_status=original_status,
+        context_warning=context_warning,
+        require_rerun_after_inspection=require_rerun_after_inspection,
+        stream=stream,
+        tty_opener=tty_opener,
+    ).consent
+
+
+def request_fallback_decision(
+    proposal: FallbackProposal,
+    *,
+    approval: tuple[str, str] | None,
+    no_fallback: bool,
+    program_name: str,
+    original_status: int | None = None,
+    context_warning: bool = False,
+    require_rerun_after_inspection: bool = False,
+    stream: IO[str] | None = None,
+    tty_opener: Callable[[], IO[str] | None] = _open_tty,
+    reset_time: datetime | None = None,
+    approval_scope: tuple[str, float | None] | None = None,
+    extra_disclosures: Iterable[str] = (),
+) -> ConsentDecision:
     """Notify, bind consent to the exact candidate, and never infer approval."""
     original = proposal.original
     candidate = proposal.candidate
@@ -710,6 +842,8 @@ def request_fallback_consent(
             f"The failed attempt's exit status was {original_status}.",
             stream=stream,
         )
+    for disclosure in extra_disclosures:
+        _safe_print(disclosure, stream=stream)
 
     if no_fallback:
         _safe_print(
@@ -717,7 +851,7 @@ def request_fallback_consent(
             "made.",
             stream=stream,
         )
-        return Consent.DECLINED
+        return ConsentDecision(Consent.DECLINED)
 
     if require_rerun_after_inspection:
         _safe_print("ORRERY FALLBACK APPROVAL REQUIRED", stream=stream)
@@ -732,16 +866,23 @@ def request_fallback_consent(
             f"{program_name} did not start another write-capable process.",
             stream=stream,
         )
-        return Consent.REQUIRED
+        return ConsentDecision(Consent.REQUIRED)
 
+    scopes = available_scopes(reset_time)
     expected = (candidate.provider, candidate.model)
     if approval is not None:
         if approval == expected:
+            scope, expires_at = (
+                approval_scope
+                if approval_scope is not None
+                else (RUN_SCOPE, None)
+            )
             _safe_print(
-                f"Fallback approved for {proposal.approval_key}.",
+                f"Fallback approved for {proposal.approval_key} "
+                f"{_scope_phrase(scope, expires_at)}.",
                 stream=stream,
             )
-            return Consent.APPROVED
+            return ConsentDecision(Consent.APPROVED, scope, expires_at)
         _safe_print(
             "The supplied approval names a different candidate and was not "
             "accepted.",
@@ -750,24 +891,63 @@ def request_fallback_consent(
 
     tty = tty_opener()
     if tty is not None and tty.isatty():
+        label = _candidate_label(candidate)
+        expires_at = (
+            reset_time.timestamp() if reset_time is not None else None
+        )
+        numbered: list[tuple[str, float | None]] = [
+            (scope, expires_at if scope == UNTIL_SCOPE else None)
+            for scope in scopes
+        ]
         try:
-            tty.write(
-                f"Continue with {proposal.approval_key}? [y/N] "
-            )
+            tty.write("Choose how to continue:\n")
+            for index, (scope, scope_expiry) in enumerate(numbered, start=1):
+                tty.write(
+                    f"  {index}) Fall back to {label} "
+                    f"{_scope_phrase(scope, scope_expiry)}\n"
+                )
+            stop_number = len(numbered) + 1
+            tty.write(f"  {stop_number}) Stop here\n")
+            tty.write(f"Choice [1-{stop_number}, Enter stops]: ")
             tty.flush()
             answer = tty.readline().strip().lower()
         finally:
             tty.close()
+
+        chosen: tuple[str, float | None] | None = None
         if answer in {"y", "yes"}:
+            chosen = (RUN_SCOPE, None)
+        elif answer.isdigit() and 1 <= int(answer) <= len(numbered):
+            chosen = numbered[int(answer) - 1]
+        if chosen is not None:
             _safe_print(
-                f"Fallback approved for {proposal.approval_key}.",
+                f"Fallback approved for {proposal.approval_key} "
+                f"{_scope_phrase(chosen[0], chosen[1])}.",
                 stream=stream,
             )
-            return Consent.APPROVED
-        _safe_print("Fallback declined; no substitution was made.", stream=stream)
-        return Consent.DECLINED
+            return ConsentDecision(Consent.APPROVED, chosen[0], chosen[1])
+        _safe_print(
+            "Fallback declined; no substitution was made.", stream=stream
+        )
+        return ConsentDecision(Consent.DECLINED)
 
     _safe_print("ORRERY FALLBACK APPROVAL REQUIRED", stream=stream)
+    scope_entries = [
+        f"{UNTIL_SCOPE}:{reset_time.isoformat()}"
+        if scope == UNTIL_SCOPE and reset_time is not None
+        else scope
+        for scope in scopes
+    ]
+    _safe_print(
+        f"Candidate: {_candidate_label(candidate)}",
+        stream=stream,
+    )
+    _safe_print(f"Scopes: {', '.join(scope_entries)}", stream=stream)
+    _safe_print(
+        f"Rerun with: --approve-fallback {proposal.approval_key} "
+        f"--approval-scope {'|'.join(scope_entries)}",
+        stream=stream,
+    )
     _safe_print(
         "Ask the user for explicit approval, then rerun the same command with "
         f"`--approve-fallback {proposal.approval_key}` before `--`.",
@@ -777,4 +957,4 @@ def request_fallback_consent(
         f"{program_name} did not start the proposed fallback.",
         stream=stream,
     )
-    return Consent.REQUIRED
+    return ConsentDecision(Consent.REQUIRED)

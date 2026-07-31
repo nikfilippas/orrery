@@ -38,6 +38,11 @@ skip() {
     printf 'SKIP  %s\n' "$1"
 }
 
+warn() {
+    # Visible but never counted as a failure.
+    printf 'WARN  %s\n' "$1"
+}
+
 check_command() {
     if command -v "$1" >/dev/null 2>&1; then
         pass "Command available: $1"
@@ -547,6 +552,31 @@ if [ "$KERNEL" = "Linux" ]; then
     check_command systemctl
 else
     skip "systemd control-group containment is not applicable on $KERNEL"
+fi
+
+printf '\n=== Standing fallback approvals ===\n'
+if STANDING_LIST="$(
+    python3 - "$KIT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_standing import describe, list_active
+
+for record in list_active():
+    print(describe(record))
+PY
+)"; then
+    if [ -n "$STANDING_LIST" ]; then
+        while IFS= read -r line; do
+            warn "Standing fallback active: $line"
+        done <<< "$STANDING_LIST"
+        printf 'Revoke with: orrery --revoke-fallbacks\n'
+    else
+        pass "No standing fallback approvals"
+    fi
+else
+    fail "The standing-approval store could not be read"
 fi
 
 printf '\n=== Kit repository ===\n'

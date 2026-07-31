@@ -35,6 +35,11 @@ from orrery_model_catalogue import (  # noqa: E402
     DiscoveryResult,
     discover_catalogue,
 )
+from orrery_standing import (  # noqa: E402
+    describe as describe_standing,
+    list_active as list_standing,
+    revoke_all as revoke_standing,
+)
 
 # A request carries only a few short model names.
 MAX_BODY_BYTES = 64 * 1024
@@ -815,6 +820,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     Known models expose only the thinking levels reported for that model;
     a custom identifier also requires an explicit provider.
   </div>
+  __STANDING__
   <div class="actions">
     <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
     <button id="apply" class="btn btn-primary" type="button" disabled>Apply</button>
@@ -1358,6 +1364,20 @@ applyButton.addEventListener("click", async () => {
 
 document.getElementById("revert").addEventListener("click", () => location.reload());
 
+const revokeStanding = document.getElementById("revoke-standing");
+if (revokeStanding) {
+  revokeStanding.addEventListener("click", async () => {
+    revokeStanding.disabled = true;
+    const reply = await post("revoke", {});
+    if (reply.error) {
+      result.innerHTML = `<p class="err">${esc(reply.error)}</p>`;
+      revokeStanding.disabled = false;
+      return;
+    }
+    location.reload();
+  });
+}
+
 render();
 </script>
 </body>
@@ -1411,6 +1431,35 @@ def render_page(token: str) -> str:
         .replace("__CHART__", script_json(manifest.get("chart", {})))
         .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
         .replace("__CATALOGUE_NOTE__", html.escape(catalogue_note))
+        .replace("__STANDING__", standing_html())
+    )
+
+
+def standing_html() -> str:
+    """The active standing approvals, or nothing at all.
+
+    Rendered server-side so the control exists only when there is
+    something real to revoke; the page never implies configurability
+    that is not there.
+    """
+    try:
+        records = list_standing()
+    except OSError:
+        records = []
+    if not records:
+        return ""
+    items = "".join(
+        f"<li>{html.escape(describe_standing(record))}</li>"
+        for record in records
+    )
+    return (
+        '<div class="scopenote">'
+        "<strong>Standing fallback approvals</strong> — prior recorded "
+        "consent; every use is disclosed and the approval expires by "
+        f"itself:<ul>{items}</ul>"
+        '<button id="revoke-standing" class="btn btn-ghost" type="button">'
+        "Revoke standing fallbacks</button>"
+        "</div>"
     )
 
 
@@ -1430,6 +1479,11 @@ def print_state() -> int:
             f"{setting['value']} "
             f"[{setting['minimum']}–{setting['maximum']}; "
             "global/orchestration.json]"
+        )
+    for record in list_standing():
+        print(
+            f"{'Standing fallback':24} {'consent':10} "
+            f"{describe_standing(record)}"
         )
     return 0
 
@@ -1518,6 +1572,16 @@ class Handler(BaseHTTPRequestHandler):
             elif self.endpoint() == "apply":
                 with Handler.lock:
                     self.reply(apply_edits(plan(changes), Handler.previewed))
+            elif self.endpoint() == "revoke":
+                with Handler.lock:
+                    removed = revoke_standing()
+                self.reply(
+                    {
+                        "revoked": [
+                            describe_standing(record) for record in removed
+                        ]
+                    }
+                )
             else:
                 self.send_error(404)
         except (ConfigError, json.JSONDecodeError, OSError) as exc:
