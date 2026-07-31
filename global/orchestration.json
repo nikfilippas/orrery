@@ -53,26 +53,26 @@
     }
   ],
   "chart": {
-    "width": 2760,
-    "height": 1020,
+    "width": 1520,
+    "height": 760,
     "nodes": [
       {
         "id": "request",
-        "label": "ordinary development request",
-        "x": 130,
-        "y": 480,
-        "w": 170,
-        "h": 58,
+        "label": "ordinary development\nrequest",
+        "x": 85,
+        "y": 310,
+        "w": 130,
+        "h": 52,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "classify",
         "label": "classify once",
-        "x": 350,
-        "y": 480,
-        "w": 140,
-        "h": 52,
+        "x": 250,
+        "y": 310,
+        "w": 130,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -81,10 +81,10 @@
       {
         "id": "investigation",
         "label": "read-only investigation",
-        "x": 610,
-        "y": 120,
+        "x": 450,
+        "y": 60,
         "w": 190,
-        "h": 52,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -93,10 +93,10 @@
       {
         "id": "trivial",
         "label": "principal implements directly",
-        "x": 610,
-        "y": 300,
+        "x": 450,
+        "y": 185,
         "w": 200,
-        "h": 52,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -105,10 +105,10 @@
       {
         "id": "mechanical",
         "label": "mechanical worker edits",
-        "x": 610,
-        "y": 480,
+        "x": 450,
+        "y": 310,
         "w": 190,
-        "h": 52,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "mechanic"
@@ -117,10 +117,10 @@
       {
         "id": "standard",
         "label": "implementation worker edits",
-        "x": 610,
-        "y": 660,
-        "w": 210,
-        "h": 52,
+        "x": 450,
+        "y": 435,
+        "w": 200,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "implementer"
@@ -129,10 +129,10 @@
       {
         "id": "plan",
         "label": "principal writes the plan\nand acceptance criteria",
-        "x": 610,
-        "y": 840,
-        "w": 230,
-        "h": 64,
+        "x": 420,
+        "y": 610,
+        "w": 190,
+        "h": 56,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -141,20 +141,30 @@
       {
         "id": "investigation-result",
         "label": "report facts, inferences,\nand uncertainty",
-        "x": 940,
-        "y": 120,
-        "w": 230,
-        "h": 58,
+        "x": 690,
+        "y": 60,
+        "w": 190,
+        "h": 52,
+        "shape": "rect",
+        "roles": []
+      },
+      {
+        "id": "plan-rounds",
+        "label": "review rounds",
+        "x": 615,
+        "y": 610,
+        "w": 96,
+        "h": 40,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "plan-review-step",
         "label": "fresh plan-review session\nblocking versus advisory",
-        "x": 1010,
-        "y": 840,
-        "w": 230,
-        "h": 64,
+        "x": 810,
+        "y": 610,
+        "w": 200,
+        "h": 60,
         "shape": "rect",
         "roles": [
           "plan-reviewer"
@@ -163,10 +173,10 @@
       {
         "id": "complex-implementation",
         "label": "implementation worker edits",
-        "x": 1460,
-        "y": 690,
-        "w": 210,
-        "h": 52,
+        "x": 960,
+        "y": 400,
+        "w": 180,
+        "h": 48,
         "shape": "rect",
         "roles": [
           "implementer"
@@ -175,20 +185,20 @@
       {
         "id": "plan-escalation",
         "label": "stop before implementation\nand ask the user",
-        "x": 1460,
-        "y": 850,
-        "w": 210,
-        "h": 58,
+        "x": 1010,
+        "y": 700,
+        "w": 190,
+        "h": 48,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "inspect",
         "label": "principal inspects the real diff,\nnever the summary",
-        "x": 1620,
-        "y": 530,
-        "w": 240,
-        "h": 64,
+        "x": 1160,
+        "y": 510,
+        "w": 210,
+        "h": 56,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -197,30 +207,30 @@
       {
         "id": "verify",
         "label": "proportionate verification:\ntests, lint, types, build",
-        "x": 1870,
-        "y": 480,
-        "w": 230,
-        "h": 64,
+        "x": 1180,
+        "y": 310,
+        "w": 180,
+        "h": 56,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "review-gate",
         "label": "independent final\nreview warranted?",
-        "x": 2110,
-        "y": 480,
-        "w": 200,
-        "h": 130,
+        "x": 1170,
+        "y": 150,
+        "w": 176,
+        "h": 108,
         "shape": "diamond",
         "roles": []
       },
       {
         "id": "review",
         "label": "fresh final-review session\nread-only, ephemeral",
-        "x": 2345,
-        "y": 400,
-        "w": 210,
-        "h": 64,
+        "x": 1410,
+        "y": 150,
+        "w": 200,
+        "h": 74,
         "shape": "rect",
         "roles": [
           "reviewer"
@@ -229,30 +239,30 @@
       {
         "id": "findings",
         "label": "material finding\nsurvives verification?",
-        "x": 2580,
-        "y": 480,
-        "w": 200,
-        "h": 130,
+        "x": 1410,
+        "y": 330,
+        "w": 176,
+        "h": 108,
         "shape": "diamond",
         "roles": []
       },
       {
         "id": "done",
         "label": "done: external actions\nstill require approval",
-        "x": 2580,
-        "y": 190,
-        "w": 210,
-        "h": 58,
+        "x": 1000,
+        "y": 45,
+        "w": 190,
+        "h": 44,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "correct",
         "label": "principal corrects and adds\nregression coverage",
-        "x": 1740,
-        "y": 700,
-        "w": 230,
-        "h": 64,
+        "x": 1410,
+        "y": 510,
+        "w": 190,
+        "h": 56,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -268,12 +278,14 @@
         "from": "classify",
         "to": "investigation",
         "label": "investigation",
-        "offset": -60
+        "enter": "left"
       },
       {
         "from": "classify",
         "to": "trivial",
-        "label": "trivial"
+        "label": "trivial",
+        "enter": "bottom",
+        "offset": -40
       },
       {
         "from": "classify",
@@ -283,13 +295,15 @@
       {
         "from": "classify",
         "to": "standard",
-        "label": "standard"
+        "label": "standard",
+        "enter": "top",
+        "offset": 40
       },
       {
         "from": "classify",
         "to": "plan",
         "label": "complex",
-        "offset": -60
+        "offset": -55
       },
       {
         "from": "investigation",
@@ -299,13 +313,15 @@
         "from": "plan",
         "to": "plan-review-step",
         "label": "fresh challenge",
-        "offset": -85
+        "offset": -100,
+        "enter": "top"
       },
       {
         "from": "plan-review-step",
         "to": "plan",
         "label": "supported blocking\nobjections \u00b7 within cap",
-        "offset": 85
+        "offset": 100,
+        "enter": "bottom"
       },
       {
         "from": "plan-review-step",
@@ -315,11 +331,13 @@
       {
         "from": "plan-review-step",
         "to": "plan-escalation",
-        "label": "repeated objection\nor round cap"
+        "label": "repeated objection\nor round cap",
+        "offset": 40
       },
       {
         "from": "mechanical",
-        "to": "inspect"
+        "to": "inspect",
+        "offset": 40
       },
       {
         "from": "standard",
@@ -344,8 +362,7 @@
       {
         "from": "review-gate",
         "to": "done",
-        "label": "no",
-        "offset": -160
+        "label": "no"
       },
       {
         "from": "review-gate",
@@ -364,7 +381,17 @@
       {
         "from": "findings",
         "to": "done",
-        "label": "none"
+        "label": "none",
+        "via": [
+          [
+            1288,
+            240
+          ],
+          [
+            1058,
+            240
+          ]
+        ]
       },
       {
         "from": "correct",
@@ -378,7 +405,7 @@
       "value": 2,
       "minimum": 1,
       "maximum": 4,
-      "node": "plan-review-step",
+      "node": "plan-rounds",
       "label": "review rounds",
       "description": "How many plan-review rounds complex work may use. Round one challenges the plan; later rounds only confirm that blocking objections were addressed. A repeated blocking objection, or one still open at the cap, escalates to the user rather than looping."
     }

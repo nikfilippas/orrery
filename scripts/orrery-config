@@ -705,12 +705,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 1660px; margin: 0 auto; padding: 28px 20px 60px; }
+  .wrap { max-width: 1880px; margin: 0 auto; padding: 24px 20px 48px; }
+  .layout { display: flex; gap: 16px; align-items: flex-start; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
   .chartwrap {
-    overflow-x: auto; overflow-y: visible; padding: 4px 0 48px;
-    width: 100vw; margin-left: calc(50% - 50vw);
+    flex: 1 1 auto; min-width: 0;
+    overflow-x: auto; overflow-y: visible; padding: 4px 0 16px;
   }
   .canvas { position: relative; margin: 0 auto; }
   .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
@@ -760,22 +761,33 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   .info:hover + .tip, .info:focus-visible + .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
-  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 20px; }
+  .legend {
+    display: flex; flex-direction: column; gap: 10px;
+    flex: none; width: 302px;
+  }
   .legend-row {
-    display: flex; align-items: center; gap: 10px; background: var(--panel);
-    border: 1px solid var(--edge); border-radius: 10px; padding: 8px 12px;
+    display: flex; flex-direction: column; gap: 6px; background: var(--panel);
+    border: 1px solid var(--edge); border-radius: 10px; padding: 9px 12px;
   }
+  .legend-head { display: flex; align-items: center; gap: 8px; }
   .roledot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
-  .legend-name {
-    font-size: 12.5px; font-weight: 600; min-width: 128px;
-    display: flex; flex-direction: column; gap: 2px;
-  }
+  .legend-name { font-size: 12.5px; font-weight: 600; }
   .accesschip {
-    font-size: 9.5px; font-weight: 500; letter-spacing: .05em;
+    margin-left: auto; font-size: 9.5px; font-weight: 500;
+    letter-spacing: .05em; text-transform: uppercase; color: var(--soft);
+  }
+  .legend-group {
+    display: flex; flex-direction: column; gap: 8px;
+    border: 1px solid var(--edge); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 9px 10px; background: var(--panel);
+  }
+  .legend-caption {
+    font-size: 9.5px; font-weight: 600; letter-spacing: .06em;
     text-transform: uppercase; color: var(--soft);
   }
+  .legend-group .legend-row { border: 0; padding: 0; background: transparent; }
   .legend .control-row {
-    grid-template-columns: minmax(170px, auto) minmax(96px, auto);
+    grid-template-columns: minmax(150px, 1fr) minmax(84px, auto);
   }
   .role-controls { display: flex; flex-direction: column; gap: 3px; }
   .control-row {
@@ -828,8 +840,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <p class="sub">The pipeline as it runs. Choose each role's model in the
      legend; the boxes show the live assignment, and nothing is saved until
      you apply.</p>
-  <div class="legend" id="legend"></div>
-  <div class="chartwrap" id="chart"></div>
+  <div class="layout">
+    <div class="legend" id="legend"></div>
+    <div class="chartwrap" id="chart"></div>
+  </div>
   <div class="scopenote">
     Saving sets the defaults for <strong>new Orrery sessions</strong>;
     running sessions keep theirs, and a repository's private
@@ -965,23 +979,35 @@ function tip(node) {
   return roleText + settingText;
 }
 
+function legendRow(step) {
+  const [fill] = FILL[step.id] || FILL.none;
+  return `<div class="legend-row"><div class="legend-head">` +
+    `<span class="roledot" style="background:${fill}"></span>` +
+    `<span class="legend-name">${esc(step.title)}</span>` +
+    `<span class="accesschip">${esc(step.access)}</span></div>` +
+    picker(step) +
+    `</div>`;
+}
+
 function renderLegend() {
-  const legend = document.getElementById("legend");
-  legend.innerHTML = STATE.map(step => {
-    const [fill] = FILL[step.id] || FILL.none;
-    return `<div class="legend-row">` +
-      `<span class="roledot" style="background:${fill}"></span>` +
-      `<div class="legend-name">${esc(step.title)}` +
-      `<span class="accesschip">${esc(step.access)}</span></div>` +
-      picker(step) +
-      `</div>`;
-  }).join("") +
-    `<div class="legend-row">` +
+  const byId = Object.fromEntries(STATE.map(step => [step.id, step]));
+  // The principal and the plan reviewer form one organic loop, so their
+  // entries sit together with the loop's round bound.
+  const loop = `<div class="legend-group">` +
+    `<div class="legend-caption">bounded plan loop</div>` +
+    legendRow(byId["orchestrator"]) +
+    legendRow(byId["plan-reviewer"]) +
+    `<div class="legend-row"><div class="legend-head">` +
     `<span class="roledot" style="background:${FILL.none[0]}"></span>` +
-    `<div class="legend-name">Workflow` +
+    `<span class="legend-name">Workflow</span>` +
     `<span class="accesschip">bounded loops</span></div>` +
     SETTINGS.map(settingPicker).join("") +
-    `</div>`;
+    `</div></div>`;
+  const rest = STATE
+    .filter(step => !["orchestrator", "plan-reviewer"].includes(step.id))
+    .map(legendRow)
+    .join("");
+  document.getElementById("legend").innerHTML = loop + rest;
 }
 
 function nodeModelText(roleId) {
@@ -1162,11 +1188,30 @@ function drawWires(svg, marks, canvas) {
     const a = rect(link.from);
     const b = rect(link.to);
     if (!a || !b) continue;
-    const start = edge(a, b);
-    // The marker extends backwards from the path endpoint. Stop the path
-    // outside the target by more than one complete marker, so neither its
-    // tip nor its shoulders can disappear beneath an opaque node.
-    const end = moveAway(edge(b, a), b, ARROW_CLEARANCE);
+    const vias = Array.isArray(link.via)
+      ? (Array.isArray(link.via[0]) ? link.via : [link.via])
+          .map(([x, y]) => ({ x, y }))
+      : [];
+    const start = edge(a, vias.length ? vias[0] : b);
+    // A declared entry face pins the arrival to that face's midpoint and
+    // makes the approach perpendicular; otherwise the arrival aims at the
+    // node from wherever the curve comes.
+    const face = link.enter && {
+      top: { x: b.x, y: b.y - b.h / 2, nx: 0, ny: -1 },
+      bottom: { x: b.x, y: b.y + b.h / 2, nx: 0, ny: 1 },
+      left: { x: b.x - b.w / 2, y: b.y, nx: -1, ny: 0 },
+      right: { x: b.x + b.w / 2, y: b.y, nx: 1, ny: 0 },
+    }[link.enter];
+    const end = face
+      ? {
+          x: face.x + face.nx * ARROW_CLEARANCE,
+          y: face.y + face.ny * ARROW_CLEARANCE,
+        }
+      : moveAway(
+          edge(b, vias.length ? vias[vias.length - 1] : a),
+          b,
+          ARROW_CLEARANCE,
+        );
     const dxTotal = end.x - start.x;
     const dyTotal = end.y - start.y;
     const horizontal = Math.abs(dxTotal) >= Math.abs(dyTotal);
@@ -1184,22 +1229,56 @@ function drawWires(svg, marks, canvas) {
       x: start.x + alongX * lift + (horizontal ? 0 : offset),
       y: start.y + alongY * lift + (horizontal ? offset : 0),
     };
-    const c2 = {
-      x: end.x - alongX * lift + (horizontal ? 0 : offset),
-      y: end.y - alongY * lift + (horizontal ? offset : 0),
-    };
+    // The end control point carries only a quarter of the bow, so the
+    // arrowhead's final direction points at the node it lands on.
+    const c2 = face
+      ? { x: end.x + face.nx * lift, y: end.y + face.ny * lift }
+      : {
+          x: end.x - alongX * lift + (horizontal ? 0 : offset * 0.25),
+          y: end.y - alongY * lift + (horizontal ? offset * 0.25 : 0),
+        };
+    let d = `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ` +
+      `${c2.x} ${c2.y}, ${end.x} ${end.y}`;
+    if (vias.length) {
+      // A routed elbow: chained curves through the waypoints, for the
+      // rare path that no single bow can keep clear of every node.
+      const bend = (from, to) => {
+        const wide = Math.abs(to.x - from.x) >= Math.abs(to.y - from.y);
+        const reach = Math.max(
+          22,
+          (wide ? Math.abs(to.x - from.x) : Math.abs(to.y - from.y)) * 0.4,
+        );
+        return {
+          x: from.x + (wide ? Math.sign(to.x - from.x) * reach : 0),
+          y: from.y + (wide ? 0 : Math.sign(to.y - from.y) * reach),
+        };
+      };
+      const points = [start, ...vias, end];
+      d = `M ${start.x} ${start.y}`;
+      for (let index = 1; index < points.length; index += 1) {
+        const from = points[index - 1];
+        const to = points[index];
+        const p1 = bend(from, to);
+        const p2 = bend(to, from);
+        d += ` C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${to.x} ${to.y}`;
+      }
+    }
     svg.appendChild(element("path", {
       class: "edge", "marker-end": "url(#arrow)",
       "data-from": link.from, "data-to": link.to,
-      d: `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${end.x} ${end.y}`,
+      d,
     }));
     if (link.label) {
       const t = 0.45;
       const at = (p0, p1, p2, p3) =>
         (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 +
         3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3;
-      const labelX = at(start.x, c1.x, c2.x, end.x);
-      const labelY = at(start.y, c1.y, c2.y, end.y);
+      const labelX = vias.length
+        ? vias[0].x
+        : at(start.x, c1.x, c2.x, end.x);
+      const labelY = vias.length
+        ? vias[0].y
+        : at(start.y, c1.y, c2.y, end.y);
       const text = element("text", { x: labelX, y: labelY });
       const lines = String(link.label).split("\\n");
       lines.forEach((line, index) => {

@@ -5711,9 +5711,11 @@ def test_manifest_chart() -> None:
         )
     reached = {edge["to"] for edge in chart["edges"]}
     entry = chart["nodes"][0]["id"]
+    # plan-rounds is the loop's information node, deliberately unwired.
     require(
-        set(nodes) - reached == {entry},
-        f"unreachable chart nodes: {set(nodes) - reached - {entry}}",
+        set(nodes) - reached == {entry, "plan-rounds"},
+        f"unreachable chart nodes: "
+        f"{set(nodes) - reached - {entry, 'plan-rounds'}}",
     )
 
     edge_pairs = {(edge["from"], edge["to"]) for edge in chart["edges"]}
@@ -5860,11 +5862,36 @@ def test_manifest_chart() -> None:
                 return moved
             travel *= 1.5
 
+    faces = {
+        "top": (0, -1),
+        "bottom": (0, 1),
+        "left": (-1, 0),
+        "right": (1, 0),
+    }
     for edge in chart["edges"]:
         source = nodes[edge["from"]]
         target = nodes[edge["to"]]
-        start = boundary(source, target)
-        end = move_away(boundary(target, source), target, 19)
+        raw_via = edge.get("via")
+        vias = []
+        if isinstance(raw_via, list):
+            vias = raw_via if isinstance(raw_via[0], list) else [raw_via]
+            vias = [tuple(point) for point in vias]
+        aim_start = (
+            {"x": vias[0][0], "y": vias[0][1]} if vias else target
+        )
+        aim_end = (
+            {"x": vias[-1][0], "y": vias[-1][1]} if vias else source
+        )
+        start = boundary(source, aim_start)
+        entry_face = faces.get(edge.get("enter", ""))
+        if entry_face is not None:
+            nx, ny = entry_face
+            end = (
+                target["x"] + nx * (target["w"] / 2 + 19),
+                target["y"] + ny * (target["h"] / 2 + 19),
+            )
+        else:
+            end = move_away(boundary(target, aim_end), target, 19)
         dx_total = end[0] - start[0]
         dy_total = end[1] - start[1]
         is_horizontal = abs(dx_total) >= abs(dy_total)
@@ -5879,17 +5906,55 @@ def test_manifest_chart() -> None:
             start[0] + along_x * lift + (0 if is_horizontal else offset),
             start[1] + along_y * lift + (offset if is_horizontal else 0),
         )
-        c2 = (
-            end[0] - along_x * lift + (0 if is_horizontal else offset),
-            end[1] - along_y * lift + (offset if is_horizontal else 0),
-        )
-        for index in range(1, 500):
+        if entry_face is not None:
+            nx, ny = entry_face
+            c2 = (end[0] + nx * lift, end[1] + ny * lift)
+        else:
+            c2 = (
+                end[0] - along_x * lift
+                + (0 if is_horizontal else offset * 0.25),
+                end[1] - along_y * lift
+                + (offset * 0.25 if is_horizontal else 0),
+            )
+        segments = [(start, c1, c2, end)]
+        if vias:
+            def bend(seg_from, seg_to):
+                wide = (
+                    abs(seg_to[0] - seg_from[0])
+                    >= abs(seg_to[1] - seg_from[1])
+                )
+                reach = max(
+                    22,
+                    (
+                        abs(seg_to[0] - seg_from[0])
+                        if wide
+                        else abs(seg_to[1] - seg_from[1])
+                    ) * 0.4,
+                )
+                if wide:
+                    step = reach if seg_to[0] >= seg_from[0] else -reach
+                    return (seg_from[0] + step, seg_from[1])
+                step = reach if seg_to[1] >= seg_from[1] else -reach
+                return (seg_from[0], seg_from[1] + step)
+
+            points = [start, *vias, end]
+            segments = [
+                (
+                    points[i - 1],
+                    bend(points[i - 1], points[i]),
+                    bend(points[i], points[i - 1]),
+                    points[i],
+                )
+                for i in range(1, len(points))
+            ]
+        for seg_start, seg_c1, seg_c2, seg_end in segments:
+          for index in range(1, 500):
             t = index / 500
             point = tuple(
-                (1 - t) ** 3 * start[axis]
-                + 3 * (1 - t) ** 2 * t * c1[axis]
-                + 3 * (1 - t) * t ** 2 * c2[axis]
-                + t ** 3 * end[axis]
+                (1 - t) ** 3 * seg_start[axis]
+                + 3 * (1 - t) ** 2 * t * seg_c1[axis]
+                + 3 * (1 - t) * t ** 2 * seg_c2[axis]
+                + t ** 3 * seg_end[axis]
                 for axis in (0, 1)
             )
             for node_id, node in nodes.items():
@@ -5959,8 +6024,8 @@ def test_manifest_chart() -> None:
     )
     plan_rounds = manifest["settings"]["plan_review_rounds"]
     require(
-        plan_rounds["node"] == "plan-review-step",
-        "the round control is not attached to the plan-review node",
+        plan_rounds["node"] == "plan-rounds",
+        "the round bound does not sit inside the plan-review loop",
     )
 
     # The chart is the README's flowchart, so its shape must not drift
@@ -6014,7 +6079,7 @@ def test_plan_review_setting_validation() -> None:
     require(
         state["value"] == 2
         and state["choices"] == [1, 2, 3, 4]
-        and state["node"] == "plan-review-step",
+        and state["node"] == "plan-rounds",
         f"the plan-review setting state is wrong: {state}",
     )
     printed = io.StringIO()
