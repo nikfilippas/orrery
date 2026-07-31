@@ -88,6 +88,7 @@ settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
 review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
 runtime_module = sys.modules["orrery_runtime"]
 fallback_module = sys.modules["orrery_fallback"]
+import orrery_standing as standing_module  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -7482,6 +7483,972 @@ def test_no_system_browser() -> None:
             if needle in text:
                 offenders.append(f"{path.relative_to(KIT_DIR)}: {needle}")
     require(not offenders, f"system browser references: {offenders}")
+
+
+# ---------------------------------------------------------------------------
+# Standing fallback approvals
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def standing_stores() -> Any:
+    """Isolated session and until stores for standing-approval tests."""
+    saved = {
+        name: os.environ.get(name)
+        for name in ("XDG_RUNTIME_DIR", "XDG_STATE_HOME")
+    }
+    with tempfile.TemporaryDirectory() as base:
+        runtime_dir = Path(base) / "runtime"
+        state_dir = Path(base) / "state"
+        runtime_dir.mkdir()
+        state_dir.mkdir()
+        os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
+        os.environ["XDG_STATE_HOME"] = str(state_dir)
+        try:
+            yield runtime_dir, state_dir
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def standing_candidate(configured: Any) -> Any:
+    return runtime_module.Role(
+        id=configured.id,
+        title=configured.title,
+        provider="anthropic",
+        model="fable",
+        thinking="max",
+        access=configured.access,
+    )
+
+
+@test("provider reset times parse only from announcing diagnostics")
+def test_parse_reset_time() -> None:
+    codex_prose = (
+        "ERROR: You've hit your usage limit. Upgrade to Pro, or "
+        "try again at Aug 5th, 2091 4:49 PM."
+    )
+    parsed = fallback_module.parse_reset_time(codex_prose)
+    require(
+        parsed is not None
+        and (parsed.year, parsed.month, parsed.day) == (2091, 8, 5)
+        and (parsed.hour, parsed.minute) == (16, 49)
+        and parsed.tzinfo is not None,
+        f"the Codex reset wording did not parse: {parsed!r}",
+    )
+
+    iso = fallback_module.parse_reset_time(
+        "quota exhausted; rate limit resets at 2091-08-05T16:49:00+03:00"
+    )
+    require(
+        iso is not None
+        and iso.utcoffset() is not None
+        and iso.hour == 16
+        and int(iso.utcoffset().total_seconds()) == 3 * 3600,
+        f"the ISO reset wording did not parse: {iso!r}",
+    )
+
+    require(
+        fallback_module.parse_reset_time(
+            "the build started on Aug 5th, 2091 4:49 PM and then failed"
+        )
+        is None,
+        "a date without reset wording was wrongly trusted",
+    )
+    require(
+        fallback_module.parse_reset_time(
+            "try again at Aug 5th, 2001 4:49 PM"
+        )
+        is None,
+        "a reset time in the past was wrongly trusted",
+    )
+    require(
+        fallback_module.parse_reset_time("no dates here") is None
+        and fallback_module.parse_reset_time("") is None,
+        "absent reset wording must parse to None",
+    )
+
+
+@test("standing approvals round-trip with scoped lifetimes and modes")
+def test_standing_round_trip() -> None:
+    with standing_stores() as (runtime_dir, state_dir):
+        configured = runtime_module.load_role("reviewer")
+        candidate = standing_candidate(configured)
+        saved_boot = standing_module.current_boot_id
+        try:
+            standing_module.current_boot_id = lambda: "boot-a"
+            standing_module.record_approval(
+                configured=configured,
+                candidate=candidate,
+                scope="session",
+                expires_at=None,
+                reason="usage limit reached",
+                failure_scope="provider",
+            )
+            store = runtime_dir / "orrery" / "standing.json"
+            require(store.is_file(), "the session store was not created")
+            require(
+                stat.S_IMODE(store.stat().st_mode) == 0o600
+                and stat.S_IMODE(store.parent.stat().st_mode) == 0o700,
+                "standing store modes are not 0600 file in 0700 directory",
+            )
+
+            found = standing_module.match(configured)
+            require(
+                found is not None
+                and found["candidate_model"] == "fable"
+                and found["boot_id"] == "boot-a",
+                f"a live session approval did not match: {found!r}",
+            )
+            rebuilt = standing_module.candidate_role(configured, found)
+            require(
+                (rebuilt.provider, rebuilt.model, rebuilt.thinking)
+                == ("anthropic", "fable", "max")
+                and rebuilt.access == configured.access,
+                "the recorded candidate did not rebuild exactly",
+            )
+
+            standing_module.current_boot_id = lambda: "boot-b"
+            require(
+                standing_module.match(configured) is None,
+                "a session approval survived a reboot",
+            )
+
+            standing_module.current_boot_id = lambda: None
+            capless = standing_module.record_approval(
+                configured=configured,
+                candidate=candidate,
+                scope="session",
+                expires_at=None,
+                reason="usage limit reached",
+                failure_scope="provider",
+            )
+            far_future = capless["created_at"] + 25 * 3600
+            require(
+                standing_module.list_active(now=far_future) == [],
+                "a boot-id-less session approval outlived the 24h cap",
+            )
+        finally:
+            standing_module.current_boot_id = saved_boot
+
+        standing_module.revoke_all()
+        expired = standing_module.record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope="until",
+            expires_at=time.time() - 60,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+        require(expired["scope"] == "until", "the until record did not save")
+        require(
+            standing_module.match(configured) is None,
+            "an expired until approval matched",
+        )
+        until_store = state_dir / "orrery" / "standing.json"
+        remaining = json.loads(until_store.read_text())["approvals"]
+        require(
+            remaining == [],
+            "an expired until approval was not deleted on match",
+        )
+
+        standing_module.record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+        reconfigured = runtime_module.Role(
+            id=configured.id,
+            title=configured.title,
+            provider=configured.provider,
+            model="another-model",
+            thinking=configured.thinking,
+            access=configured.access,
+        )
+        require(
+            standing_module.match(reconfigured) is None,
+            "a fingerprint mismatch wrongly matched",
+        )
+        kept = json.loads(until_store.read_text())["approvals"]
+        require(
+            len(kept) == 1,
+            "a fingerprint mismatch wrongly deleted a valid approval",
+        )
+
+
+@test("standing stores tolerate corruption and revoke across both scopes")
+def test_standing_corruption_and_revoke() -> None:
+    with standing_stores() as (runtime_dir, state_dir):
+        configured = runtime_module.load_role("reviewer")
+        candidate = standing_candidate(configured)
+        until_store = state_dir / "orrery" / "standing.json"
+        until_store.parent.mkdir(parents=True)
+        until_store.write_text("{not json")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            require(
+                standing_module.list_active() == [],
+                "a corrupt store was not tolerated",
+            )
+        standing_module.record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit",
+            failure_scope="provider",
+        )
+        standing_module.record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope="session",
+            expires_at=None,
+            reason="usage limit",
+            failure_scope="provider",
+        )
+        require(
+            len(standing_module.list_active()) == 2,
+            "both scoped approvals should be active",
+        )
+        removed = standing_module.revoke_all()
+        require(
+            len(removed) == 2
+            and standing_module.list_active() == []
+            and standing_module.revoke_all() == [],
+            "revocation did not clear both stores exactly once",
+        )
+
+        os.environ.pop("XDG_RUNTIME_DIR")
+        os.environ["XDG_STATE_HOME"] = "/proc/1"
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            tolerated = standing_module.match(configured)
+        require(
+            tolerated is None and "unusable" in errors.getvalue(),
+            "an unusable store crashed the consult instead of degrading",
+        )
+
+
+@test("a concurrent record cannot resurrect revoked standing approvals")
+def test_standing_lock_interleaving() -> None:
+    with standing_stores() as (_runtime_dir, state_dir):
+        os.environ.pop("XDG_RUNTIME_DIR")
+        configured = runtime_module.load_role("reviewer")
+        candidate = standing_candidate(configured)
+        in_lock = threading.Event()
+        release = threading.Event()
+
+        def hook() -> None:
+            in_lock.set()
+            release.wait(timeout=10)
+
+        recorder = threading.Thread(
+            target=standing_module.record_approval,
+            kwargs={
+                "configured": configured,
+                "candidate": candidate,
+                "scope": "until",
+                "expires_at": time.time() + 3600,
+                "reason": "usage limit",
+                "failure_scope": "provider",
+                "_test_hook": hook,
+            },
+        )
+        recorder.start()
+        require(in_lock.wait(timeout=5), "the recorder never took the lock")
+
+        revoked: list[list[dict[str, Any]]] = []
+        revoker = threading.Thread(
+            target=lambda: revoked.append(standing_module.revoke_all())
+        )
+        revoker.start()
+        revoker.join(timeout=0.4)
+        require(
+            revoker.is_alive(),
+            "revocation did not serialise behind the writer's lock",
+        )
+        release.set()
+        recorder.join(timeout=5)
+        revoker.join(timeout=5)
+        require(
+            not recorder.is_alive() and not revoker.is_alive(),
+            "the interleaved writers did not finish",
+        )
+        final = json.loads(
+            (state_dir / "orrery" / "standing.json").read_text()
+        )["approvals"]
+        require(
+            final == [] and len(revoked[0]) == 1,
+            "the revoked store was resurrected or the record was lost",
+        )
+
+
+class FakeTty:
+    """A scriptable controlling terminal for consent-menu tests."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.rendered = ""
+
+    def isatty(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        self.rendered += text
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> str:
+        return self.answer
+
+    def close(self) -> None:
+        pass
+
+
+def consent_proposal() -> Any:
+    principal = runtime_module.load_role("orchestrator")
+    proposal = fallback_module.nearest_fallback(
+        principal,
+        "authentication unavailable",
+        excluded_providers={"anthropic"},
+        assumed_ready={"openai"},
+        discover_live=False,
+    )
+    require(proposal is not None, "the menu test has no proposal")
+    return proposal
+
+
+@test("the consent menu offers exactly the valid scopes and defaults to stop")
+def test_consent_menu_scopes() -> None:
+    proposal = consent_proposal()
+    reset = fallback_module.parse_reset_time(
+        "try again at Aug 5th, 2091 4:49 PM"
+    )
+    require(reset is not None, "the fixture reset time must parse")
+
+    def decide(answer: str, *, with_reset: bool = True) -> Any:
+        tty = FakeTty(answer)
+        decision = fallback_module.request_fallback_decision(
+            proposal,
+            approval=None,
+            no_fallback=False,
+            program_name="orrery-agent",
+            stream=io.StringIO(),
+            tty_opener=lambda: tty,
+            reset_time=reset if with_reset else None,
+        )
+        return decision, tty.rendered
+
+    with standing_stores():
+        decision, rendered = decide("1")
+        require(
+            decision.consent is fallback_module.Consent.APPROVED
+            and decision.scope == "run"
+            and decision.expires_at is None
+            and "for this run only" in rendered
+            and "in this login session" in rendered
+            and "until 2091-08-05" in rendered
+            and "4) Stop here" in rendered,
+            f"the full menu did not render or select run: {rendered}",
+        )
+        decision, _ = decide("2")
+        require(
+            decision.consent is fallback_module.Consent.APPROVED
+            and decision.scope == "session",
+            "menu option 2 did not select the session scope",
+        )
+        decision, _ = decide("3")
+        require(
+            decision.consent is fallback_module.Consent.APPROVED
+            and decision.scope == "until"
+            and decision.expires_at == reset.timestamp(),
+            "menu option 3 did not carry the parsed reset time",
+        )
+        for answer in ("4", "", "n", "no", "junk", "99"):
+            decision, _ = decide(answer)
+            require(
+                decision.consent is fallback_module.Consent.DECLINED,
+                f"answer {answer!r} did not stop",
+            )
+        decision, _ = decide("y")
+        require(
+            decision.consent is fallback_module.Consent.APPROVED
+            and decision.scope == "run",
+            "y is no longer an alias for the run scope",
+        )
+        decision, rendered = decide("2", with_reset=False)
+        require(
+            "until" not in rendered
+            and decision.scope == "session"
+            and "3) Stop here" in rendered,
+            "a menu without a reset time still offered until",
+        )
+
+    saved_runtime = os.environ.pop("XDG_RUNTIME_DIR", None)
+    try:
+        decision, rendered = decide("2")
+        require(
+            "login session" not in rendered
+            and decision.consent is fallback_module.Consent.APPROVED
+            and decision.scope == "until",
+            "a menu without a session store still offered the session scope",
+        )
+    finally:
+        if saved_runtime is not None:
+            os.environ["XDG_RUNTIME_DIR"] = saved_runtime
+
+
+@test("non-interactive consent lists candidate, scopes, and the rerun line")
+def test_consent_required_block() -> None:
+    proposal = consent_proposal()
+    reset = fallback_module.parse_reset_time(
+        "try again at Aug 5th, 2091 4:49 PM"
+    )
+    with standing_stores():
+        output = io.StringIO()
+        decision = fallback_module.request_fallback_decision(
+            proposal,
+            approval=None,
+            no_fallback=False,
+            program_name="orrery-agent",
+            stream=output,
+            tty_opener=lambda: None,
+            reset_time=reset,
+            extra_disclosures=(
+                "The candidate is the same model as the configured "
+                "principal; this will not be cross-provider review.",
+            ),
+        )
+        text = output.getvalue()
+        require(
+            decision.consent is fallback_module.Consent.REQUIRED
+            and "Candidate: openai:gpt-5.6-sol" in text
+            and "Scopes: run, session, until:2091-08-05T16:49" in text
+            and (
+                "Rerun with: --approve-fallback openai:gpt-5.6-sol "
+                "--approval-scope run|session|until:2091-08-05T16:49" in text
+            )
+            and "ORRERY FALLBACK APPROVAL REQUIRED" in text
+            and "same model as the configured principal" in text,
+            f"the REQUIRED block is incomplete: {text}",
+        )
+
+    approved = fallback_module.request_fallback_decision(
+        proposal,
+        approval=("openai", "gpt-5.6-sol"),
+        no_fallback=False,
+        program_name="orrery-agent",
+        stream=io.StringIO(),
+        tty_opener=lambda: None,
+        approval_scope=("until", reset.timestamp()),
+    )
+    require(
+        approved.consent is fallback_module.Consent.APPROVED
+        and approved.scope == "until"
+        and approved.expires_at == reset.timestamp(),
+        "an explicit approval scope was not carried into the decision",
+    )
+
+
+@test("approval scopes parse strictly and only when usable")
+def test_parse_approval_scope() -> None:
+    with standing_stores():
+        require(
+            standing_module.parse_approval_scope("run") == ("run", None),
+            "run must parse with no expiry",
+        )
+        scope, expiry = standing_module.parse_approval_scope("session")
+        require(
+            scope == "session" and expiry is None,
+            "session must parse when a session store exists",
+        )
+        scope, expiry = standing_module.parse_approval_scope(
+            "until:2091-08-05T16:49"
+        )
+        require(
+            scope == "until" and expiry is not None and expiry > time.time(),
+            "an until scope with a timestamp must parse",
+        )
+        for bad in ("until", "until:junk", "until:2001-01-01T00:00", "weekly"):
+            try:
+                standing_module.parse_approval_scope(bad)
+            except runtime_module.RuntimeConfigError:
+                continue
+            raise Failure(f"approval scope {bad!r} was wrongly accepted")
+
+    saved_runtime = os.environ.pop("XDG_RUNTIME_DIR", None)
+    try:
+        try:
+            standing_module.parse_approval_scope("session")
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "session" in str(exc),
+                "the session rejection does not explain itself",
+            )
+        else:
+            raise Failure(
+                "session parsed without a login-session runtime directory"
+            )
+    finally:
+        if saved_runtime is not None:
+            os.environ["XDG_RUNTIME_DIR"] = saved_runtime
+
+
+@contextlib.contextmanager
+def until_store_only() -> Any:
+    """An isolated until store while the real runtime dir stays usable.
+
+    Subprocess wrapper tests must not repoint XDG_RUNTIME_DIR: the systemd
+    user bus lives there, and moving it would disable the containment the
+    rest of the suite exercises. The until store lives under
+    XDG_STATE_HOME, which nothing else consumes.
+    """
+    saved = os.environ.get("XDG_STATE_HOME")
+    with tempfile.TemporaryDirectory() as base:
+        os.environ["XDG_STATE_HOME"] = base
+        try:
+            yield Path(base)
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+def seed_standing_reviewer(
+    candidate_model: str = "fable",
+    scope: str = "until",
+) -> Any:
+    configured = runtime_module.load_role("reviewer")
+    candidate = runtime_module.Role(
+        id=configured.id,
+        title=configured.title,
+        provider="anthropic",
+        model=candidate_model,
+        thinking="max",
+        access=configured.access,
+    )
+    standing_module.record_approval(
+        configured=configured,
+        candidate=candidate,
+        scope=scope,
+        expires_at=time.time() + 3600 if scope == "until" else None,
+        reason="usage limit reached",
+        failure_scope="provider",
+    )
+    return configured
+
+
+@test("a standing approval starts the recorded candidate without codex")
+def test_standing_adoption_end_to_end() -> None:
+    with until_store_only():
+        seed_standing_reviewer()
+        with tempfile.TemporaryDirectory() as directory:
+            codex_arguments = Path(directory) / "codex-args"
+            environment = review_environment("success")
+            environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+            process = start_review(
+                environment, "--timeout", "60", "--", "prompt"
+            )
+            stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 0
+                and "fake Claude verdict" in stdout,
+                f"the standing candidate did not run: {stderr}",
+            )
+            require(
+                "standing fallback active" in stderr
+                and "anthropic/fable (thinking max)" in stderr
+                and "↳ Fallback reviewer · anthropic · fable" in stderr,
+                f"the standing adoption was not disclosed: {stderr}",
+            )
+            require(
+                not codex_arguments.exists(),
+                "the configured provider was attempted despite a standing "
+                "approval",
+            )
+            require(
+                "ORRERY FALLBACK PROPOSED" not in stderr,
+                "a standing adoption still proposed a fallback",
+            )
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("an explicit approval wins over a conflicting standing record")
+def test_explicit_approval_beats_standing() -> None:
+    with until_store_only():
+        seed_standing_reviewer(candidate_model="opus")
+        environment = review_environment("success")
+        environment["CODEX_FAKE_MODE"] = "quota"
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--approve-fallback",
+            "anthropic:fable",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0 and "fake Claude verdict" in stdout,
+            f"the explicit approval did not start its candidate: {stderr}",
+        )
+        require(
+            "standing fallback active" not in stderr
+            and "opus" not in stderr,
+            "a standing record overrode an explicit approval",
+        )
+        active = standing_module.list_active()
+        require(
+            len(active) == 1 and active[0]["candidate_model"] == "opus",
+            "the conflicting standing record was modified",
+        )
+
+
+@test("no-fallback ignores standing approvals and says so")
+def test_no_fallback_ignores_standing() -> None:
+    with until_store_only():
+        seed_standing_reviewer()
+        environment = review_environment("success")
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--no-fallback",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"the configured reviewer did not run under --no-fallback: "
+            f"{stderr}",
+        )
+        require(
+            "standing fallback approvals are ignored under --no-fallback"
+            in stderr
+            and "standing fallback active" not in stderr,
+            f"--no-fallback did not report the ignored store: {stderr}",
+        )
+
+
+@test("an until approval records from the flag and is honoured next run")
+def test_until_scope_records_and_replays() -> None:
+    with until_store_only() as state_dir:
+        failed_environment = review_environment("success")
+        failed_environment["CODEX_FAKE_MODE"] = "quota"
+        failed = start_review(
+            failed_environment, "--timeout", "60", "--", "prompt"
+        )
+        _, failed_stderr = finish_review(failed, failed_environment)
+        require(
+            failed.returncode == 7
+            and "Scopes: run, session" in failed_stderr
+            and "--approval-scope run|session" in failed_stderr,
+            f"the REQUIRED block lost its scope lines: {failed_stderr}",
+        )
+
+        approved_environment = review_environment("success")
+        approved_environment["CODEX_FAKE_MODE"] = "quota"
+        approved = start_review(
+            approved_environment,
+            "--timeout",
+            "60",
+            "--approve-fallback",
+            "anthropic:fable",
+            "--approval-scope",
+            "until:2091-08-05T16:49",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(approved, approved_environment)
+        require(
+            approved.returncode == 0
+            and "fake Claude verdict" in stdout
+            and "for every project until 2091-08-05" in stderr
+            and "standing fallback recorded" in stderr,
+            f"the until approval was not recorded: {stderr}",
+        )
+        stored = json.loads(
+            (state_dir / "orrery" / "standing.json").read_text()
+        )["approvals"]
+        require(
+            len(stored) == 1
+            and stored[0]["scope"] == "until"
+            and stored[0]["candidate_model"] == "fable",
+            f"the until store content is wrong: {stored}",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            codex_arguments = Path(directory) / "codex-args"
+            replay_environment = review_environment("success")
+            replay_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+            replay = start_review(
+                replay_environment, "--timeout", "60", "--", "prompt"
+            )
+            stdout, stderr = finish_review(replay, replay_environment)
+            require(
+                replay.returncode == 0
+                and "fake Claude verdict" in stdout
+                and "standing fallback active" in stderr
+                and not codex_arguments.exists(),
+                f"the recorded until approval was not honoured: {stderr}",
+            )
+
+
+@test("revocation clears standing approvals from both binaries")
+def test_revoke_fallbacks_cli() -> None:
+    with standing_stores():
+        seed_standing_reviewer()
+        environment = review_environment("success")
+        revoke = start_review(environment, "--revoke-fallbacks")
+        stdout, stderr = finish_review(revoke, environment)
+        require(
+            revoke.returncode == 0
+            and "revoked standing fallback" in stdout
+            and standing_module.list_active() == [],
+            f"orrery-agent revocation failed: {stdout} {stderr}",
+        )
+
+        principal = run_principal(environment, "--revoke-fallbacks")
+        require(
+            principal.returncode == 0
+            and "No standing fallback approvals." in principal.stdout
+            and "↳" not in principal.stderr,
+            f"orrery revocation failed: {principal.stdout} "
+            f"{principal.stderr}",
+        )
+
+        combined = run_principal(
+            environment, "--revoke-fallbacks", "--no-fallback"
+        )
+        require(
+            combined.returncode == 2
+            and "stands alone" in combined.stderr,
+            "--revoke-fallbacks combined with other flags was accepted",
+        )
+
+
+@test("adoption validates availability and seeds exclusions")
+def test_adopt_standing_helper() -> None:
+    with standing_stores():
+        configured = seed_standing_reviewer()
+        original_status = review_module.provider_status
+
+        def unavailable(provider: str) -> Any:
+            return fallback_module.ProviderStatus(
+                provider,
+                fallback_module.Availability.UNAVAILABLE,
+                None,
+                "simulated outage",
+            )
+
+        def ready(provider: str) -> Any:
+            return fallback_module.ProviderStatus(
+                provider,
+                fallback_module.Availability.READY,
+                "claude",
+                "active",
+            )
+
+        try:
+            review_module.provider_status = unavailable
+            state = review_module.DelegationState(
+                configured=configured, role=configured
+            )
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                adopted = review_module.adopt_standing_approval(state)
+            require(
+                adopted is None
+                and state.role is configured
+                and not state.is_fallback
+                and len(standing_module.list_active()) == 1,
+                "an unavailable candidate mutated state or the store",
+            )
+
+            review_module.provider_status = ready
+            with contextlib.redirect_stderr(errors):
+                adopted = review_module.adopt_standing_approval(state)
+            require(
+                adopted is not None
+                and state.role.model == "fable"
+                and state.is_fallback
+                and state.excluded_providers == {"openai"},
+                "adoption did not seed exclusions from the record",
+            )
+        finally:
+            review_module.provider_status = original_status
+
+        try:
+            review_module.parse_args(
+                ["--role", "reviewer", "--approval-scope", "run", "--", "x"]
+            )
+        except review_module.UsageError as exc:
+            require(
+                "--approve-fallback" in str(exc),
+                "the scope-without-approval rejection does not explain",
+            )
+        else:
+            raise Failure("--approval-scope without approval was accepted")
+
+
+@test("the doctor lists standing approvals as warnings, never failures")
+def test_doctor_lists_standing() -> None:
+    with until_store_only():
+        environment = review_environment("success")
+        empty = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "PASS  No standing fallback approvals" in empty.stdout,
+            "an empty store did not report as a pass",
+        )
+
+        seed_standing_reviewer()
+        listed = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "WARN  Standing fallback active: reviewer:" in listed.stdout
+            and "Revoke with: orrery --revoke-fallbacks" in listed.stdout
+            and "FAIL  The standing-approval store" not in listed.stdout,
+            f"the standing warning is missing: {listed.stdout[-800:]}",
+        )
+
+
+@test("the configuration page shows and revokes standing approvals")
+def test_config_standing_revoke() -> None:
+    import urllib.error
+    import urllib.request
+
+    with until_store_only():
+        seed_standing_reviewer()
+        environment = review_environment("success")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(CONFIG_SCRIPT),
+                "--port",
+                "0",
+                "--timeout",
+                "120",
+                "--no-browser",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            url = None
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                if line.startswith("CONFIG_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    break
+            require(bool(url), "the server never announced its URL")
+
+            page = urllib.request.urlopen(url, timeout=10).read().decode()
+            require(
+                "Standing fallback approvals" in page
+                and 'id="revoke-standing"' in page
+                and "anthropic/fable (thinking max)" in page,
+                "the page does not show the active standing approval",
+            )
+
+            bad = url.replace(url.split("/t/")[1].split("/")[0], "x" * 24)
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        bad + "revoke",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    ),
+                    timeout=10,
+                )
+            except urllib.error.HTTPError as error:
+                require(
+                    error.code == 404,
+                    f"a wrong token got {error.code}, not 404",
+                )
+            else:
+                raise Failure("a wrong token was accepted for revoke")
+            require(
+                len(standing_module.list_active()) == 1,
+                "a rejected revoke still cleared the store",
+            )
+
+            reply = json.loads(
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        url + "revoke",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    ),
+                    timeout=10,
+                ).read()
+            )
+            require(
+                len(reply.get("revoked", [])) == 1
+                and standing_module.list_active() == [],
+                f"the revoke endpoint did not clear the store: {reply}",
+            )
+
+            after = urllib.request.urlopen(url, timeout=10).read().decode()
+            require(
+                'id="revoke-standing"' not in after,
+                "the revoke control remained without anything to revoke",
+            )
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+
+        seed_standing_reviewer()
+        printed = subprocess.run(
+            [sys.executable, str(CONFIG_SCRIPT), "--print"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        require(
+            printed.returncode == 0
+            and "Standing fallback" in printed.stdout
+            and "anthropic/fable" in printed.stdout,
+            f"--print does not list standing approvals: {printed.stdout}",
+        )
 
 
 # ---------------------------------------------------------------------------
