@@ -708,7 +708,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .wrap { max-width: 1660px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
   .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
-  .chartwrap { overflow-x: auto; overflow-y: visible; padding: 4px 0 92px; }
+  .chartwrap {
+    overflow-x: auto; overflow-y: visible; padding: 4px 0 48px;
+    width: 100vw; margin-left: calc(50% - 50vw);
+  }
   .canvas { position: relative; margin: 0 auto; }
   .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
   .canvas svg.marks { position: absolute; inset: 0; overflow: visible;
@@ -723,8 +726,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   .cnode {
     position: absolute; box-sizing: border-box; border-radius: 9px;
-    padding: 9px 11px; z-index: 1; transition: box-shadow .16s, opacity .16s;
-    display: flex; flex-direction: column; gap: 7px; scroll-margin-block: 92px;
+    padding: 8px 10px; z-index: 1; transition: box-shadow .16s, opacity .16s;
+    display: flex; flex-direction: column; gap: 4px;
+    justify-content: center; scroll-margin-block: 92px;
   }
   .cnode.diamond { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
   .cnode.dim { opacity: 0.26; }
@@ -734,8 +738,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     font-size: 12px; font-weight: 600; line-height: 1.32;
     white-space: pre-line;
   }
+  .cnode .nodemodel {
+    font-family: ui-monospace, monospace; font-size: 10.5px; opacity: .85;
+  }
   .cnode.has-info .title { padding-right: 16px; }
-  .cnode.diamond .title { padding: 0; text-align: center; margin: auto; }
+  .cnode.diamond .title { padding: 0 26px; text-align: center; margin: auto; }
   .cnode .info {
     position: absolute; top: 5px; right: 6px; width: 17px; height: 17px;
     border: 0; border-radius: 50%; background: rgba(255,255,255,.22);
@@ -753,26 +760,38 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   .info:hover + .tip, .info:focus-visible + .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
-  .tip .meta { color: var(--soft); margin-top: 6px; font-family: ui-monospace, monospace; font-size: 10.5px; }
-  .role-controls { display: flex; flex-direction: column; gap: 3px; }
-  .role-label {
-    font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase;
-    opacity: .82; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 20px; }
+  .legend-row {
+    display: flex; align-items: center; gap: 10px; background: var(--panel);
+    border: 1px solid var(--edge); border-radius: 10px; padding: 8px 12px;
   }
+  .roledot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
+  .legend-name {
+    font-size: 12.5px; font-weight: 600; min-width: 128px;
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .accesschip {
+    font-size: 9.5px; font-weight: 500; letter-spacing: .05em;
+    text-transform: uppercase; color: var(--soft);
+  }
+  .legend .control-row {
+    grid-template-columns: minmax(170px, auto) minmax(96px, auto);
+  }
+  .role-controls { display: flex; flex-direction: column; gap: 3px; }
   .control-row {
     display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(72px, 1fr);
     gap: 5px; align-items: start;
   }
   .pick { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
   .pick label { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; opacity: .8; }
-  .cnode select, .cnode input[type=text] {
-    width: 100%; box-sizing: border-box; border: 0; border-radius: 5px;
-    padding: 4px 6px; font-size: 11.5px;
+  .legend select, .legend input[type=text] {
+    width: 100%; box-sizing: border-box; border: 1px solid var(--edge);
+    border-radius: 5px; padding: 4px 6px; font-size: 11.5px;
     font-family: ui-monospace, monospace;
-    background: rgba(255,255,255,.94); color: #1b2226;
+    background: var(--ground); color: var(--ink);
   }
-  .cnode select:focus-visible, .cnode input:focus-visible {
-    outline: 2px solid #ffffff; outline-offset: 1px;
+  .legend select:focus-visible, .legend input:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
   }
   .actions {
     display: flex; gap: 10px;
@@ -806,19 +825,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>Órrery configuration</h1>
-  <p class="sub">The pipeline as it actually runs, generated from this checkout's canonical files.
-     Steps sharing a role share one model, and bounded workflow controls sit at
-     the stage they govern.</p>
+  <p class="sub">The pipeline as it runs. Choose each role's model in the
+     legend; the boxes show the live assignment, and nothing is saved until
+     you apply.</p>
+  <div class="legend" id="legend"></div>
   <div class="chartwrap" id="chart"></div>
   <div class="scopenote">
-    Saving changes the defaults for <strong>new Orrery processes</strong>;
-    running sessions are unaffected. A repository's private
-    <code>.orrery.json</code> principal override still wins. Every role may use either provider.
-    Runtime failure automatically ranks the nearest potential model, but never
-    starts it without the user's explicit, candidate-bound approval.
+    Saving sets the defaults for <strong>new Orrery sessions</strong>;
+    running sessions keep theirs, and a repository's private
+    <code>.orrery.json</code> override still wins.
     __CATALOGUE_NOTE__
-    Known models expose only the thinking levels reported for that model;
-    a custom identifier also requires an explicit provider.
+    A custom model needs its provider picked too.
   </div>
   __STANDING__
   <div class="actions">
@@ -846,7 +863,9 @@ const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
 const SVGNS = "http://www.w3.org/2000/svg";
 const ARROW_SIZE = 12;
-const ARROW_CLEARANCE = 20;
+// The path ends at the arrowhead's base and the head continues towards
+// the node, so the clearance is what keeps the tip itself off the box.
+const ARROW_CLEARANCE = 19;
 
 const FILL = {
   orchestrator: ["#38617f", "#ffffff"], mechanic: ["#8891a8", "#ffffff"],
@@ -902,8 +921,7 @@ function picker(step) {
         `<option value="${esc(level)}" ${level === step.thinking ? "selected" : ""}>` +
         `${esc(level)}</option>`).join("")
     : `<option value="">${choice ? "unavailable" : "manual setup"}</option>`;
-  return `<div class="role-controls" data-role="${id}">` +
-    `<div class="role-label">${esc(step.title)}</div><div class="control-row">` +
+  return `<div class="role-controls" data-role="${id}"><div class="control-row">` +
     `<div class="pick"><label>model</label>` +
     `<select data-step="${id}" data-kind="model">${grouped}` +
     `<option value="__custom__" ${selectedKnown ? "" : "selected"}>custom…</option></select>` +
@@ -935,25 +953,57 @@ function tip(node) {
     const step = roles[id];
     const count = stepsUsing(id);
     const shared = count > 1
-      ? `Shared with ${count - 1} other step${count === 2 ? "" : "s"}: ` +
-        `changing it here changes them too.`
-      : "Used at this step only.";
-    return `<b>${esc(step.title)}</b>${esc(step.summary)} ${shared}` +
-      `<div class="meta">${esc(step.provider)} · ${esc(step.model)}` +
-      (step.thinking ? ` · thinking ${esc(step.thinking)}` :
-        " · thinking unavailable") +
-      `<br>${esc(step.file)}</div>`;
+      ? ` The ${count} highlighted steps share this role and change together.`
+      : "";
+    const access = step.access ? ` Access: ${esc(step.access)}.` : "";
+    return `<b>${esc(step.title)}</b>${esc(step.summary)}${shared}${access}`;
   }).join('<div style="height:8px"></div>');
   const settingText = settingsForNode(node.id).map(setting =>
     `<div style="height:8px"></div><b>${esc(setting.label)}</b>` +
-    `${esc(setting.description)}` +
-    `<div class="meta">global/orchestration.json · ${setting.minimum}–` +
-    `${setting.maximum}, loaded ${originalSettings[setting.id]}</div>`
+    `${esc(setting.description)}`
   ).join("");
   return roleText + settingText;
 }
 
+function renderLegend() {
+  const legend = document.getElementById("legend");
+  legend.innerHTML = STATE.map(step => {
+    const [fill] = FILL[step.id] || FILL.none;
+    return `<div class="legend-row">` +
+      `<span class="roledot" style="background:${fill}"></span>` +
+      `<div class="legend-name">${esc(step.title)}` +
+      `<span class="accesschip">${esc(step.access)}</span></div>` +
+      picker(step) +
+      `</div>`;
+  }).join("") +
+    `<div class="legend-row">` +
+    `<span class="roledot" style="background:${FILL.none[0]}"></span>` +
+    `<div class="legend-name">Workflow` +
+    `<span class="accesschip">bounded loops</span></div>` +
+    SETTINGS.map(settingPicker).join("") +
+    `</div>`;
+}
+
+function nodeModelText(roleId) {
+  const model = currentModel(roleId) || roles[roleId].model;
+  const thinking = currentThinking(roleId);
+  return model + (thinking ? ` · ${thinking}` : "");
+}
+
+function updateNodeText() {
+  document.querySelectorAll("[data-model-for]").forEach(element => {
+    element.textContent = nodeModelText(element.dataset.modelFor);
+  });
+  document.querySelectorAll("[data-setting-for]").forEach(element => {
+    const value = currentSetting(element.dataset.settingFor);
+    if (value !== null) {
+      element.textContent = `${value} round${value === 1 ? "" : "s"}`;
+    }
+  });
+}
+
 function render() {
+  renderLegend();
   const canvas = document.createElement("div");
   canvas.className = "canvas";
   canvas.style.width = CHART.width + "px";
@@ -965,7 +1015,7 @@ function render() {
   });
   const defs = element("defs", {});
   const marker = element("marker", {
-    id: "arrow", viewBox: "0 0 12 12", refX: "11.5", refY: "6",
+    id: "arrow", viewBox: "0 0 12 12", refX: "0.5", refY: "6",
     markerWidth: String(ARROW_SIZE), markerHeight: String(ARROW_SIZE),
     markerUnits: "userSpaceOnUse", orient: "auto",
   });
@@ -993,13 +1043,19 @@ function render() {
     box.style.cssText =
       `left:${node.x - node.w / 2}px;top:${node.y - node.h / 2}px;` +
       `width:${node.w}px;min-height:${node.h}px;background:${fill};color:${ink}`;
+    const modelLine = node.roles.length
+      ? `<div class="nodemodel" data-model-for=` +
+        `"${esc(node.roles[node.roles.length - 1])}"></div>`
+      : "";
+    const settingLine = settingsForNode(node.id).map(setting =>
+      `<div class="nodemodel" data-setting-for="${esc(setting.id)}"></div>`
+    ).join("");
     box.innerHTML =
       `<div class="title">${esc(node.label)}</div>` +
+      modelLine + settingLine +
       (detail ?
         `<button class="info" type="button" aria-label="About this step">&#128712;</button>` +
-        `<div class="tip">${detail}</div>` : "") +
-      node.roles.map(id => picker(roles[id])).join("") +
-      settingsForNode(node.id).map(settingPicker).join("");
+        `<div class="tip">${detail}</div>` : "");
     box.addEventListener("mouseenter", () => highlight(node.id, node.roles));
     box.addEventListener("mouseleave", () => highlight(null, null));
     box.addEventListener("focusin", () => highlight(node.id, node.roles));
@@ -1010,6 +1066,7 @@ function render() {
   }
 
   host.appendChild(canvas);
+  updateNodeText();
   drawWires(svg, marks, canvas);
   window.addEventListener("resize", () => drawWires(svg, marks, canvas));
   requestAnimationFrame(() => {
@@ -1110,14 +1167,27 @@ function drawWires(svg, marks, canvas) {
     // outside the target by more than one complete marker, so neither its
     // tip nor its shoulders can disappear beneath an opaque node.
     const end = moveAway(edge(b, a), b, ARROW_CLEARANCE);
-    const lift = Math.max(26, Math.abs(end.y - start.y) * 0.4);
-    const way = end.y >= start.y ? 1 : -1;
-    // A reverse edge would otherwise be painted directly over its forward
-    // partner. The manifest can bow one direction sideways so both arrows
-    // remain independently legible as a cycle.
+    const dxTotal = end.x - start.x;
+    const dyTotal = end.y - start.y;
+    const horizontal = Math.abs(dxTotal) >= Math.abs(dyTotal);
+    const lift = Math.max(
+      26,
+      (horizontal ? Math.abs(dxTotal) : Math.abs(dyTotal)) * 0.35,
+    );
+    const alongX = horizontal ? Math.sign(dxTotal) || 1 : 0;
+    const alongY = horizontal ? 0 : Math.sign(dyTotal) || 1;
+    // The manifest offset bends a curve perpendicular to its main
+    // direction; a cycle bows its two directions apart with opposite
+    // signs, so both arrows stay independently legible as one loop.
     const offset = Number(link.offset || 0);
-    const c1 = { x: start.x + offset, y: start.y + lift * way };
-    const c2 = { x: end.x + offset, y: end.y - lift * way };
+    const c1 = {
+      x: start.x + alongX * lift + (horizontal ? 0 : offset),
+      y: start.y + alongY * lift + (horizontal ? offset : 0),
+    };
+    const c2 = {
+      x: end.x - alongX * lift + (horizontal ? 0 : offset),
+      y: end.y - alongY * lift + (horizontal ? offset : 0),
+    };
     svg.appendChild(element("path", {
       class: "edge", "marker-end": "url(#arrow)",
       "data-from": link.from, "data-to": link.to,
@@ -1304,6 +1374,7 @@ document.addEventListener("input", event => {
     );
   }
   applyButton.disabled = true;
+  updateNodeText();
 });
 
 document.addEventListener("change", event => {
@@ -1328,6 +1399,7 @@ document.addEventListener("change", event => {
     );
   }
   applyButton.disabled = true;
+  updateNodeText();
 });
 
 document.getElementById("preview").addEventListener("click", async () => {

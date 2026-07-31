@@ -203,15 +203,17 @@ Selecting a known model rebuilds the adjacent thinking menu from that model's
 reported capabilities. A custom exact identifier remains possible and
 requires an explicit provider.
 
-The diagram is the workflow:
+The diagram is the workflow, flowing left to right:
 
-- hovering a node outlines only that node;
-- tandem nodes using the same role are highlighted without another outline;
-- the five classifier arrows run primarily downward in the required order;
-- the plan and plan-review arrows use equal and opposite curves to form one
-  visual cycle; and
-- investigation, escalation, review bypass, correction, and completion all
-  have explicit destinations.
+- the legend is the single place where roles are configured; the boxes show
+  each live assignment as plain text;
+- hovering a node outlines only that node, and steps sharing its role stay
+  lit;
+- the five classifier outcomes stack top to bottom in the required order;
+- the plan and plan-review arrows bow apart into one visibly cyclical loop;
+  and
+- every path, including escalation, review bypass, correction, and
+  completion, has an explicit destination.
 
 Preview shows one atomic `global/orchestration.json` diff. Apply writes exactly
 that preview and runs the doctor. Running sessions are never mutated. A

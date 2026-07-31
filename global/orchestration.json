@@ -53,26 +53,26 @@
     }
   ],
   "chart": {
-    "width": 1600,
-    "height": 2340,
+    "width": 2760,
+    "height": 1020,
     "nodes": [
       {
         "id": "request",
         "label": "ordinary development request",
-        "x": 750,
-        "y": 70,
-        "w": 250,
-        "h": 56,
+        "x": 130,
+        "y": 480,
+        "w": 170,
+        "h": 58,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "classify",
         "label": "classify once",
-        "x": 750,
-        "y": 230,
-        "w": 230,
-        "h": 100,
+        "x": 350,
+        "y": 480,
+        "w": 140,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -81,10 +81,10 @@
       {
         "id": "investigation",
         "label": "read-only investigation",
-        "x": 130,
-        "y": 540,
-        "w": 220,
-        "h": 150,
+        "x": 610,
+        "y": 120,
+        "w": 190,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -92,11 +92,11 @@
       },
       {
         "id": "trivial",
-        "label": "principal orchestrator\nimplements directly",
-        "x": 415,
-        "y": 540,
-        "w": 220,
-        "h": 150,
+        "label": "principal implements directly",
+        "x": 610,
+        "y": 300,
+        "w": 200,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -104,11 +104,11 @@
       },
       {
         "id": "mechanical",
-        "label": "mechanical worker edits\nworkspace-write",
-        "x": 710,
-        "y": 540,
-        "w": 240,
-        "h": 150,
+        "label": "mechanical worker edits",
+        "x": 610,
+        "y": 480,
+        "w": 190,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "mechanic"
@@ -116,11 +116,11 @@
       },
       {
         "id": "standard",
-        "label": "implementation worker edits\nworkspace-write",
-        "x": 1015,
-        "y": 540,
-        "w": 240,
-        "h": 150,
+        "label": "implementation worker edits",
+        "x": 610,
+        "y": 660,
+        "w": 210,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "implementer"
@@ -128,11 +128,11 @@
       },
       {
         "id": "plan",
-        "label": "principal orchestrator writes\nthe plan and acceptance criteria",
-        "x": 1360,
-        "y": 540,
-        "w": 260,
-        "h": 150,
+        "label": "principal writes the plan\nand acceptance criteria",
+        "x": 610,
+        "y": 840,
+        "w": 230,
+        "h": 64,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -141,20 +141,20 @@
       {
         "id": "investigation-result",
         "label": "report facts, inferences,\nand uncertainty",
-        "x": 130,
-        "y": 830,
-        "w": 220,
-        "h": 80,
+        "x": 940,
+        "y": 120,
+        "w": 230,
+        "h": 58,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "plan-review-step",
         "label": "fresh plan-review session\nblocking versus advisory",
-        "x": 1360,
-        "y": 830,
-        "w": 270,
-        "h": 220,
+        "x": 1010,
+        "y": 840,
+        "w": 230,
+        "h": 64,
         "shape": "rect",
         "roles": [
           "plan-reviewer"
@@ -162,11 +162,11 @@
       },
       {
         "id": "complex-implementation",
-        "label": "implementation worker edits\nworkspace-write",
-        "x": 1090,
-        "y": 1120,
-        "w": 250,
-        "h": 150,
+        "label": "implementation worker edits",
+        "x": 1460,
+        "y": 690,
+        "w": 210,
+        "h": 52,
         "shape": "rect",
         "roles": [
           "implementer"
@@ -175,20 +175,20 @@
       {
         "id": "plan-escalation",
         "label": "stop before implementation\nand ask the user",
-        "x": 1390,
-        "y": 1120,
-        "w": 200,
-        "h": 80,
+        "x": 1460,
+        "y": 850,
+        "w": 210,
+        "h": 58,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "inspect",
-        "label": "principal orchestrator inspects\nthe real diff, never the summary",
-        "x": 850,
-        "y": 1320,
-        "w": 260,
-        "h": 150,
+        "label": "principal inspects the real diff,\nnever the summary",
+        "x": 1620,
+        "y": 530,
+        "w": 240,
+        "h": 64,
         "shape": "rect",
         "roles": [
           "orchestrator"
@@ -197,30 +197,30 @@
       {
         "id": "verify",
         "label": "proportionate verification:\ntests, lint, types, build",
-        "x": 700,
-        "y": 1535,
-        "w": 250,
-        "h": 60,
+        "x": 1870,
+        "y": 480,
+        "w": 230,
+        "h": 64,
         "shape": "rect",
         "roles": []
       },
       {
         "id": "review-gate",
-        "label": "independent final review\nwarranted?",
-        "x": 700,
-        "y": 1680,
-        "w": 150,
-        "h": 110,
+        "label": "independent final\nreview warranted?",
+        "x": 2110,
+        "y": 480,
+        "w": 200,
+        "h": 130,
         "shape": "diamond",
         "roles": []
       },
       {
         "id": "review",
         "label": "fresh final-review session\nread-only, ephemeral",
-        "x": 700,
-        "y": 1850,
-        "w": 270,
-        "h": 150,
+        "x": 2345,
+        "y": 400,
+        "w": 210,
+        "h": 64,
         "shape": "rect",
         "roles": [
           "reviewer"
@@ -228,35 +228,35 @@
       },
       {
         "id": "findings",
-        "label": "material finding survives\nverification?",
-        "x": 700,
-        "y": 2025,
-        "w": 180,
-        "h": 110,
+        "label": "material finding\nsurvives verification?",
+        "x": 2580,
+        "y": 480,
+        "w": 200,
+        "h": 130,
         "shape": "diamond",
         "roles": []
       },
       {
+        "id": "done",
+        "label": "done: external actions\nstill require approval",
+        "x": 2580,
+        "y": 190,
+        "w": 210,
+        "h": 58,
+        "shape": "rect",
+        "roles": []
+      },
+      {
         "id": "correct",
-        "label": "principal orchestrator corrects\nthe defect and adds regression coverage",
-        "x": 340,
-        "y": 2220,
-        "w": 270,
-        "h": 150,
+        "label": "principal corrects and adds\nregression coverage",
+        "x": 1740,
+        "y": 700,
+        "w": 230,
+        "h": 64,
         "shape": "rect",
         "roles": [
           "orchestrator"
         ]
-      },
-      {
-        "id": "done",
-        "label": "done: external actions\nstill require approval",
-        "x": 1060,
-        "y": 2220,
-        "w": 230,
-        "h": 80,
-        "shape": "rect",
-        "roles": []
       }
     ],
     "edges": [
@@ -267,7 +267,8 @@
       {
         "from": "classify",
         "to": "investigation",
-        "label": "investigation"
+        "label": "investigation",
+        "offset": -60
       },
       {
         "from": "classify",
@@ -287,7 +288,8 @@
       {
         "from": "classify",
         "to": "plan",
-        "label": "complex"
+        "label": "complex",
+        "offset": -60
       },
       {
         "from": "investigation",
@@ -297,13 +299,13 @@
         "from": "plan",
         "to": "plan-review-step",
         "label": "fresh challenge",
-        "offset": 115
+        "offset": -85
       },
       {
         "from": "plan-review-step",
         "to": "plan",
-        "label": "supported blocking\nobjections · within cap",
-        "offset": -115
+        "label": "supported blocking\nobjections \u00b7 within cap",
+        "offset": 85
       },
       {
         "from": "plan-review-step",
@@ -343,7 +345,7 @@
         "from": "review-gate",
         "to": "done",
         "label": "no",
-        "offset": 440
+        "offset": -160
       },
       {
         "from": "review-gate",
@@ -367,8 +369,7 @@
       {
         "from": "correct",
         "to": "verify",
-        "label": "rerun affected checks",
-        "offset": -470
+        "label": "rerun affected checks"
       }
     ]
   },

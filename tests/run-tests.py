@@ -5760,15 +5760,15 @@ def test_manifest_chart() -> None:
     )
     targets = [nodes[target] for _label, target in expected_branches]
     require(
-        [target["x"] for target in targets]
-        == sorted(target["x"] for target in targets)
-        and all(target["y"] > nodes["classify"]["y"] for target in targets),
-        "classifier results are not a left-to-right downward rank",
+        [target["y"] for target in targets]
+        == sorted(target["y"] for target in targets)
+        and all(target["x"] > nodes["classify"]["x"] for target in targets),
+        "classifier results are not a top-to-bottom rank right of classify",
     )
     for first, second in zip(targets, targets[1:]):
         gap = (
-            second["x"] - second["w"] / 2
-            - (first["x"] + first["w"] / 2)
+            second["y"] - second["h"] / 2
+            - (first["y"] + first["h"] / 2)
         )
         require(gap >= 24, f"classifier nodes are only {gap}px apart")
 
@@ -5864,12 +5864,25 @@ def test_manifest_chart() -> None:
         source = nodes[edge["from"]]
         target = nodes[edge["to"]]
         start = boundary(source, target)
-        end = move_away(boundary(target, source), target, 20)
-        lift = max(26, abs(end[1] - start[1]) * 0.4)
-        way = 1 if end[1] >= start[1] else -1
+        end = move_away(boundary(target, source), target, 19)
+        dx_total = end[0] - start[0]
+        dy_total = end[1] - start[1]
+        is_horizontal = abs(dx_total) >= abs(dy_total)
+        lift = max(
+            26,
+            (abs(dx_total) if is_horizontal else abs(dy_total)) * 0.35,
+        )
+        along_x = (1 if dx_total >= 0 else -1) if is_horizontal else 0
+        along_y = 0 if is_horizontal else (1 if dy_total >= 0 else -1)
         offset = edge.get("offset", 0)
-        c1 = (start[0] + offset, start[1] + lift * way)
-        c2 = (end[0] + offset, end[1] - lift * way)
+        c1 = (
+            start[0] + along_x * lift + (0 if is_horizontal else offset),
+            start[1] + along_y * lift + (offset if is_horizontal else 0),
+        )
+        c2 = (
+            end[0] - along_x * lift + (0 if is_horizontal else offset),
+            end[1] - along_y * lift + (offset if is_horizontal else 0),
+        )
         for index in range(1, 500):
             t = index / 500
             point = tuple(
@@ -5936,12 +5949,13 @@ def test_manifest_chart() -> None:
 
     config_source = CONFIG_SCRIPT.read_text()
     require(
-        'const ARROW_CLEARANCE = 20;' in config_source
+        'const ARROW_CLEARANCE = 19;' in config_source
+        and 'refX: "0.5"' in config_source
         and 'markerUnits: "userSpaceOnUse"' in config_source
         and 'class: "edge", "marker-end": "url(#arrow)"' in config_source
         and ".wires marker path { fill: var(--wire); stroke: none; }"
         in config_source,
-        "the config no longer renders fixed-size, fully visible arrowheads",
+        "the config no longer joins fixed-size arrowheads at their base",
     )
     plan_rounds = manifest["settings"]["plan_review_rounds"]
     require(
