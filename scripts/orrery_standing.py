@@ -354,6 +354,9 @@ def candidate_role(configured: Role, record: dict[str, Any]) -> Role:
         provider=record["candidate_provider"],
         model=record["candidate_model"],
         thinking=record["candidate_thinking"],
+        # A recorded approval names a first-party provider and model, so
+        # the candidate must not keep the configured role's endpoint.
+        endpoint=None,
     )
 
 

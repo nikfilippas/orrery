@@ -16,18 +16,49 @@ KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = KIT_DIR / "global" / "orchestration.json"
 CATALOGUE_PATH = KIT_DIR / "global" / "model-catalogue.json"
 PROVIDERS = frozenset({"anthropic", "openai"})
+
+# The delegated-run containment model (no CLI bubblewrap isolation,
+# unit-level ReadOnlyPaths) was live-validated against this Claude CLI
+# version. The doctor warns when the installed version drifts, until a
+# fresh delegated shell probe revalidates the behaviour.
+VALIDATED_CLAUDE_CLI = "2.1.220"
 ROLE_IDS = frozenset(
     {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"}
 )
 ACCESS_LEVELS = frozenset({"principal", "workspace-write", "read-only"})
 THINKING_LEVEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 MODEL_ID = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-\[\]]{0,119}$"
+    r"^[A-Za-z0-9~][A-Za-z0-9._:@/+~\-\[\]]{0,119}$"
 )
+ENDPOINT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# Loopback hosts are the only plain-HTTP destinations allowed: a local
+# runtime such as Ollama has no certificate, while a remote endpoint
+# reached over HTTP would put the key on the wire in clear text.
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
 
 
 class RuntimeConfigError(Exception):
     """The canonical runtime configuration is unsafe or incomplete."""
+
+
+@dataclass(frozen=True)
+class Endpoint:
+    """Where a role's provider CLI should send its requests.
+
+    The adapter names the CLI that speaks the endpoint's wire protocol:
+    `anthropic` for the Claude CLI against an Anthropic Messages
+    compatible base URL, `openai` for the Codex CLI against an OpenAI
+    Responses compatible one. `key_env` names the environment variable
+    holding the credential; the credential itself is never stored in
+    the manifest.
+    """
+
+    id: str
+    label: str
+    adapter: str
+    base_url: str
+    key_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +69,8 @@ class Role:
     model: str
     thinking: str | None
     access: str
+    timeout_seconds: int | None = None
+    endpoint: Endpoint | None = None
 
     @property
     def read_only(self) -> bool:
@@ -82,6 +115,87 @@ def load_catalogue(
     return parsed
 
 
+def load_endpoint(manifest: dict[str, Any], endpoint_id: Any) -> Endpoint:
+    """Resolve and validate one endpoint named by a role."""
+    if not isinstance(endpoint_id, str) or not ENDPOINT_ID.fullmatch(
+        endpoint_id
+    ):
+        raise RuntimeConfigError(f"invalid endpoint name: {endpoint_id!r}")
+    endpoints = manifest.get("endpoints")
+    if not isinstance(endpoints, dict) or endpoint_id not in endpoints:
+        raise RuntimeConfigError(
+            f"the manifest does not define endpoint {endpoint_id!r}"
+        )
+    entry = endpoints[endpoint_id]
+    if not isinstance(entry, dict):
+        raise RuntimeConfigError(f"endpoint {endpoint_id} is not an object")
+
+    unknown = set(entry) - {"label", "adapter", "base_url", "key_env"}
+    if unknown:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} has unknown fields: {sorted(unknown)}"
+        )
+    label = entry.get("label", endpoint_id)
+    adapter = entry.get("adapter")
+    base_url = entry.get("base_url")
+    key_env = entry.get("key_env")
+    if not isinstance(label, str) or not label.strip():
+        raise RuntimeConfigError(f"endpoint {endpoint_id} has no label")
+    if adapter not in PROVIDERS:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} has invalid adapter: {adapter!r}"
+        )
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise RuntimeConfigError(f"endpoint {endpoint_id} has no base URL")
+    base_url = base_url.strip()
+    match = re.fullmatch(r"(https?)://([^/\s?#]+)(/[^\s?#]*)?", base_url)
+    if match is None:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} needs an http(s) base URL without a "
+            "query or fragment"
+        )
+    scheme, authority, _path = match.groups()
+    host = authority.rsplit("@", 1)[-1].rsplit(":", 1)[0]
+    if "@" in authority:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} must not embed credentials in its URL"
+        )
+    if scheme == "http" and host not in LOOPBACK_HOSTS:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} may use plain http only for a local "
+            "service on localhost"
+        )
+    if key_env is not None and (
+        not isinstance(key_env, str) or not ENV_NAME.fullmatch(key_env)
+    ):
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id} has an invalid key_env name"
+        )
+    return Endpoint(
+        id=endpoint_id,
+        label=label.strip(),
+        adapter=adapter,
+        base_url=base_url,
+        key_env=key_env,
+    )
+
+
+def adopted_root(cwd: Path) -> Path | None:
+    """The repository root holding the `.orrery.json` adoption marker.
+
+    Walks like project_override: upward from cwd, stopping at the first
+    git boundary. A repository without the marker has not been adopted,
+    and Orrery's orchestration layer does not apply there.
+    """
+    current = cwd.resolve(strict=False)
+    for directory in (current, *current.parents):
+        if (directory / ".orrery.json").is_file():
+            return directory
+        if (directory / ".git").exists():
+            break
+    return None
+
+
 def project_override(cwd: Path) -> dict[str, Any] | None:
     current = cwd.resolve(strict=False)
     for directory in (current, *current.parents):
@@ -118,7 +232,8 @@ def load_role(
 ) -> Role:
     if role_id not in ROLE_IDS:
         raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
-    steps = load_manifest(path).get("steps")
+    manifest = load_manifest(path)
+    steps = manifest.get("steps")
     if not isinstance(steps, list):
         raise RuntimeConfigError("the orchestration manifest has no role list")
     matches = [
@@ -133,7 +248,12 @@ def load_role(
     if role_id == "orchestrator" and path == MANIFEST_PATH:
         override = project_override(cwd or Path.cwd())
         if override is not None:
-            unknown = set(override) - {"provider", "model", "thinking"}
+            unknown = set(override) - {
+                "provider",
+                "model",
+                "thinking",
+                "endpoint",
+            }
             if unknown:
                 raise RuntimeConfigError(
                     "the repository orchestrator override contains unknown "
@@ -167,10 +287,41 @@ def load_role(
         )
     if access not in ACCESS_LEVELS:
         raise RuntimeConfigError(f"{role_id} has invalid access: {access!r}")
+    timeout_seconds = step.get("timeout_seconds")
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 30 <= timeout_seconds <= 7200
+    ):
+        raise RuntimeConfigError(
+            f"{role_id} timeout_seconds must be an integer between "
+            "30 and 7200"
+        )
     if role_id == "orchestrator" and access != "principal":
         raise RuntimeConfigError("the orchestrator must use principal access")
     if role_id != "orchestrator" and access == "principal":
         raise RuntimeConfigError(f"{role_id} cannot use principal access")
+    endpoint = None
+    if step.get("endpoint") is not None:
+        endpoint = load_endpoint(manifest, step.get("endpoint"))
+        if endpoint.adapter != provider:
+            raise RuntimeConfigError(
+                f"{role_id} uses provider {provider} but endpoint "
+                f"{endpoint.id} speaks {endpoint.adapter}"
+            )
+        # A third-party endpoint serves its own models, so the
+        # first-party catalogue cannot judge this model or its
+        # thinking levels.
+        return Role(
+            id=role_id,
+            title=title.strip(),
+            provider=provider,
+            model=model.strip(),
+            thinking=thinking,
+            access=access,
+            timeout_seconds=timeout_seconds,
+            endpoint=endpoint,
+        )
     catalogue = load_catalogue()
     known_providers = [
         known_provider
@@ -208,6 +359,7 @@ def load_role(
         model=model.strip(),
         thinking=thinking,
         access=access,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -221,6 +373,29 @@ def provider_executable(provider: str) -> str:
             f"required command unavailable for {provider}: {command}"
         )
     return resolved
+
+
+def codex_endpoint_arguments(endpoint: Endpoint) -> list[str]:
+    """Dotted `-c` overrides that point Codex at a custom provider.
+
+    Passed on the command line rather than written to config.toml
+    because delegated runs use --ignore-user-config, and because a
+    config file would be shared mutable state between concurrent runs.
+    `wire_api` is always `responses`: Codex removed chat/completions
+    support, so a chat-only service cannot be driven this way.
+    """
+    slug = endpoint.id.replace("-", "_")
+    settings = {
+        f"model_providers.{slug}.name": endpoint.label,
+        f"model_providers.{slug}.base_url": endpoint.base_url,
+        f"model_providers.{slug}.wire_api": "responses",
+    }
+    if endpoint.key_env:
+        settings[f"model_providers.{slug}.env_key"] = endpoint.key_env
+    arguments = ["-c", f"model_provider={json.dumps(slug)}"]
+    for key, value in settings.items():
+        arguments.extend(["-c", f"{key}={json.dumps(value)}"])
+    return arguments
 
 
 def thinking_override(thinking: str) -> str:
@@ -249,6 +424,8 @@ def principal_command(role: Role, extra: list[str]) -> list[str]:
         ]
         if role.thinking:
             command.extend(["-c", thinking_override(role.thinking)])
+        if role.endpoint is not None:
+            command.extend(codex_endpoint_arguments(role.endpoint))
         command.extend(["--sandbox", "workspace-write"])
     return [*command, *extra]
 
@@ -284,6 +461,8 @@ def delegated_command(
         command = [executable, "--model", role.model]
         if role.thinking:
             command.extend(["-c", thinking_override(role.thinking)])
+        if role.endpoint is not None:
+            command.extend(codex_endpoint_arguments(role.endpoint))
         command.extend(
             [
                 "exec",
@@ -300,12 +479,11 @@ def delegated_command(
         return command
 
     if settings_path is None:
-        raise RuntimeConfigError("Claude roles require a sandbox settings file")
-    # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces the default permission mode
-    # unless the allowed tools are declared explicitly; without this list a
-    # non-interactive delegated run aborts before its first real turn. One
-    # comma-joined token, because the variadic flag would swallow whatever
-    # argument follows it.
+        raise RuntimeConfigError("Claude roles require a settings file")
+    # The tool surface is declared explicitly so a non-interactive run
+    # never stalls on an approval it cannot receive. One comma-joined
+    # token, because the variadic flag would swallow whatever argument
+    # follows it.
     allowed_tools = (
         "Read,Grep,Glob,Bash"
         if role.read_only
@@ -318,6 +496,9 @@ def delegated_command(
         role.model,
         "--exclude-dynamic-system-prompt-sections",
         "--no-session-persistence",
+        # No --mcp-config is passed, so strict mode means a worker never
+        # loads MCP servers from user, project, or ancestor configs.
+        "--strict-mcp-config",
         "--output-format",
         "json",
         "--settings",
@@ -333,15 +514,23 @@ def delegated_command(
 
 
 def claude_sandbox_settings(role: Role, cwd: Path) -> dict[str, Any]:
-    sandbox: dict[str, Any] = {
-        "enabled": True,
-        "failIfUnavailable": True,
-        "allowUnsandboxedCommands": False,
-        "autoAllowBashIfSandboxed": not role.read_only,
-    }
+    """Settings for a delegated Claude run, with the CLI sandbox off.
+
+    The CLI's bubblewrap isolation cannot be used for delegated work on
+    2.1.220: its ancestor-config hiding walks past $HOME into
+    root-owned directories where the mount point cannot be created
+    (bwrap: Can't create file at /home/.mcp.json), which kills every
+    shell command in any repository under /home/<user>. That applies to
+    the sandbox.enabled bash sandbox and to the SUBPROCESS_ENV_SCRUB
+    isolation alike, so neither is requested, and the documented escape
+    hatch (sandbox.filesystem.disabled) is ignored when it arrives via
+    --settings, because flag settings may only harden the sandbox.
+    Containment comes from the service unit instead: allowlisted
+    environment, UMask, RuntimeMaxSec, and ReadOnlyPaths for read-only
+    roles.
+    """
     permissions: dict[str, Any] = {}
     if role.read_only:
-        sandbox["filesystem"] = {"denyWrite": [str(cwd.resolve())]}
         permissions["deny"] = [
             "Edit",
             "Write",
@@ -350,12 +539,129 @@ def claude_sandbox_settings(role: Role, cwd: Path) -> dict[str, Any]:
             "Bash(git push *)",
         ]
     return {
-        "sandbox": sandbox,
+        "sandbox": {"enabled": False},
         "permissions": permissions,
     }
 
 
-def provider_environment(provider: str, tmp_dir: Path) -> dict[str, str]:
+# The Claude CLI sandbox plants zero-byte trap files in the working
+# directory and hides them by appending their names to .git/info/exclude.
+# A graceful exit removes them again; an aborted run leaves both behind,
+# and every later aborted run appends the exclude block once more.
+CLAUDE_SANDBOX_CANARIES = (
+    ".env",
+    ".env.development",
+    ".env.development.local",
+    ".env.local",
+    ".env.production",
+    ".env.production.local",
+    ".env.test",
+    ".env.test.local",
+    ".gitmodules",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "node_modules",
+    "package-lock.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+)
+
+
+def claude_canary_snapshot(cwd: Path) -> dict[str, Any]:
+    """What the workspace looked like before a delegated Claude run."""
+    exclude = cwd / ".git" / "info" / "exclude"
+    try:
+        exclude_bytes: bytes | None = exclude.read_bytes()
+    except OSError:
+        exclude_bytes = None
+    return {
+        "cwd": cwd,
+        "exclude": exclude_bytes,
+        "present": {
+            name
+            for name in CLAUDE_SANDBOX_CANARIES
+            if (cwd / name).exists() or (cwd / name).is_symlink()
+        },
+    }
+
+
+def sweep_claude_canaries(snapshot: dict[str, Any]) -> list[str]:
+    """Remove sandbox residue an aborted Claude run left behind.
+
+    Only artefacts that did not exist before the run are touched, and a
+    file is only removed while still zero bytes, so anything the worker
+    genuinely produced survives.
+    """
+    cwd: Path = snapshot["cwd"]
+    removed: list[str] = []
+    for name in sorted(CLAUDE_SANDBOX_CANARIES):
+        if name in snapshot["present"]:
+            continue
+        path = cwd / name
+        try:
+            if path.is_symlink():
+                continue
+            if name == "node_modules":
+                # The CLI plants node_modules/.bin as well, so "empty"
+                # means no files anywhere in the tree, only directories.
+                if path.is_dir() and not any(
+                    entry
+                    for entry in path.rglob("*")
+                    if not entry.is_dir() or entry.is_symlink()
+                ):
+                    shutil.rmtree(path)
+                    removed.append(name)
+            elif path.is_file() and path.stat().st_size == 0:
+                path.unlink()
+                removed.append(name)
+        except OSError:
+            continue
+
+    exclude = cwd / ".git" / "info" / "exclude"
+    before = snapshot["exclude"]
+    try:
+        current: bytes | None = exclude.read_bytes()
+    except OSError:
+        current = None
+    if current is None or current == before:
+        return removed
+    prior_lines = (
+        []
+        if before is None
+        else before.decode("utf-8", "replace").splitlines()
+    )
+    current_lines = current.decode("utf-8", "replace").splitlines()
+    if current_lines[: len(prior_lines)] != prior_lines:
+        # The run rewrote the file rather than appending; not ours to fix.
+        return removed
+    canary_lines = {f"/{name}" for name in CLAUDE_SANDBOX_CANARIES}
+    added = current_lines[len(prior_lines) :]
+    kept = [line for line in added if line.strip() not in canary_lines]
+    if kept == added:
+        return removed
+    try:
+        if before is None and not kept:
+            exclude.unlink()
+        elif not kept:
+            exclude.write_bytes(before)
+        else:
+            text = "\n".join(prior_lines + kept) + "\n"
+            exclude.write_bytes(text.encode())
+    except OSError:
+        return removed
+    removed.append(".git/info/exclude entries")
+    return removed
+
+
+def provider_environment(
+    provider: str,
+    tmp_dir: Path,
+    role_id: str = "",
+    endpoint: Endpoint | None = None,
+) -> dict[str, str]:
     if provider not in PROVIDERS:
         raise RuntimeConfigError(f"unknown provider: {provider}")
     environment = {
@@ -363,6 +669,11 @@ def provider_environment(provider: str, tmp_dir: Path) -> dict[str, str]:
         "PATH": os.environ.get("PATH", ""),
         "TMPDIR": str(tmp_dir),
     }
+    if role_id:
+        # Marks the session as a bounded delegate so the SessionStart
+        # hook stays out of its way instead of injecting principal
+        # framing that contradicts the role handoff.
+        environment["ORRERY_ROLE"] = role_id
     exact_names = {
         "ALL_PROXY",
         "CURL_CA_BUNDLE",
@@ -408,22 +719,56 @@ def provider_environment(provider: str, tmp_dir: Path) -> dict[str, str]:
             environment[name] = value
     if provider == "openai":
         environment["CODEX_HOME"] = str(codex_home())
-    else:
-        environment["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+    if endpoint is not None:
+        environment.update(endpoint_environment(endpoint))
     # A delegated role is an independent context contained by this runner,
     # not a child of the invoking Claude Code session. Forwarding the
     # parent's identity markers makes the parent's lifecycle tooling treat
     # the delegated process tree as its own unregistered residue and reap
     # it mid-run, and invites nested-session behaviour in the provider CLI.
+    # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is dropped rather than set: it
+    # wraps every shell command in the CLI's bubblewrap isolation, whose
+    # ancestor-config hiding walks past $HOME and dies in root-owned
+    # directories (bwrap: Can't create file at /home/.mcp.json), killing
+    # all shell execution. This environment is already a strict allowlist,
+    # so the scrub added nothing but the breakage.
     for marker in (
         "CLAUDECODE",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_ENTRYPOINT",
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_SSE_PORT",
+        "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
     ):
         environment.pop(marker, None)
     return environment
+
+
+def endpoint_environment(endpoint: Endpoint) -> dict[str, str]:
+    """Route one role's CLI at its endpoint, with its own credential.
+
+    Raises when the named key variable is missing, because a silent
+    fall-through would send the assignment to the first-party account
+    the user believed they had redirected away from.
+    """
+    key = ""
+    if endpoint.key_env:
+        key = os.environ.get(endpoint.key_env, "")
+        if not key.strip():
+            raise RuntimeConfigError(
+                f"endpoint {endpoint.id} needs {endpoint.key_env} to be set"
+            )
+    if endpoint.adapter == "anthropic":
+        return {
+            "ANTHROPIC_BASE_URL": endpoint.base_url,
+            # Bearer token, which outranks an API key and a subscription
+            # login in the Claude CLI's authentication order.
+            "ANTHROPIC_AUTH_TOKEN": key,
+            # Explicitly empty rather than absent, so a first-party key
+            # elsewhere in the environment cannot silently take over.
+            "ANTHROPIC_API_KEY": "",
+        }
+    return {endpoint.key_env: key} if endpoint.key_env else {}
 
 
 def codex_home() -> Path:

@@ -103,6 +103,10 @@ def serve_catalogue() -> int:
 def main() -> int:
     mode = os.environ.get("CLAUDE_FAKE_MODE", "success")
 
+    if sys.argv[1:2] == ["--version"]:
+        print(os.environ.get("CLAUDE_FAKE_VERSION", "9.9.9 (Claude Code)"))
+        return 0
+
     if sys.argv[1:3] == ["auth", "status"]:
         if os.environ.get("CLAUDE_FAKE_AUTH", "ready") == "logged-out":
             print(json.dumps({"loggedIn": False}))
@@ -127,7 +131,21 @@ def main() -> int:
     if stdin_path := os.environ.get("CLAUDE_FAKE_STDIN"):
         Path(stdin_path).write_text(assignment)
     if write_path := os.environ.get("CLAUDE_FAKE_WRITE"):
-        Path(write_path).write_text("partial fake Claude edit\n")
+        try:
+            Path(write_path).write_text("partial fake Claude edit\n")
+        except OSError:
+            print("fake write blocked", file=sys.stderr)
+
+    if os.environ.get("CLAUDE_FAKE_PLANT"):
+        # Mimic the real CLI's sandbox traps: zero-byte files hidden by an
+        # appended .git/info/exclude block, left behind when a run aborts.
+        for name in (".env", "package.json"):
+            Path(name).touch()
+        Path("node_modules/.bin").mkdir(parents=True, exist_ok=True)
+        exclude = Path(".git/info/exclude")
+        if exclude.parent.is_dir():
+            with exclude.open("a") as handle:
+                handle.write("/.env\n/package.json\n")
 
     if settings_copy := os.environ.get("CLAUDE_FAKE_SETTINGS"):
         settings = option_value("--settings")

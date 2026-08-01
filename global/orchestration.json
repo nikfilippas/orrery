@@ -19,7 +19,8 @@
       "thinking": "low",
       "access": "workspace-write",
       "summary": "Handles narrow, repetitive, well-specified edits and boilerplate in a separate process.",
-      "selects": "The provider, model, and thinking level used by orrery-agent --role mechanic."
+      "selects": "The provider, model, and thinking level used by orrery-agent --role mechanic.",
+      "timeout_seconds": 600
     },
     {
       "id": "implementer",
@@ -29,7 +30,8 @@
       "thinking": "medium",
       "access": "workspace-write",
       "summary": "Handles contained features, real bug fixes, and coherent multi-file implementation tasks in a separate process.",
-      "selects": "The provider, model, and thinking level used by orrery-agent --role implementer."
+      "selects": "The provider, model, and thinking level used by orrery-agent --role implementer.",
+      "timeout_seconds": 900
     },
     {
       "id": "plan-reviewer",
@@ -39,7 +41,8 @@
       "thinking": "ultra",
       "access": "read-only",
       "summary": "Challenges a complex or high-risk plan in a fresh, read-only process before code is written.",
-      "selects": "The provider, model, and thinking level used by orrery-agent --role plan-reviewer."
+      "selects": "The provider, model, and thinking level used by orrery-agent --role plan-reviewer.",
+      "timeout_seconds": 900
     },
     {
       "id": "reviewer",
@@ -49,7 +52,8 @@
       "thinking": "ultra",
       "access": "read-only",
       "summary": "Reviews finished work or difficult diagnoses in a fresh, read-only process.",
-      "selects": "The provider, model, and thinking level used by orrery-agent --role reviewer."
+      "selects": "The provider, model, and thinking level used by orrery-agent --role reviewer.",
+      "timeout_seconds": 900
     }
   ],
   "chart": {

@@ -186,6 +186,32 @@ if (
 ):
     raise SystemExit("plan-review cap must be 1–4")
 
+endpoints = manifest.get("endpoints", {})
+if not isinstance(endpoints, dict):
+    raise SystemExit("manifest endpoints must be an object")
+sys.path.insert(0, str(kit / "scripts"))
+from orrery_runtime import load_endpoint  # noqa: E402
+
+for name in endpoints:
+    load_endpoint(manifest, name)
+
+for step in manifest["steps"]:
+    if step.get("endpoint") is not None:
+        endpoint = load_endpoint(manifest, step["endpoint"])
+        if endpoint.adapter != step["provider"]:
+            raise SystemExit(
+                f"{step['id']} provider does not match its endpoint adapter"
+            )
+    step_timeout = step.get("timeout_seconds")
+    if step_timeout is not None and (
+        isinstance(step_timeout, bool)
+        or not isinstance(step_timeout, int)
+        or not 30 <= step_timeout <= 7200
+    ):
+        raise SystemExit(
+            "role timeout_seconds must be an integer between 30 and 7200"
+        )
+
 chart = manifest.get("chart", {})
 nodes = chart.get("nodes")
 edges = chart.get("edges")
@@ -210,23 +236,32 @@ if labels != required_labels:
 targets = [
     edge["to"] for edge in edges if edge.get("from") == "classify"
 ]
-if [node_by_id[target]["x"] for target in targets] != sorted(
-    node_by_id[target]["x"] for target in targets
+if [node_by_id[target]["y"] for target in targets] != sorted(
+    node_by_id[target]["y"] for target in targets
+) or any(
+    node_by_id[target]["x"] <= node_by_id["classify"]["x"]
+    for target in targets
 ):
-    raise SystemExit("classifier nodes are not ordered left to right")
-forward = next(
-    edge for edge in edges
-    if edge.get("from") == "plan" and edge.get("to") == "plan-review-step"
-)
+    raise SystemExit(
+        "classifier results are not a top-to-bottom rank right of classify"
+    )
+pairs = {(edge.get("from"), edge.get("to")) for edge in edges}
+if (
+    ("plan", "plan-review-step") not in pairs
+    or ("plan-review-step", "plan") not in pairs
+):
+    raise SystemExit("chart omits the bounded plan-review cycle")
 reverse = next(
     edge for edge in edges
     if edge.get("from") == "plan-review-step" and edge.get("to") == "plan"
 )
+return_offset = reverse.get("offset")
 if (
-    not forward.get("offset")
-    or forward["offset"] != -reverse.get("offset", 0)
+    isinstance(return_offset, bool)
+    or not isinstance(return_offset, (int, float))
+    or return_offset == 0
 ):
-    raise SystemExit("plan-review cycle curves are not symmetric")
+    raise SystemExit("plan-review return curve does not separate the cycle")
 required_nodes = {
     "investigation-result", "review-gate", "review", "findings",
     "correct", "done", "plan-escalation",
@@ -428,6 +463,40 @@ case ":$PATH:" in
 esac
 
 printf '\n=== Claude-specific settings and cleanup ===\n'
+if command -v claude >/dev/null 2>&1; then
+    VALIDATED_CLAUDE="$(
+        python3 -c "import sys; sys.path.insert(0, '$KIT_DIR/scripts'); \
+from orrery_runtime import VALIDATED_CLAUDE_CLI; print(VALIDATED_CLAUDE_CLI)" \
+            2>/dev/null
+    )"
+    INSTALLED_CLAUDE="$(claude --version 2>/dev/null | awk '{print $1}')"
+    if [ -z "$VALIDATED_CLAUDE" ] || [ -z "$INSTALLED_CLAUDE" ]; then
+        skip "Claude CLI version could not be compared with the baseline"
+    elif [ "$INSTALLED_CLAUDE" = "$VALIDATED_CLAUDE" ]; then
+        pass "Claude CLI matches the validated delegated-run baseline ($VALIDATED_CLAUDE)"
+    else
+        warn "Claude CLI $INSTALLED_CLAUDE differs from the validated baseline $VALIDATED_CLAUDE; re-run the delegated shell probe (docs/setup-guide.md) and update VALIDATED_CLAUDE_CLI"
+    fi
+fi
+# A sandboxed Claude run that dies before cleanup leaves zero-byte
+# mount-point files in $HOME. An empty .bash_profile is the damaging
+# one: login shells then skip .profile, and PATH loses ~/.local/bin
+# machine-wide.
+SANDBOX_RESIDUE=""
+for name in .bash_profile .bash_aliases .bash_login .bash_logout \
+    .zshrc .zprofile .zshenv .zlogin .zlogout \
+    .netrc .npmrc .yarnrc .yarnrc.yml .bunfig.toml .ripgreprc; do
+    candidate="$HOME/$name"
+    if [ -f "$candidate" ] && [ ! -s "$candidate" ] \
+        && [ ! -L "$candidate" ]; then
+        SANDBOX_RESIDUE="$SANDBOX_RESIDUE $name"
+    fi
+done
+if [ -n "$SANDBOX_RESIDUE" ]; then
+    warn "Zero-byte shell/config files in \$HOME:$SANDBOX_RESIDUE - likely sandbox mount-point residue; an empty .bash_profile masks .profile and breaks login PATH. Remove them if you did not create them."
+else
+    pass "No zero-byte sandbox residue in \$HOME shell configuration"
+fi
 check_link \
     "$HOME/.claude/hooks/leave-no-trace.py" \
     "$KIT_DIR/global/hooks/leave-no-trace.py"
@@ -553,6 +622,55 @@ if [ "$KERNEL" = "Linux" ]; then
 else
     skip "systemd control-group containment is not applicable on $KERNEL"
 fi
+
+printf '\n=== Model endpoints ===\n'
+ENDPOINT_REPORT="$(
+    python3 - "$KIT_DIR/global/orchestration.json" "$KIT_DIR" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+from orrery_runtime import load_endpoint  # noqa: E402
+
+manifest = json.loads(Path(sys.argv[1]).read_text())
+used = {
+    step["endpoint"]: step["id"]
+    for step in manifest.get("steps", [])
+    if step.get("endpoint")
+}
+if not used:
+    print("PASS|Every role uses its provider's first-party endpoint")
+for name, role in sorted(used.items()):
+    endpoint = load_endpoint(manifest, name)
+    if endpoint.key_env and not os.environ.get(endpoint.key_env, "").strip():
+        print(
+            f"FAIL|{role} routes to {endpoint.label} but "
+            f"{endpoint.key_env} is unset"
+        )
+    else:
+        credential = (
+            f"{endpoint.key_env} is set"
+            if endpoint.key_env
+            else "no credential required"
+        )
+        print(
+            f"PASS|{role} routes to {endpoint.label} "
+            f"({endpoint.base_url}; {credential})"
+        )
+PY
+)" || ENDPOINT_REPORT="FAIL|Model endpoint configuration is invalid"
+while IFS='|' read -r verdict message; do
+    [ -n "$message" ] || continue
+    if [ "$verdict" = "PASS" ]; then
+        pass "$message"
+    else
+        fail "$message"
+    fi
+done <<EOF
+$ENDPOINT_REPORT
+EOF
 
 printf '\n=== Standing fallback approvals ===\n'
 if STANDING_LIST="$(

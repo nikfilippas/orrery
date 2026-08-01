@@ -204,12 +204,92 @@ On systemd systems the delegated process runs in a transient service with:
 - a `RuntimeMaxSec` backstop
 - a private umask
 - a fixed working directory
+- `ReadOnlyPaths` on the workspace for read-only roles, enforced by the
+  kernel rather than by tool rules alone
 
 The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
 stops the whole control group and removes the private prompt, settings, log,
 and result. Without systemd the runner uses a new process group and announces
 that a detached descendant cannot receive the same uncatchable-death
 guarantee.
+
+The delegated-run behaviour above was validated against a specific Claude
+CLI version, recorded as `VALIDATED_CLAUDE_CLI` in
+`scripts/orrery_runtime.py`. After a CLI update the doctor warns until you
+re-validate: in a scratch repository under `/home/<user>`, run
+
+```bash
+orrery-agent --role implementer --timeout 300 -- \
+    "Using the Bash tool, run: echo PROBE-OK. Quote the output, or the
+verbatim error if the tool fails."
+```
+
+A `PROBE-OK` reply means delegated shell execution still works; update the
+recorded version. A bwrap error means the CLI changed behaviour again; keep
+the old baseline and investigate before trusting delegated verification.
+
+Delegated Claude runs deliberately do not use the Claude CLI's own
+bubblewrap isolation (the bash sandbox and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`
+alike): on CLI 2.1.220 its ancestor-configuration hiding walks past `$HOME`
+into root-owned directories where the bind mount point cannot be created
+(`bwrap: Can't create file at /home/.mcp.json`), which kills every shell
+command in any repository under `/home/<user>`. Containment comes from the
+allowlisted service environment, the transient unit, and `ReadOnlyPaths`
+instead. If an aborted sandboxed run from another source leaves the CLI's
+zero-byte trap files behind (`.env*`, `package.json`, lockfiles, an empty
+`node_modules`, plus `.git/info/exclude` entries), the runner sweeps the
+residue after the unit stops and reports what it removed.
+
+## Route a role at another model service
+
+A role's `provider` names the CLI that runs it. An optional `endpoint`
+names where that CLI sends its requests, so a role can run on Kimi,
+DeepSeek, GLM, Qwen, MiniMax, OpenRouter, a local Ollama, or anything else
+speaking one of the two wire protocols. Pick one in `orrery-config`; the
+page writes both halves of the manifest:
+
+```json
+"endpoints": {
+  "kimi": {
+    "label": "Kimi (Moonshot AI)",
+    "adapter": "anthropic",
+    "base_url": "https://api.moonshot.ai/anthropic",
+    "key_env": "MOONSHOT_API_KEY"
+  }
+},
+"steps": [
+  { "id": "implementer", "provider": "anthropic", "model": "kimi-k3[1m]",
+    "endpoint": "kimi", "...": "..." }
+]
+```
+
+- `adapter: anthropic` uses the Claude CLI against an Anthropic Messages
+  compatible base URL. Orrery sets `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN` from `key_env`, and an empty `ANTHROPIC_API_KEY`
+  so a first-party key elsewhere cannot silently take over. The routing
+  applies to that role's process only, so first-party and third-party
+  roles run side by side.
+- `adapter: openai` uses the Codex CLI, configured entirely through
+  `-c model_providers.<id>.*` overrides on the command line, with
+  `wire_api = "responses"`. Codex dropped chat/completions, so a service
+  offering only that wire format cannot be driven this way. Mistral is
+  the notable example; reach it through a Responses-compatible gateway or
+  through OpenRouter instead.
+- **Keys are never stored in the manifest**, only the name of the
+  environment variable holding one. A missing variable stops the run with
+  a named error rather than falling back to a first-party account. A
+  local endpoint may set `key_env` to `null`.
+- Plain `http://` is refused except on localhost, and a URL may not embed
+  credentials.
+- Third-party models are not in the first-party catalogue, so Orrery
+  cannot validate their thinking levels: the level is left to the
+  endpoint's own default, and the doctor reports each routed role and
+  whether its credential variable is set.
+
+`global/endpoints.json` holds the presets the configuration page offers,
+each with the provider documentation it was taken from. Editing that file
+only changes what is offered; a role is routed only when its manifest
+entry says so.
 
 ## Adopt a repository
 
@@ -219,6 +299,17 @@ orrery-init [model] /path/to/repository
 
 When no usable Git worktree exists and no malformed `.git` marker is present,
 the command runs `git init` automatically.
+
+Adoption is what switches the orchestration layer on. The command always
+leaves a `.orrery.json` at the repository root (kept out of Git through
+`info/exclude`), and both the global policy and the SessionStart check treat
+that marker as the gate. In a repository without it, a direct Claude or Codex
+session announces "repository not adopted" and behaves as a normal
+single-provider session: the model is whatever the interface has selected,
+and only Part I of the global policy, the engineering baseline, applies.
+Sessions started through `orrery` or `orrery-agent` carry the orchestration
+layer with them regardless, so adoption is never required just to run the
+launchers.
 
 Instruction migration:
 
@@ -391,6 +482,9 @@ The maintained artefacts are:
   lifecycle helpers.
 - `tests/run-tests.py`, `tests/fake-codex`, and `tests/fake-claude` — offline
   regression suite and provider stand-ins.
+- `.github/workflows/ci.yml` — lint and suite on push and pull request. The
+  suite needs a systemd user manager, so the job enables lingering before it
+  runs.
 
 ## Troubleshooting
 

@@ -1,0 +1,113 @@
+{
+  "_comment": "Presets for routing a role at a third-party or local model service. Data, not policy: adding an entry here only offers it in the configuration page. 'adapter' names the CLI that speaks to it: 'anthropic' means the Claude CLI against an Anthropic Messages-compatible base URL, 'openai' means the Codex CLI against an OpenAI Responses-compatible base URL. Keys are never stored here, only the name of the environment variable that holds one. Verified entries were taken from the provider's own Claude Code or Codex documentation.",
+  "endpoints": [
+    {
+      "id": "kimi",
+      "label": "Kimi (Moonshot AI)",
+      "adapter": "anthropic",
+      "base_url": "https://api.moonshot.ai/anthropic",
+      "key_env": "MOONSHOT_API_KEY",
+      "models": ["kimi-k3[1m]", "kimi-k2.7-code"],
+      "verified": true,
+      "documentation": "https://platform.kimi.ai/docs/guide/claude-code-kimi"
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "adapter": "anthropic",
+      "base_url": "https://api.deepseek.com/anthropic",
+      "key_env": "DEEPSEEK_API_KEY",
+      "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+      "verified": true,
+      "documentation": "https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code"
+    },
+    {
+      "id": "glm",
+      "label": "GLM (Z.ai)",
+      "adapter": "anthropic",
+      "base_url": "https://api.z.ai/api/anthropic",
+      "key_env": "ZAI_API_KEY",
+      "models": ["glm-5.2", "glm-4.7"],
+      "verified": true,
+      "documentation": "https://docs.z.ai/scenario-example/develop-tools/claude"
+    },
+    {
+      "id": "qwen",
+      "label": "Qwen (Alibaba Model Studio, coding plan)",
+      "adapter": "anthropic",
+      "base_url": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic",
+      "key_env": "DASHSCOPE_API_KEY",
+      "models": ["qwen3.7-plus", "qwen3-coder-next"],
+      "verified": true,
+      "documentation": "https://www.alibabacloud.com/help/en/model-studio/claude-code"
+    },
+    {
+      "id": "minimax",
+      "label": "MiniMax",
+      "adapter": "anthropic",
+      "base_url": "https://api.minimax.io/anthropic",
+      "key_env": "MINIMAX_API_KEY",
+      "models": ["MiniMax-M3[1m]", "MiniMax-M3"],
+      "verified": true,
+      "documentation": "https://platform.minimax.io/docs/token-plan/claude-code"
+    },
+    {
+      "id": "minimax-codex",
+      "label": "MiniMax through Codex",
+      "adapter": "openai",
+      "base_url": "https://api.minimax.io/v1",
+      "key_env": "MINIMAX_API_KEY",
+      "models": ["MiniMax-M3"],
+      "verified": true,
+      "documentation": "https://platform.minimax.io/docs/token-plan/codex"
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "adapter": "anthropic",
+      "base_url": "https://openrouter.ai/api",
+      "key_env": "OPENROUTER_API_KEY",
+      "models": ["~anthropic/claude-sonnet-latest", "~openai/gpt-latest"],
+      "verified": true,
+      "documentation": "https://openrouter.ai/blog/tutorials/claude-code-openrouter/"
+    },
+    {
+      "id": "ollama",
+      "label": "Ollama (local)",
+      "adapter": "anthropic",
+      "base_url": "http://localhost:11434",
+      "key_env": null,
+      "models": ["qwen3-coder", "gpt-oss:20b"],
+      "verified": true,
+      "documentation": "https://docs.ollama.com/api/anthropic-compatibility"
+    },
+    {
+      "id": "ollama-codex",
+      "label": "Ollama through Codex (local)",
+      "adapter": "openai",
+      "base_url": "http://localhost:11434/v1",
+      "key_env": null,
+      "models": ["gpt-oss:20b", "gpt-oss:120b"],
+      "verified": true,
+      "documentation": "https://docs.ollama.com/integrations/codex"
+    },
+    {
+      "id": "grok",
+      "label": "Grok (xAI)",
+      "adapter": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "key_env": "XAI_API_KEY",
+      "models": ["grok-4.5", "grok-4.3"],
+      "verified": false,
+      "documentation": "https://docs.x.ai/docs/api-reference"
+    }
+  ],
+  "unsupported": [
+    {
+      "id": "mistral",
+      "label": "Mistral",
+      "reason": "Mistral publishes no Anthropic Messages-compatible endpoint, and its OpenAI-compatible surface is chat/completions only, which the Codex CLI no longer speaks. Reachable through an OpenAI-compatible gateway that exposes the Responses API, or through OpenRouter.",
+      "documentation": "https://docs.mistral.ai/api/"
+    }
+  ]
+}

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from orrery_runtime import (  # noqa: E402
     MODEL_ID,
     PROVIDERS,
     RuntimeConfigError,
+    adopted_root,
     load_role,
 )
 
@@ -61,6 +63,26 @@ def main() -> int:
         )
         return 0
     active_provider = sys.argv[1]
+    delegated_role = os.environ.get("ORRERY_ROLE", "").strip()
+    if delegated_role:
+        # A bounded delegate carries its role in the environment set by
+        # the runner. Principal comparison does not apply to it, and
+        # injecting principal framing here only forces the worker to
+        # spend its reply disclaiming the contradiction.
+        print(
+            json.dumps(
+                hook_output(
+                    f"Orrery bounded {delegated_role} session; principal "
+                    "checks do not apply.",
+                    "This is a bounded, non-principal Orrery session. "
+                    "Follow the ORRERY ROLE HANDOFF in the prompt. Do not "
+                    "adopt principal duties, open replies with a principal "
+                    "header, or treat principal-surface guidance as "
+                    "applying here.",
+                )
+            )
+        )
+        return 0
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
@@ -79,6 +101,32 @@ def main() -> int:
             raise ValueError("hook input has no active model")
         if not isinstance(cwd, str) or not cwd:
             cwd = str(Path.cwd())
+        if (
+            adopted_root(Path(cwd)) is None
+            and os.environ.get("ORRERY_SESSION") != "principal"
+        ):
+            # An un-adopted repository gets a normal single-provider
+            # session; the orchestration layer must stand down rather
+            # than gate or reshape it.
+            print(
+                json.dumps(
+                    hook_output(
+                        "Orrery: repository not adopted; standard "
+                        f"{provider_label(active_provider)} session.",
+                        "This repository has not been adopted by Orrery: "
+                        "there is no .orrery.json at its root (run "
+                        "orrery-init to adopt it). Apply only the "
+                        "engineering baseline from the global policy. Run "
+                        "as a normal single-provider session with the "
+                        "model chosen in this interface, and do not "
+                        "classify requests into orchestration routes, "
+                        "delegate to orrery-agent, run plan-review loops, "
+                        "apply the fallback protocol, or require "
+                        "principal approval.",
+                    )
+                )
+            )
+            return 0
         configured = load_role("orchestrator", cwd=Path(cwd))
     except (OSError, ValueError, json.JSONDecodeError, RuntimeConfigError) as exc:
         detail = re.sub(r"[\r\n]+", " ", str(exc))[:300]

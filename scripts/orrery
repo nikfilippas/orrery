@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from orrery_fallback import (  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
+    endpoint_environment,
     load_role,
     principal_command,
 )
@@ -420,13 +422,30 @@ def main() -> int:
         print(
             ("↳ Fallback principal" if is_fallback else "↳ Principal orchestrator")
             + f" · {role.provider} · {role.model}"
-            + (f" · thinking {role.thinking}" if role.thinking else ""),
+            + (f" · thinking {role.thinking}" if role.thinking else "")
+            + (f" · via {role.endpoint.label}" if role.endpoint else ""),
             file=sys.stderr,
             flush=True,
         )
+        # Marks the session as deliberately started through the launcher,
+        # so the SessionStart hook applies the orchestration layer even in
+        # a repository that has not been adopted with orrery-init.
+        principal_environment = {**os.environ, "ORRERY_SESSION": "principal"}
+        if role.endpoint is not None:
+            try:
+                principal_environment.update(
+                    endpoint_environment(role.endpoint)
+                )
+            except RuntimeConfigError as exc:
+                print(f"orrery: {exc}", file=sys.stderr)
+                return 2
         workspace_before = git_workspace_fingerprint()
         try:
-            result = subprocess.run(command, check=False)
+            result = subprocess.run(
+                command,
+                check=False,
+                env=principal_environment,
+            )
             return_code = result.returncode
         except KeyboardInterrupt:
             return 128 + signal.SIGINT

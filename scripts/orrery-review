@@ -19,12 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
+    claude_canary_snapshot,
     claude_sandbox_settings,
     codex_home,
     delegated_command,
     load_role,
     provider_environment,
     role_handoff,
+    sweep_claude_canaries,
 )
 from orrery_fallback import (  # noqa: E402
     APPROVAL_REQUIRED,
@@ -80,6 +82,7 @@ class Invocation:
         no_fallback: bool,
         approval_scope: tuple[str, float | None] | None = None,
         revoke: bool = False,
+        timeout_is_default: bool = False,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.output_path = output_path
@@ -89,6 +92,7 @@ class Invocation:
         self.no_fallback = no_fallback
         self.approval_scope = approval_scope
         self.revoke = revoke
+        self.timeout_is_default = timeout_is_default
 
 
 class DelegationState:
@@ -214,6 +218,10 @@ def parse_args(argv: list[str]) -> Invocation:
         raise UsageError(
             "ORRERY_AGENT_TIMEOUT_SECONDS must be a positive integer"
         ) from exc
+    timeout_is_default = (
+        "ORRERY_AGENT_TIMEOUT_SECONDS" not in os.environ
+        and "CODEX_REVIEW_TIMEOUT_SECONDS" not in os.environ
+    )
 
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
@@ -245,6 +253,7 @@ def parse_args(argv: list[str]) -> Invocation:
                 raise UsageError(
                     "--timeout must be a positive integer"
                 ) from exc
+            timeout_is_default = False
         elif argument.startswith("--timeout="):
             try:
                 timeout_seconds = int(argument.split("=", 1)[1])
@@ -252,6 +261,7 @@ def parse_args(argv: list[str]) -> Invocation:
                 raise UsageError(
                     "--timeout must be a positive integer"
                 ) from exc
+            timeout_is_default = False
         elif argument == "--output":
             if index + 1 >= len(argv):
                 raise UsageError("missing value for --output")
@@ -326,6 +336,7 @@ def parse_args(argv: list[str]) -> Invocation:
             approval=None,
             no_fallback=False,
             revoke=True,
+            timeout_is_default=timeout_is_default,
         )
 
     if prompt_parts is not None and prompt_parts:
@@ -363,6 +374,7 @@ def parse_args(argv: list[str]) -> Invocation:
         approval=approval,
         no_fallback=no_fallback,
         approval_scope=approval_scope,
+        timeout_is_default=timeout_is_default,
     )
 
 
@@ -623,6 +635,8 @@ def write_service_launcher(
     run_dir: Path,
     tmp_dir: Path,
     provider: str,
+    role_id: str = "",
+    endpoint: Any = None,
 ) -> tuple[Path, Path]:
     environment_path = run_dir / "service-environment.json"
     environment_fd = os.open(
@@ -632,7 +646,7 @@ def write_service_launcher(
     )
     with os.fdopen(environment_fd, "w", encoding="utf-8") as handle:
         json.dump(
-            provider_environment(provider, tmp_dir),
+            provider_environment(provider, tmp_dir, role_id, endpoint),
             handle,
             ensure_ascii=False,
         )
@@ -1206,6 +1220,13 @@ def main(
             )
 
     timeout_seconds = invocation.timeout_seconds
+    if (
+        invocation.timeout_is_default
+        and role_config.timeout_seconds is not None
+    ):
+        # The manifest's per-role budget applies only when neither the
+        # flag nor the environment chose a timeout.
+        timeout_seconds = role_config.timeout_seconds
     output_path = invocation.output_path
     prompt = invocation.prompt
     role_id = invocation.role_id
@@ -1224,6 +1245,14 @@ def main(
             "control-group containment.",
             file=sys.stderr,
         )
+        if role_config.read_only:
+            # ReadOnlyPaths exists only on the systemd path, so here the
+            # workspace is guarded by tool permissions alone.
+            print(
+                f"{PROGRAM_NAME}: workspace write protection for this "
+                "read-only role is tool-level only without systemd.",
+                file=sys.stderr,
+            )
 
     display, purpose = role_label(role_id)
     print(
@@ -1236,6 +1265,11 @@ def main(
         + (
             f" · thinking {role_config.thinking}"
             if role_config.thinking
+            else ""
+        )
+        + (
+            f" · via {role_config.endpoint.label}"
+            if role_config.endpoint is not None
             else ""
         )
         + f" · {purpose}",
@@ -1260,6 +1294,7 @@ def main(
     process: subprocess.Popen[bytes] | None = None
     unit_may_exist = False
     control_returned = False
+    canary_snapshot = None
 
     def return_control() -> None:
         nonlocal control_returned
@@ -1327,6 +1362,10 @@ def main(
                 + "\n"
             )
             settings_path.chmod(0o600)
+            if canary_snapshot is None:
+                # First attempt only: a retried attempt must not mistake
+                # the previous attempt's litter for pre-existing files.
+                canary_snapshot = claude_canary_snapshot(Path.cwd())
         try:
             provider_arguments = delegated_command(
                 role_config,
@@ -1350,6 +1389,8 @@ def main(
                 run_dir,
                 tmp_dir,
                 role_config.provider,
+                role_config.id,
+                role_config.endpoint,
             )
             command = [
                 "systemd-run",
@@ -1372,6 +1413,15 @@ def main(
                 # running forever. The wrapper's own timeout fires first
                 # and reports diagnostics.
                 f"--property=RuntimeMaxSec={timeout_seconds + 60}s",
+                # Kernel-level write protection for read-only roles. The
+                # Claude sandbox no longer carries denyWrite (its
+                # filesystem layer is disabled to keep shell execution
+                # alive); the unit enforces it for every provider.
+                *(
+                    [f"--property=ReadOnlyPaths={Path.cwd()}"]
+                    if role_config.read_only
+                    else []
+                ),
                 f"--working-directory={Path.cwd()}",
                 sys.executable,
                 str(launcher_path),
@@ -1427,7 +1477,12 @@ def main(
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        env=provider_environment(role_config.provider, tmp_dir),
+                        env=provider_environment(
+                            role_config.provider,
+                            tmp_dir,
+                            role_config.id,
+                            role_config.endpoint,
+                        ),
                     )
             finally:
                 signal.pthread_sigmask(
@@ -1657,6 +1712,15 @@ def main(
             terminate_client(process)
             if not use_systemd:
                 terminate_group(process)
+
+        # Only once the provider tree is provably stopped; sweeping under
+        # a live CLI would race its own graceful cleanup.
+        if canary_snapshot is not None and unit_stopped:
+            swept = sweep_claude_canaries(canary_snapshot)
+            if swept:
+                report(
+                    "Removed Claude sandbox residue: " + ", ".join(swept)
+                )
 
         if run_dir is not None:
             if unit_stopped:

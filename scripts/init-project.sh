@@ -225,6 +225,14 @@ for pattern in "/.orrery.json" "/CLAUDE.local.md"; do
     fi
 done
 
+# The marker that adopts the repository: the SessionStart check and the
+# global policy apply Orrery's orchestration layer only where it exists.
+MARKER="$PROJECT_ROOT/.orrery.json"
+if [ ! -f "$MARKER" ]; then
+    printf '{}\n' > "$MARKER"
+    printf 'Created adoption marker %s\n' "$MARKER"
+fi
+
 if [ -n "$MODEL" ]; then
     IFS=$'\t' read -r MODEL_PROVIDER MODEL_VALUE MODEL_THINKING <<< "$MODEL_SPEC"
     python3 - \

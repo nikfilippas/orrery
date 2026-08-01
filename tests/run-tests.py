@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -290,6 +291,10 @@ def finish_review(
                 process.communicate(timeout=20)
         stop_stray_units(f"orrery-review-{process.pid}-")
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        if environment.get("KIT_NO_SYSTEMD_BIN"):
+            shutil.rmtree(
+                environment["KIT_NO_SYSTEMD_BIN"], ignore_errors=True
+            )
 
 
 def wait_for_unit(process: subprocess.Popen[str], timeout: float = 20.0) -> str:
@@ -2456,13 +2461,22 @@ def test_prompt_required() -> None:
 def fallback_environment(mode: str) -> dict[str, str]:
     """A review environment whose PATH has no systemd tools at all.
 
-    The interpreter's own directory stays on PATH so the stand-in's
-    `env python3` shebang still resolves; it contains no systemd tools.
+    Relying on the interpreter's own directory is not safe here: when
+    the suite happens to run under /usr/bin/python3, that directory is
+    exactly where systemd-run lives. An isolated bin directory with
+    symlinks to only the required tools keeps the degradation
+    deterministic regardless of which python invoked the suite.
     """
     environment = review_environment(mode)
+    isolated = Path(tempfile.mkdtemp(prefix="kit-no-systemd."))
+    for name in ("python3", "git", "env", "sh", "bash"):
+        target = shutil.which(name)
+        if target is not None:
+            (isolated / name).symlink_to(target)
     environment["PATH"] = os.pathsep.join(
-        [environment["KIT_FAKE_BIN"], str(Path(sys.executable).parent)]
+        [environment["KIT_FAKE_BIN"], str(isolated)]
     )
+    environment["KIT_NO_SYSTEMD_BIN"] = str(isolated)
     return environment
 
 
@@ -2491,6 +2505,11 @@ def test_fallback_completion() -> None:
         require(
             "without control-group containment" in stderr,
             f"the degraded mode was not announced: {stderr!r}",
+        )
+        require(
+            "write protection for this read-only role is tool-level only"
+            in stderr,
+            f"the weaker read-only guarantee was not announced: {stderr!r}",
         )
         own_units = [
             line
@@ -2760,17 +2779,23 @@ def test_claude_invocation_contract() -> None:
             "the Claude assignment was exposed in argv or lost from stdin",
         )
 
+        require(
+            "--strict-mcp-config" in arguments,
+            "a delegated Claude run may load ambient MCP configuration",
+        )
         settings = read_json(settings_path)
         sandbox = settings.get("sandbox", {})
         deny = settings.get("permissions", {}).get("deny", [])
         require(
-            sandbox.get("enabled") is True
-            and sandbox.get("failIfUnavailable") is True
-            and sandbox.get("allowUnsandboxedCommands") is False
-            and str(Path.cwd().resolve())
-            in sandbox.get("filesystem", {}).get("denyWrite", [])
+            # The CLI sandbox must stay off for delegated runs: its
+            # ancestor-config hiding walks past $HOME and kills every
+            # shell command (bwrap: Can't create file at
+            # /home/.mcp.json). Write protection comes from the unit's
+            # ReadOnlyPaths instead.
+            sandbox.get("enabled") is False
+            and "filesystem" not in sandbox
             and {"Edit", "Write", "NotebookEdit"} <= set(deny),
-            f"the Claude reviewer sandbox is not fail-closed: {settings}",
+            f"the Claude reviewer settings are wrong: {settings}",
         )
         provider_env = read_json(environment_path)
         require(
@@ -6631,6 +6656,122 @@ def test_config_surface() -> None:
     exercise_provider_neutral_config_surface()
     return
 
+
+@test("the config token stays out of argv and substitution is one pass")
+def test_config_launcher_hygiene() -> None:
+    """The browser must never see the URL token in a process argument
+    list, and a substituted value containing a placeholder must be
+    served verbatim rather than substituted again."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        marker = "shipped __CATALOGUE_NOTE__ verbatim"
+        manifest["chart"]["nodes"][-1]["label"] = marker
+        write_json(manifest_path, manifest)
+
+        home = root / "home"
+        home.mkdir()
+        capture = root / "browser-argv.txt"
+        browser = root / "capture-browser.sh"
+        browser.write_text(
+            f'#!/bin/sh\nprintf \'%s\' "$1" > "{capture}"\n'
+        )
+        browser.chmod(0o755)
+
+        environment = review_environment("success")
+        environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(home / ".codex")
+        environment["BROWSER"] = str(browser)
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(kit / "scripts" / "orrery-config"),
+                "--port",
+                "0",
+                "--timeout",
+                "6",
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            url = None
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                if line.startswith("CONFIG_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    break
+            require(bool(url), "the server never announced its URL")
+            token = url.rstrip("/").rsplit("/", 1)[-1]
+
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not capture.exists():
+                time.sleep(0.1)
+            require(capture.exists(), "the BROWSER command was never run")
+            argv_url = capture.read_text()
+            require(
+                argv_url.startswith("file://"),
+                f"the browser was not handed a private file: {argv_url}",
+            )
+            require(
+                token not in argv_url,
+                "the URL token leaked into the browser argument list",
+            )
+
+            import urllib.parse
+            import urllib.request
+
+            launcher = Path(
+                urllib.parse.unquote(argv_url[len("file://") :])
+            )
+            require(launcher.is_file(), "the launcher file is missing")
+            mode = launcher.stat().st_mode & 0o777
+            parent_mode = launcher.parent.stat().st_mode & 0o777
+            require(
+                mode == 0o600 and parent_mode == 0o700,
+                f"launcher permissions are open: "
+                f"{oct(mode)}/{oct(parent_mode)}",
+            )
+            require(
+                url in launcher.read_text(),
+                "the launcher does not forward to the tokened URL",
+            )
+
+            page = urllib.request.urlopen(url, timeout=10).read().decode()
+            require(
+                marker in page,
+                "a value containing a placeholder was substituted again",
+            )
+            require(
+                f"/t/{token}/" in page,
+                "the token path placeholder was not substituted",
+            )
+
+            process.wait(timeout=30)
+            require(
+                not launcher.parent.exists(),
+                "the launcher directory outlived the server",
+            )
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            with contextlib.suppress(Exception):
+                process.stdout.close()
+            process.wait(timeout=20)
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
 @test("the model alias map is valid and covers the documented aliases")
 def test_model_alias_map() -> None:
     table = read_json(KIT_DIR / "global" / "model-catalogue.json")
@@ -6749,23 +6890,33 @@ def test_canonical_hook_events() -> None:
     require(not unknown, f"unknown hook events: {unknown}")
 
 
+def adopted_repository(directory: str) -> Path:
+    """A temporary repository carrying the Orrery adoption marker."""
+    root = Path(directory)
+    (root / ".git").mkdir(exist_ok=True)
+    (root / ".orrery.json").write_text("{}\n")
+    return root
+
+
 @test("direct Codex sessions visibly require principal fallback approval")
 def test_codex_session_start_fallback_notice() -> None:
-    payload = {
-        "hook_event_name": "SessionStart",
-        "source": "startup",
-        "cwd": str(KIT_DIR),
-        "model": "gpt-5.6-sol",
-    }
-    result = subprocess.run(
-        [sys.executable, str(SESSION_START_SCRIPT), "openai"],
-        input=json.dumps(payload),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+            "model": "gpt-5.6-sol",
+        }
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
     require(result.returncode == 0, f"Codex SessionStart failed: {result.stderr}")
     notice = json.loads(result.stdout)
     context = notice.get("hookSpecificOutput", {}).get("additionalContext", "")
@@ -6777,6 +6928,101 @@ def test_codex_session_start_fallback_notice() -> None:
         and "Do not infer approval" in context
         and "does not report the active thinking level" in context,
         f"the direct-session warning is incomplete: {notice}",
+    )
+
+
+@test("an un-adopted repository gets a standard single-provider session")
+def test_unadopted_session_start_stands_down() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        (repository / ".git").mkdir()
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+            "model": "gpt-5.6-sol",
+        }
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        require(
+            result.returncode == 0,
+            f"the un-adopted hook failed: {result.stderr}",
+        )
+        notice = json.loads(result.stdout)
+        context = notice.get("hookSpecificOutput", {}).get(
+            "additionalContext", ""
+        )
+        require(
+            "repository not adopted" in notice.get("systemMessage", "")
+            and "engineering baseline" in context
+            and "single-provider" in context
+            and "APPROVAL REQUIRED" not in context,
+            f"the un-adopted session was still gated: {notice}",
+        )
+
+        environment = os.environ.copy()
+        environment["ORRERY_SESSION"] = "principal"
+        launched = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        launcher_notice = json.loads(launched.stdout)
+        require(
+            "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED"
+            in launcher_notice.get("hookSpecificOutput", {}).get(
+                "additionalContext", ""
+            ),
+            "a launcher-started session lost the orchestration layer: "
+            f"{launcher_notice}",
+        )
+
+
+@test("a delegated session silences the principal hook")
+def test_delegated_session_start_is_bounded() -> None:
+    payload = {
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": str(KIT_DIR),
+        "model": "claude-sonnet-5",
+    }
+    environment = os.environ.copy()
+    environment["ORRERY_ROLE"] = "implementer"
+    result = subprocess.run(
+        [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+        input=json.dumps(payload),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    require(
+        result.returncode == 0,
+        f"delegated SessionStart failed: {result.stderr}",
+    )
+    notice = json.loads(result.stdout)
+    context = notice.get("hookSpecificOutput", {}).get(
+        "additionalContext", ""
+    )
+    require(
+        "bounded implementer session" in notice.get("systemMessage", "")
+        and "ORRERY ROLE HANDOFF" in context
+        and "APPROVAL REQUIRED" not in context,
+        f"the delegated session still got principal framing: {notice}",
     )
 
 
@@ -6818,21 +7064,23 @@ def test_matching_session_start_is_quiet() -> None:
 
 @test("direct sessions distinguish the active model from the nearest candidate")
 def test_session_start_recommends_nearest_model() -> None:
-    payload = {
-        "hook_event_name": "SessionStart",
-        "source": "startup",
-        "cwd": str(KIT_DIR),
-        "model": "gpt-5.6-terra",
-    }
-    result = subprocess.run(
-        [sys.executable, str(SESSION_START_SCRIPT), "openai"],
-        input=json.dumps(payload),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+            "model": "gpt-5.6-terra",
+        }
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
     notice = json.loads(result.stdout)
     require(
         "active OpenAI / gpt-5.6-terra" in notice["systemMessage"]
@@ -7098,6 +7346,10 @@ def exercise_green_path_install() -> None:
             "/.orrery.json" in exclude
             and "/CLAUDE.local.md" in exclude,
             "private project artefacts were not excluded",
+        )
+        require(
+            read_json(repository / ".orrery.json") == {},
+            "initialization did not leave the adoption marker",
         )
 
         chosen = initialize("fable")
@@ -8547,6 +8799,16 @@ def test_delegated_environment_drops_session_markers() -> None:
                 ).get("CLAUDE_CONFIG_DIR") == markers["CLAUDE_CONFIG_DIR"],
                 "the configuration directory must keep flowing to Claude",
             )
+            require(
+                runtime_module.provider_environment(
+                    "anthropic", Path(directory), role_id="reviewer"
+                ).get("ORRERY_ROLE") == "reviewer"
+                and "ORRERY_ROLE"
+                not in runtime_module.provider_environment(
+                    "anthropic", Path(directory)
+                ),
+                "the delegated role marker is missing or leaks by default",
+            )
     finally:
         for name, value in saved.items():
             if value is None:
@@ -8579,6 +8841,630 @@ def test_claude_verdict_noisy_log() -> None:
             pass
         else:
             raise Failure("a log without a result object was accepted")
+
+
+@test("the canary sweep restores only what an aborted Claude run planted")
+def test_claude_canary_sweep() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repo = Path(directory)
+        (repo / ".git" / "info").mkdir(parents=True)
+        exclude = repo / ".git" / "info" / "exclude"
+        prior = "# ours\n/keepme\n"
+        exclude.write_text(prior)
+        (repo / ".env.local").touch()
+        snapshot = runtime_module.claude_canary_snapshot(repo)
+
+        for name in (".env", "package.json", "yarn.lock"):
+            (repo / name).touch()
+        (repo / "node_modules" / ".bin").mkdir(parents=True)
+        with exclude.open("a") as handle:
+            handle.write("/.env\n/package.json\n/yarn.lock\n")
+        (repo / "pnpm-lock.yaml").write_text('{"real": true}\n')
+        with exclude.open("a") as handle:
+            handle.write("/worker-artefact\n")
+
+        removed = runtime_module.sweep_claude_canaries(snapshot)
+        require(
+            sorted(removed)
+            == [
+                ".env",
+                ".git/info/exclude entries",
+                "node_modules",
+                "package.json",
+                "yarn.lock",
+            ],
+            f"unexpected sweep result: {removed}",
+        )
+        require(
+            (repo / ".env.local").exists()
+            and (repo / "pnpm-lock.yaml").read_text() == '{"real": true}\n',
+            "the sweep touched genuine workspace files",
+        )
+        require(
+            exclude.read_text() == prior + "/worker-artefact\n",
+            f"exclude was not restored: {exclude.read_text()!r}",
+        )
+
+        fresh = repo / "fresh"
+        (fresh / ".git" / "info").mkdir(parents=True)
+        snapshot = runtime_module.claude_canary_snapshot(fresh)
+        fresh_exclude = fresh / ".git" / "info" / "exclude"
+        fresh_exclude.write_text("/.env\n")
+        (fresh / ".env").touch()
+        runtime_module.sweep_claude_canaries(snapshot)
+        require(
+            not fresh_exclude.exists() and not (fresh / ".env").exists(),
+            "a CLI-created exclude file was not removed",
+        )
+
+        rewritten = repo / "rewritten"
+        (rewritten / ".git" / "info").mkdir(parents=True)
+        rewritten_exclude = rewritten / ".git" / "info" / "exclude"
+        rewritten_exclude.write_text("first\n")
+        snapshot = runtime_module.claude_canary_snapshot(rewritten)
+        rewritten_exclude.write_text("completely different\n/.env\n")
+        runtime_module.sweep_claude_canaries(snapshot)
+        require(
+            rewritten_exclude.read_text() == "completely different\n/.env\n",
+            "a rewritten exclude file was modified",
+        )
+
+
+@test("an aborted delegated Claude run leaves no sandbox residue behind")
+def test_claude_canary_sweep_end_to_end() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory) / "workspace"
+        workspace.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(workspace)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        exclude = workspace / ".git" / "info" / "exclude"
+        prior = exclude.read_bytes() if exclude.exists() else None
+        environment = review_environment("success")
+        environment["CLAUDE_FAKE_MODE"] = "fail"
+        environment["CLAUDE_FAKE_PLANT"] = "1"
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--role",
+            "implementer",
+            "--approve-fallback",
+            "anthropic:sonnet",
+            "--",
+            "prompt",
+            cwd=workspace,
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            "Removed Claude sandbox residue:" in stderr,
+            f"the sweep never reported: {stderr[-800:]}",
+        )
+        require(
+            not (workspace / ".env").exists()
+            and not (workspace / "package.json").exists()
+            and not (workspace / "node_modules").exists(),
+            "sandbox residue survived an aborted delegated run",
+        )
+        current = exclude.read_bytes() if exclude.exists() else None
+        require(
+            current == prior,
+            f"the exclude file was not restored: {current!r}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a read-only delegated unit cannot write the workspace")
+def test_read_only_unit_workspace_guard() -> None:
+    with until_store_only() as state_dir:
+        seed_standing_reviewer()
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            subprocess.run(
+                ["git", "init", "--quiet", str(workspace)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            environment = review_environment(
+                "success", standing_state=state_dir
+            )
+            environment["CLAUDE_FAKE_WRITE"] = str(
+                workspace / "blocked.txt"
+            )
+            process = start_review(
+                environment,
+                "--timeout",
+                "60",
+                "--",
+                "prompt",
+                cwd=workspace,
+            )
+            stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 0
+                and "fake Claude verdict" in stdout,
+                f"the read-only run failed outright: {stderr[-600:]}",
+            )
+            require(
+                not (workspace / "blocked.txt").exists(),
+                "a read-only unit wrote into the workspace",
+            )
+
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory) / "workspace"
+        workspace.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(workspace)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        environment = review_environment("success")
+        environment["CLAUDE_FAKE_WRITE"] = str(workspace / "allowed.txt")
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--role",
+            "implementer",
+            "--approve-fallback",
+            "anthropic:sonnet",
+            "--",
+            "prompt",
+            cwd=workspace,
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0
+            and (workspace / "allowed.txt").exists(),
+            f"a write-capable unit lost workspace access: {stderr[-600:]}",
+        )
+
+
+@test("endpoint definitions are validated before they can route a role")
+def test_endpoint_validation() -> None:
+    def endpoint(**fields: Any) -> dict[str, Any]:
+        base = {
+            "label": "Test",
+            "adapter": "anthropic",
+            "base_url": "https://api.example.com/anthropic",
+            "key_env": "TEST_API_KEY",
+        }
+        base.update(fields)
+        return {"endpoints": {"probe": base}}
+
+    good = runtime_module.load_endpoint(endpoint(), "probe")
+    require(
+        good.base_url == "https://api.example.com/anthropic"
+        and good.key_env == "TEST_API_KEY",
+        f"a valid endpoint did not load: {good}",
+    )
+    require(
+        runtime_module.load_endpoint(
+            endpoint(base_url="http://localhost:11434", key_env=None),
+            "probe",
+        ).key_env is None,
+        "a local endpoint may not require a credential",
+    )
+
+    for description, manifest, name in (
+        ("unknown adapter", endpoint(adapter="mistral"), "probe"),
+        ("plain http remotely", endpoint(base_url="http://api.example.com"), "probe"),
+        ("credentials in the URL", endpoint(base_url="https://k@api.example.com"), "probe"),
+        ("a query string", endpoint(base_url="https://api.example.com/?k=1"), "probe"),
+        ("an invalid key variable", endpoint(key_env="not a name"), "probe"),
+        ("an unknown endpoint", endpoint(), "missing"),
+        ("an invalid endpoint id", endpoint(), "Bad Name"),
+        ("an unknown field", endpoint(secret="x"), "probe"),
+    ):
+        try:
+            runtime_module.load_endpoint(manifest, name)
+        except runtime_module.RuntimeConfigError:
+            continue
+        raise Failure(f"{description} was accepted")
+
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "orchestration.json"
+        mismatched = copy.deepcopy(manifest)
+        mismatched["endpoints"] = {
+            "probe": {
+                "label": "Test",
+                "adapter": "openai",
+                "base_url": "https://api.example.com/v1",
+                "key_env": "TEST_API_KEY",
+            }
+        }
+        step = next(
+            item for item in mismatched["steps"] if item["id"] == "reviewer"
+        )
+        step["provider"] = "anthropic"
+        step["endpoint"] = "probe"
+        write_json(path, mismatched)
+        try:
+            runtime_module.load_role("reviewer", path)
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "speaks" in str(exc),
+                f"the adapter mismatch reported oddly: {exc}",
+            )
+        else:
+            raise Failure("a role kept a provider its endpoint cannot serve")
+
+
+@test("an endpoint routes the CLI without exposing its key in arguments")
+def test_endpoint_routing_contract() -> None:
+    anthropic = runtime_module.Endpoint(
+        id="kimi",
+        label="Kimi",
+        adapter="anthropic",
+        base_url="https://api.moonshot.ai/anthropic",
+        key_env="ORRERY_TEST_KEY",
+    )
+    saved = os.environ.get("ORRERY_TEST_KEY")
+    os.environ.pop("ORRERY_TEST_KEY", None)
+    try:
+        try:
+            runtime_module.endpoint_environment(anthropic)
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "ORRERY_TEST_KEY" in str(exc),
+                f"a missing key was reported unhelpfully: {exc}",
+            )
+        else:
+            raise Failure("a missing credential fell through silently")
+
+        os.environ["ORRERY_TEST_KEY"] = "secret-token"
+        routed = runtime_module.endpoint_environment(anthropic)
+        require(
+            routed["ANTHROPIC_BASE_URL"] == anthropic.base_url
+            and routed["ANTHROPIC_AUTH_TOKEN"] == "secret-token"
+            and routed["ANTHROPIC_API_KEY"] == "",
+            f"the Anthropic adapter was not routed: {routed}",
+        )
+
+        codex = runtime_module.Endpoint(
+            id="minimax-codex",
+            label="MiniMax",
+            adapter="openai",
+            base_url="https://api.minimax.io/v1",
+            key_env="ORRERY_TEST_KEY",
+        )
+        arguments = runtime_module.codex_endpoint_arguments(codex)
+        joined = " ".join(arguments)
+        require(
+            'model_provider="minimax_codex"' in joined
+            and 'model_providers.minimax_codex.base_url='
+            '"https://api.minimax.io/v1"' in joined
+            and 'wire_api="responses"' in joined
+            and 'env_key="ORRERY_TEST_KEY"' in joined,
+            f"the Codex provider override is wrong: {arguments}",
+        )
+        require(
+            "secret-token" not in joined,
+            "a credential value reached the command line",
+        )
+        require(
+            runtime_module.endpoint_environment(codex)
+            == {"ORRERY_TEST_KEY": "secret-token"},
+            "the Codex adapter did not pass its credential through",
+        )
+    finally:
+        if saved is None:
+            os.environ.pop("ORRERY_TEST_KEY", None)
+        else:
+            os.environ["ORRERY_TEST_KEY"] = saved
+
+
+@test("a delegated run reaches its endpoint with the routed credential")
+def test_endpoint_delegated_run() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        manifest["endpoints"] = {
+            "kimi": {
+                "label": "Kimi (Moonshot AI)",
+                "adapter": "anthropic",
+                "base_url": "https://api.moonshot.ai/anthropic",
+                "key_env": "ORRERY_TEST_KEY",
+            }
+        }
+        reviewer = next(
+            step for step in manifest["steps"] if step["id"] == "reviewer"
+        )
+        reviewer.update(
+            provider="anthropic",
+            model="kimi-k3[1m]",
+            thinking=None,
+            endpoint="kimi",
+        )
+        write_json(manifest_path, manifest)
+
+        # The reviewer is read-only, so its unit mounts the workspace
+        # read-only: the capture files must live outside it.
+        workspace = root / "workspace"
+        workspace.mkdir()
+        captured_env = root / "env.json"
+        captured_args = root / "args.txt"
+        environment = review_environment("success")
+        environment["ORRERY_TEST_KEY"] = "secret-token"
+        environment["CLAUDE_FAKE_ENV"] = str(captured_env)
+        environment["CLAUDE_FAKE_ARGS"] = str(captured_args)
+
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(kit / "scripts" / "orrery-review"),
+                "--timeout",
+                "60",
+                "--",
+                "prompt",
+            ],
+            env=environment,
+            cwd=str(workspace),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=90)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    process.communicate(timeout=20)
+            stop_stray_units(f"orrery-review-{process.pid}-")
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+        require(
+            process.returncode == 0,
+            f"the endpoint-routed run failed: {stderr[-600:]}",
+        )
+        require(
+            "via Kimi (Moonshot AI)" in stderr,
+            f"the run did not disclose its endpoint: {stderr[-400:]}",
+        )
+        routed = json.loads(captured_env.read_text())
+        require(
+            routed.get("ANTHROPIC_BASE_URL")
+            == "https://api.moonshot.ai/anthropic"
+            and routed.get("ANTHROPIC_AUTH_TOKEN") == "secret-token"
+            and routed.get("ANTHROPIC_API_KEY") == "",
+            f"the delegated process was not routed: {routed}",
+        )
+        arguments = captured_args.read_text()
+        require(
+            "secret-token" not in arguments
+            and "kimi-k3[1m]" in arguments,
+            f"the delegated arguments are wrong: {arguments}",
+        )
+
+
+@test("a fallback candidate never inherits the failed role's endpoint")
+def test_fallback_drops_endpoint() -> None:
+    """A ranked candidate is a first-party model. Inheriting the custom
+    endpoint would send that model's name, and the third-party key, to a
+    service that never served it."""
+    endpoint = runtime_module.Endpoint(
+        id="kimi",
+        label="Kimi (Moonshot AI)",
+        adapter="anthropic",
+        base_url="https://api.moonshot.ai/anthropic",
+        key_env="ORRERY_TEST_KEY",
+    )
+    routed = dataclasses.replace(
+        runtime_module.load_role("implementer"),
+        provider="anthropic",
+        model="kimi-k3[1m]",
+        thinking=None,
+        endpoint=endpoint,
+    )
+    proposal = fallback_module.nearest_fallback(
+        routed,
+        "the endpoint failed",
+        assumed_ready={"anthropic", "openai"},
+        discover_live=False,
+    )
+    require(proposal is not None, "no candidate was ranked at all")
+    require(
+        proposal.candidate.endpoint is None,
+        f"the candidate kept the endpoint: {proposal.candidate.endpoint}",
+    )
+
+    adopted = standing_module.candidate_role(
+        routed,
+        {
+            "candidate_provider": "anthropic",
+            "candidate_model": "fable",
+            "candidate_thinking": "max",
+        },
+    )
+    require(
+        adopted.endpoint is None,
+        "a standing approval revived the configured endpoint",
+    )
+
+    transcript = io.StringIO()
+    fallback_module.request_fallback_decision(
+        proposal,
+        approval=None,
+        no_fallback=False,
+        program_name="orrery-agent",
+        stream=transcript,
+        tty_opener=lambda: None,
+    )
+    disclosed = transcript.getvalue()
+    require(
+        "does not use the configured endpoint Kimi (Moonshot AI)" in disclosed
+        and "own service" in disclosed,
+        f"leaving the endpoint was not disclosed: {disclosed}",
+    )
+
+
+@test("role timeout budgets load, validate, and steer the wrapper")
+def test_role_timeout_budgets() -> None:
+    role = runtime_module.load_role("reviewer")
+    require(
+        role.timeout_seconds == 900,
+        f"the reviewer manifest budget did not load: {role.timeout_seconds}",
+    )
+
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    with tempfile.TemporaryDirectory() as directory:
+        bad_path = Path(directory) / "orchestration.json"
+        bad = copy.deepcopy(manifest)
+        next(
+            step for step in bad["steps"] if step["id"] == "reviewer"
+        )["timeout_seconds"] = 5
+        write_json(bad_path, bad)
+        try:
+            runtime_module.load_role("reviewer", bad_path)
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "timeout_seconds" in str(exc),
+                f"the wrong validation error surfaced: {exc}",
+            )
+        else:
+            raise Failure("an out-of-range role timeout was accepted")
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR,
+            kit,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        shortened = read_json(manifest_path)
+        next(
+            step
+            for step in shortened["steps"]
+            if step["id"] == "reviewer"
+        )["timeout_seconds"] = 30
+        write_json(manifest_path, shortened)
+
+        environment = review_environment("sleep")
+        environment.pop("ORRERY_AGENT_TIMEOUT_SECONDS", None)
+        environment.pop("CODEX_REVIEW_TIMEOUT_SECONDS", None)
+        process = subprocess.Popen(
+            [sys.executable, str(kit / "scripts" / "orrery-review"), "--", "p"],
+            env=environment,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=90)
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    process.communicate(timeout=20)
+            stop_stray_units(f"orrery-review-{process.pid}-")
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        require(
+            process.returncode == 124
+            and "timed out after 30s" in stderr,
+            f"the manifest budget did not steer the timeout: "
+            f"{process.returncode}, {stderr[-500:]}",
+        )
+
+
+@test("the doctor warns about zero-byte sandbox residue in HOME")
+def test_doctor_home_residue() -> None:
+    environment = review_environment("success")
+    home = Path(tempfile.mkdtemp(prefix="kit-doc-home."))
+    (home / ".bash_profile").touch()
+    environment["HOME"] = str(home)
+    try:
+        warned = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "WARN  Zero-byte shell/config files" in warned.stdout
+            and ".bash_profile" in warned.stdout
+            and "masks .profile" in warned.stdout,
+            f"home residue was not warned about: {warned.stdout[-500:]}",
+        )
+        (home / ".bash_profile").unlink()
+        clean = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "No zero-byte sandbox residue" in clean.stdout,
+            f"a clean HOME still warned: {clean.stdout[-400:]}",
+        )
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
+@test("the doctor warns when the Claude CLI drifts from the baseline")
+def test_doctor_claude_version_guard() -> None:
+    environment = review_environment("success")
+    try:
+        drifted = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "WARN  Claude CLI 9.9.9 differs from the validated baseline"
+            in drifted.stdout,
+            f"no drift warning for a changed CLI: {drifted.stdout[-600:]}",
+        )
+        baseline = runtime_module.VALIDATED_CLAUDE_CLI
+        environment["CLAUDE_FAKE_VERSION"] = f"{baseline} (Claude Code)"
+        matching = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "PASS  Claude CLI matches the validated delegated-run "
+            f"baseline ({baseline})" in matching.stdout,
+            f"the matching CLI did not pass: {matching.stdout[-600:]}",
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 @test("the doctor lists standing approvals as warnings, never failures")

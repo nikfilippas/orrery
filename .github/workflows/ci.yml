@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The suite drives real transient units, which needs the runner's
+      # systemd user manager and its bus to exist.
+      - name: Enable the systemd user manager
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          for _ in $(seq 1 30); do
+            [ -S "/run/user/$(id -u)/bus" ] && break
+            sleep 1
+          done
+          test -S "/run/user/$(id -u)/bus"
+      - name: Run the suite
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          git config --global user.email ci@invalid
+          git config --global user.name CI
+          ./tests/run-tests.py

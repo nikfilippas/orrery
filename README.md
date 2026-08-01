@@ -5,18 +5,27 @@
 
 # Órrery
 
-**One orchestrator, four specialist roles, either provider.**
+**One orchestrator, four specialist roles, any model.**
 
 Órrery, pronounced *OR-ər-ee*, is a provider-neutral development workflow for
 Claude Code and the Codex CLI. One configured model is the principal
 orchestrator. Separate processes can act as a mechanical worker,
 implementation worker, plan reviewer, and final reviewer. Any role may use
 Anthropic or OpenAI, including every role on one provider when the other
-subscription is unavailable.
+subscription is unavailable, or a third-party or local service such as Kimi,
+DeepSeek, GLM, Qwen, MiniMax, OpenRouter, or Ollama through the same two
+CLIs.
 
 The principal classifies ordinary requests, delegates bounded work when useful,
 inspects the real diff, verifies the outcome, and remains accountable. Role
 names determine permissions and workflow; provider names do not.
+
+Orchestration applies only in **adopted** repositories, marked by the
+`.orrery.json` that `orrery-init` creates, or in sessions started through the
+`orrery` launchers. Anywhere else, a direct Claude or Codex session behaves
+as a normal single-provider session with the model chosen in its own
+interface, governed by the engineering-baseline half of the shared policy
+alone, and the SessionStart check says so explicitly.
 
 ## How a request flows
 
@@ -42,17 +51,16 @@ flowchart TB
 
     T0 --> TRI["principal implements<br/>and inspects"]
     M0 --> MEC["mechanical worker edits"]
-    S0 --> STD["implementation worker edits"]
+    S0 --> STD["implementation worker edits<br/>workspace-write"]
 
     X0 --> PLAN["principal writes plan<br/>and acceptance criteria"]
     PLAN -->|fresh independent challenge| PLAN_REVIEW["fresh plan-review session<br/>blocking versus advisory"]
     PLAN_REVIEW -->|supported blocking objections<br/>and a round remains| PLAN
-    PLAN_REVIEW -->|none remain| COMPLEX_IMPL["implementation worker edits<br/>workspace-write"]
+    PLAN_REVIEW -->|none remain| STD
     PLAN_REVIEW -->|repeated objection<br/>or round cap| ESCALATE["stop before implementation<br/>and ask the user"]
 
     MEC --> INSPECT["principal inspects the real diff,<br/>never the worker summary"]
     STD --> INSPECT
-    COMPLEX_IMPL --> INSPECT
 
     TRI --> VERIFY["proportionate verification:<br/>tests, lint, types, and build"]
     INSPECT --> VERIFY
@@ -76,7 +84,7 @@ flowchart TB
 
     class C,INV,TRI,PLAN,INSPECT,CORRECT principal
     class MEC mechanic
-    class STD,COMPLEX_IMPL implementer
+    class STD implementer
     class PLAN_REVIEW planreviewer
     class REVIEW reviewer
     class U,REPORT,ESCALATE,VERIFY,REVIEW_GATE,FINDINGS,DONE quiet
@@ -103,15 +111,20 @@ implementation and asks the user to choose.
 
 ## Default roles
 
-These defaults are unchanged:
+The shipped configuration:
 
-| Role | Provider | Model | Thinking | Access |
-| --- | --- | --- | --- | --- |
-| Principal orchestrator | Anthropic | `fable` | `max` | interactive principal |
-| Mechanical worker | OpenAI | `gpt-5.6-luna` | `low` | workspace-write |
-| Implementation worker | OpenAI | `gpt-5.6-terra` | `medium` | workspace-write |
-| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only |
-| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only |
+| Role | Provider | Model | Thinking | Access | Timeout |
+| --- | --- | --- | --- | --- | --- |
+| Principal orchestrator | Anthropic | `fable` | `max` | interactive principal | none |
+| Mechanical worker | OpenAI | `gpt-5.6-luna` | `low` | workspace-write | 600 s |
+| Implementation worker | OpenAI | `gpt-5.6-terra` | `medium` | workspace-write | 900 s |
+| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s |
+| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s |
+
+The timeout is the role's default budget for one delegated run; a `--timeout`
+flag or an `ORRERY_AGENT_TIMEOUT_SECONDS` environment variable still wins.
+Read-only roles additionally run inside a service unit whose workspace is
+mounted read-only by the kernel, not merely guarded by tool rules.
 
 `global/orchestration.json` is the only role-assignment source. Every row may
 be changed to either provider. For example, Sol may be the principal while
@@ -210,10 +223,22 @@ The diagram is the workflow, flowing left to right:
 - hovering a node outlines only that node, and steps sharing its role stay
   lit;
 - the five classifier outcomes stack top to bottom in the required order;
-- the plan and plan-review arrows bow apart into one visibly cyclical loop;
-  and
+- the plan and plan-review pair sit in a framed loop: a straight challenge
+  arrow in, a return arc outside the frame, and the round cap between them;
+- the standard branch and the loop's clean exit continue through one shared
+  implementation node; and
 - every path, including escalation, review bypass, correction, and
   completion, has an explicit destination.
+
+Each role also has an **endpoint** menu. Leaving it on first-party runs the
+role on the provider's own service; choosing a preset such as Kimi, DeepSeek,
+GLM, Qwen, MiniMax, OpenRouter or a local Ollama points that role's CLI at
+that service instead, and the role's model menu becomes the endpoint's own
+models. Routing is per role, so a first-party principal can review the work of
+a third-party implementer. Credentials stay in environment variables named by
+the manifest, never in the manifest itself, and a missing one stops the run
+rather than falling back to a first-party account. See
+[docs/setup-guide.md](docs/setup-guide.md) for the wire-protocol limits.
 
 Preview shows one atomic `global/orchestration.json` diff. Apply writes exactly
 that preview and runs the doctor. Running sessions are never mutated. A
@@ -228,8 +253,13 @@ their provider-picker position until explicitly seeded.
 
 ## Shared instructions and prompt caching
 
-`global/AGENTS.md` is canonical. The installer links it to both
-`$CODEX_HOME/AGENTS.md` and `~/.claude/AGENTS.md`.
+`global/AGENTS.md` is canonical and has two layers. Part I is an
+engineering baseline that governs every Claude and Codex session on the
+machine: assumptions surfaced before coding, the simplest complete change,
+surgical diffs, goal-driven execution, verification before completion
+claims, and leave-no-trace hygiene. Part II is the orchestration layer,
+and it applies only in adopted repositories. The installer links the file
+to both `$CODEX_HOME/AGENTS.md` and `~/.claude/AGENTS.md`.
 `global/CLAUDE.md` contains only:
 
 ```text
@@ -241,10 +271,14 @@ This follows Claude Code’s documented
 while using Codex’s native
 [`AGENTS.md` discovery](https://learn.chatgpt.com/docs/agent-configuration/agents-md).
 The same provider-neutral orchestration skill is installed for both CLIs.
-SessionStart hooks also compare directly opened Claude and Codex sessions with
-the configured principal. A mismatch is shown to the user and injected into the
-agent context as `ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED`; the direct
-session must ask before acting as principal. The check refreshes on startup,
+SessionStart hooks route every session to the right layer: in an un-adopted
+repository they announce a standard single-provider session and stand the
+orchestration layer down; in a delegated Orrery run they stay out of the
+worker's way entirely; in an adopted repository they compare directly opened
+Claude and Codex sessions with the configured principal. A mismatch is shown
+to the user and injected into the agent context as
+`ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED`; the direct session must ask
+before acting as principal. The check refreshes on startup,
 resume, clear, and compaction; approval already present in that conversation
 remains valid unless revoked. SessionStart exposes the active model but not its
 thinking level, so use `orrery` when effort must be mechanically enforced.
@@ -370,7 +404,11 @@ orrery-doctor
 
 The deterministic suite uses fake provider commands and spends no model
 credits. The doctor validates files, role assignments, links, provider
-availability for configured roles, access contracts, and instruction imports.
+availability for configured roles, endpoint routing and credentials, access
+contracts, and instruction imports, and warns when the installed Claude CLI
+drifts from the version the delegated-run behaviour was validated against.
+The same lint and suite run on GitHub Actions for every push and pull
+request.
 
 ## Repository layout
 
@@ -380,6 +418,7 @@ availability for configured roles, access contracts, and instruction imports.
 | `global/CLAUDE.md` | one-line Claude import of `AGENTS.md` |
 | `global/orchestration.json` | role assignments, workflow settings, and configuration-chart geometry |
 | `global/model-catalogue.json` | provider fallback choices and Orrery-specific thinking defaults |
+| `global/endpoints.json` | offered third-party and local endpoint presets |
 | `global/claude-settings.json` | Claude-specific hooks and permissions, not role selection |
 | `global/codex-hooks.json` | Codex SessionStart principal-mismatch notification |
 | `global/skills/development-orchestrator/` | detailed classification and routing procedure |
@@ -388,6 +427,7 @@ availability for configured roles, access contracts, and instruction imports.
 | `project-template/CLAUDE.md` | one-line project import |
 | `scripts/orrery` | supervised configured-principal launcher |
 | `scripts/orrery_fallback.py` | provider checks, nearest-model ranking, failure classification, and consent |
+| `scripts/orrery_standing.py` | scoped standing-approval store with locked serialisation |
 | `scripts/orrery-session-start` | direct Claude/Codex principal-mismatch hook |
 | `scripts/orrery_model_catalogue.py` | no-inference live model and thinking-capability discovery |
 | `scripts/orrery_runtime.py` | validated role loader and static provider adapters |
@@ -397,10 +437,13 @@ availability for configured roles, access contracts, and instruction imports.
 | `scripts/install.sh` | user-level instruction, skill, hook, and command links |
 | `scripts/doctor.sh` | installation and configuration diagnostics |
 | `tests/run-tests.py` | deterministic regression suite |
+| `.github/workflows/ci.yml` | lint and suite on every push and pull request |
 | `docs/setup-guide.md` | detailed operation and maintenance |
 
 ## Design principles
 
+- **Orchestration is opt-in.** Only adopted repositories run the workflow;
+  everywhere else a session stays a standard single-provider session.
 - **Responsibility stays with the principal.** Workers perform bounded work;
   the principal inspects and verifies it.
 - **Roles are not providers.** Any supported model may be principal, worker,

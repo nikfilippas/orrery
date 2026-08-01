@@ -457,6 +457,12 @@ def nearest_fallback(
                 provider=provider,
                 model=model,
                 thinking=thinking,
+                # Candidates are ranked from first-party catalogues, so a
+                # substitute never inherits the failed role's custom
+                # endpoint: that would send this model's name, and the
+                # third-party credential, to a service that never served
+                # it.
+                endpoint=None,
             )
             configured_distance = (
                 abs(configured_tiers[identity] - target_tier)
@@ -846,6 +852,16 @@ def request_fallback_decision(
         _safe_print(
             "A cross-provider fallback starts a fresh context; conversation "
             "state and provider-specific CLI arguments cannot migrate.",
+            stream=stream,
+        )
+    if original.endpoint is not None and candidate.endpoint is None:
+        # Approving this moves the assignment to a different company's
+        # service, billing, and data handling, which the user must see.
+        _safe_print(
+            f"This candidate does not use the configured endpoint "
+            f"{original.endpoint.label} ({original.endpoint.base_url}); it "
+            f"runs on {provider_label(candidate.provider)}'s own service "
+            "with that account's credentials.",
             stream=stream,
         )
     if context_warning:

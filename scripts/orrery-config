@@ -16,6 +16,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,11 +36,17 @@ from orrery_model_catalogue import (  # noqa: E402
     DiscoveryResult,
     discover_catalogue,
 )
+from orrery_runtime import (  # noqa: E402
+    RuntimeConfigError,
+    load_endpoint,
+)
 from orrery_standing import (  # noqa: E402
     describe as describe_standing,
     list_active as list_standing,
     revoke_all as revoke_standing,
 )
+
+ENDPOINTS_PATH = KIT_DIR / "global" / "endpoints.json"
 
 # A request carries only a few short model names.
 MAX_BODY_BYTES = 64 * 1024
@@ -288,9 +295,70 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
         "file": "global/orchestration.json",
         "summary": step.get("summary", ""),
         "selects": step.get("selects", ""),
+        "endpoint": step.get("endpoint") or "",
     }
     state["choices"] = model_choices(provider, model)
     return state
+
+
+def prune_endpoints(manifest: dict[str, Any]) -> None:
+    """Drop endpoint definitions no role refers to any more."""
+    registry = manifest.get("endpoints")
+    if not isinstance(registry, dict):
+        return
+    used = {
+        step.get("endpoint")
+        for step in manifest.get("steps", [])
+        if step.get("endpoint")
+    }
+    for name in [name for name in registry if name not in used]:
+        del registry[name]
+    if not registry:
+        manifest.pop("endpoints", None)
+
+
+def endpoint_presets() -> list[dict[str, Any]]:
+    """The offered endpoints, as data for the page.
+
+    A missing or malformed catalogue is not fatal: the page simply
+    offers first-party routing only, rather than refusing to load.
+    """
+    try:
+        catalogue = json.loads(ENDPOINTS_PATH.read_text())
+        entries = catalogue.get("endpoints", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+    presets = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            endpoint = load_endpoint(
+                {"endpoints": {entry.get("id"): {
+                    "label": entry.get("label"),
+                    "adapter": entry.get("adapter"),
+                    "base_url": entry.get("base_url"),
+                    "key_env": entry.get("key_env"),
+                }}},
+                entry.get("id"),
+            )
+        except (RuntimeConfigError, TypeError):
+            continue
+        models = [
+            model
+            for model in entry.get("models", [])
+            if isinstance(model, str)
+        ]
+        presets.append({
+            "id": endpoint.id,
+            "label": endpoint.label,
+            "adapter": endpoint.adapter,
+            "base_url": endpoint.base_url,
+            "key_env": endpoint.key_env or "",
+            "models": models,
+            "verified": bool(entry.get("verified")),
+        })
+    return presets
 
 
 def snapshot(
@@ -301,7 +369,9 @@ def snapshot(
     return [step_state(step) for step in manifest["steps"]]
 
 
-MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+-]*(\[[A-Za-z0-9.]+\])?$")
+MODEL_NAME = re.compile(
+    r"^[A-Za-z0-9~][A-Za-z0-9._:@/+~-]*(\[[A-Za-z0-9.]+\])?$"
+)
 
 
 def validate_model(value: Any) -> str:
@@ -319,7 +389,7 @@ def validate_model(value: Any) -> str:
     if not MODEL_NAME.match(candidate):
         raise ConfigError(
             "a model name may contain only letters, digits and "
-            f". _ : @ / + - with an optional [suffix]: {candidate!r}"
+            f". _ : @ / + - ~ with an optional [suffix]: {candidate!r}"
         )
     return candidate
 
@@ -451,14 +521,68 @@ def planned_manifest_edit(
             raise ConfigError(f"unknown step or setting: {item_id}")
         if not isinstance(change, dict):
             raise ConfigError(f"invalid change for step {item_id}")
-        unknown = set(change) - {"provider", "model", "thinking"}
+        unknown = set(change) - {"provider", "model", "thinking", "endpoint"}
         if unknown:
             raise ConfigError(
-                f"only provider, model and thinking can be changed for "
-                f"{item_id}, not: {sorted(unknown)}"
+                f"only provider, model, thinking and endpoint can be "
+                f"changed for {item_id}, not: {sorted(unknown)}"
             )
 
         current = step_state(step)
+        if "endpoint" in change:
+            endpoint_id = change["endpoint"] or ""
+            if not isinstance(endpoint_id, str):
+                raise ConfigError("an endpoint must be named by its id")
+            if endpoint_id:
+                preset = next(
+                    (
+                        item
+                        for item in endpoint_presets()
+                        if item["id"] == endpoint_id
+                    ),
+                    None,
+                )
+                if preset is None:
+                    raise ConfigError(f"unknown endpoint: {endpoint_id}")
+                model = validate_model(
+                    change.get("model", current["model"])
+                )
+                thinking = change.get("thinking") or None
+                if thinking is not None and not EFFORT_NAME.fullmatch(
+                    str(thinking)
+                ):
+                    raise ConfigError("invalid thinking level")
+                registry = manifest.setdefault("endpoints", {})
+                registry[endpoint_id] = {
+                    "label": preset["label"],
+                    "adapter": preset["adapter"],
+                    "base_url": preset["base_url"],
+                    **(
+                        {"key_env": preset["key_env"]}
+                        if preset["key_env"]
+                        else {}
+                    ),
+                }
+                replacement = {
+                    # The endpoint's adapter decides which CLI runs, so
+                    # the provider follows from the choice rather than
+                    # being picked separately.
+                    "provider": preset["adapter"],
+                    "model": model,
+                    "thinking": thinking,
+                    "endpoint": endpoint_id,
+                }
+                if any(
+                    step.get(key) != value
+                    for key, value in replacement.items()
+                ):
+                    step.update(replacement)
+                    changed.append(item_id)
+                prune_endpoints(manifest)
+                continue
+            step.pop("endpoint", None)
+            prune_endpoints(manifest)
+
         model = validate_model(change.get("model", current["model"]))
         known_providers = [
             provider
@@ -705,13 +829,13 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 1880px; margin: 0 auto; padding: 24px 20px 48px; }
+  .wrap { max-width: 1880px; margin: 0 auto; padding: 12px 20px 10px; }
   .layout { display: flex; gap: 16px; align-items: flex-start; }
-  h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 4px; }
-  .sub { color: var(--soft); margin: 0 0 26px; font-size: 14px; }
+  h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 2px; }
+  .sub { color: var(--soft); margin: 0 0 8px; font-size: 14px; }
   .chartwrap {
     flex: 1 1 auto; min-width: 0;
-    overflow-x: auto; overflow-y: visible; padding: 4px 0 16px;
+    overflow-x: auto; overflow-y: visible; padding: 4px 0 4px;
   }
   .canvas { position: relative; margin: 0 auto; }
   .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
@@ -766,12 +890,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .info:hover + .tip, .info:focus-visible + .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
   .legend {
-    display: flex; flex-direction: column; gap: 10px;
+    display: flex; flex-direction: column; gap: 7px;
     flex: none; width: 302px;
   }
   .legend-row {
-    display: flex; flex-direction: column; gap: 6px; background: var(--panel);
-    border: 1px solid var(--edge); border-radius: 10px; padding: 9px 12px;
+    display: flex; flex-direction: column; gap: 4px; background: var(--panel);
+    border: 1px solid var(--edge); border-radius: 10px; padding: 7px 10px;
   }
   .legend-head { display: flex; align-items: center; gap: 8px; }
   .roledot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
@@ -781,9 +905,9 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     letter-spacing: .05em; text-transform: uppercase; color: var(--soft);
   }
   .legend-group {
-    display: flex; flex-direction: column; gap: 8px;
+    display: flex; flex-direction: column; gap: 6px;
     border: 1px solid var(--edge); border-left: 3px solid var(--accent);
-    border-radius: 10px; padding: 9px 10px; background: var(--panel);
+    border-radius: 10px; padding: 7px 9px; background: var(--panel);
   }
   .legend-caption {
     font-size: 9.5px; font-weight: 600; letter-spacing: .06em;
@@ -794,15 +918,17 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     grid-template-columns: minmax(150px, 1fr) minmax(84px, auto);
   }
   .role-controls { display: flex; flex-direction: column; gap: 3px; }
+  .pick.endpoint { grid-column: 1 / -1; }
+  .endpointnote { font-size: 9px; color: var(--soft); line-height: 1.35; }
   .control-row {
     display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(72px, 1fr);
-    gap: 5px; align-items: start;
+    gap: 4px 5px; align-items: start;
   }
-  .pick { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
-  .pick label { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; opacity: .8; }
+  .pick { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
+  .pick label { font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase; opacity: .8; }
   .legend select, .legend input[type=text] {
     width: 100%; box-sizing: border-box; border: 1px solid var(--edge);
-    border-radius: 5px; padding: 4px 6px; font-size: 11.5px;
+    border-radius: 5px; padding: 3px 6px; font-size: 11.5px;
     font-family: ui-monospace, monospace;
     background: var(--ground); color: var(--ink);
   }
@@ -811,7 +937,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   }
   .actions {
     display: flex; gap: 10px;
-    align-items: center; padding: 12px 0; margin-top: 8px;
+    align-items: center; padding: 8px 0; margin-top: 4px;
     border-top: 1px solid var(--edge);
   }
   .btn {
@@ -833,8 +959,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .hint { font-size: 12px; color: var(--soft); margin-left: auto; }
 
   .scopenote {
-    border-left: 3px solid var(--accent); padding: 8px 12px;
-    font-size: 13px; color: var(--soft); margin: 20px 0;
+    border-left: 3px solid var(--accent); padding: 5px 12px;
+    font-size: 13px; color: var(--soft); margin: 6px 0;
   }
 </style>
 </head>
@@ -868,6 +994,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 const STATE = __STATE__;
 const SETTINGS = __SETTINGS__;
 const CHART = __CHART__;
+const ENDPOINTS = __ENDPOINTS__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
 const original = Object.fromEntries(
@@ -939,7 +1066,49 @@ function picker(step) {
         `<option value="${esc(level)}" ${level === step.thinking ? "selected" : ""}>` +
         `${esc(level)}</option>`).join("")
     : `<option value="">${choice ? "unavailable" : "manual setup"}</option>`;
+  const preset = ENDPOINTS.find(item => item.id === step.endpoint);
+  const endpointOptions = [
+    `<option value="">first-party (${
+      step.provider === "anthropic" ? "Anthropic" : "OpenAI"
+    })</option>`,
+  ].concat(ENDPOINTS.map(item =>
+    `<option value="${esc(item.id)}" ${
+      item.id === step.endpoint ? "selected" : ""
+    }>${esc(item.label)}${item.verified ? "" : " (unverified)"}</option>`
+  )).join("");
+  const endpointPick =
+    `<div class="pick endpoint"><label>endpoint</label>` +
+    `<select data-step="${id}" data-kind="endpoint">${endpointOptions}` +
+    `</select></div>`;
+  if (preset) {
+    // A third-party endpoint serves its own models, so the first-party
+    // catalogue and its thinking levels do not apply here.
+    const suggestions = preset.models.map(model =>
+      `<option value="${esc(model)}" ${
+        model === step.model ? "selected" : ""
+      }>${esc(model)}</option>`).join("");
+    const listed = preset.models.includes(step.model);
+    const credential = preset.key_env
+      ? `key from ${esc(preset.key_env)}`
+      : "no credential required";
+    return `<div class="role-controls" data-role="${id}">` +
+      `<div class="control-row">` + endpointPick +
+      `<div class="pick"><label>model</label>` +
+      `<select data-step="${id}" data-kind="model">${suggestions}` +
+      `<option value="__custom__" ${listed ? "" : "selected"}>custom…` +
+      `</option></select>` +
+      `<input type="text" data-step="${id}" data-kind="custom" ` +
+      `value="${listed ? "" : esc(step.model)}" ` +
+      `style="display:${listed ? "none" : "block"}" ` +
+      `placeholder="exact identifier"></div>` +
+      `<div class="pick"><label>thinking</label>` +
+      `<select data-step="${id}" data-kind="thinking" disabled>` +
+      `<option value="">endpoint's</option></select></div>` +
+      `</div><div class="endpointnote">${esc(preset.base_url)} · ` +
+      `${credential}</div></div>`;
+  }
   return `<div class="role-controls" data-role="${id}"><div class="control-row">` +
+    endpointPick +
     `<div class="pick"><label>model</label>` +
     `<select data-step="${id}" data-kind="model">${grouped}` +
     `<option value="__custom__" ${selectedKnown ? "" : "selected"}>custom…</option></select>` +
@@ -1439,13 +1608,24 @@ function currentProvider(id) {
   return customProvider ? customProvider.value : "";
 }
 
+function currentEndpoint(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="endpoint"]`
+  );
+  return select ? select.value : "";
+}
+
 function currentModel(id) {
   const select = document.querySelector(
     `select[data-step="${id}"][data-kind="model"]`
   );
   if (!select) return "";
   if (select.value !== "__custom__") {
-    return select.value.slice(select.value.indexOf("::") + 2);
+    // Endpoint menus hold bare identifiers; first-party menus qualify
+    // each option with its provider.
+    return currentEndpoint(id)
+      ? select.value
+      : select.value.slice(select.value.indexOf("::") + 2);
   }
   const custom = select.parentNode.querySelector('input[data-kind="custom"]');
   return custom ? custom.value.trim() : "";
@@ -1466,9 +1646,31 @@ function currentSetting(id) {
 function changes() {
   const out = {};
   for (const id of Object.keys(original)) {
-    const provider = currentProvider(id);
+    const endpoint = currentEndpoint(id);
     const model = currentModel(id);
     const thinking = currentThinking(id);
+    if (endpoint) {
+      const preset = ENDPOINTS.find(item => item.id === endpoint);
+      if (!model || !preset) continue;
+      if (
+        endpoint !== original[id].endpoint ||
+        model !== original[id].model ||
+        preset.adapter !== original[id].provider
+      ) {
+        out[id] = {endpoint, model, provider: preset.adapter};
+      }
+      continue;
+    }
+    const provider = currentProvider(id);
+    if (original[id].endpoint) {
+      // Leaving an endpoint always counts as a change, even when the
+      // model text happens to be unchanged.
+      if (provider && model) {
+        out[id] = {endpoint: "", provider, model};
+        if (thinking !== null) out[id].thinking = thinking;
+      }
+      continue;
+    }
     if (
       provider && model &&
       (provider !== original[id].provider ||
@@ -1512,6 +1714,30 @@ document.addEventListener("input", event => {
 
 document.addEventListener("change", event => {
   const data = event.target.dataset || {};
+  if (data.kind === "endpoint" && data.step) {
+    // The row's whole shape depends on the endpoint, so rebuild it from
+    // a state copy carrying the new selection.
+    const step = STATE.find(entry => entry.id === data.step);
+    if (step) {
+      const preset = ENDPOINTS.find(item => item.id === event.target.value);
+      step.endpoint = event.target.value;
+      if (preset) {
+        step.provider = preset.adapter;
+        if (!preset.models.includes(step.model) && preset.models.length) {
+          step.model = preset.models[0];
+        }
+      } else {
+        const initial = original[data.step];
+        step.provider = initial.provider;
+        step.model = initial.model;
+        step.thinking = initial.thinking;
+      }
+      renderLegend();
+      applyButton.disabled = true;
+      updateNodeText();
+      return;
+    }
+  }
   if (data.kind === "model") {
     const custom = event.target.parentNode.querySelector('input[data-kind="custom"]');
     if (custom) custom.style.display = event.target.value === "__custom__" ? "block" : "none";
@@ -1629,14 +1855,21 @@ def render_page(token: str) -> str:
             "Live model discovery is using the bundled fallback for "
             f"{', '.join(fallback)}."
         )
-    return (
-        PAGE_TEMPLATE
-        .replace("__STATE__", script_json(snapshot(manifest)))
-        .replace("__SETTINGS__", script_json(settings_snapshot(manifest)))
-        .replace("__CHART__", script_json(manifest.get("chart", {})))
-        .replace("__TOKEN_PATH__", script_json(f"/t/{token}/"))
-        .replace("__CATALOGUE_NOTE__", html.escape(catalogue_note))
-        .replace("__STANDING__", standing_html())
+    replacements = {
+        "__STATE__": script_json(snapshot(manifest)),
+        "__SETTINGS__": script_json(settings_snapshot(manifest)),
+        "__CHART__": script_json(manifest.get("chart", {})),
+        "__ENDPOINTS__": script_json(endpoint_presets()),
+        "__TOKEN_PATH__": script_json(f"/t/{token}/"),
+        "__CATALOGUE_NOTE__": html.escape(catalogue_note),
+        "__STANDING__": standing_html(),
+    }
+    # One pass, so a substituted value that happens to contain another
+    # placeholder is served verbatim rather than substituted again.
+    return re.sub(
+        "|".join(map(re.escape, replacements)),
+        lambda match: replacements[match.group(0)],
+        PAGE_TEMPLATE,
     )
 
 
@@ -1793,6 +2026,27 @@ class Handler(BaseHTTPRequestHandler):
             self.reply({"error": str(exc)}, status=400)
 
 
+def write_browser_launcher(url: str) -> Path:
+    """A private page that forwards the browser to the tokened URL.
+
+    Opening the URL directly would place the token in the argument
+    list of xdg-open and the browser, where any local process can read
+    it with ps. The browser gets a 0600 file in a 0700 directory
+    instead and follows its refresh to the real page.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="orrery-config-open-"))
+    target = html.escape(url, quote=True)
+    page = directory / "open-orrery-config.html"
+    page.write_text(
+        "<!doctype html><title>Órrery configuration</title>"
+        f'<meta http-equiv="refresh" content="0;url={target}">'
+        f'<p><a href="{target}">Open the Órrery configuration page</a></p>',
+        encoding="utf-8",
+    )
+    page.chmod(0o600)
+    return page
+
+
 def serve(port: int, timeout: float, open_browser: bool) -> int:
     Handler.token = secrets.token_hex(12)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
@@ -1815,8 +2069,10 @@ def serve(port: int, timeout: float, open_browser: bool) -> int:
         "or on Ctrl-C.",
         flush=True,
     )
+    launcher = None
     if open_browser:
-        webbrowser.open(url)
+        launcher = write_browser_launcher(url)
+        webbrowser.open(launcher.as_uri())
 
     try:
         server.serve_forever()
@@ -1824,6 +2080,8 @@ def serve(port: int, timeout: float, open_browser: bool) -> int:
         print("Interrupted; exiting.", flush=True)
     finally:
         server.server_close()
+        if launcher is not None:
+            shutil.rmtree(launcher.parent, ignore_errors=True)
     return 0
 
 
