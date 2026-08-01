@@ -205,7 +205,10 @@ On systemd systems the delegated process runs in a transient service with:
 - a private umask
 - a fixed working directory
 - `ReadOnlyPaths` on the workspace for read-only roles, enforced by the
-  kernel rather than by tool rules alone
+  kernel rather than by tool rules alone. A probe unit checks that the
+  environment can actually enforce it; where unprivileged user
+  namespaces are restricted and systemd would drop the option silently,
+  the runner announces that write protection is tool-level only.
 
 The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
 stops the whole control group and removes the private prompt, settings, log,

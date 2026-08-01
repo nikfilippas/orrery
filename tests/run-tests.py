@@ -8970,6 +8970,12 @@ def test_read_only_unit_workspace_guard() -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            # Some environments (CI runners restricting unprivileged
+            # user namespaces) cannot enforce ReadOnlyPaths, and systemd
+            # drops it silently there. The wrapper must then announce
+            # tool-level-only protection; where enforcement works, the
+            # write must actually be blocked and nothing announced.
+            enforced = review_module.read_only_paths_enforced(workspace)
             environment = review_environment(
                 "success", standing_state=state_dir
             )
@@ -8990,10 +8996,22 @@ def test_read_only_unit_workspace_guard() -> None:
                 and "fake Claude verdict" in stdout,
                 f"the read-only run failed outright: {stderr[-600:]}",
             )
-            require(
-                not (workspace / "blocked.txt").exists(),
-                "a read-only unit wrote into the workspace",
-            )
+            if enforced:
+                require(
+                    not (workspace / "blocked.txt").exists(),
+                    "a read-only unit wrote into the workspace",
+                )
+                require(
+                    "cannot enforce ReadOnlyPaths" not in stderr,
+                    "enforced protection was reported as unavailable",
+                )
+            else:
+                require(
+                    "cannot enforce ReadOnlyPaths" in stderr
+                    and "tool-level only" in stderr,
+                    "degraded read-only protection was not announced: "
+                    f"{stderr[-500:]}",
+                )
 
     with tempfile.TemporaryDirectory() as directory:
         workspace = Path(directory) / "workspace"

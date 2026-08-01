@@ -9,18 +9,20 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff
+      # Pinned to the version used for local verification, so a ruff
+      # release can never turn a locally green tree red in CI.
+      - run: pip install ruff==0.13.3
       - run: ruff check .
 
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The suite drives real transient units, which needs the runner's
       # systemd user manager and its bus to exist.
       - name: Enable the systemd user manager

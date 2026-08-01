@@ -477,6 +477,41 @@ def unit_status(unit: str) -> tuple[bool, str]:
     return True, active_state
 
 
+def read_only_paths_enforced(target: Path) -> bool:
+    """Whether the user manager can actually apply ReadOnlyPaths.
+
+    Some environments restrict the unprivileged user namespaces that
+    mount sandboxing needs, and systemd then drops the option silently
+    rather than failing the unit. A quick probe unit answers the
+    question, so a missing guarantee is announced instead of assumed.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--wait",
+                "--collect",
+                "--pipe",
+                f"--property=ReadOnlyPaths={target}",
+                "/bin/sh",
+                "-c",
+                'test ! -w "$1"',
+                "probe",
+                str(target),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def unit_is_loaded(unit: str) -> bool:
     loaded, _active_state = unit_status(unit)
     return loaded
@@ -1239,6 +1274,14 @@ def main(
     use_systemd = all(
         shutil.which(tool) is not None for tool in ("systemd-run", "systemctl")
     )
+    if use_systemd and role_config.read_only:
+        if not read_only_paths_enforced(Path.cwd()):
+            print(
+                f"{PROGRAM_NAME}: this environment cannot enforce "
+                "ReadOnlyPaths; workspace write protection for this "
+                "read-only role is tool-level only.",
+                file=sys.stderr,
+            )
     if not use_systemd:
         print(
             f"{PROGRAM_NAME}: systemd is unavailable; running without "

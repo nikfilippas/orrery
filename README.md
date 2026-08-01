@@ -124,7 +124,9 @@ The shipped configuration:
 The timeout is the role's default budget for one delegated run; a `--timeout`
 flag or an `ORRERY_AGENT_TIMEOUT_SECONDS` environment variable still wins.
 Read-only roles additionally run inside a service unit whose workspace is
-mounted read-only by the kernel, not merely guarded by tool rules.
+mounted read-only by the kernel wherever the user manager supports mount
+sandboxing; where an environment cannot enforce it, the runner announces
+that protection is tool-level only rather than assuming the guarantee.
 
 `global/orchestration.json` is the only role-assignment source. Every row may
 be changed to either provider. For example, Sol may be the principal while
