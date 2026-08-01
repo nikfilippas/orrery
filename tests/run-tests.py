@@ -6659,9 +6659,13 @@ def test_config_surface() -> None:
 
 @test("the config token stays out of argv and substitution is one pass")
 def test_config_launcher_hygiene() -> None:
-    """The browser must never see the URL token in a process argument
-    list, and a substituted value containing a placeholder must be
-    served verbatim rather than substituted again."""
+    """The browser is handed a single-use claim, never the session
+    token, because a command line is readable by other local users.
+    The claim must redirect once and then be spent. A file:// launcher
+    cannot serve this purpose: a confined browser (snap, flatpak) has
+    a private /tmp and reports the file as missing. A substituted value
+    containing a placeholder must also be served verbatim rather than
+    substituted again."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         kit = root / "kit"
@@ -6722,32 +6726,47 @@ def test_config_launcher_hygiene() -> None:
             require(capture.exists(), "the BROWSER command was never run")
             argv_url = capture.read_text()
             require(
-                argv_url.startswith("file://"),
-                f"the browser was not handed a private file: {argv_url}",
+                argv_url.startswith("http://127.0.0.1:")
+                and "/c/" in argv_url,
+                f"the browser was not handed a claim URL: {argv_url}",
             )
             require(
                 token not in argv_url,
                 "the URL token leaked into the browser argument list",
             )
 
-            import urllib.parse
+            import urllib.error
             import urllib.request
 
-            launcher = Path(
-                urllib.parse.unquote(argv_url[len("file://") :])
+            opener = urllib.request.build_opener(
+                type(
+                    "NoRedirect",
+                    (urllib.request.HTTPRedirectHandler,),
+                    {"redirect_request": lambda *arguments: None},
+                )()
             )
-            require(launcher.is_file(), "the launcher file is missing")
-            mode = launcher.stat().st_mode & 0o777
-            parent_mode = launcher.parent.stat().st_mode & 0o777
-            require(
-                mode == 0o600 and parent_mode == 0o700,
-                f"launcher permissions are open: "
-                f"{oct(mode)}/{oct(parent_mode)}",
-            )
-            require(
-                url in launcher.read_text(),
-                "the launcher does not forward to the tokened URL",
-            )
+            # With redirection suppressed, urllib reports the 302 itself
+            # as an error, which carries the headers to inspect.
+            try:
+                opener.open(argv_url, timeout=10)
+            except urllib.error.HTTPError as error:
+                require(
+                    error.code == 302
+                    and error.headers["Location"] == f"/t/{token}/",
+                    f"the claim did not redirect to the page: "
+                    f"{error.code} {error.headers.get('Location')}",
+                )
+            else:
+                raise Failure("the claim did not redirect at all")
+            try:
+                opener.open(argv_url, timeout=10)
+            except urllib.error.HTTPError as error:
+                require(
+                    error.code == 404,
+                    f"a spent claim gave {error.code}",
+                )
+            else:
+                raise Failure("a claim could be redeemed twice")
 
             page = urllib.request.urlopen(url, timeout=10).read().decode()
             require(
@@ -6759,11 +6778,9 @@ def test_config_launcher_hygiene() -> None:
                 "the token path placeholder was not substituted",
             )
 
+            # The idle timeout ends the run, leaving nothing behind:
+            # the claim never touched the filesystem.
             process.wait(timeout=30)
-            require(
-                not launcher.parent.exists(),
-                "the launcher directory outlived the server",
-            )
         finally:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)

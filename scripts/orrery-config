@@ -16,7 +16,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -1928,6 +1927,9 @@ def print_state() -> int:
 
 class Handler(BaseHTTPRequestHandler):
     token = ""
+    # Single-use redirect credential handed to the browser, cleared by
+    # the first request that presents it.
+    claim = ""
     lock = threading.Lock()
     last_activity = time.time()
     # The exact edit each file was last previewed with. An apply is only
@@ -1958,7 +1960,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def redeem_claim(self) -> bool:
+        """Spend a one-time claim and send the browser to the page."""
+        prefix = "/c/"
+        if not self.path.startswith(prefix):
+            return False
+        supplied = self.path[len(prefix):].strip("/")
+        with Handler.lock:
+            expected = Handler.claim
+            if not expected or not secrets.compare_digest(
+                supplied,
+                expected,
+            ):
+                self.send_error(404)
+                return True
+            Handler.claim = ""
+            Handler.last_activity = time.time()
+        self.send_response(302)
+        self.send_header("Location", f"/t/{Handler.token}/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
     def do_GET(self) -> None:
+        if self.redeem_claim():
+            return
         if not self.touch():
             return
         if self.endpoint() not in ("", "/"):
@@ -2026,31 +2052,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply({"error": str(exc)}, status=400)
 
 
-def write_browser_launcher(url: str) -> Path:
-    """A private page that forwards the browser to the tokened URL.
-
-    Opening the URL directly would place the token in the argument
-    list of xdg-open and the browser, where any local process can read
-    it with ps. The browser gets a 0600 file in a 0700 directory
-    instead and follows its refresh to the real page.
-    """
-    directory = Path(tempfile.mkdtemp(prefix="orrery-config-open-"))
-    target = html.escape(url, quote=True)
-    page = directory / "open-orrery-config.html"
-    page.write_text(
-        "<!doctype html><title>Órrery configuration</title>"
-        f'<meta http-equiv="refresh" content="0;url={target}">'
-        f'<p><a href="{target}">Open the Órrery configuration page</a></p>',
-        encoding="utf-8",
-    )
-    page.chmod(0o600)
-    return page
-
-
 def serve(port: int, timeout: float, open_browser: bool) -> int:
     Handler.token = secrets.token_hex(12)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{server.server_address[1]}/t/{Handler.token}/"
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    url = f"{origin}/t/{Handler.token}/"
 
     def watch_idle() -> None:
         while True:
@@ -2069,10 +2075,15 @@ def serve(port: int, timeout: float, open_browser: bool) -> int:
         "or on Ctrl-C.",
         flush=True,
     )
-    launcher = None
     if open_browser:
-        launcher = write_browser_launcher(url)
-        webbrowser.open(launcher.as_uri())
+        # The browser is handed a single-use claim rather than the
+        # session token: a command line is readable by other local
+        # users through /proc, and the claim is spent by the browser's
+        # own first request. A file:// launcher cannot be used instead,
+        # because a confined browser (snap, flatpak) has a private /tmp
+        # and would report the file as missing.
+        Handler.claim = secrets.token_urlsafe(18)
+        webbrowser.open(f"{origin}/c/{Handler.claim}")
 
     try:
         server.serve_forever()
@@ -2080,8 +2091,6 @@ def serve(port: int, timeout: float, open_browser: bool) -> int:
         print("Interrupted; exiting.", flush=True)
     finally:
         server.server_close()
-        if launcher is not None:
-            shutil.rmtree(launcher.parent, ignore_errors=True)
     return 0
 
 
