@@ -210,6 +210,10 @@ link_file \
     "$HOME/.local/bin/orrery-usage"
 
 link_file \
+    "$KIT_DIR/scripts/orrery-incidents" \
+    "$HOME/.local/bin/orrery-incidents"
+
+link_file \
     "$KIT_DIR/scripts/orrery-config" \
     "$HOME/.local/bin/orrery-config"
 

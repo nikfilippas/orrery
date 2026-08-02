@@ -1,4 +1,5 @@
 {
+  "verbosity": 1,
   "steps": [
     {
       "id": "orchestrator",
@@ -31,7 +32,8 @@
       "access": "workspace-write",
       "summary": "Handles contained features, real bug fixes, and coherent multi-file implementation tasks in a separate process.",
       "selects": "The provider, model, and thinking level used by orrery-agent --role implementer.",
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "hard_timeout_seconds": 1800
     },
     {
       "id": "plan-reviewer",
@@ -42,7 +44,8 @@
       "access": "read-only",
       "summary": "Challenges a complex or high-risk plan in a fresh, read-only process before code is written.",
       "selects": "The provider, model, and thinking level used by orrery-agent --role plan-reviewer.",
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "hard_timeout_seconds": 1800
     },
     {
       "id": "reviewer",
@@ -53,7 +56,8 @@
       "access": "read-only",
       "summary": "Reviews finished work or difficult diagnoses in a fresh, read-only process.",
       "selects": "The provider, model, and thinking level used by orrery-agent --role reviewer.",
-      "timeout_seconds": 900
+      "timeout_seconds": 900,
+      "hard_timeout_seconds": 1800
     }
   ],
   "chart": {

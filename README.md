@@ -113,16 +113,26 @@ implementation and asks the user to choose.
 
 The shipped configuration:
 
-| Role | Provider | Model | Thinking | Access | Timeout |
-| --- | --- | --- | --- | --- | --- |
-| Principal orchestrator | Anthropic | `fable` | `max` | interactive principal | none |
-| Mechanical worker | OpenAI | `gpt-5.6-luna` | `low` | workspace-write | 600 s |
-| Implementation worker | OpenAI | `gpt-5.6-terra` | `medium` | workspace-write | 900 s |
-| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s |
-| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s |
+| Role | Provider | Model | Thinking | Access | Timeout | Hard cap |
+| --- | --- | --- | --- | --- | --- | --- |
+| Principal orchestrator | Anthropic | `fable` | `max` | interactive principal | none | none |
+| Mechanical worker | OpenAI | `gpt-5.6-luna` | `low` | workspace-write | 600 s | none |
+| Implementation worker | OpenAI | `gpt-5.6-terra` | `medium` | workspace-write | 900 s | 1800 s |
+| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s | 1800 s |
+| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s | 1800 s |
 
-The timeout is the role's default budget for one delegated run; a `--timeout`
+The timeout is the role's base budget for one delegated run; a `--timeout`
 flag or an `ORRERY_AGENT_TIMEOUT_SECONDS` environment variable still wins.
+The hard cap makes the budget progress-aware: at its base deadline a run
+whose merged output grew within the last three minutes keeps running, in
+two-minute steps, up to the cap (`hard_timeout_seconds` in the manifest,
+`--hard-timeout` per run), because review time varies with task
+complexity, rate limits, and time of day. A run that stalls, never
+produces output, or reaches the cap times out exactly as before. The
+runner surfaces the delegate's own newest output line every couple of
+minutes so slow progress is visible rather than silent, with
+provider-derived text sanitised so it can never forge Orrery's consent
+markers or inject terminal escapes.
 Read-only roles additionally run inside a service unit whose workspace is
 mounted read-only by the kernel wherever the user manager supports mount
 sandboxing; where an environment cannot enforce it, the runner announces
@@ -195,6 +205,9 @@ The launcher builds provider commands from static adapters:
 - Reviewer access is fixed in code and cannot be widened by the prompt.
 - The prompt is provided on stdin under a stable `ORRERY ROLE HANDOFF`, not
   exposed in the process argument list.
+- The handoff carries a report-style line steering delegates away from
+  wordy output: `verbosity` in the manifest (1 terse, 2 concise, 3
+  unconstrained; default 1), overridable per run with `ORRERY_VERBOSITY`.
 
 Delegated runs are synchronous. On systemd systems they live in a transient
 user service with `KillMode=control-group` and a runtime backstop. Timeout,
@@ -303,9 +316,14 @@ permission to use it:
 - a missing CLI or inactive login is detected before inference;
 - account, quota, billing, authentication, or unknown provider failure excludes
   that provider from the next candidate;
-- model-specific failure prefers the nearest model on the same provider;
+- model-specific failure, including a timeout or a limit announced for one
+  model, prefers the nearest model on the same provider (an unavailable
+  `fable` proposes `opus`), crossing providers only when the same-provider
+  capability gap reaches two tiers;
 - a recognized transient failure is retried once before fallback is proposed,
-  except when a failed writer changed the workspace;
+  except when a failed writer changed the workspace; budget timeouts are
+  never retried in place, but a run whose output is still growing first
+  extends to its hard cap before a timeout is declared;
 - a terminal shows a numbered menu (this run, this login session, until the
   provider-stated reset time when the diagnostics state one, or stop);
   Enter and any unrecognised input stop;
@@ -321,7 +339,9 @@ permission to use it:
   `orrery --revoke-fallbacks`, skipped when the role is reconfigured, and
   always overridden by `--no-fallback`, an explicit `--approve-fallback`,
   and the changed-workspace writer refusal;
-- an approved rerun skips the provider/model that produced its proposal;
+- an approved rerun starts the exact identity the user named, accepted from
+  anywhere in the current ranking with every nearer candidate excluded, so
+  a non-interactive fallback ladder stays approvable rung by rung;
 - if a failed writer changed the Git workspace, Orrery refuses an inline
   handoff and requires inspection plus a separately approved rerun; and
 - unavailable independent review is reported rather than falsely claimed.
@@ -397,6 +417,24 @@ This reads local Claude and Codex session logs, deduplicates replayed messages,
 and reports fresh input, cache reads, cache writes, and output by provider and
 model. It does not access the network.
 
+## Incident log
+
+```bash
+orrery-incidents --since 7
+orrery-incidents --json
+```
+
+Every launcher failure is also a data point: blockers, timeouts, fallback
+proposals and their outcomes, consent stops, degraded containment, and
+cleanup problems are appended as JSON lines to
+`~/.local/state/orrery/incidents.jsonl`, outside every repository. Events
+hold structured identities and wrapper-authored reasons only, never
+prompts, verdicts, diagnostics text, or credentials; writing is
+best-effort and cannot change a run's outcome. `orrery-incidents`
+aggregates the log and the doctor warns when the last 7 days recorded
+anything, so the default configuration can be tuned with evidence rather
+than memory.
+
 ## Verification
 
 ```bash
@@ -434,6 +472,8 @@ request.
 | `scripts/orrery_model_catalogue.py` | no-inference live model and thinking-capability discovery |
 | `scripts/orrery_runtime.py` | validated role loader and static provider adapters |
 | `scripts/orrery-review` | contained generic role runner; compatibility filename |
+| `scripts/orrery_incidents.py` | best-effort incident log writer and validated reader |
+| `scripts/orrery-incidents` | incident aggregation and reporting command |
 | `scripts/orrery-config` | atomic visual configuration surface |
 | `scripts/init-project.sh` | safe project adoption and Git initialization |
 | `scripts/install.sh` | user-level instruction, skill, hook, and command links |

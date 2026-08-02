@@ -205,6 +205,22 @@ def main() -> int:
         time.sleep(3600)
         return 0
 
+    if mode == "drip":
+        # Emits one line per second so the wrapper's log grows, the way
+        # a real codex exec run streams tool output while it works.
+        total = float(os.environ.get("CODEX_FAKE_DRIP_SECONDS", "10"))
+        text = os.environ.get("CODEX_FAKE_DRIP_TEXT", "examined a hunk")
+        end = time.time() + total
+        while time.time() < end:
+            print(text, flush=True)
+            time.sleep(1.0)
+        if os.environ.get("CODEX_FAKE_AFTER") == "sleep":
+            time.sleep(3600)
+        destination = output_path(sys.argv[1:])
+        if destination is not None:
+            destination.write_text("# PASS\nfake verdict\n")
+        return 0
+
     if mode == "linger":
         # A descendant in the same process group that outlives its parent:
         # writes its identifier to the marker so a test can prove it died.
@@ -225,7 +241,10 @@ def main() -> int:
         return 0
 
     if mode == "fail":
-        print("simulated codex failure", file=sys.stderr)
+        print(
+            os.environ.get("CODEX_FAKE_FAIL_TEXT", "simulated codex failure"),
+            file=sys.stderr,
+        )
         return 7
     if mode == "quota":
         print("usage limit reached; no credits remain", file=sys.stderr)

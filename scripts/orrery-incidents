@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Report Orrery incidents from the local incident log.
+
+The launchers append one JSON line to the store for everything that
+goes wrong: blockers, timeouts, fallbacks, consent stops, degraded
+containment, cleanup failures. This command aggregates those events so
+edge cases can be assessed and the default configuration tuned with
+evidence. The store is only read here, never modified.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_incidents import read_events, store_path  # noqa: E402
+
+
+RECENT_LIMIT = 15
+DETAIL_COLUMN = 76
+
+
+def parse_since(value: str) -> datetime:
+    try:
+        return datetime.now(timezone.utc) - timedelta(days=int(value))
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise SystemExit(
+            f"orrery-incidents: --since must be a day count or a date: "
+            f"{value}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def identity(event: dict[str, Any]) -> str:
+    provider = event.get("provider")
+    model = event.get("model")
+    if provider and model:
+        return f"{provider}/{model}"
+    return provider or "-"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Report incidents recorded by the Orrery launchers."
+    )
+    parser.add_argument(
+        "--since",
+        default="30",
+        help="day count or ISO date to start from (default: 30)",
+    )
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    args = parser.parse_args()
+
+    since = parse_since(args.since)
+    events = read_events(since=since)
+
+    if args.as_json:
+        print(
+            json.dumps(
+                {"since": since.isoformat(), "events": events},
+                indent=2,
+            )
+        )
+        return 0
+
+    if not events:
+        print(
+            f"No incidents recorded since {since:%Y-%m-%d %H:%M} UTC "
+            f"({store_path()})."
+        )
+        return 0
+
+    print(f"Incidents since {since:%Y-%m-%d %H:%M} UTC: {len(events)}")
+    print()
+
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for event in events:
+        key = (
+            event["kind"],
+            event.get("role") or "-",
+            identity(event),
+        )
+        bucket = grouped.setdefault(key, {"count": 0, "last": event["ts"]})
+        bucket["count"] += 1
+        bucket["last"] = max(bucket["last"], event["ts"])
+
+    header = (
+        f"{'KIND':28} {'ROLE':14} {'PROVIDER/MODEL':26} "
+        f"{'COUNT':>5}  LAST"
+    )
+    print(header)
+    print("-" * len(header))
+    ordered = sorted(
+        grouped.items(),
+        key=lambda item: (-item[1]["count"], item[0]),
+    )
+    for (kind, role, model), bucket in ordered:
+        last = bucket["last"][:16].replace("T", " ")
+        print(
+            f"{kind[:28]:28} {role[:14]:14} {model[:26]:26} "
+            f"{bucket['count']:>5}  {last}"
+        )
+
+    print()
+    print(f"Recent (last {min(RECENT_LIMIT, len(events))}):")
+    for event in events[-RECENT_LIMIT:]:
+        stamp = event["ts"][:16].replace("T", " ")
+        parts = [stamp, event["program"], event["kind"]]
+        if event.get("role"):
+            parts.append(str(event["role"]))
+        model = identity(event)
+        if model != "-":
+            parts.append(model)
+        line = " · ".join(parts)
+        detail = event.get("detail", "")
+        if detail:
+            line += f" · {detail[:DETAIL_COLUMN]}"
+        print(f"  {line}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

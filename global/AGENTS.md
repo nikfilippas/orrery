@@ -113,6 +113,14 @@ For visual work, capture the target desktop and narrow viewport, read each
 screenshot back, describe what it shows, and remove the screenshot from the
 repository. Close the context and browser, then verify the process is gone.
 
+### Communication style
+
+Write plainly and tersely, in prose. State findings, decisions, and
+evidence directly; avoid preamble, filler, flourish, and restating the
+task. Use headers or lists only when they carry data. Length must be
+proportional to information. This applies to replies, reports, and
+delegated results alike.
+
 ### Completion report
 
 For substantial work, report what changed, the observed verification results,
@@ -142,10 +150,11 @@ the active provider/model with Orrery's configuration. When it emits
 delegate until the user explicitly approves this active session as the
 principal fallback. On resume or compaction, an unrevoked approval already in
 that conversation remains sufficient. Opening an IDE or provider CLI is not
-approval. SessionStart cannot verify the active thinking level, so disclose
-that limitation and ask the user to verify the recommended level where
-possible. If the check cannot run, disclose that the principal match was not
-verified.
+approval. Where the surface does not export the active thinking level,
+SessionStart cannot verify it; follow the hook's own message, which states
+whether the level was verified, and otherwise disclose the limitation and
+ask the user to verify the recommended level where possible. If the check
+cannot run, disclose that the principal match was not verified.
 
 An explicit role handoff overrides that default. A non-principal session:
 

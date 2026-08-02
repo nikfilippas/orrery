@@ -17,13 +17,30 @@ from orrery_fallback import nearest_fallback, provider_label  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     MODEL_ID,
     PROVIDERS,
+    THINKING_LEVEL,
     RuntimeConfigError,
     adopted_root,
     load_role,
 )
+import orrery_incidents as incident_log  # noqa: E402
 
 
 MAX_INPUT_BYTES = 1024 * 1024
+PROGRAM = "orrery-session-start"
+
+
+def environment_effort() -> str | None:
+    """The session's thinking level, when this surface exports it.
+
+    CLAUDE_CODE_EFFORT_LEVEL and CLAUDE_EFFORT are Claude settings, so
+    callers consult them only on an anthropic surface; an OpenAI
+    session's reasoning level is not observable here.
+    """
+    for name in ("CLAUDE_CODE_EFFORT_LEVEL", "CLAUDE_EFFORT"):
+        value = os.environ.get(name, "").strip().lower()
+        if value and THINKING_LEVEL.fullmatch(value):
+            return value
+    return None
 
 
 def same_model(provider: str, configured: str, active: str) -> bool:
@@ -92,22 +109,17 @@ def main() -> int:
             raise ValueError("hook input is not an object")
         if payload.get("hook_event_name") != "SessionStart":
             return 0
-        active_model = payload.get("model")
         cwd = payload.get("cwd")
-        if (
-            not isinstance(active_model, str)
-            or not MODEL_ID.fullmatch(active_model)
-        ):
-            raise ValueError("hook input has no active model")
         if not isinstance(cwd, str) or not cwd:
             cwd = str(Path.cwd())
+        # Adoption is decided before the payload's model is examined:
+        # an un-adopted repository gets a normal single-provider
+        # session however incomplete the payload is, rather than
+        # principal noise about a comparison that will never apply.
         if (
             adopted_root(Path(cwd)) is None
             and os.environ.get("ORRERY_SESSION") != "principal"
         ):
-            # An un-adopted repository gets a normal single-provider
-            # session; the orchestration layer must stand down rather
-            # than gate or reshape it.
             print(
                 json.dumps(
                     hook_output(
@@ -135,11 +147,90 @@ def main() -> int:
                 hook_output(
                     "Orrery could not verify this session's principal: "
                     f"{detail}",
-                    "Tell the user that Orrery could not compare this direct "
-                    "session with the configured principal. Do not claim the "
-                    "configured principal or a fallback was verified.",
+                    "Orrery's principal check failed before any "
+                    "comparison. Say so in one short line in your first "
+                    "reply; do not claim the configured principal or a "
+                    "fallback was verified.",
                 )
             )
+        )
+        incident_log.record(
+            "config-error",
+            program=PROGRAM,
+            detail=detail,
+            active_provider=active_provider,
+        )
+        return 0
+
+    configured_label = (
+        f"{provider_label(configured.provider)} / {configured.model}"
+        + (
+            f" / thinking {configured.thinking}"
+            if configured.thinking
+            else ""
+        )
+    )
+    active_model = payload.get("model")
+    if (
+        not isinstance(active_model, str)
+        or not MODEL_ID.fullmatch(active_model)
+    ):
+        # This surface (for example the VS Code extension) sends no
+        # model in its SessionStart payload, so the principal match
+        # cannot run at all. That is a property of the surface, not an
+        # error in the configuration, and it earns one short line, not
+        # an alarm.
+        effort = (
+            environment_effort()
+            if active_provider == "anthropic"
+            else None
+        )
+        reference = (
+            configured.thinking
+            if configured.provider == "anthropic"
+            else None
+        )
+        if effort is not None and reference is not None:
+            thinking_note = (
+                f"the session's thinking level {effort} matches the "
+                "configured level"
+                if effort == reference
+                else (
+                    f"the session reports thinking {effort}, not the "
+                    f"configured {reference}"
+                )
+            )
+        elif effort is not None:
+            thinking_note = (
+                f"the session reports thinking {effort}, which has no "
+                "comparable level on the configured provider's scale"
+            )
+        else:
+            thinking_note = "the thinking level is likewise unreported"
+        print(
+            json.dumps(
+                hook_output(
+                    "Orrery: this surface reported no model, so the "
+                    "principal match could not be checked. Configured "
+                    f"principal: {configured_label}; {thinking_note}.",
+                    "This surface's SessionStart payload carries no "
+                    "model, so Orrery could not compare the session "
+                    "with the configured principal "
+                    f"({configured_label}); {thinking_note}. Open your "
+                    "first reply with one short line noting that the "
+                    "check could not run; do not claim a verified "
+                    "principal or fallback, and do not elaborate "
+                    "unless asked.",
+                )
+            )
+        )
+        incident_log.record(
+            "principal-unverified",
+            program=PROGRAM,
+            role=configured,
+            detail="the surface reported no model",
+            active_provider=active_provider,
+            session_thinking=effort,
         )
         return 0
 
@@ -162,19 +253,10 @@ def main() -> int:
     active_label = (
         f"{provider_label(active_provider)} / {active_model}"
     )
-    configured_label = (
-        f"{provider_label(configured.provider)} / {configured.model}"
-        + (
-            f" / thinking {configured.thinking}"
-            if configured.thinking
-            else ""
-        )
-    )
     if recommended is None:
         recommendation = (
             "No potential fallback could be ranked for this provider surface."
         )
-        active_is_recommended = False
     else:
         recommended_label = (
             f"{provider_label(recommended.provider)} / {recommended.model}"
@@ -184,15 +266,40 @@ def main() -> int:
                 else ""
             )
         )
-        active_is_recommended = same_model(
-            active_provider,
-            recommended.model,
-            active_model,
-        )
         recommendation = (
             f"This is the nearest potential fallback ({recommended_label})."
-            if active_is_recommended
+            if same_model(active_provider, recommended.model, active_model)
             else f"The nearest potential fallback is {recommended_label}."
+        )
+
+    # The effort variables are Claude settings, so the comparison only
+    # runs on an anthropic surface, and against the recommended
+    # candidate's position-mapped level rather than the configured
+    # provider's raw wording, which may use a different scale.
+    effort = (
+        environment_effort() if active_provider == "anthropic" else None
+    )
+    reference = (
+        recommended.thinking
+        if recommended is not None
+        and recommended.provider == "anthropic"
+        and active_provider == "anthropic"
+        else None
+    )
+    if effort is not None and reference is not None:
+        thinking_sentence = (
+            f"The session's thinking level {effort} matches the "
+            "recommended level."
+            if effort == reference
+            else (
+                f"The session reports thinking {effort}; the "
+                f"recommended level is {reference}."
+            )
+        )
+    else:
+        thinking_sentence = (
+            "The thinking level is not reported by this surface; ask "
+            "the user to verify it where possible."
         )
 
     system_message = (
@@ -202,21 +309,31 @@ def main() -> int:
     )
     context = (
         "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED\n"
-        f"The configured principal is {configured_label}, but this direct "
-        f"session uses {active_label}. {recommendation} Unless this "
-        "conversation already contains unrevoked, explicit user approval for "
-        "this exact active provider/model, notify the user of the mismatch "
-        "before running tools, editing files, or delegating, and ask whether "
-        "they approve it as the principal fallback. SessionStart does not "
-        "report the active thinking level, so disclose that limitation and "
-        "ask the user to verify the recommended level in the provider UI "
-        "where possible. Do not infer approval from the act of opening the "
-        "IDE or provider CLI. If they decline, make no repository changes "
-        "and direct them to start `orrery` or switch models. Once they "
-        "explicitly approve, continue in this same conversation and report "
-        "the fallback honestly."
+        f"Configured principal: {configured_label}. Active session: "
+        f"{active_label}. {recommendation} {thinking_sentence} Unless "
+        "this conversation already holds unrevoked, explicit user "
+        "approval for this exact provider/model, tell the user about "
+        "the mismatch in one short line and ask whether they approve "
+        "this session as the principal fallback before running tools, "
+        "editing files, or delegating. Opening the IDE or provider CLI "
+        "is not approval. If they decline, change nothing and point "
+        "them to `orrery` or a model switch. If they approve, continue "
+        "here and report the fallback honestly and briefly."
     )
     print(json.dumps(hook_output(system_message, context)))
+    incident_log.record(
+        "principal-mismatch",
+        program=PROGRAM,
+        role=configured,
+        detail=f"active session is {active_provider}/{active_model}",
+        active_provider=active_provider,
+        candidate=(
+            f"{recommended.provider}:{recommended.model}"
+            if recommended is not None
+            else None
+        ),
+        session_thinking=effort,
+    )
     return 0
 
 

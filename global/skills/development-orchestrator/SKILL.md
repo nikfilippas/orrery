@@ -21,8 +21,9 @@ or Codex session that receives
 `ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED` remains only a candidate until
 the user explicitly approves it. Ask before any tool call, edit, or delegation;
 opening the provider surface does not itself count as approval. An unrevoked
-approval in a resumed or compacted conversation remains valid. Because
-SessionStart does not report active thinking, disclose that limitation and ask
+approval in a resumed or compacted conversation remains valid. The hook's
+message states whether the active thinking level was verified from the
+session environment; where it was not, disclose that limitation and ask
 the user to verify the recommended level where possible.
 
 ## Runtime roles

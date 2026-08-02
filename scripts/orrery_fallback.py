@@ -66,6 +66,12 @@ ROLE_TIER = {
     "mechanic": 1,
 }
 
+# A same-provider candidate is preferred only while its capability gap
+# stays below this many tiers; from here on, a near-tier model on the
+# other provider is the better substitute. On the 1-3 tier scale this
+# means one step down keeps the provider and two steps crosses.
+LARGE_TIER_GAP = 2
+
 
 class Availability(str, Enum):
     READY = "ready"
@@ -346,9 +352,8 @@ def _thinking_for(
     return str(levels[0])
 
 
-def nearest_fallback(
+def _ranked_candidates(
     original: Role,
-    reason: str,
     *,
     excluded_providers: Iterable[str] = (),
     excluded_models: Iterable[tuple[str, str]] = (),
@@ -357,8 +362,8 @@ def nearest_fallback(
     assumed_ready: Iterable[str] = (),
     additional_models: dict[str, list[str]] | None = None,
     discover_live: bool = True,
-) -> FallbackProposal | None:
-    """Return the closest potentially usable role without authorising it."""
+) -> list[tuple[tuple[int, int, int, int, int, str, str], Role, str]]:
+    """Every potentially usable candidate, nearest first."""
     env = dict(os.environ if environment is None else environment)
     excluded_provider_set = set(excluded_providers)
     excluded_model_set = set(excluded_models)
@@ -388,7 +393,7 @@ def nearest_fallback(
     )
 
     ranked: list[
-        tuple[tuple[int, int, int, int, str, str], Role, str]
+        tuple[tuple[int, int, int, int, int, str, str], Role, str]
     ] = []
     for provider in sorted(PROVIDERS):
         if provider in excluded_provider_set:
@@ -469,9 +474,16 @@ def nearest_fallback(
                 if identity in configured_tiers
                 else 4
             )
+            tier_gap = abs(tier - target_tier)
             score = (
+                # Providers often limit one model rather than the whole
+                # account, so the nearest same-provider model comes
+                # first, but only while the capability gap stays small:
+                # a distant same-provider model ranks behind a near-tier
+                # model on the other provider.
+                1 if tier_gap >= LARGE_TIER_GAP else 0,
                 0 if provider == original.provider else 1,
-                abs(tier - target_tier),
+                tier_gap,
                 configured_distance,
                 0 if status.state is Availability.READY else 1,
                 provider,
@@ -479,9 +491,36 @@ def nearest_fallback(
             )
             ranked.append((score, candidate, source))
 
+    ranked.sort(key=lambda item: item[0])
+    return ranked
+
+
+def nearest_fallback(
+    original: Role,
+    reason: str,
+    *,
+    excluded_providers: Iterable[str] = (),
+    excluded_models: Iterable[tuple[str, str]] = (),
+    environment: dict[str, str] | None = None,
+    statuses: dict[str, ProviderStatus] | None = None,
+    assumed_ready: Iterable[str] = (),
+    additional_models: dict[str, list[str]] | None = None,
+    discover_live: bool = True,
+) -> FallbackProposal | None:
+    """Return the closest potentially usable role without authorising it."""
+    ranked = _ranked_candidates(
+        original,
+        excluded_providers=excluded_providers,
+        excluded_models=excluded_models,
+        environment=environment,
+        statuses=statuses,
+        assumed_ready=assumed_ready,
+        additional_models=additional_models,
+        discover_live=discover_live,
+    )
     if not ranked:
         return None
-    _score, candidate, catalogue_source = min(ranked, key=lambda item: item[0])
+    _score, candidate, catalogue_source = ranked[0]
     rationale = (
         "closest role/model capability match among authenticated or "
         "potentially authenticated models"
@@ -503,10 +542,16 @@ def proposal_for_approval(
 ) -> tuple[FallbackProposal | None, set[str], set[tuple[str, str]]]:
     """Resolve an approval from a previous failed invocation.
 
-    A cross-provider approval means the configured provider already failed;
-    a same-provider approval means only the configured model failed. This
-    lets a rerun start the exact approved candidate without needlessly
-    retrying the known-bad process.
+    A cross-provider approval means the configured provider already
+    failed; a same-provider approval means at least the configured
+    model failed. The approved identity may sit deeper than the
+    freshly ranked nearest candidate: the exclusions a failing
+    invocation accumulates while walking the ladder do not survive its
+    exit, so a rerun cannot rebuild them. An explicitly named identity
+    is therefore accepted from anywhere in the current ranking, and
+    every candidate ranking nearer is excluded as already ruled out,
+    so a later failure of the approved candidate proposes a strictly
+    deeper rung instead of walking back up the ladder.
     """
     excluded_providers: set[str] = set()
     excluded_models: set[tuple[str, str]] = set()
@@ -515,14 +560,32 @@ def proposal_for_approval(
     else:
         excluded_providers.add(original.provider)
 
-    proposal = nearest_fallback(
+    ranked = _ranked_candidates(
         original,
-        "the user approved a candidate proposed by an earlier failed attempt",
         excluded_providers=excluded_providers,
         excluded_models=excluded_models,
         environment=environment,
     )
-    return proposal, excluded_providers, excluded_models
+    for _score, candidate, catalogue_source in ranked:
+        identity = (candidate.provider, candidate.model)
+        if identity == approval:
+            proposal = FallbackProposal(
+                original=original,
+                candidate=candidate,
+                reason=(
+                    "the user approved a candidate proposed by an "
+                    "earlier failed attempt"
+                ),
+                rationale=(
+                    "explicitly approved candidate from the current "
+                    "ranking; nearer candidates are excluded as "
+                    "already ruled out"
+                ),
+                catalogue_source=catalogue_source,
+            )
+            return proposal, excluded_providers, excluded_models
+        excluded_models.add(identity)
+    return None, excluded_providers, excluded_models
 
 
 def git_workspace_fingerprint(
@@ -610,6 +673,11 @@ MODEL_FAILURE_PATTERNS = (
     r"not available|unavailable|not supported|unsupported)\b",
     r"\b(?:unknown|invalid)\s+model\b",
     r"\bno access to (?:the )?model\b",
+    # A limit announced for one model is a model failure, not an
+    # account failure: the provider still serves its other models.
+    # Generic limit wording stays provider scope below.
+    r"\b(?:usage|rate)\s+limit\b[^\n]{0,80}\bmodel\b",
+    r"\bmodel\b[^\n]{0,80}\b(?:usage|rate)\s+limit\b",
 )
 PROVIDER_FAILURE_PATTERNS = (
     r"\bnot logged in\b",

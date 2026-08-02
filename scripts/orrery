@@ -42,6 +42,7 @@ from orrery_standing import (  # noqa: E402
     record_approval,
     revoke_all,
 )
+import orrery_incidents as incident_log  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -171,16 +172,30 @@ def _record_standing(
             "it applies to this run only.",
             file=sys.stderr,
         )
+        incident_log.record(
+            "standing-record-failed",
+            program="orrery",
+            role=configured,
+            detail=str(exc),
+        )
         return
     print(
         f"orrery: standing fallback recorded · {describe(record)}",
         file=sys.stderr,
+    )
+    incident_log.record(
+        "standing-recorded",
+        program="orrery",
+        role=configured,
+        candidate=f"{candidate.provider}:{candidate.model}",
+        approval_scope=decision.scope,
     )
 
 
 def _proposal_status(
     configured: Role,
     *,
+    failed: Role,
     reason: str,
     excluded_providers: set[str],
     excluded_models: set[tuple[str, str]],
@@ -190,7 +205,16 @@ def _proposal_status(
     require_rerun_after_inspection: bool = False,
     approval_required_status: int | None = None,
     failure_scope: str = "provider",
+    kind: str = "provider-failure",
 ) -> tuple[Role | None, int]:
+    incident_log.record(
+        kind,
+        program="orrery",
+        role=failed,
+        detail=reason,
+        status=status,
+        scope=failure_scope,
+    )
     proposal = nearest_fallback(
         configured,
         reason,
@@ -202,6 +226,13 @@ def _proposal_status(
             "orrery: no authenticated or potentially authenticated fallback "
             "candidate remains; no substitution was made.",
             file=sys.stderr,
+        )
+        incident_log.record(
+            "fallback-unavailable",
+            program="orrery",
+            role=failed,
+            detail=reason,
+            status=status,
         )
         return None, status
     decision = request_fallback_decision(
@@ -215,6 +246,14 @@ def _proposal_status(
         approval_scope=invocation.approval_scope,
     )
     if decision.consent is Consent.APPROVED:
+        incident_log.record(
+            "fallback-approved",
+            program="orrery",
+            role=failed,
+            candidate=proposal.approval_key,
+            approval_scope=decision.scope,
+            crosses_provider=proposal.crosses_provider,
+        )
         _record_standing(
             configured,
             proposal.candidate,
@@ -224,11 +263,26 @@ def _proposal_status(
         )
         return proposal.candidate, status
     if decision.consent is Consent.REQUIRED:
+        incident_log.record(
+            "fallback-approval-required",
+            program="orrery",
+            role=failed,
+            candidate=proposal.approval_key,
+            inspection_required=require_rerun_after_inspection,
+            status=status,
+        )
         return None, (
             APPROVAL_REQUIRED
             if approval_required_status is None
             else approval_required_status
         )
+    incident_log.record(
+        "fallback-declined",
+        program="orrery",
+        role=failed,
+        candidate=proposal.approval_key,
+        status=status,
+    )
     return None, status
 
 
@@ -260,6 +314,12 @@ def main() -> int:
         configured = load_role("orchestrator")
     except RuntimeConfigError as exc:
         print(f"orrery: {exc}", file=sys.stderr)
+        incident_log.record(
+            "config-error",
+            program="orrery",
+            detail=str(exc),
+            status=2,
+        )
         return 2
 
     role = configured
@@ -278,6 +338,17 @@ def main() -> int:
                 "available candidate; no process was started.",
                 file=sys.stderr,
             )
+            incident_log.record(
+                "fallback-unavailable",
+                program="orrery",
+                role=configured,
+                detail=(
+                    "the approved fallback is no longer a potentially "
+                    "available candidate"
+                ),
+                candidate=f"{invocation.approval[0]}:"
+                f"{invocation.approval[1]}",
+            )
             return APPROVAL_REQUIRED
         decision = request_fallback_decision(
             proposal,
@@ -287,11 +358,27 @@ def main() -> int:
             approval_scope=invocation.approval_scope,
         )
         if decision.consent is not Consent.APPROVED:
+            incident_log.record(
+                "fallback-approval-required"
+                if decision.consent is Consent.REQUIRED
+                else "fallback-declined",
+                program="orrery",
+                role=configured,
+                candidate=proposal.approval_key,
+            )
             return (
                 APPROVAL_REQUIRED
                 if decision.consent is Consent.REQUIRED
                 else 2
             )
+        incident_log.record(
+            "fallback-approved",
+            program="orrery",
+            role=configured,
+            candidate=proposal.approval_key,
+            approval_scope=decision.scope,
+            crosses_provider=proposal.crosses_provider,
+        )
         _record_standing(
             configured,
             proposal.candidate,
@@ -324,6 +411,13 @@ def main() -> int:
                     "will be attempted.",
                     file=sys.stderr,
                 )
+                incident_log.record(
+                    "standing-unavailable",
+                    program="orrery",
+                    role=configured,
+                    detail=availability.reason,
+                    candidate=f"{candidate.provider}:{candidate.model}",
+                )
             else:
                 if record["failure_scope"] == "model":
                     excluded_models.add(
@@ -337,6 +431,12 @@ def main() -> int:
                     f"orrery: standing fallback active · {describe(record)}",
                     file=sys.stderr,
                 )
+                incident_log.record(
+                    "standing-adopted",
+                    program="orrery",
+                    role=configured,
+                    candidate=f"{candidate.provider}:{candidate.model}",
+                )
 
     while True:
         availability = provider_status(role.provider)
@@ -344,6 +444,7 @@ def main() -> int:
             excluded_providers.add(role.provider)
             candidate, status = _proposal_status(
                 configured,
+                failed=role,
                 reason=availability.reason,
                 excluded_providers=excluded_providers,
                 excluded_models=excluded_models,
@@ -351,6 +452,7 @@ def main() -> int:
                 status=2,
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
+                kind="provider-unavailable",
             )
             if candidate is None:
                 return status
@@ -363,12 +465,19 @@ def main() -> int:
                 "configured process.",
                 file=sys.stderr,
             )
+            incident_log.record(
+                "provider-unknown",
+                program="orrery",
+                role=role,
+                detail=availability.reason,
+            )
         elif availability.state is Availability.READY:
             visibility, visibility_reason = model_status(role, availability)
             if visibility is Availability.UNAVAILABLE:
                 excluded_models.add((role.provider, role.model))
                 candidate, status = _proposal_status(
                     configured,
+                    failed=role,
                     reason=visibility_reason,
                     excluded_providers=excluded_providers,
                     excluded_models=excluded_models,
@@ -377,6 +486,7 @@ def main() -> int:
                     context_warning=False,
                     approval_required_status=APPROVAL_REQUIRED,
                     failure_scope="model",
+                    kind="model-unavailable",
                 )
                 if candidate is None:
                     return status
@@ -405,6 +515,7 @@ def main() -> int:
             excluded_providers.add(role.provider)
             candidate, status = _proposal_status(
                 configured,
+                failed=role,
                 reason=str(exc),
                 excluded_providers=excluded_providers,
                 excluded_models=excluded_models,
@@ -412,6 +523,7 @@ def main() -> int:
                 status=2,
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
+                kind="config-error",
             )
             if candidate is None:
                 return status
@@ -438,8 +550,16 @@ def main() -> int:
                 )
             except RuntimeConfigError as exc:
                 print(f"orrery: {exc}", file=sys.stderr)
+                incident_log.record(
+                    "config-error",
+                    program="orrery",
+                    role=role,
+                    detail=str(exc),
+                    status=2,
+                )
                 return 2
         workspace_before = git_workspace_fingerprint()
+        spawn_failure: str | None = None
         try:
             result = subprocess.run(
                 command,
@@ -451,6 +571,7 @@ def main() -> int:
             return 128 + signal.SIGINT
         except OSError as exc:
             print(f"orrery: principal process could not start: {exc}", file=sys.stderr)
+            spawn_failure = str(exc)
             return_code = 127
 
         if return_code == 0:
@@ -466,10 +587,15 @@ def main() -> int:
         workspace_after = git_workspace_fingerprint()
         candidate, status = _proposal_status(
             configured,
+            failed=role,
             reason=(
-                f"{role.provider}/{role.model} exited with status "
-                f"{return_code}; hidden quota, entitlement, model, or service "
-                "failure is possible"
+                f"the principal process could not start: {spawn_failure}"
+                if spawn_failure is not None
+                else (
+                    f"{role.provider}/{role.model} exited with status "
+                    f"{return_code}; hidden quota, entitlement, model, or "
+                    "service failure is possible"
+                )
             ),
             excluded_providers=excluded_providers,
             excluded_models=excluded_models,
@@ -482,6 +608,11 @@ def main() -> int:
                 or workspace_before != workspace_after
             ),
             approval_required_status=return_code,
+            kind=(
+                "spawn-failure"
+                if spawn_failure is not None
+                else "provider-failure"
+            ),
         )
         if candidate is None:
             return status

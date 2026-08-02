@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -89,6 +90,7 @@ settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
 review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
 runtime_module = sys.modules["orrery_runtime"]
 fallback_module = sys.modules["orrery_fallback"]
+import orrery_incidents as incidents_module  # noqa: E402
 import orrery_standing as standing_module  # noqa: E402
 
 
@@ -206,12 +208,19 @@ def runtime_residue() -> list[str]:
     return sorted(entry.name for entry in root.iterdir())
 
 
+# Directories created by review_environment, swept at the end of the
+# run for any test that bypasses finish_review or run_principal.
+STATE_DIRS: list[str] = []
+FAKE_BIN_DIRS: list[str] = []
+
+
 def review_environment(
     mode: str,
     marker: Path | None = None,
     standing_state: Path | None = None,
 ) -> dict[str, str]:
     bin_dir = Path(tempfile.mkdtemp(prefix="kit-fake-bin."))
+    FAKE_BIN_DIRS.append(str(bin_dir))
     shutil.copy2(FAKE_CODEX, bin_dir / "codex")
     shutil.copy2(FAKE_CLAUDE, bin_dir / "claude")
     (bin_dir / "codex").chmod(0o755)
@@ -231,8 +240,20 @@ def review_environment(
     # systemd user bus and cannot be relocated safely.
     if standing_state is None:
         standing_state = Path(tempfile.mkdtemp(prefix="kit-standing."))
+        STATE_DIRS.append(str(standing_state))
     environment["XDG_STATE_HOME"] = str(standing_state)
     return environment
+
+
+def remove_helper_state(environment: dict[str, str]) -> None:
+    """Reclaim a state directory review_environment itself created.
+
+    A directory the test supplied stays: its owner removes it, and it
+    may still hold assertions to make.
+    """
+    state_home = environment.get("XDG_STATE_HOME", "")
+    if Path(state_home).name.startswith("kit-standing."):
+        shutil.rmtree(state_home, ignore_errors=True)
 
 
 def start_review(
@@ -268,6 +289,7 @@ def run_principal(
         )
     finally:
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
 
 
 def finish_review(
@@ -291,6 +313,7 @@ def finish_review(
                 process.communicate(timeout=20)
         stop_stray_units(f"orrery-review-{process.pid}-")
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
         if environment.get("KIT_NO_SYSTEMD_BIN"):
             shutil.rmtree(
                 environment["KIT_NO_SYSTEMD_BIN"], ignore_errors=True
@@ -2987,6 +3010,98 @@ def test_nearest_fallback_ranking() -> None:
     )
 
 
+@test("fallback prefers the same provider until the capability gap is large")
+def test_fallback_same_provider_ladder() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    opus = fallback_module.nearest_fallback(
+        principal,
+        "test",
+        excluded_models={("anthropic", "fable")},
+        assumed_ready={"anthropic", "openai"},
+        discover_live=False,
+    )
+    require(
+        opus is not None
+        and (opus.candidate.provider, opus.candidate.model)
+        == ("anthropic", "opus"),
+        f"an unavailable Fable did not propose Opus: {opus}",
+    )
+
+    reviewer = runtime_module.load_role("reviewer")
+    terra = fallback_module.nearest_fallback(
+        reviewer,
+        "test",
+        excluded_models={("openai", "gpt-5.6-sol")},
+        assumed_ready={"anthropic", "openai"},
+        discover_live=False,
+    )
+    require(
+        terra is not None
+        and (terra.candidate.provider, terra.candidate.model)
+        == ("openai", "gpt-5.6-terra"),
+        f"a Sol model failure did not stay on OpenAI: {terra}",
+    )
+
+    crossed = fallback_module.nearest_fallback(
+        reviewer,
+        "test",
+        excluded_models={
+            ("openai", "gpt-5.6-sol"),
+            ("openai", "gpt-5.6-terra"),
+            ("openai", "gpt-5.5"),
+        },
+        assumed_ready={"anthropic", "openai"},
+        discover_live=False,
+    )
+    require(
+        crossed is not None
+        and (crossed.candidate.provider, crossed.candidate.model)
+        == ("anthropic", "fable"),
+        "a two-tier same-provider drop was not outranked by a "
+        f"near-tier cross-provider model: {crossed}",
+    )
+
+
+@test("an explicit approval reaches deeper rungs of the ladder")
+def test_approval_ladder_across_reruns() -> None:
+    reviewer = runtime_module.load_role("reviewer")
+    environment = review_environment("success")
+    try:
+        proposal, _providers, excluded_models = (
+            fallback_module.proposal_for_approval(
+                reviewer,
+                ("openai", "gpt-5.5"),
+                environment=environment,
+            )
+        )
+        require(
+            proposal is not None
+            and (proposal.candidate.provider, proposal.candidate.model)
+            == ("openai", "gpt-5.5")
+            and proposal.candidate.thinking == "xhigh",
+            f"a deeper approved rung was not accepted: {proposal}",
+        )
+        require(
+            ("openai", "gpt-5.6-terra") in excluded_models
+            and ("openai", "gpt-5.6-sol") in excluded_models,
+            "nearer rungs were not excluded, so a later failure would "
+            f"walk back up the ladder: {excluded_models}",
+        )
+
+        absent, _providers, _models = fallback_module.proposal_for_approval(
+            reviewer,
+            ("openai", "no-such-model"),
+            environment=environment,
+        )
+        require(
+            absent is None,
+            f"an unrankable approval produced a proposal: {absent}",
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        shutil.rmtree(environment["XDG_STATE_HOME"], ignore_errors=True)
+
+
 @test("fallback consent is exact, explicit, and non-interactive-safe")
 def test_fallback_consent_contract() -> None:
     principal = runtime_module.load_role("orchestrator")
@@ -3074,6 +3189,20 @@ def test_failure_classification() -> None:
         fallback_module.classify_failure("usage limit reached; no credits remain")
         is fallback_module.FailureScope.PROVIDER,
         "credit exhaustion did not exclude the provider",
+    )
+    require(
+        fallback_module.classify_failure(
+            "usage limit reached for model gpt-5.6-sol"
+        )
+        is fallback_module.FailureScope.MODEL,
+        "a per-model usage limit was not isolated to the model",
+    )
+    require(
+        fallback_module.classify_failure(
+            "the model claude-fable-5 hit its rate limit for this plan"
+        )
+        is fallback_module.FailureScope.MODEL,
+        "a per-model rate limit was not isolated to the model",
     )
     require(
         fallback_module.classify_failure("service unavailable: 503")
@@ -3599,6 +3728,11 @@ def test_timeout() -> None:
     require(
         process.returncode == 124,
         f"expected status 124, got {process.returncode}: {stderr}",
+    )
+    require(
+        "Nearest candidate: OpenAI / gpt-5.6-terra" in stderr,
+        "a timeout excluded the provider instead of walking the "
+        f"same provider's ladder: {stderr}",
     )
     assert_no_review_residue(f"orrery-review-{process.pid}-")
 
@@ -5470,6 +5604,20 @@ def test_orchestration_manifest() -> None:
         f"plan-review setting lacks explanatory metadata: {plan_rounds}",
     )
 
+    verbosity = manifest.get("verbosity")
+    require(
+        not isinstance(verbosity, bool)
+        and isinstance(verbosity, int)
+        and 1 <= verbosity <= 3,
+        f"invalid manifest verbosity: {verbosity!r}",
+    )
+
+    for role_id in ("implementer", "plan-reviewer", "reviewer"):
+        require(
+            steps[role_id].get("hard_timeout_seconds") == 1800,
+            f"{role_id} lost its default hard cap",
+        )
+
 
 @test("every step offers a dropdown covering its provider's models")
 def test_model_catalogue() -> None:
@@ -6942,8 +7090,8 @@ def test_codex_session_start_fallback_notice() -> None:
         and "thinking max" in notice.get("systemMessage", "")
         and "active OpenAI / gpt-5.6-sol" in notice.get("systemMessage", "")
         and "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED" in context
-        and "Do not infer approval" in context
-        and "does not report the active thinking level" in context,
+        and "is not approval" in context
+        and "not reported by this surface" in context,
         f"the direct-session warning is incomplete: {notice}",
     )
 
@@ -6982,6 +7130,30 @@ def test_unadopted_session_start_stands_down() -> None:
             and "single-provider" in context
             and "APPROVAL REQUIRED" not in context,
             f"the un-adopted session was still gated: {notice}",
+        )
+
+        # A surface that reports no model (the VS Code extension) must
+        # reach the same stand-down, not a principal-verification
+        # error: adoption is decided before the model is examined.
+        modelless = dict(payload)
+        del modelless["model"]
+        modelless_result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(modelless),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        modelless_notice = json.loads(modelless_result.stdout)
+        require(
+            "repository not adopted"
+            in modelless_notice.get("systemMessage", "")
+            and "could not verify"
+            not in modelless_notice.get("systemMessage", ""),
+            "a model-less payload produced principal noise in an "
+            f"un-adopted repository: {modelless_notice}",
         )
 
         environment = os.environ.copy()
@@ -7107,6 +7279,162 @@ def test_session_start_recommends_nearest_model() -> None:
     )
 
 
+@test("an adopted repository without a payload model gets one concise line")
+def test_session_start_missing_model() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+        }
+        environment = os.environ.copy()
+        environment["XDG_STATE_HOME"] = str(state_home)
+        environment["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=json.dumps(payload),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        require(
+            result.returncode == 0,
+            f"the missing-model hook failed: {result.stderr}",
+        )
+        notice = json.loads(result.stdout)
+        message = notice.get("systemMessage", "")
+        context = notice.get("hookSpecificOutput", {}).get(
+            "additionalContext", ""
+        )
+        require(
+            "reported no model" in message
+            and "Anthropic / fable" in message
+            and "thinking level max matches" in message
+            and "could not verify" not in message,
+            f"the missing-model disclosure is wrong: {message}",
+        )
+        require(
+            "one short line" in context
+            and "APPROVAL REQUIRED" not in context,
+            f"the missing-model instruction is wrong: {context}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line)
+            for line in store.read_text().splitlines()
+        ]
+        require(
+            len(events) == 1
+            and events[0]["kind"] == "principal-unverified"
+            and events[0]["program"] == "orrery-session-start"
+            and events[0]["role"] == "orchestrator"
+            and events[0]["provider"] == "anthropic"
+            and events[0]["session_thinking"] == "max",
+            f"the missing-model incident is wrong: {events}",
+        )
+
+        # An OpenAI surface must not consult the Claude effort
+        # variables, whatever they claim.
+        openai_result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "openai"],
+            input=json.dumps(payload),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        openai_notice = json.loads(openai_result.stdout)
+        require(
+            "thinking level max matches"
+            not in openai_notice.get("systemMessage", ""),
+            "a Claude effort variable was used to verify an OpenAI "
+            f"surface: {openai_notice}",
+        )
+
+
+@test("a principal mismatch verifies thinking from the session environment")
+def test_session_start_mismatch_effort() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        payload = {
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": str(repository),
+            "model": "claude-sonnet-5",
+        }
+        environment = os.environ.copy()
+        environment["XDG_STATE_HOME"] = str(state_home)
+        environment["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
+        result = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=json.dumps(payload),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        notice = json.loads(result.stdout)
+        context = notice.get("hookSpecificOutput", {}).get(
+            "additionalContext", ""
+        )
+        require(
+            "ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED" in context
+            and "thinking level max matches the recommended level"
+            in context
+            and "not reported by this surface" not in context
+            and "one short line" in context,
+            f"the mismatch context lost its gate or its effort check: "
+            f"{context}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line)
+            for line in store.read_text().splitlines()
+        ]
+        require(
+            len(events) == 1
+            and events[0]["kind"] == "principal-mismatch"
+            and events[0]["candidate"] == "anthropic:opus"
+            and events[0]["session_thinking"] == "max",
+            f"the mismatch incident is wrong: {events}",
+        )
+
+        without_effort = os.environ.copy()
+        without_effort["XDG_STATE_HOME"] = str(state_home)
+        without_effort.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+        without_effort.pop("CLAUDE_EFFORT", None)
+        absent = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=json.dumps(payload),
+            env=without_effort,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        absent_context = json.loads(absent.stdout)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        require(
+            "not reported by this surface" in absent_context,
+            "the unverifiable-thinking clause disappeared with the "
+            f"variables: {absent_context}",
+        )
+
+
 @test("the canonical Codex hook uses the supported SessionStart contract")
 def test_canonical_codex_hook() -> None:
     canonical = read_json(KIT_DIR / "global" / "codex-hooks.json")
@@ -7132,6 +7460,7 @@ def test_installer_covers_doctor_commands() -> None:
         "orrery-review",
         "orrery-usage",
         "orrery-config",
+        "orrery-incidents",
     ):
         require(
             f"$HOME/.local/bin/{command}" in installer,
@@ -9652,6 +9981,956 @@ def test_config_standing_revoke() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Incident log: schema, locking, rotation, validation
+# ---------------------------------------------------------------------------
+
+
+@test("incident events append with schema, modes, and truncation")
+def test_incident_append_schema() -> None:
+    with until_store_only() as state_dir:
+        incidents_module._warned = False
+        role = runtime_module.load_role("reviewer")
+        incidents_module.record(
+            "timeout",
+            program="orrery-agent",
+            role=role,
+            detail="  spaced\n\nout   reason  " + "x" * 400,
+            status=124,
+            timeout_seconds=600,
+            fallback=False,
+        )
+        incidents_module.record("provider-unknown", program="orrery")
+        store = state_dir / "orrery" / "incidents.jsonl"
+        require(store.is_file(), "the incident store was not created")
+        require(
+            stat.S_IMODE(store.stat().st_mode) == 0o600
+            and stat.S_IMODE(store.parent.stat().st_mode) == 0o700,
+            "incident store modes are not 0600 in a 0700 directory",
+        )
+        lines = store.read_text().splitlines()
+        require(len(lines) == 2, f"expected two events: {lines}")
+        first = json.loads(lines[0])
+        second = json.loads(lines[1])
+        require(
+            first["v"] == 1
+            and first["kind"] == "timeout"
+            and first["program"] == "orrery-agent"
+            and first["role"] == "reviewer"
+            and first["provider"] == "openai"
+            and first["model"] == "gpt-5.6-sol"
+            and first["thinking"] == "ultra"
+            and first["status"] == 124
+            and first["timeout_seconds"] == 600
+            and first["fallback"] is False,
+            f"event fields are wrong: {first}",
+        )
+        require(
+            "spaced out reason" in first["detail"]
+            and len(first["detail"]) <= 300
+            and "\n" not in first["detail"],
+            "detail was not squashed and truncated",
+        )
+        require(
+            first["run"] == second["run"] and first["pid"] == os.getpid(),
+            "events do not share the process correlation id",
+        )
+        parsed = incidents_module.read_events()
+        require(len(parsed) == 2, f"the reader dropped valid events: {parsed}")
+        moment = datetime.fromisoformat(parsed[0]["ts"])
+        require(moment.tzinfo is not None, "timestamps are not aware")
+
+
+@test("the incident store rotates over the cap and keeps one predecessor")
+def test_incident_rotation() -> None:
+    with until_store_only() as state_dir:
+        incidents_module._warned = False
+        directory = state_dir / "orrery"
+        directory.mkdir(parents=True, exist_ok=True)
+        store = directory / "incidents.jsonl"
+        filler = json.dumps(
+            {
+                "v": 1,
+                "ts": "2026-01-01T00:00:00+00:00",
+                "kind": "filler",
+                "program": "orrery",
+            }
+        )
+        with store.open("w") as handle:
+            while handle.tell() <= incidents_module.ROTATE_BYTES:
+                handle.write(filler + "\n")
+        incidents_module.record("timeout", program="orrery-agent")
+        previous = directory / "incidents.jsonl.1"
+        require(previous.is_file(), "rotation did not keep the predecessor")
+        current_lines = store.read_text().splitlines()
+        require(
+            len(current_lines) == 1
+            and json.loads(current_lines[0])["kind"] == "timeout",
+            "the fresh store does not hold exactly the new event",
+        )
+        events = incidents_module.read_events()
+        require(
+            events[-1]["kind"] == "timeout"
+            and any(event["kind"] == "filler" for event in events),
+            "the reader did not merge both store files",
+        )
+
+
+@test("an unwritable incident store warns once and never raises")
+def test_incident_writer_never_raises() -> None:
+    saved = os.environ.get("XDG_STATE_HOME")
+    with tempfile.TemporaryDirectory() as base:
+        blocker = Path(base) / "blocker"
+        blocker.write_text("not a directory\n")
+        os.environ["XDG_STATE_HOME"] = str(blocker)
+        incidents_module._warned = False
+        captured = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(captured):
+                incidents_module.record("timeout", program="orrery-agent")
+                incidents_module.record("timeout", program="orrery-agent")
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+            incidents_module._warned = False
+        text = captured.getvalue()
+        require(
+            text.count("incident log could not be written") == 1,
+            f"the writer did not warn exactly once: {text!r}",
+        )
+
+
+@test("the incident reader skips torn and malformed events")
+def test_incident_reader_validation() -> None:
+    with until_store_only() as state_dir:
+        incidents_module._warned = False
+        incidents_module.record(
+            "timeout", program="orrery-agent", status=124
+        )
+        store = state_dir / "orrery" / "incidents.jsonl"
+        stamp = "2026-01-01T00:00:00+00:00"
+        with store.open("a") as handle:
+            handle.write("{\n")
+            handle.write("[]\n")
+            for wrong in (
+                {"v": 1, "ts": None, "kind": "x", "program": "p"},
+                {"v": 1, "ts": stamp, "kind": [], "program": "p"},
+                {"v": 2, "ts": stamp, "kind": "x", "program": "p"},
+                {"v": True, "ts": stamp, "kind": "x", "program": "p"},
+                {"v": 1, "ts": stamp, "kind": "k" * 60, "program": "p"},
+                {"v": 1, "ts": stamp, "kind": "x", "program": ""},
+                {"v": 1, "ts": stamp, "kind": "x", "program": "p",
+                 "detail": 5},
+                {"v": 1, "ts": stamp, "kind": "x", "program": "p",
+                 "detail": "d" * 400},
+                {
+                    "v": 1,
+                    "ts": stamp,
+                    "kind": "x",
+                    "program": "p",
+                    "extra": {"nested": 1},
+                },
+            ):
+                handle.write(json.dumps(wrong) + "\n")
+            handle.write(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "ts": "2026-02-01T00:00:00+00:00",
+                        "kind": "old-but-valid",
+                        "program": "p",
+                    }
+                )
+                + "\n"
+            )
+        events = incidents_module.read_events()
+        kinds = [event["kind"] for event in events]
+        require(
+            kinds == ["old-but-valid", "timeout"],
+            f"validation let the wrong events through: {kinds}",
+        )
+        since = datetime.now(timezone.utc) - timedelta(days=1)
+        recent = incidents_module.read_events(since=since)
+        require(
+            [event["kind"] for event in recent] == ["timeout"],
+            f"the since filter failed: {recent}",
+        )
+
+
+@test("the verbosity dial validates, defaults terse, and honours the env")
+def test_verbosity_dial() -> None:
+    require(
+        runtime_module.load_verbosity({}) == 1,
+        "an absent manifest verbosity is not terse",
+    )
+    require(
+        runtime_module.load_verbosity({"verbosity": 2}) == 2,
+        "a manifest verbosity of 2 did not load",
+    )
+    for wrong in (0, 4, True, "1", 1.5):
+        try:
+            runtime_module.load_verbosity({"verbosity": wrong})
+        except runtime_module.RuntimeConfigError:
+            continue
+        raise Failure(f"invalid manifest verbosity accepted: {wrong!r}")
+
+    saved = os.environ.get("ORRERY_VERBOSITY")
+    try:
+        os.environ["ORRERY_VERBOSITY"] = "3"
+        require(
+            runtime_module.load_verbosity({"verbosity": 1}) == 3,
+            "the environment override lost to the manifest",
+        )
+        os.environ["ORRERY_VERBOSITY"] = "zero"
+        try:
+            runtime_module.load_verbosity({})
+        except runtime_module.RuntimeConfigError:
+            pass
+        else:
+            raise Failure("an invalid ORRERY_VERBOSITY was accepted")
+    finally:
+        if saved is None:
+            os.environ.pop("ORRERY_VERBOSITY", None)
+        else:
+            os.environ["ORRERY_VERBOSITY"] = saved
+
+    role = runtime_module.load_role("reviewer")
+    terse = runtime_module.role_handoff(role, "task")
+    require(
+        "Report style: plain, terse prose" in terse
+        and "no praise or filler" in terse,
+        f"the default handoff is not terse: {terse}",
+    )
+    concise = runtime_module.role_handoff(role, "task", 2)
+    require(
+        "concise, plain prose" in concise and "terse prose" not in concise,
+        f"level 2 style is wrong: {concise}",
+    )
+    free = runtime_module.role_handoff(role, "task", 3)
+    require(
+        "Report style" not in free
+        and "ORRERY ROLE HANDOFF" in free
+        and "Assignment:" in free,
+        f"level 3 must drop only the style line: {free}",
+    )
+
+
+@test("delegated prompts carry the verbosity style end to end")
+def test_verbosity_delegated_prompt() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        stdin_path = Path(directory) / "stdin.txt"
+        environment = review_environment("success")
+        environment["CODEX_FAKE_STDIN"] = str(stdin_path)
+        process = start_review(
+            environment, "--timeout", "60", "--", "the assignment"
+        )
+        _, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0,
+            f"the terse delegated run failed: {stderr}",
+        )
+        content = stdin_path.read_text()
+        require(
+            "Report style: plain, terse prose" in content
+            and "the assignment" in content,
+            f"the default handoff lost the style line: {content!r}",
+        )
+
+        stdin_path.unlink()
+        environment = review_environment("success")
+        environment["CODEX_FAKE_STDIN"] = str(stdin_path)
+        environment["ORRERY_VERBOSITY"] = "3"
+        process = start_review(
+            environment, "--timeout", "60", "--", "the assignment"
+        )
+        _, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0,
+            f"the unconstrained delegated run failed: {stderr}",
+        )
+        require(
+            "Report style" not in stdin_path.read_text(),
+            "ORRERY_VERBOSITY=3 still injected a style line",
+        )
+
+
+@test("a delegated timeout writes timeout and approval incidents")
+def test_incidents_from_delegated_timeout() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        environment = review_environment("sleep", standing_state=state_home)
+        process = start_review(environment, "--timeout", "5", "--", "prompt")
+        _, stderr = finish_review(process, environment, timeout=180)
+        require(
+            process.returncode == 124,
+            f"expected status 124, got {process.returncode}: {stderr}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line) for line in store.read_text().splitlines()
+        ]
+        kinds = [event["kind"] for event in events]
+        require(
+            "timeout" in kinds and "fallback-approval-required" in kinds,
+            f"the timeout flow did not record its incidents: {kinds}",
+        )
+        timeout_event = next(
+            event for event in events if event["kind"] == "timeout"
+        )
+        require(
+            timeout_event["program"] == "orrery-review"
+            and timeout_event["role"] == "reviewer"
+            and timeout_event["provider"] == "openai"
+            and timeout_event["model"] == "gpt-5.6-sol"
+            and timeout_event["status"] == 124
+            and timeout_event["timeout_seconds"] == 5
+            and timeout_event["scope"] == "model"
+            and timeout_event["fallback"] is False,
+            f"the timeout incident is wrong: {timeout_event}",
+        )
+        approval_event = next(
+            event
+            for event in events
+            if event["kind"] == "fallback-approval-required"
+        )
+        require(
+            approval_event["candidate"] == "openai:gpt-5.6-terra"
+            and approval_event["inspection_required"] is False,
+            f"the approval incident is wrong: {approval_event}",
+        )
+        require(
+            all(
+                "prompt" not in json.dumps(event)
+                for event in events
+            ),
+            "an incident leaked assignment content",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("an approved delegated rerun records its fallback-approved incident")
+def test_incidents_from_approved_rerun() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        environment = review_environment(
+            "success", standing_state=state_home
+        )
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--approve-fallback",
+            "anthropic:fable",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0 and "fake Claude verdict" in stdout,
+            f"the approved rerun failed: {stderr}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line) for line in store.read_text().splitlines()
+        ]
+        approved = [
+            event for event in events if event["kind"] == "fallback-approved"
+        ]
+        require(
+            len(approved) == 1
+            and approved[0]["program"] == "orrery-review"
+            and approved[0]["role"] == "reviewer"
+            and approved[0]["candidate"] == "anthropic:fable"
+            and approved[0]["approval_scope"] == "run"
+            and approved[0]["crosses_provider"] is True,
+            f"the approval fast-path did not record its incident: {events}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a failed principal writes provider-failure and approval incidents")
+def test_incidents_from_principal_failure() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        environment = review_environment(
+            "success", standing_state=state_home
+        )
+        environment["CLAUDE_FAKE_MODE"] = "quota"
+        result = run_principal(environment)
+        require(
+            result.returncode == 8,
+            f"the failed principal exited {result.returncode}: "
+            f"{result.stderr}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line) for line in store.read_text().splitlines()
+        ]
+        kinds = [event["kind"] for event in events]
+        require(
+            "provider-failure" in kinds
+            and "fallback-approval-required" in kinds,
+            f"the principal failure did not record its incidents: {kinds}",
+        )
+        failure_event = next(
+            event for event in events if event["kind"] == "provider-failure"
+        )
+        require(
+            failure_event["program"] == "orrery"
+            and failure_event["role"] == "orchestrator"
+            and failure_event["provider"] == "anthropic"
+            and failure_event["model"] == "fable"
+            and failure_event["status"] == 8,
+            f"the principal incident is wrong: {failure_event}",
+        )
+
+
+@test("orrery-incidents renders, filters, and tolerates an empty store")
+def test_incidents_cli() -> None:
+    script = KIT_DIR / "scripts" / "orrery-incidents"
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory)
+        environment = os.environ.copy()
+        environment["XDG_STATE_HOME"] = str(state_home)
+
+        empty = subprocess.run(
+            [sys.executable, str(script)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        require(
+            empty.returncode == 0
+            and "No incidents recorded" in empty.stdout,
+            f"an empty store did not report plainly: {empty.stdout!r} "
+            f"{empty.stderr!r}",
+        )
+
+        store_directory = state_home / "orrery"
+        store_directory.mkdir()
+        now_stamp = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
+        lines = [
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": "2026-01-01T00:00:00+00:00",
+                    "kind": "timeout",
+                    "program": "orrery-agent",
+                    "role": "reviewer",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "status": 124,
+                }
+            ),
+            "{torn",
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": now_stamp,
+                    "kind": "timeout",
+                    "program": "orrery-agent",
+                    "role": "reviewer",
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "status": 124,
+                    "detail": "timed out after 5s",
+                }
+            ),
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": now_stamp,
+                    "kind": "fallback-approved",
+                    "program": "orrery",
+                    "candidate": "anthropic:opus",
+                }
+            ),
+            # A schema-shaped event with a non-string detail must be
+            # rejected by validation, never crash the renderer.
+            json.dumps(
+                {
+                    "v": 1,
+                    "ts": now_stamp,
+                    "kind": "poison",
+                    "program": "orrery",
+                    "detail": 5,
+                }
+            ),
+        ]
+        (store_directory / "incidents.jsonl").write_text(
+            "\n".join(lines) + "\n"
+        )
+
+        report = subprocess.run(
+            [sys.executable, str(script), "--since", "7"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        require(
+            report.returncode == 0
+            and "Incidents since" in report.stdout
+            and "timeout" in report.stdout
+            and "fallback-approved" in report.stdout
+            and "2026-01-01" not in report.stdout,
+            f"the human report is wrong: {report.stdout!r}",
+        )
+
+        as_json = subprocess.run(
+            [sys.executable, str(script), "--json", "--since", "3650"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        data = json.loads(as_json.stdout)
+        require(
+            len(data["events"]) == 3
+            and data["events"][0]["ts"] == "2026-01-01T00:00:00+00:00",
+            "the JSON report dropped events, kept the torn line, or "
+            f"lost ordering: {data}",
+        )
+
+
+@test("the doctor warns on recent incidents and passes on a quiet store")
+def test_doctor_incidents() -> None:
+    with until_store_only() as state_dir:
+        environment = review_environment("success", standing_state=state_dir)
+        quiet = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "PASS  No incidents recorded in the last 7 days" in quiet.stdout,
+            f"a quiet store did not pass: {quiet.stdout[-800:]}",
+        )
+
+        incidents_module._warned = False
+        incidents_module.record(
+            "timeout",
+            program="orrery-agent",
+            detail="doctor probe",
+            status=124,
+        )
+        listed = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "WARN  1 incident(s) recorded in the last 7 days: timeout x1"
+            in listed.stdout
+            and "Review with: orrery-incidents" in listed.stdout
+            and "FAIL  The incident log" not in listed.stdout,
+            f"the incident warning is missing: {listed.stdout[-800:]}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Progress-aware delegated budgets
+# ---------------------------------------------------------------------------
+
+
+@test("the deadline decision extends only while growth is recent")
+def test_next_deadline_transitions() -> None:
+    decide = review_module.next_deadline
+    require(
+        decide(10.0, 10.0, 60.0, None, stall_window=0.18, step=0.12)
+        is None,
+        "a run that never grew was extended",
+    )
+    require(
+        decide(10.0, 10.0, 60.0, 0.05, stall_window=0.18, step=0.12)
+        == 10.12,
+        "recent growth did not extend by one step",
+    )
+    require(
+        decide(10.0, 10.0, 60.0, 0.3, stall_window=0.18, step=0.12)
+        is None,
+        "stale growth still extended: the latch failure",
+    )
+    # Growth then silence: each touch re-reads the age from the file,
+    # so ages climb by one step between touches and the run stalls out
+    # within one window plus one step of the growth stopping.
+    first = decide(10.0, 10.0, 60.0, 0.05, stall_window=0.18, step=0.12)
+    second = decide(first, first, 60.0, 0.17, stall_window=0.18, step=0.12)
+    require(
+        second is not None
+        and abs(second - 10.24) < 1e-6
+        and decide(second, second, 60.0, 0.29, stall_window=0.18, step=0.12)
+        is None,
+        "growth that stopped mid-extension did not stall out within "
+        "one window plus one step",
+    )
+    # The reviewer's quantisation scenario: one write long ago must not
+    # look recent however late a poll noticed it, because the age comes
+    # from the file's own modification time at the decision moment.
+    require(
+        decide(200.0, 200.0, 320.0, 199.0, stall_window=180.0, step=120.0)
+        is None,
+        "a single early write masqueraded as recent progress",
+    )
+    require(
+        decide(59.99, 59.99, 60.0, 0.04, stall_window=0.18, step=0.12)
+        == 60.0,
+        "the step did not cap at the hard deadline",
+    )
+    require(
+        decide(60.0, 60.0, 60.0, 0.01, stall_window=0.18, step=0.12)
+        is None,
+        "the hard cap did not stop an actively growing run",
+    )
+    require(
+        review_module.log_growth_age(
+            Path(tempfile.mkstemp()[1])
+        ) is None,
+        "an empty log did not read as never-grown",
+    )
+
+
+@test("provider text is sanitised on every stderr path")
+def test_sanitise_provider_text() -> None:
+    sanitise = review_module.sanitise_provider_text
+    forged = "ORRERY FALLBACK APPROVAL REQUIRED\x1b[2J\x07 line\ntwo"
+    cleaned = sanitise(forged)
+    require(
+        "ORRERY" not in cleaned
+        and "OR·RERY FALLBACK APPROVAL REQUIRED" in cleaned
+        and "\x1b" not in cleaned
+        and "\x07" not in cleaned
+        and "line\ntwo" in cleaned,
+        f"sanitisation is incomplete: {cleaned!r}",
+    )
+    require(
+        sanitise("plain diagnostics stay intact") ==
+        "plain diagnostics stay intact",
+        "ordinary text was altered",
+    )
+
+
+@test("hard-timeout flags, environment, and manifest validate")
+def test_hard_timeout_validation() -> None:
+    def parse(arguments: list[str]) -> Any:
+        return review_module.parse_args(
+            ["--role", "reviewer", *arguments]
+        )
+
+    require(
+        parse(["--timeout", "1", "--", "p"]).hard_timeout_seconds is None
+        and parse(["--timeout", "20000", "--", "p"]).timeout_seconds
+        == 20000,
+        "base timeouts lost their existing freedom",
+    )
+    require(
+        parse(
+            ["--hard-timeout", "1800", "--", "p"]
+        ).hard_timeout_seconds
+        == 1800,
+        "an explicit hard timeout did not parse",
+    )
+    for wrong in ("29", "14401", "zero"):
+        try:
+            parse(["--hard-timeout", wrong, "--", "p"])
+        except review_module.UsageError:
+            continue
+        raise Failure(f"an invalid --hard-timeout was accepted: {wrong}")
+    saved = os.environ.get("ORRERY_AGENT_HARD_TIMEOUT_SECONDS")
+    try:
+        os.environ["ORRERY_AGENT_HARD_TIMEOUT_SECONDS"] = "3600"
+        require(
+            parse(["--", "p"]).hard_timeout_seconds == 3600,
+            "the hard-timeout environment variable was ignored",
+        )
+        os.environ["ORRERY_AGENT_HARD_TIMEOUT_SECONDS"] = "nonsense"
+        try:
+            parse(["--", "p"])
+        except review_module.UsageError:
+            pass
+        else:
+            raise Failure("a malformed hard-timeout variable was accepted")
+    finally:
+        if saved is None:
+            os.environ.pop("ORRERY_AGENT_HARD_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["ORRERY_AGENT_HARD_TIMEOUT_SECONDS"] = saved
+
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    with tempfile.TemporaryDirectory() as directory:
+        bad_path = Path(directory) / "orchestration.json"
+        for mutation, expected in (
+            ({"hard_timeout_seconds": 600}, "must not be smaller"),
+            ({"hard_timeout_seconds": 20000}, "between 30 and 14400"),
+            (
+                {"hard_timeout_seconds": 1800, "timeout_seconds": None},
+                "requires timeout_seconds",
+            ),
+        ):
+            bad = copy.deepcopy(manifest)
+            step = next(
+                item for item in bad["steps"] if item["id"] == "reviewer"
+            )
+            for key, value in mutation.items():
+                if value is None:
+                    step.pop(key, None)
+                else:
+                    step[key] = value
+            write_json(bad_path, bad)
+            try:
+                runtime_module.load_role("reviewer", bad_path)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    expected in str(exc),
+                    f"the wrong hard-timeout validation fired: {exc}",
+                )
+            else:
+                raise Failure(
+                    f"an invalid hard timeout was accepted: {mutation}"
+                )
+
+    environment = review_environment("success")
+    process = start_review(
+        environment,
+        "--timeout",
+        "100",
+        "--hard-timeout",
+        "50",
+        "--",
+        "p",
+    )
+    _, stderr = finish_review(process, environment)
+    require(
+        process.returncode == 2
+        and "must not be smaller than the effective timeout" in stderr,
+        f"a hard cap below the base was not rejected: {stderr}",
+    )
+
+    # The rejection must precede every consent and availability path:
+    # an unavailable provider must not turn the invalid pair into a
+    # fallback proposal, and an explicit approval must not be granted
+    # or recorded on the way to the error.
+    unavailable = review_environment("success")
+    unavailable["CODEX_FAKE_AUTH"] = "logged-out"
+    process = start_review(
+        unavailable,
+        "--timeout",
+        "100",
+        "--hard-timeout",
+        "50",
+        "--",
+        "p",
+    )
+    _, stderr = finish_review(process, unavailable)
+    require(
+        process.returncode == 2
+        and "must not be smaller than the effective timeout" in stderr
+        and "ORRERY FALLBACK APPROVAL REQUIRED" not in stderr,
+        "an unavailable provider preempted budget validation: "
+        f"{process.returncode} {stderr}",
+    )
+
+    approved = review_environment("success")
+    process = start_review(
+        approved,
+        "--timeout",
+        "100",
+        "--hard-timeout",
+        "50",
+        "--approve-fallback",
+        "anthropic:fable",
+        "--",
+        "p",
+    )
+    _, stderr = finish_review(process, approved)
+    require(
+        process.returncode == 2
+        and "Fallback approved" not in stderr,
+        "an approval was processed before budget validation: "
+        f"{process.returncode} {stderr}",
+    )
+
+
+@test("a progressing run extends past its base budget and completes")
+def test_progress_extends_run() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        environment = review_environment("drip", standing_state=state_home)
+        environment["CODEX_FAKE_DRIP_SECONDS"] = "12"
+        process = start_review(
+            environment,
+            "--timeout",
+            "5",
+            "--hard-timeout",
+            "60",
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment, timeout=120)
+        require(
+            process.returncode == 0 and "fake verdict" in stdout,
+            f"the progressing run did not complete: {stderr}",
+        )
+        require(
+            "budget extended" in stderr
+            and "B output" in stderr
+            and "examined a hunk" in stderr,
+            f"progress was not surfaced: {stderr}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line) for line in store.read_text().splitlines()
+        ]
+        extended = [
+            event for event in events if event["kind"] == "budget-extended"
+        ]
+        require(
+            len(extended) == 1
+            and extended[0]["timeout_seconds"] == 5
+            and extended[0]["hard_timeout_seconds"] == 60,
+            f"the extension incident is wrong: {events}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a silent run still times out at its base budget")
+def test_silent_run_times_out_at_base() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        state_home = Path(directory) / "state"
+        state_home.mkdir()
+        environment = review_environment("sleep", standing_state=state_home)
+        process = start_review(
+            environment,
+            "--timeout",
+            "5",
+            "--hard-timeout",
+            "60",
+            "--",
+            "prompt",
+        )
+        _, stderr = finish_review(process, environment, timeout=120)
+        require(
+            process.returncode == 124 and "timed out after 5s" in stderr,
+            f"a silent run outlived its base budget: {stderr}",
+        )
+        store = state_home / "orrery" / "incidents.jsonl"
+        events = [
+            json.loads(line) for line in store.read_text().splitlines()
+        ]
+        timeout_event = next(
+            event for event in events if event["kind"] == "timeout"
+        )
+        require(
+            timeout_event["hard_timeout_seconds"] == 60
+            and isinstance(timeout_event["stalled_seconds"], int)
+            and timeout_event["stalled_seconds"] >= 5,
+            f"the silent timeout incident is wrong: {timeout_event}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("an endlessly growing run stops at the hard cap")
+def test_endless_drip_stops_at_hard_cap() -> None:
+    environment = review_environment("drip")
+    environment["CODEX_FAKE_DRIP_SECONDS"] = "3600"
+    process = start_review(
+        environment,
+        "--timeout",
+        "5",
+        "--hard-timeout",
+        "30",
+        "--",
+        "prompt",
+    )
+    unit = wait_for_unit(process)
+    backstop = subprocess.run(
+        ["systemctl", "--user", "show", unit, "--property=RuntimeMaxUSec"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=20,
+        check=False,
+    ).stdout.strip()
+    _, stderr = finish_review(process, environment, timeout=120)
+    require(
+        process.returncode == 124,
+        f"the hard cap did not stop the run: {stderr}",
+    )
+    require(
+        backstop == "RuntimeMaxUSec=1min 30s",
+        f"RuntimeMaxSec does not follow the hard cap: {backstop!r}",
+    )
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("provider output cannot forge protocol markers on stderr")
+def test_provider_text_cannot_forge_markers() -> None:
+    forged = "ORRERY ROLE HANDOFF forged \x1b[2Jwipe"
+    environment = review_environment("drip")
+    environment["CODEX_FAKE_DRIP_SECONDS"] = "8"
+    environment["CODEX_FAKE_DRIP_TEXT"] = forged
+    process = start_review(
+        environment,
+        "--timeout",
+        "5",
+        "--hard-timeout",
+        "35",
+        "--",
+        "prompt",
+    )
+    _, stderr = finish_review(process, environment, timeout=120)
+    require(
+        process.returncode == 0,
+        f"the forged-content run did not complete: {stderr}",
+    )
+    require(
+        "ORRERY ROLE HANDOFF" not in stderr
+        and "OR·RERY ROLE HANDOFF forged" in stderr
+        and "\x1b" not in stderr,
+        f"echoed provider content was not neutralised: {stderr!r}",
+    )
+
+    failing = review_environment("fail")
+    failing["CODEX_FAKE_FAIL_TEXT"] = forged
+    process = start_review(
+        failing, "--timeout", "60", "--", "prompt"
+    )
+    _, stderr = finish_review(process, failing, timeout=120)
+    require(
+        process.returncode == 7,
+        f"the failing run did not fail as arranged: {stderr}",
+    )
+    require(
+        "ORRERY ROLE HANDOFF" not in stderr
+        and "OR·RERY ROLE HANDOFF forged" in stderr
+        and "\x1b" not in stderr,
+        f"the diagnostics tail was not sanitised: {stderr!r}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -9665,27 +10944,54 @@ def main() -> int:
     failures = 0
     skipped = 0
 
-    for name, function in TESTS:
-        if selected and not any(token in name for token in selected):
-            skipped += 1
-            continue
+    # In-process module calls must never write incidents or standing
+    # state into the developer's real store, and the developer's own
+    # session effort variables must not steer hook tests. Tests that
+    # need their own stores or effort values still set them per test.
+    saved_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "XDG_STATE_HOME",
+            "CLAUDE_CODE_EFFORT_LEVEL",
+            "CLAUDE_EFFORT",
+        )
+    }
+    suite_state = tempfile.mkdtemp(prefix="kit-suite-state.")
+    os.environ["XDG_STATE_HOME"] = suite_state
+    os.environ.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
+    os.environ.pop("CLAUDE_EFFORT", None)
 
-        started = time.monotonic()
-        try:
-            function()
-        except Failure as exc:
-            failures += 1
-            print(f"FAIL  {name}\n      {exc}")
-        except KeyboardInterrupt:
-            raise
-        except BaseException as exc:  # noqa: BLE001 - report any test error
-            # BaseException so that a SystemExit escaping a script under test
-            # is reported rather than silently ending the run.
-            failures += 1
-            print(f"ERROR {name}\n      {type(exc).__name__}: {exc}")
-        else:
-            elapsed = time.monotonic() - started
-            print(f"PASS  {name} ({elapsed:.1f}s)")
+    try:
+        for name, function in TESTS:
+            if selected and not any(token in name for token in selected):
+                skipped += 1
+                continue
+
+            started = time.monotonic()
+            try:
+                function()
+            except Failure as exc:
+                failures += 1
+                print(f"FAIL  {name}\n      {exc}")
+            except KeyboardInterrupt:
+                raise
+            except BaseException as exc:  # noqa: BLE001 - report any test error
+                # BaseException so that a SystemExit escaping a script under
+                # test is reported rather than silently ending the run.
+                failures += 1
+                print(f"ERROR {name}\n      {type(exc).__name__}: {exc}")
+            else:
+                elapsed = time.monotonic() - started
+                print(f"PASS  {name} ({elapsed:.1f}s)")
+    finally:
+        for name, value in saved_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        shutil.rmtree(suite_state, ignore_errors=True)
+        for leftover in (*STATE_DIRS, *FAKE_BIN_DIRS):
+            shutil.rmtree(leftover, ignore_errors=True)
 
     total = len(TESTS) - skipped
     print()

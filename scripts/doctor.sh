@@ -186,6 +186,14 @@ if (
 ):
     raise SystemExit("plan-review cap must be 1–4")
 
+verbosity = manifest.get("verbosity", 1)
+if (
+    isinstance(verbosity, bool)
+    or not isinstance(verbosity, int)
+    or verbosity not in (1, 2, 3)
+):
+    raise SystemExit("manifest verbosity must be 1, 2, or 3")
+
 endpoints = manifest.get("endpoints", {})
 if not isinstance(endpoints, dict):
     raise SystemExit("manifest endpoints must be an object")
@@ -211,6 +219,22 @@ for step in manifest["steps"]:
         raise SystemExit(
             "role timeout_seconds must be an integer between 30 and 7200"
         )
+    hard_timeout = step.get("hard_timeout_seconds")
+    if hard_timeout is not None:
+        if (
+            isinstance(hard_timeout, bool)
+            or not isinstance(hard_timeout, int)
+            or not 30 <= hard_timeout <= 14400
+        ):
+            raise SystemExit(
+                "role hard_timeout_seconds must be an integer between "
+                "30 and 14400"
+            )
+        if step_timeout is None or hard_timeout < step_timeout:
+            raise SystemExit(
+                "role hard_timeout_seconds requires timeout_seconds "
+                "and must not be smaller"
+            )
 
 chart = manifest.get("chart", {})
 nodes = chart.get("nodes")
@@ -446,7 +470,8 @@ for entry in \
     "orrery-init:scripts/init-project.sh" \
     "orrery-doctor:scripts/doctor.sh" \
     "orrery-config:scripts/orrery-config" \
-    "orrery-usage:scripts/orrery-usage"
+    "orrery-usage:scripts/orrery-usage" \
+    "orrery-incidents:scripts/orrery-incidents"
 do
     name="${entry%%:*}"
     relative="${entry#*:}"
@@ -695,6 +720,41 @@ PY
     fi
 else
     fail "The standing-approval store could not be read"
+fi
+
+printf '\n=== Incident log ===\n'
+if INCIDENT_SUMMARY="$(
+    python3 - "$KIT_DIR" <<'PY'
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_incidents import read_events
+
+since = datetime.now(timezone.utc) - timedelta(days=7)
+events = read_events(since=since)
+if events:
+    kinds: dict[str, int] = {}
+    for event in events:
+        kinds[event["kind"]] = kinds.get(event["kind"], 0) + 1
+    summary = ", ".join(
+        f"{kind} x{count}"
+        for kind, count in sorted(kinds.items(), key=lambda i: -i[1])[:4]
+    )
+    print(f"{len(events)}|{summary}")
+PY
+)"; then
+    if [ -n "$INCIDENT_SUMMARY" ]; then
+        COUNT="${INCIDENT_SUMMARY%%|*}"
+        SUMMARY="${INCIDENT_SUMMARY#*|}"
+        warn "$COUNT incident(s) recorded in the last 7 days: $SUMMARY"
+        printf 'Review with: orrery-incidents\n'
+    else
+        pass "No incidents recorded in the last 7 days"
+    fi
+else
+    warn "The incident log could not be read"
 fi
 
 printf '\n=== Kit repository ===\n'

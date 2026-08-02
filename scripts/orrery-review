@@ -13,6 +13,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -24,6 +25,7 @@ from orrery_runtime import (  # noqa: E402
     codex_home,
     delegated_command,
     load_role,
+    load_verbosity,
     provider_environment,
     role_handoff,
     sweep_claude_canaries,
@@ -53,6 +55,7 @@ from orrery_standing import (  # noqa: E402
     record_approval,
     revoke_all,
 )
+import orrery_incidents as incident_log  # noqa: E402
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
 PROGRAM_NAME = Path(sys.argv[0]).name
@@ -60,6 +63,24 @@ PROGRAM_NAME = Path(sys.argv[0]).name
 # How long a transient unit is allowed to reach a terminal state after a stop
 # and again after an escalation to SIGKILL.
 STOP_SETTLE_SECONDS = 10.0
+
+# Progress-aware budgets: at its base deadline a run whose merged log
+# grew within the stall window keeps going, one step at a time, up to
+# its hard cap; codex exec streams tool output and messages
+# continuously, so log growth is a live progress signal. Delegated
+# Claude runs print only their final JSON, never grow mid-run, and so
+# keep plain base-deadline behaviour. Deliberately constants, not
+# configuration.
+STALL_WINDOW_SECONDS = 180.0
+EXTEND_STEP_SECONDS = 120.0
+# The delegate's own newest log line is echoed to stderr at most this
+# often: a few lines every couple of minutes, not a scroll.
+CONTENT_ECHO_SECONDS = 120.0
+# Explicitly supplied hard caps (flag, environment, manifest) must sit
+# in this range; a cap derived from the base inherits the base's
+# freedom.
+HARD_TIMEOUT_MINIMUM = 30
+HARD_TIMEOUT_MAXIMUM = 14400
 
 
 class UsageError(Exception):
@@ -83,6 +104,7 @@ class Invocation:
         approval_scope: tuple[str, float | None] | None = None,
         revoke: bool = False,
         timeout_is_default: bool = False,
+        hard_timeout_seconds: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.output_path = output_path
@@ -93,6 +115,7 @@ class Invocation:
         self.approval_scope = approval_scope
         self.revoke = revoke
         self.timeout_is_default = timeout_is_default
+        self.hard_timeout_seconds = hard_timeout_seconds
 
 
 class DelegationState:
@@ -189,7 +212,8 @@ def role_label(role: str) -> tuple[str, str]:
 def usage() -> str:
     return (
         "Usage:\n"
-        f"  {PROGRAM_NAME} [--timeout SECONDS] [--output PATH]\n"
+        f"  {PROGRAM_NAME} [--timeout SECONDS] [--hard-timeout SECONDS]\n"
+        "                 [--output PATH]\n"
         "                 [--approve-fallback PROVIDER:MODEL]\n"
         "                 [--approval-scope run|session|until:ISO8601]\n"
         "                 [--no-fallback] [--role NAME] -- PROMPT...\n"
@@ -222,6 +246,15 @@ def parse_args(argv: list[str]) -> Invocation:
         "ORRERY_AGENT_TIMEOUT_SECONDS" not in os.environ
         and "CODEX_REVIEW_TIMEOUT_SECONDS" not in os.environ
     )
+    hard_raw = os.environ.get("ORRERY_AGENT_HARD_TIMEOUT_SECONDS")
+    try:
+        hard_timeout_seconds = (
+            int(hard_raw) if hard_raw is not None else None
+        )
+    except ValueError as exc:
+        raise UsageError(
+            "ORRERY_AGENT_HARD_TIMEOUT_SECONDS must be an integer"
+        ) from exc
 
     output_path: Path | None = None
     prompt_parts: list[str] | None = None
@@ -262,6 +295,23 @@ def parse_args(argv: list[str]) -> Invocation:
                     "--timeout must be a positive integer"
                 ) from exc
             timeout_is_default = False
+        elif argument == "--hard-timeout":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --hard-timeout")
+            index += 1
+            try:
+                hard_timeout_seconds = int(argv[index])
+            except ValueError as exc:
+                raise UsageError(
+                    "--hard-timeout must be a positive integer"
+                ) from exc
+        elif argument.startswith("--hard-timeout="):
+            try:
+                hard_timeout_seconds = int(argument.split("=", 1)[1])
+            except ValueError as exc:
+                raise UsageError(
+                    "--hard-timeout must be a positive integer"
+                ) from exc
         elif argument == "--output":
             if index + 1 >= len(argv):
                 raise UsageError("missing value for --output")
@@ -315,6 +365,13 @@ def parse_args(argv: list[str]) -> Invocation:
 
     if timeout_seconds <= 0:
         raise UsageError("--timeout must be a positive integer")
+    if hard_timeout_seconds is not None and not (
+        HARD_TIMEOUT_MINIMUM <= hard_timeout_seconds <= HARD_TIMEOUT_MAXIMUM
+    ):
+        raise UsageError(
+            "--hard-timeout must be between "
+            f"{HARD_TIMEOUT_MINIMUM} and {HARD_TIMEOUT_MAXIMUM} seconds"
+        )
 
     if revoke:
         if (
@@ -375,7 +432,106 @@ def parse_args(argv: list[str]) -> Invocation:
         no_fallback=no_fallback,
         approval_scope=approval_scope,
         timeout_is_default=timeout_is_default,
+        hard_timeout_seconds=hard_timeout_seconds,
     )
+
+
+# Provider-derived text reaching stderr must never be able to forge
+# Orrery's exact protocol markers (a reviewer can legitimately quote
+# ORRERY FALLBACK APPROVAL REQUIRED) or smuggle terminal escape
+# sequences into the transcript, so every such path renders through
+# this filter. Stdout is the verdict's data channel and stays raw.
+_PROTOCOL_TOKEN = re.compile(r"ORRERY")
+
+
+def sanitise_provider_text(text: str) -> str:
+    kept = "".join(
+        ch
+        for ch in text
+        if ch in "\n\t" or 0x20 <= ord(ch) < 0x7F or ord(ch) >= 0xA0
+    )
+    return _PROTOCOL_TOKEN.sub("OR·RERY", kept)
+
+
+def next_deadline(
+    now: float,
+    deadline: float,
+    hard_deadline: float,
+    growth_age: float | None,
+    *,
+    stall_window: float = STALL_WINDOW_SECONDS,
+    step: float = EXTEND_STEP_SECONDS,
+) -> float | None:
+    """The extended deadline, or None when the run has timed out.
+
+    Evaluated afresh at every deadline touch with the growth age taken
+    from the log file's own modification time at that moment, not from
+    when a poll happened to notice growth, so a single early write can
+    never masquerade as recent progress. Staying alive requires growth
+    within the stall window at every touch: a run that grew and then
+    went silent stalls out within one window plus one step. A run
+    whose log never grew (growth_age None) keeps its base deadline
+    whatever the cap, which also preserves exact current behaviour for
+    delegated Claude runs that print only their final JSON.
+    """
+    if growth_age is None:
+        return None
+    if growth_age > stall_window:
+        return None
+    if deadline >= hard_deadline:
+        return None
+    return min(deadline + step, hard_deadline)
+
+
+def log_growth_age(path: Path) -> float | None:
+    """Seconds since the log last grew, or None while it is empty."""
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    if status.st_size <= 0:
+        return None
+    return max(0.0, time.time() - status.st_mtime)
+
+
+def effective_budgets(invocation: Invocation, role: Role) -> tuple[int, int]:
+    """The effective base and hard budgets for one delegated run.
+
+    The manifest's per-role values apply only when neither the flag nor
+    the environment chose a base; an explicitly chosen base without an
+    explicit hard cap is its own bound. Fallback and standing
+    candidates inherit the configured role's budget fields, so the
+    configured role decides these numbers for the whole invocation.
+    """
+    base = invocation.timeout_seconds
+    if invocation.timeout_is_default and role.timeout_seconds is not None:
+        base = role.timeout_seconds
+    hard = invocation.hard_timeout_seconds
+    if hard is None:
+        hard = (
+            role.hard_timeout_seconds
+            if invocation.timeout_is_default
+            and role.timeout_seconds is not None
+            and role.hard_timeout_seconds is not None
+            else base
+        )
+    return base, hard
+
+
+def newest_log_line(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 4096))
+            chunk = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    for line in reversed(chunk.splitlines()):
+        line = line.strip()
+        if line:
+            return line
+    return ""
 
 
 def report(message: str) -> None:
@@ -397,7 +553,7 @@ def tail_text(path: Path, lines: int = 80) -> str:
     if not path.exists():
         return ""
     content = path.read_text(errors="replace").splitlines()
-    return "\n".join(content[-lines:])
+    return sanitise_provider_text("\n".join(content[-lines:]))
 
 
 def run_systemctl(
@@ -860,12 +1016,34 @@ def sweep_stale_runtime(root: Path) -> None:
                 stop_unit(unit)
             except RuntimeError:
                 # The unit could not be confirmed stopped, so its files stay.
+                incident_log.record(
+                    "runtime-reclaim-failed",
+                    program=PROGRAM_NAME,
+                    detail=(
+                        f"orphaned unit {unit} could not be confirmed "
+                        "stopped; state kept for a later sweep"
+                    ),
+                )
                 continue
 
         if not force_remove(entry):
             print(
                 f"orrery-review: could not reclaim {entry}",
                 file=sys.stderr,
+            )
+            incident_log.record(
+                "runtime-reclaim-failed",
+                program=PROGRAM_NAME,
+                detail=f"could not reclaim {entry.name}",
+            )
+        else:
+            # A reclaimed directory means an earlier wrapper died
+            # uncatchably; nothing else can have recorded that.
+            incident_log.record(
+                "runtime-reclaimed",
+                program=PROGRAM_NAME,
+                detail=f"reclaimed {entry.name}"
+                + (f" and stopped {unit}" if unit else ""),
             )
 
 
@@ -976,10 +1154,23 @@ def record_standing(
             f"({exc}); it applies to this run only.",
             file=sys.stderr,
         )
+        incident_log.record(
+            "standing-record-failed",
+            program=PROGRAM_NAME,
+            role=configured,
+            detail=str(exc),
+        )
         return
     print(
         f"{PROGRAM_NAME}: standing fallback recorded · {describe(record)}",
         file=sys.stderr,
+    )
+    incident_log.record(
+        "standing-recorded",
+        program=PROGRAM_NAME,
+        role=configured,
+        candidate=f"{candidate.provider}:{candidate.model}",
+        approval_scope=decision.scope,
     )
 
 
@@ -1002,6 +1193,13 @@ def adopt_standing_approval(state: DelegationState) -> dict | None:
             "will be attempted.",
             file=sys.stderr,
         )
+        incident_log.record(
+            "standing-unavailable",
+            program=PROGRAM_NAME,
+            role=state.configured,
+            detail=availability.reason,
+            candidate=f"{candidate.provider}:{candidate.model}",
+        )
         return None
     if record["failure_scope"] == "model":
         state.excluded_models.add(
@@ -1014,6 +1212,12 @@ def adopt_standing_approval(state: DelegationState) -> dict | None:
     print(
         f"{PROGRAM_NAME}: standing fallback active · {describe(record)}",
         file=sys.stderr,
+    )
+    incident_log.record(
+        "standing-adopted",
+        program=PROGRAM_NAME,
+        role=state.configured,
+        candidate=f"{candidate.provider}:{candidate.model}",
     )
     return record
 
@@ -1029,9 +1233,31 @@ def handle_failed_attempt(
     require_rerun_after_inspection: bool = False,
     approval_required_status: int | None = None,
     diagnostics: str = "",
+    kind: str = "provider-failure",
+    incident_fields: dict[str, Any] | None = None,
 ) -> int:
     """Retry one transient failure or request exact fallback consent."""
     failed = state.role
+    # Reserved names are filtered so a future caller's field can never
+    # collide with an explicit parameter and abort the failure handler
+    # with a TypeError before record()'s own never-raise guard applies.
+    extra_fields = {
+        "scope": scope.value,
+        "fallback": state.is_fallback,
+        **{
+            name: value
+            for name, value in (incident_fields or {}).items()
+            if name not in {"kind", "program", "role", "detail", "status"}
+        },
+    }
+    incident_log.record(
+        kind,
+        program=PROGRAM_NAME,
+        role=failed,
+        detail=reason,
+        status=status,
+        **extra_fields,
+    )
     identity = (failed.provider, failed.model)
     if (
         scope is FailureScope.TRANSIENT
@@ -1044,6 +1270,12 @@ def handle_failed_attempt(
             f"{failed.provider}/{failed.model}; retrying it once.",
             file=sys.stderr,
             flush=True,
+        )
+        incident_log.record(
+            "transient-retry",
+            program=PROGRAM_NAME,
+            role=failed,
+            detail=reason,
         )
         raise NextAttempt(invocation, state)
     if (
@@ -1076,6 +1308,13 @@ def handle_failed_attempt(
             "fallback candidate remains; no substitution was made.",
             file=sys.stderr,
         )
+        incident_log.record(
+            "fallback-unavailable",
+            program=PROGRAM_NAME,
+            role=failed,
+            detail=reason,
+            status=status,
+        )
         return status
 
     disclosures: tuple[str, ...] = ()
@@ -1106,6 +1345,14 @@ def handle_failed_attempt(
         extra_disclosures=disclosures,
     )
     if decision.consent is Consent.APPROVED:
+        incident_log.record(
+            "fallback-approved",
+            program=PROGRAM_NAME,
+            role=failed,
+            candidate=proposal.approval_key,
+            approval_scope=decision.scope,
+            crosses_provider=proposal.crosses_provider,
+        )
         record_standing(
             state.configured,
             proposal.candidate,
@@ -1117,11 +1364,26 @@ def handle_failed_attempt(
         state.is_fallback = True
         raise NextAttempt(invocation, state)
     if decision.consent is Consent.REQUIRED:
+        incident_log.record(
+            "fallback-approval-required",
+            program=PROGRAM_NAME,
+            role=failed,
+            candidate=proposal.approval_key,
+            inspection_required=require_rerun_after_inspection,
+            status=status,
+        )
         return (
             APPROVAL_REQUIRED
             if approval_required_status is None
             else approval_required_status
         )
+    incident_log.record(
+        "fallback-declined",
+        program=PROGRAM_NAME,
+        role=failed,
+        candidate=proposal.approval_key,
+        status=status,
+    )
     return status
 
 
@@ -1165,6 +1427,20 @@ def main(
         if state is None:
             configured = load_role(invocation.role_id)
             state = DelegationState(configured=configured, role=configured)
+            # Budgets are validated before any consent handling or
+            # provider preflight, so an invalid pair can never trigger
+            # a fallback proposal or record a standing approval on its
+            # way to rejection.
+            base_budget, hard_budget = effective_budgets(
+                invocation, configured
+            )
+            if hard_budget < base_budget:
+                print(
+                    f"{PROGRAM_NAME}: --hard-timeout must not be smaller "
+                    f"than the effective timeout ({base_budget}s)",
+                    file=sys.stderr,
+                )
+                return 2
             if invocation.approval is not None:
                 (
                     proposal,
@@ -1181,6 +1457,17 @@ def main(
                         "started.",
                         file=sys.stderr,
                     )
+                    incident_log.record(
+                        "fallback-unavailable",
+                        program=PROGRAM_NAME,
+                        role=configured,
+                        detail=(
+                            "the approved fallback is no longer a "
+                            "potentially available candidate"
+                        ),
+                        candidate=f"{invocation.approval[0]}:"
+                        f"{invocation.approval[1]}",
+                    )
                     return APPROVAL_REQUIRED
                 decision = request_fallback_decision(
                     proposal,
@@ -1190,11 +1477,27 @@ def main(
                     approval_scope=invocation.approval_scope,
                 )
                 if decision.consent is not Consent.APPROVED:
+                    incident_log.record(
+                        "fallback-approval-required"
+                        if decision.consent is Consent.REQUIRED
+                        else "fallback-declined",
+                        program=PROGRAM_NAME,
+                        role=configured,
+                        candidate=proposal.approval_key,
+                    )
                     return (
                         APPROVAL_REQUIRED
                         if decision.consent is Consent.REQUIRED
                         else 2
                     )
+                incident_log.record(
+                    "fallback-approved",
+                    program=PROGRAM_NAME,
+                    role=configured,
+                    candidate=proposal.approval_key,
+                    approval_scope=decision.scope,
+                    crosses_provider=proposal.crosses_provider,
+                )
                 record_standing(
                     configured,
                     proposal.candidate,
@@ -1218,10 +1521,18 @@ def main(
             else:
                 adopt_standing_approval(state)
         role_config = state.role
+        verbosity = load_verbosity()
         if role_config.provider == "openai":
             codex_home()
     except RuntimeConfigError as exc:
         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+        incident_log.record(
+            "config-error",
+            program=PROGRAM_NAME,
+            role=state.role if state is not None else None,
+            detail=str(exc),
+            status=2,
+        )
         return 2
 
     availability = provider_status(role_config.provider)
@@ -1234,12 +1545,19 @@ def main(
             scope=FailureScope.PROVIDER,
             context_warning=False,
             approval_required_status=APPROVAL_REQUIRED,
+            kind="provider-unavailable",
         )
     if availability.state is Availability.UNKNOWN:
         print(
             f"{PROGRAM_NAME}: warning: {availability.reason}; attempting the "
             "configured process.",
             file=sys.stderr,
+        )
+        incident_log.record(
+            "provider-unknown",
+            program=PROGRAM_NAME,
+            role=role_config,
+            detail=availability.reason,
         )
     elif availability.state is Availability.READY:
         visibility, visibility_reason = model_status(role_config, availability)
@@ -1252,16 +1570,12 @@ def main(
                 scope=FailureScope.MODEL,
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
+                kind="model-unavailable",
             )
 
-    timeout_seconds = invocation.timeout_seconds
-    if (
-        invocation.timeout_is_default
-        and role_config.timeout_seconds is not None
-    ):
-        # The manifest's per-role budget applies only when neither the
-        # flag nor the environment chose a timeout.
-        timeout_seconds = role_config.timeout_seconds
+    timeout_seconds, hard_timeout_seconds = effective_budgets(
+        invocation, state.configured
+    )
     output_path = invocation.output_path
     prompt = invocation.prompt
     role_id = invocation.role_id
@@ -1282,11 +1596,26 @@ def main(
                 "read-only role is tool-level only.",
                 file=sys.stderr,
             )
+            incident_log.record(
+                "containment-degraded",
+                program=PROGRAM_NAME,
+                role=role_config,
+                detail=(
+                    "ReadOnlyPaths unenforceable; workspace write "
+                    "protection is tool-level only"
+                ),
+            )
     if not use_systemd:
         print(
             f"{PROGRAM_NAME}: systemd is unavailable; running without "
             "control-group containment.",
             file=sys.stderr,
+        )
+        incident_log.record(
+            "containment-degraded",
+            program=PROGRAM_NAME,
+            role=role_config,
+            detail="systemd unavailable; process-group containment only",
         )
         if role_config.read_only:
             # ReadOnlyPaths exists only on the systemd path, so here the
@@ -1392,7 +1721,7 @@ def main(
         verdict_path = run_dir / "verdict.txt"
         log_path = run_dir / "agent.log"
         prompt_path = run_dir / "assignment.txt"
-        prompt_path.write_text(role_handoff(role_config, prompt))
+        prompt_path.write_text(role_handoff(role_config, prompt, verbosity))
         prompt_path.chmod(0o600)
         settings_path: Path | None = None
         if role_config.provider == "anthropic":
@@ -1425,6 +1754,7 @@ def main(
                 scope=FailureScope.PROVIDER,
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
+                kind="config-error",
             )
 
         if use_systemd:
@@ -1453,9 +1783,10 @@ def main(
                 # Backstop owned by systemd rather than by this process, so
                 # an uncatchable death of the wrapper (SIGKILL, power loss
                 # of the controlling terminal) still cannot leave Codex
-                # running forever. The wrapper's own timeout fires first
-                # and reports diagnostics.
-                f"--property=RuntimeMaxSec={timeout_seconds + 60}s",
+                # running forever. The wrapper's own deadline, extended
+                # at most to the hard cap, fires first and reports
+                # diagnostics.
+                f"--property=RuntimeMaxSec={hard_timeout_seconds + 60}s",
                 # Kernel-level write protection for read-only roles. The
                 # Claude sandbox no longer carries denyWrite (its
                 # filesystem layer is disabled to keep shell execution
@@ -1478,6 +1809,7 @@ def main(
 
         started = time.monotonic()
         deadline = started + timeout_seconds
+        hard_deadline = started + hard_timeout_seconds
         workspace_before = (
             None
             if role_config.read_only
@@ -1534,31 +1866,84 @@ def main(
                 )
 
             timed_out = False
+            final_growth_age: float | None = None
+            last_size = 0
+            last_echo_at: float | None = None
+            extension_recorded = False
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    timed_out = True
-                    break
-
-                try:
-                    return_code = process.wait(
-                        timeout=min(30.0, remaining)
+                now = time.monotonic()
+                if now >= deadline:
+                    # The growth age is read from the file itself at the
+                    # decision moment, so a poll noticing an old write
+                    # late can never make stale output look recent.
+                    final_growth_age = log_growth_age(log_path)
+                    extended = next_deadline(
+                        now, deadline, hard_deadline, final_growth_age
                     )
-                    break
-                except subprocess.TimeoutExpired:
-                    elapsed = int(time.monotonic() - started)
+                    if extended is None:
+                        timed_out = True
+                        break
+                    deadline = extended
+                    if not extension_recorded:
+                        extension_recorded = True
+                        incident_log.record(
+                            "budget-extended",
+                            program=PROGRAM_NAME,
+                            role=role_config,
+                            timeout_seconds=timeout_seconds,
+                            hard_timeout_seconds=hard_timeout_seconds,
+                        )
                     print(
-                        f"  still running · {elapsed}s elapsed",
+                        "  budget extended · output is still growing · "
+                        f"up to {int(deadline - started)}s of "
+                        f"{hard_timeout_seconds}s",
                         file=sys.stderr,
                         flush=True,
                     )
+                    continue
+
+                try:
+                    return_code = process.wait(
+                        timeout=min(30.0, deadline - now)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    try:
+                        size = log_path.stat().st_size
+                    except OSError:
+                        size = last_size
+                    grew = size > last_size
+                    elapsed = int(time.monotonic() - started)
+                    line = f"  still running · {elapsed}s elapsed"
+                    if grew:
+                        delta = size - last_size
+                        last_size = size
+                        line += f" · +{delta} B output"
+                        if (
+                            last_echo_at is None
+                            or time.monotonic() - last_echo_at
+                            >= CONTENT_ECHO_SECONDS
+                        ):
+                            content = sanitise_provider_text(
+                                newest_log_line(log_path)
+                            )[:140]
+                            if content:
+                                line += f" · {content}"
+                                last_echo_at = time.monotonic()
+                    print(line, file=sys.stderr, flush=True)
 
             if timed_out:
                 # Reported before the stop, so a wedged user bus or an
                 # unstoppable unit cannot swallow the timeout message and
                 # the Codex diagnostics along with the 124 status.
+                elapsed_total = int(time.monotonic() - started)
+                stalled_seconds = int(
+                    final_growth_age
+                    if final_growth_age is not None
+                    else elapsed_total
+                )
                 print(
-                    f"{display} timed out after {timeout_seconds}s.",
+                    f"{display} timed out after {elapsed_total}s.",
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
@@ -1584,16 +1969,26 @@ def main(
                     state,
                     reason=(
                         f"{role_config.provider}/{role_config.model} timed out "
-                        f"after {timeout_seconds}s"
+                        f"after {elapsed_total}s"
                     ),
                     status=124,
-                    scope=FailureScope.PROVIDER,
+                    # A model that cannot finish inside the budget says
+                    # nothing about the provider account, so only this
+                    # model is excluded and the proposal ladder walks
+                    # the same provider's nearest models first.
+                    scope=FailureScope.MODEL,
                     diagnostics=diagnostics,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
                     ),
                     approval_required_status=124,
+                    kind="timeout",
+                    incident_fields={
+                        "timeout_seconds": timeout_seconds,
+                        "hard_timeout_seconds": hard_timeout_seconds,
+                        "stalled_seconds": stalled_seconds,
+                    },
                 )
 
         if return_code != 0:
@@ -1658,6 +2053,7 @@ def main(
                         workspace_requires_inspection()
                     ),
                     approval_required_status=1,
+                    kind="no-result",
                 )
 
         if (
@@ -1690,6 +2086,7 @@ def main(
                     workspace_requires_inspection()
                 ),
                 approval_required_status=1,
+                kind="no-result",
             )
 
         verdict = verdict_path.read_text(errors="replace")
@@ -1712,6 +2109,12 @@ def main(
         except (OSError, ValueError, AttributeError) as exc:
             printed = False
             report(f"the verdict could not be printed: {exc}")
+            incident_log.record(
+                "output-failure",
+                program=PROGRAM_NAME,
+                role=state.role,
+                detail=f"the verdict could not be printed: {exc}",
+            )
 
         published: bool | None = None
         if output_path is not None:
@@ -1723,12 +2126,22 @@ def main(
                 report(
                     f"the verdict could not be written to {output_path}: {exc}"
                 )
+                incident_log.record(
+                    "output-failure",
+                    program=PROGRAM_NAME,
+                    role=state.role,
+                    detail=(
+                        f"the verdict could not be written to "
+                        f"{output_path}: {exc}"
+                    ),
+                )
 
         if not printed and not published:
             # Last resort, so that a review that reached neither stdout nor
             # its destination is still recoverable from the transcript.
+            # Sanitised: this is provider text landing on stderr.
             report("--- recovered agent result ---")
-            report(verdict)
+            report(sanitise_provider_text(verdict))
 
         return 0 if printed and published is not False else 1
     except ReviewInterrupted as exc:
@@ -1736,9 +2149,23 @@ def main(
             f"{display} interrupted by signal {exc.signum}.",
             file=sys.stderr,
         )
+        incident_log.record(
+            "interrupted",
+            program=PROGRAM_NAME,
+            role=state.role,
+            signal=exc.signum,
+            status=128 + exc.signum,
+        )
         return 128 + exc.signum
     except RuntimeError as exc:
         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+        incident_log.record(
+            "runtime-error",
+            program=PROGRAM_NAME,
+            role=state.role,
+            detail=str(exc),
+            status=1,
+        )
         return 1
     finally:
         signal.pthread_sigmask(signal.SIG_BLOCK, handled_signals)
@@ -1764,6 +2191,12 @@ def main(
                 report(
                     "Removed Claude sandbox residue: " + ", ".join(swept)
                 )
+                incident_log.record(
+                    "residue-swept",
+                    program=PROGRAM_NAME,
+                    role=state.role if state is not None else None,
+                    detail=", ".join(swept),
+                )
 
         if run_dir is not None:
             if unit_stopped:
@@ -1784,6 +2217,12 @@ def main(
         return_control()
 
         if cleanup_errors:
+            incident_log.record(
+                "cleanup-failure",
+                program=PROGRAM_NAME,
+                role=state.role if state is not None else None,
+                detail="; ".join(cleanup_errors),
+            )
             raise CleanupError("; ".join(cleanup_errors))
 
 

@@ -106,6 +106,30 @@ or they may be mixed in either direction.
 The plan-review cap is also in the manifest. It accepts one through four
 rounds and defaults to two.
 
+Delegated budgets are progress-aware. A role's `timeout_seconds` is its
+base budget; an optional `hard_timeout_seconds` (30 to 14400, at least
+the base; implementer and both reviewers ship with 1800) lets a run
+whose merged output grew within the last three minutes extend in
+two-minute steps up to the cap. `codex exec` streams its work
+continuously, so growth is a live progress signal; delegated Claude
+runs print only their final JSON and therefore keep plain base-deadline
+behaviour. A stalled, silent, or capped run times out exactly as
+before, `--hard-timeout` and `ORRERY_AGENT_HARD_TIMEOUT_SECONDS`
+override per run, and an explicitly chosen `--timeout` without a hard
+cap remains its own bound. The runner echoes the delegate's newest
+output line at most every two minutes, sanitised so provider text can
+never forge Orrery's consent markers or smuggle terminal escapes into
+the transcript; extensions record a `budget-extended` incident, which
+deliberately surfaces in the doctor's seven-day summary as
+budget-tuning evidence.
+
+The manifest's top-level `verbosity` steers how delegated roles write:
+`1` (the default) injects a terse plain-prose report style into every
+`ORRERY ROLE HANDOFF`, `2` a milder concise line, and `3` nothing.
+`ORRERY_VERBOSITY` overrides it for one run. The dial shapes delegated
+prompts only; principal and direct sessions take the static
+communication-style rule in `global/AGENTS.md`.
+
 ## Start and delegate
 
 Start the configured principal in the current repository:
@@ -388,18 +412,30 @@ the user explicitly authorizes whether it runs.
 - Missing commands and inactive authentication are detected before inference.
 - Account, subscription, quota, billing, entitlement, and unknown provider
   failures exclude that provider.
-- Model-specific failures prefer another model on the same authenticated
-  provider.
+- Model-specific failures, including timeouts and limits announced for one
+  model, exclude only that model: providers often limit one model rather
+  than the account, so the ladder walks the same provider's nearest models
+  first. With the bundled tiers, an unavailable `fable` proposes `opus`,
+  and a `gpt-5.6-sol` timeout proposes `gpt-5.6-terra`.
+- A same-provider candidate two or more capability tiers away ranks behind
+  a near-tier model on the other provider, so a large capability drop
+  crosses providers instead.
 - Recognized transient failures retry once unless a write-capable attempt
-  changed the workspace or its unchanged state cannot be verified.
+  changed the workspace or its unchanged state cannot be verified. Budget
+  timeouts are not retried: a second identical budget would double the
+  wall-clock for a likely deterministic overrun.
 - Candidate ranking minimizes internal role/model distance, prefers models
   already assigned to comparable roles, uses live picker-visible catalogues
   when available, and maps thinking by relative position in each model's exact
   supported levels.
 - A model newly exposed by a provider picker participates automatically. The
   bundled catalogue supplies offline seeds and internal distance anchors.
-- An approved rerun skips the failed provider/model instead of spending
-  another attempt on it.
+- An approved rerun starts the exact identity named by
+  `--approve-fallback`, accepted from anywhere in the current ranking, and
+  excludes every nearer candidate as already ruled out. A non-interactive
+  ladder therefore stays approvable rung by rung: after `gpt-5.6-sol` and
+  `gpt-5.6-terra` both failed in separate invocations,
+  `--approve-fallback openai:gpt-5.5` starts `gpt-5.5` directly.
 - If a failed writer changes the Git workspace, Orrery mechanically refuses
   an inline handoff. Inspect the complete working tree before approving the
   separately rerun candidate.
@@ -423,6 +459,33 @@ orrery-usage --json
 ```
 
 The command reads local provider session logs and never contacts a provider.
+
+## Incident log
+
+Everything that goes wrong in a launcher - blockers, timeouts, fallback
+proposals and their outcomes, consent stops, standing-approval events,
+degraded containment, interrupted runs, cleanup failures, reclaimed
+runtime state - is appended by `scripts/orrery_incidents.py` as one JSON
+line to `$XDG_STATE_HOME/orrery/incidents.jsonl` (default
+`~/.local/state/orrery/`), beside the standing-approval store. Events
+carry structured identities, statuses, and wrapper-authored reasons
+only; prompts, verdicts, provider diagnostics, and credentials are never
+stored. The store rotates to `incidents.jsonl.1` past 1 MiB, and writing
+is best-effort: a failure warns once and can never change a run's
+outcome. The session-start hook records principal mismatches and
+surfaces that report no model.
+
+```bash
+orrery-incidents --since 7
+orrery-incidents --json
+```
+
+`scripts/orrery-incidents` aggregates events by kind, role, and model
+with a recent tail, and the doctor warns when anything was recorded in
+the last 7 days. Use the counts to tune defaults in
+`global/orchestration.json` with evidence: a role `timeout_seconds` that
+keeps expiring, a model that repeatedly hits per-model limits, or a
+surface that never verifies its principal.
 
 ## Verification and maintenance
 
@@ -475,6 +538,8 @@ The maintained artefacts are:
   thinking-capability discovery.
 - `scripts/orrery-review` — the `orrery-agent` runner and compatibility review
   entry point.
+- `scripts/orrery_incidents.py` and `scripts/orrery-incidents` — the
+  incident log writer/reader module and its reporting command.
 - `scripts/orrery-config`, `scripts/orrery-usage`, `scripts/init-project.sh`,
   `scripts/doctor.sh`, and `scripts/install.sh` — configuration, accounting,
   adoption, diagnostics, and installation.
@@ -505,8 +570,18 @@ session, inspect `/hooks`, trust the Orrery SessionStart hook, and confirm
 **Claude and Codex receive different project instructions** — make
 `AGENTS.md` canonical and reduce `CLAUDE.md` to `@AGENTS.md`.
 
-**A delegated run times out** — the runner returns status 124 after stopping
-the process tree. Inspect the provider diagnostics printed before cleanup.
+**A delegated run times out** — the runner first extends a run whose
+output is still growing, up to the role's `hard_timeout_seconds`, then
+returns status 124 after stopping the process tree. Inspect the provider
+diagnostics printed before cleanup. The proposal that follows stays on
+the same provider's nearest model; recurring expiries or
+`budget-extended` events in `orrery-incidents` argue for larger role
+budgets.
+
+**The hook says the surface reported no model** — some surfaces (the VS
+Code extension among them) omit the model from their SessionStart
+payload, so the principal match cannot run. The session states this in
+one line; verify the model in the interface picker when it matters.
 
 **The configuration page refuses Apply** — an external writer changed the
 manifest after Preview. Reload and preview the new exact diff.

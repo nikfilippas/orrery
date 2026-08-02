@@ -70,6 +70,7 @@ class Role:
     thinking: str | None
     access: str
     timeout_seconds: int | None = None
+    hard_timeout_seconds: int | None = None
     endpoint: Endpoint | None = None
 
     @property
@@ -297,6 +298,27 @@ def load_role(
             f"{role_id} timeout_seconds must be an integer between "
             "30 and 7200"
         )
+    hard_timeout_seconds = step.get("hard_timeout_seconds")
+    if hard_timeout_seconds is not None:
+        if (
+            isinstance(hard_timeout_seconds, bool)
+            or not isinstance(hard_timeout_seconds, int)
+            or not 30 <= hard_timeout_seconds <= 14400
+        ):
+            raise RuntimeConfigError(
+                f"{role_id} hard_timeout_seconds must be an integer "
+                "between 30 and 14400"
+            )
+        if timeout_seconds is None:
+            raise RuntimeConfigError(
+                f"{role_id} hard_timeout_seconds requires "
+                "timeout_seconds, its base budget"
+            )
+        if hard_timeout_seconds < timeout_seconds:
+            raise RuntimeConfigError(
+                f"{role_id} hard_timeout_seconds must not be smaller "
+                "than timeout_seconds"
+            )
     if role_id == "orchestrator" and access != "principal":
         raise RuntimeConfigError("the orchestrator must use principal access")
     if role_id != "orchestrator" and access == "principal":
@@ -320,6 +342,7 @@ def load_role(
             thinking=thinking,
             access=access,
             timeout_seconds=timeout_seconds,
+            hard_timeout_seconds=hard_timeout_seconds,
             endpoint=endpoint,
         )
     catalogue = load_catalogue()
@@ -360,7 +383,53 @@ def load_role(
         thinking=thinking,
         access=access,
         timeout_seconds=timeout_seconds,
+        hard_timeout_seconds=hard_timeout_seconds,
     )
+
+
+VERBOSITY_LEVELS = frozenset({1, 2, 3})
+VERBOSITY_STYLE = {
+    1: (
+        "Report style: plain, terse prose. State findings, decisions, "
+        "and evidence directly; no preamble, no restated assignment, no "
+        "headers or bullet lists unless they carry data, no praise or "
+        "filler. Length proportional to substance."
+    ),
+    2: "Report style: concise, plain prose; avoid filler and repetition.",
+}
+
+
+def load_verbosity(manifest: dict[str, Any] | None = None) -> int:
+    """The delegated-prompt verbosity dial: 1 terse, 2 concise, 3 free.
+
+    ORRERY_VERBOSITY overrides per run; the manifest's top-level
+    `verbosity` is the standing default and terse when absent. The dial
+    shapes delegated handoffs only: principal and direct sessions take
+    the static communication-style rule from the global policy, because
+    the matching session-start path is deliberately silent.
+    """
+    raw = os.environ.get("ORRERY_VERBOSITY")
+    if raw is not None:
+        raw = raw.strip()
+        if not raw.isdigit() or int(raw) not in VERBOSITY_LEVELS:
+            raise RuntimeConfigError(
+                "ORRERY_VERBOSITY must be 1 (terse), 2 (concise), or 3 "
+                "(unconstrained)"
+            )
+        return int(raw)
+    if manifest is None:
+        manifest = load_manifest()
+    value = manifest.get("verbosity", 1)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value not in VERBOSITY_LEVELS
+    ):
+        raise RuntimeConfigError(
+            "the manifest verbosity must be 1 (terse), 2 (concise), or "
+            "3 (unconstrained)"
+        )
+    return value
 
 
 def provider_executable(provider: str) -> str:
@@ -430,19 +499,21 @@ def principal_command(role: Role, extra: list[str]) -> list[str]:
     return [*command, *extra]
 
 
-def role_handoff(role: Role, assignment: str) -> str:
+def role_handoff(role: Role, assignment: str, verbosity: int = 1) -> str:
     access = (
         "Read-only: do not modify files."
         if role.read_only
         else "Workspace-write: modify only what the assignment requires."
     )
+    style = VERBOSITY_STYLE.get(verbosity)
     return (
         "ORRERY ROLE HANDOFF\n"
         f"Role: {role.id}\n"
         "This is a bounded non-principal session. Do not delegate, spawn "
         "another agent, or re-enter the orchestration workflow.\n"
-        f"{access}\n\n"
-        "Assignment:\n"
+        f"{access}\n"
+        + (f"{style}\n" if style else "")
+        + "\nAssignment:\n"
         f"{assignment.strip()}\n"
     )
 
