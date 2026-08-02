@@ -276,7 +276,7 @@ their provider-picker position until explicitly seeded.
 engineering baseline that governs every Claude and Codex session on the
 machine: assumptions surfaced before coding, the simplest complete change,
 surgical diffs, goal-driven execution, verification before completion
-claims, and leave-no-trace hygiene. Part II is the orchestration layer,
+claims, plain terse communication, and leave-no-trace hygiene. Part II is the orchestration layer,
 and it applies only in adopted repositories. The installer links the file
 to both `$CODEX_HOME/AGENTS.md` and `~/.claude/AGENTS.md`.
 `global/CLAUDE.md` contains only:
@@ -299,10 +299,13 @@ to the user and injected into the agent context as
 `ORRERY PRINCIPAL FALLBACK APPROVAL REQUIRED`; the direct session must ask
 before acting as principal. The check refreshes on startup,
 resume, clear, and compaction; approval already present in that conversation
-remains valid unless revoked. SessionStart exposes the active model but not its
-thinking level, so use `orrery` when effort must be mechanically enforced.
-Codex requires new or changed non-managed hooks to be reviewed through
-`/hooks`.
+remains valid unless revoked. Some surfaces (the VS Code extension among
+them) export no model to SessionStart at all; there the principal is
+interface-asserted, the session says so in one line as an expected
+property rather than an error, and the thinking level is still verified
+from the session environment where the surface exports it. Use `orrery`
+when the model and effort must be mechanically enforced. Codex requires
+new or changed non-managed hooks to be reviewed through `/hooks`.
 
 Both providers cache eligible prompt prefixes automatically. Orrery keeps the
 shared policy stable, appends only the bounded task delta, selects model and
@@ -428,10 +431,11 @@ orrery-incidents --since 7
 orrery-incidents --json
 ```
 
-Every launcher failure is also a data point: blockers, timeouts, fallback
-proposals and their outcomes, consent stops, degraded containment, and
-cleanup problems are appended as JSON lines to
-`~/.local/state/orrery/incidents.jsonl`, outside every repository. Events
+Every launcher failure is also a data point: blockers, timeouts, budget
+extensions, fallback proposals and their outcomes, consent stops,
+unverifiable principals, degraded containment, and cleanup problems are
+appended as JSON lines to `~/.local/state/orrery/incidents.jsonl`,
+outside every repository. Events
 hold structured identities and wrapper-authored reasons only, never
 prompts, verdicts, diagnostics text, or credentials; writing is
 best-effort and cannot change a run's outcome. `orrery-incidents`
@@ -479,10 +483,11 @@ request.
 | `scripts/orrery_incidents.py` | best-effort incident log writer and validated reader |
 | `scripts/orrery-incidents` | incident aggregation and reporting command |
 | `scripts/orrery-config` | atomic visual configuration surface |
+| `scripts/orrery-usage` | local token-usage accounting from provider session logs |
 | `scripts/init-project.sh` | safe project adoption and Git initialization |
 | `scripts/install.sh` | user-level instruction, skill, hook, and command links |
 | `scripts/doctor.sh` | installation and configuration diagnostics |
-| `tests/run-tests.py` | deterministic regression suite |
+| `tests/run-tests.py` | deterministic regression suite with fake provider stand-ins |
 | `.github/workflows/ci.yml` | lint and suite on every push and pull request |
 | `docs/setup-guide.md` | detailed operation and maintenance |
 
