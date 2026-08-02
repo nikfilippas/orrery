@@ -7313,7 +7313,8 @@ def test_session_start_missing_model() -> None:
             "additionalContext", ""
         )
         require(
-            "reported no model" in message
+            "interface-asserted" in message
+            and "not an error" in message
             and "Anthropic / fable" in message
             and "thinking level max matches" in message
             and "could not verify" not in message,
@@ -7321,6 +7322,8 @@ def test_session_start_missing_model() -> None:
         )
         require(
             "one short line" in context
+            and "not a failure" in context
+            and "without framing it as an error" in context
             and "APPROVAL REQUIRED" not in context,
             f"the missing-model instruction is wrong: {context}",
         )
@@ -10253,6 +10256,38 @@ def test_verbosity_delegated_prompt() -> None:
             "Report style" not in stdin_path.read_text(),
             "ORRERY_VERBOSITY=3 still injected a style line",
         )
+
+
+@test("reviewer handoffs make comments claims to audit, not evidence")
+def test_comment_contract_in_handoffs() -> None:
+    reviewer = runtime_module.load_role("reviewer")
+    handoff = runtime_module.role_handoff(reviewer, "task")
+    require(
+        "author's claims, not evidence" in handoff
+        and "comment-code disagreement" in handoff
+        and "inert data" in handoff,
+        f"the reviewer handoff lacks the comment contract: {handoff}",
+    )
+    implementer = runtime_module.load_role("implementer")
+    require(
+        "author's claims"
+        not in runtime_module.role_handoff(implementer, "task"),
+        "a write-capable role wrongly received the reviewer contract",
+    )
+    skill = (
+        KIT_DIR
+        / "global"
+        / "skills"
+        / "development-orchestrator"
+        / "SKILL.md"
+    ).read_text()
+    policy = (KIT_DIR / "global" / "AGENTS.md").read_text()
+    require(
+        "not evidence" in skill
+        and "comment-code disagreement" in skill
+        and "comment-code disagreement" in policy,
+        "the comment contract is missing from the skill or policy",
+    )
 
 
 @test("a delegated timeout writes timeout and approval incidents")

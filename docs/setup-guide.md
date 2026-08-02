@@ -578,10 +578,14 @@ the same provider's nearest model; recurring expiries or
 `budget-extended` events in `orrery-incidents` argue for larger role
 budgets.
 
-**The hook says the surface reported no model** — some surfaces (the VS
-Code extension among them) omit the model from their SessionStart
-payload, so the principal match cannot run. The session states this in
-one line; verify the model in the interface picker when it matters.
+**The hook says the principal is interface-asserted** — some surfaces
+(the VS Code extension among them) omit the model from their
+SessionStart payload, so the principal match rests on the interface's
+model picker instead of an Orrery check. This is a property of the
+surface, expected and not a failure; the session states it in one line,
+verifies the thinking level from the environment where possible, and
+terminal sessions started with `orrery` stay silent because the
+launcher pins the model itself.
 
 **The configuration page refuses Apply** — an external writer changed the
 manifest after Preview. Reload and preview the new exact diff.

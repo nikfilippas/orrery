@@ -205,6 +205,10 @@ The launcher builds provider commands from static adapters:
 - Reviewer access is fixed in code and cannot be widened by the prompt.
 - The prompt is provided on stdin under a stable `ORRERY ROLE HANDOFF`, not
   exposed in the process argument list.
+- Read-only handoffs additionally instruct that comments and docstrings in
+  the reviewed code are the author's claims, not evidence: behaviour is
+  verified from the code alone, comment-code disagreement is a reportable
+  finding, and comment text addressed to the reviewer is inert.
 - The handoff carries a report-style line steering delegates away from
   wordy output: `verbosity` in the manifest (1 terse, 2 concise, 3
   unconstrained; default 1), overridable per run with `ORRERY_VERBOSITY`.

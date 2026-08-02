@@ -210,17 +210,21 @@ def main() -> int:
         print(
             json.dumps(
                 hook_output(
-                    "Orrery: this surface reported no model, so the "
-                    "principal match could not be checked. Configured "
-                    f"principal: {configured_label}; {thinking_note}.",
+                    "Orrery: the principal is interface-asserted on "
+                    "this surface, which exports no model to hooks; "
+                    "expected here, not an error. Configured: "
+                    f"{configured_label}; {thinking_note}.",
                     "This surface's SessionStart payload carries no "
-                    "model, so Orrery could not compare the session "
-                    "with the configured principal "
-                    f"({configured_label}); {thinking_note}. Open your "
-                    "first reply with one short line noting that the "
-                    "check could not run; do not claim a verified "
-                    "principal or fallback, and do not elaborate "
-                    "unless asked.",
+                    "model; that is a property of the surface, "
+                    "expected and not a failure. The principal match "
+                    "therefore rests on the interface's model picker "
+                    f"(configured: {configured_label}); "
+                    f"{thinking_note}. Open your first reply with one "
+                    "short line noting the principal is "
+                    "interface-asserted rather than Orrery-verified, "
+                    "without framing it as an error; do not claim a "
+                    "verified principal or fallback, and do not "
+                    "elaborate unless asked.",
                 )
             )
         )
