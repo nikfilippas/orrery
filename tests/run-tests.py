@@ -131,6 +131,11 @@ CANONICAL = {
 
 def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n")
+    if path.name == ".orrery.json":
+        # Adoption refuses a group- or world-writable marker, and the
+        # developer's umask makes plain writes 0664, so a fixture marker
+        # must be created the way orrery-init now creates it.
+        path.chmod(0o600)
 
 
 def read_json(path: Path) -> Any:
@@ -2985,7 +2990,9 @@ def test_every_role_is_provider_neutral() -> None:
 def test_repository_principal_override() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = Path(directory)
-        (repository / ".git").mkdir()
+        # Adoption resolves the git top-level through git itself, so a
+        # mkdir'd .git no longer makes a directory a repository.
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
         write_json(
             repository / ".orrery.json",
             {
@@ -7001,10 +7008,22 @@ def test_canonical_hook_events() -> None:
 
 
 def adopted_repository(directory: str) -> Path:
-    """A temporary repository carrying the Orrery adoption marker."""
-    root = Path(directory)
-    (root / ".git").mkdir(exist_ok=True)
-    (root / ".orrery.json").write_text("{}\n")
+    """A temporary repository carrying the Orrery adoption marker.
+
+    The repository is a subdirectory rather than the temporary directory
+    itself, so a caller can put a state home beside it. A trust store
+    inside the repository it describes is refused, by design.
+    """
+    root = Path(directory) / "repo"
+    root.mkdir(exist_ok=True)
+    if not (root / ".git").is_dir():
+        # Adoption resolves the git top-level through git itself, with a
+        # sanitised environment, so an inherited GIT_DIR cannot redirect
+        # it. A mkdir'd .git is no longer a repository.
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+    marker = root / ".orrery.json"
+    marker.write_text("{}\n")
+    marker.chmod(0o600)
     return root
 
 
@@ -7045,7 +7064,9 @@ def test_codex_session_start_fallback_notice() -> None:
 def test_unadopted_session_start_stands_down() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = Path(directory)
-        (repository / ".git").mkdir()
+        # Adoption resolves the git top-level through git itself, so a
+        # mkdir'd .git no longer makes a directory a repository.
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
         payload = {
             "hook_event_name": "SessionStart",
             "source": "startup",
@@ -7164,7 +7185,9 @@ def test_delegated_session_start_is_bounded() -> None:
 def test_matching_session_start_is_quiet() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = Path(directory)
-        (repository / ".git").mkdir()
+        # Adoption resolves the git top-level through git itself, so a
+        # mkdir'd .git no longer makes a directory a repository.
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
         write_json(
             repository / ".orrery.json",
             {
@@ -7229,7 +7252,7 @@ def test_session_start_missing_model() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = adopted_repository(directory)
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         payload = {
             "hook_event_name": "SessionStart",
             "source": "startup",
@@ -7376,7 +7399,7 @@ def test_session_start_mismatch_effort() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = adopted_repository(directory)
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         payload = {
             "hook_event_name": "SessionStart",
             "source": "startup",
@@ -8254,7 +8277,7 @@ def standing_stores() -> Any:
         runtime_dir = Path(base) / "runtime"
         state_dir = Path(base) / "state"
         runtime_dir.mkdir()
-        state_dir.mkdir()
+        state_dir.mkdir(mode=0o700)
         os.environ["XDG_RUNTIME_DIR"] = str(runtime_dir)
         os.environ["XDG_STATE_HOME"] = str(state_dir)
         try:
@@ -10549,7 +10572,7 @@ def test_comment_contract_in_handoffs() -> None:
 def test_incidents_from_delegated_timeout() -> None:
     with tempfile.TemporaryDirectory() as directory:
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         environment = review_environment("sleep", standing_state=state_home)
         process = start_review(environment, "--timeout", "5", "--", "prompt")
         _, stderr = finish_review(process, environment, timeout=180)
@@ -10604,7 +10627,7 @@ def test_incidents_from_delegated_timeout() -> None:
 def test_incidents_from_approved_rerun() -> None:
     with tempfile.TemporaryDirectory() as directory:
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         environment = review_environment(
             "success", standing_state=state_home
         )
@@ -10645,7 +10668,7 @@ def test_incidents_from_approved_rerun() -> None:
 def test_incidents_from_principal_failure() -> None:
     with tempfile.TemporaryDirectory() as directory:
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         environment = review_environment(
             "success", standing_state=state_home
         )
@@ -11066,7 +11089,7 @@ def test_hard_timeout_validation() -> None:
 def test_progress_extends_run() -> None:
     with tempfile.TemporaryDirectory() as directory:
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         environment = review_environment("drip", standing_state=state_home)
         environment["CODEX_FAKE_DRIP_SECONDS"] = "12"
         process = start_review(
@@ -11185,7 +11208,7 @@ def test_delegate_log_and_stream() -> None:
 def test_silent_run_times_out_at_base() -> None:
     with tempfile.TemporaryDirectory() as directory:
         state_home = Path(directory) / "state"
-        state_home.mkdir()
+        state_home.mkdir(mode=0o700)
         environment = review_environment("sleep", standing_state=state_home)
         process = start_review(
             environment,
@@ -11358,7 +11381,9 @@ def test_same_provider_ladder() -> None:
 def test_sync_ignores_repository_override() -> None:
     with tempfile.TemporaryDirectory() as directory:
         repository = Path(directory)
-        (repository / ".git").mkdir()
+        # Adoption resolves the git top-level through git itself, so a
+        # mkdir'd .git no longer makes a directory a repository.
+        subprocess.run(["git", "init", "-q", str(repository)], check=True)
         write_json(
             repository / ".orrery.json",
             {"orchestrator": {"provider": "openai", "model": "gpt-5.6-sol"}},
@@ -13160,6 +13185,302 @@ def test_receipt_launcher() -> None:
         require((receipts / "stdout.log").read_bytes() == b"out", "stdout was not duplicated")
         require((receipts / "stderr.log").read_bytes() == b"err", "stderr was not duplicated")
         require(receipt["exit_status"] == 7 and receipt["stdout_bytes"] == 3 and receipt["stderr_bytes"] == 3, "receipt counters are wrong")
+
+
+@test("adoption trust rejects nested and unsafe markers")
+def test_adoption_marker_trust() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "repository"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        marker = root / ".orrery.json"
+        marker.write_text('{"orchestrator": {"model": "fable"}}\n')
+        marker.chmod(0o600)
+        nested = root / "src"
+        nested.mkdir()
+        state = Path(directory) / "state"
+        saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            require(runtime_module.adopted_root(nested) == root, "root marker was not honoured")
+            marker.unlink()
+            (nested / ".orrery.json").write_text("{}\n")
+            require(runtime_module.adopted_root(nested) is None, "nested marker adopted the repository")
+            marker.write_text("{}\n")
+            marker.chmod(0o664)
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require("group- or world-writable" in str(exc), f"wrong refusal: {exc}")
+            else:
+                raise Failure("group-writable marker was honoured")
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+@test("adoption trust records, revokes and validates state")
+def test_adoption_trust_store() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "repository"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / ".orrery.json").write_text("{}\n")
+        (root / ".orrery.json").chmod(0o600)
+        state = Path(directory) / "state"
+        saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            runtime_module.trust_adoption(root)
+            store = state / "orrery" / "adopted.json"
+            require(stat.S_IMODE(store.stat().st_mode) == 0o600, "trust record mode is not 0600")
+            require(runtime_module.forget_adoption(root), "forget could not remove marker")
+            require(not (root / ".orrery.json").exists() and runtime_module.adopted_root(root) is None, "forget did not revoke adoption")
+            (root / ".orrery.json").write_text("{}\n")
+            (root / ".orrery.json").chmod(0o600)
+            os.environ["XDG_STATE_HOME"] = "relative-state"
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require("relative" in str(exc), f"wrong state refusal: {exc}")
+            else:
+                raise Failure("relative state root was accepted")
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+@test("adoption ignores a nested marker")
+def test_adoption_ignores_nested_marker() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        write_json(root / ".orrery.json", {"orchestrator": {"model": "fable"}})
+        nested = root / "src"
+        nested.mkdir()
+        write_json(
+            nested / ".orrery.json",
+            {"orchestrator": {"model": "gpt-5.6-sol"}},
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "add", "src/.orrery.json"], check=True
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(root), "-c", "user.name=Kit",
+                "-c", "user.email=kit@test", "commit", "-q", "-m", "nested",
+            ],
+            check=True,
+        )
+        require(runtime_module.adopted_root(nested) == root, "nested marker changed adoption")
+        require(
+            runtime_module.project_override(nested) == {"model": "fable"},
+            "nested marker changed the principal override",
+        )
+
+
+@test("adoption discovery resists a redirected git environment")
+def test_adoption_git_environment_is_sanitised() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        other = Path(directory) / "other"
+        subprocess.run(["git", "init", "-q", str(other)], check=True)
+        saved = {name: os.environ.get(name) for name in ("GIT_DIR", "GIT_WORK_TREE")}
+        os.environ["GIT_DIR"] = str(other / ".git")
+        os.environ["GIT_WORK_TREE"] = str(other)
+        try:
+            require(
+                runtime_module.adopted_root(root) == root,
+                "redirected Git environment changed adoption discovery",
+            )
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+@test("adoption refuses every unsafe marker")
+def test_adoption_refuses_every_unsafe_marker() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        marker = root / ".orrery.json"
+
+        subprocess.run(["git", "-C", str(root), "add", ".orrery.json"], check=True)
+        for arguments in (
+            ["-c", "user.name=Kit", "-c", "user.email=kit@test", "commit", "-q", "-m", "marker"],
+        ):
+            subprocess.run(["git", "-C", str(root), *arguments], check=True)
+        try:
+            runtime_module.adopted_root(root)
+        except runtime_module.RuntimeConfigError as exc:
+            require("tracked" in str(exc), f"tracked marker had wrong refusal: {exc}")
+        else:
+            raise Failure("tracked marker was honoured")
+
+        subprocess.run(["git", "-C", str(root), "rm", "--cached", ".orrery.json"], check=True)
+        target = root / "marker-target"
+        target.write_text("{}\n")
+        target.chmod(0o600)
+        marker.unlink()
+        marker.symlink_to(target)
+        try:
+            runtime_module.adopted_root(root)
+        except runtime_module.RuntimeConfigError as exc:
+            require("symlinked" in str(exc), f"symlink marker had wrong refusal: {exc}")
+        else:
+            raise Failure("symlink marker was honoured")
+
+        marker.unlink()
+        marker.write_text("{}\n")
+        for mode in (0o664, 0o666):
+            marker.chmod(mode)
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "group- or world-writable" in str(exc),
+                    f"{mode:o} marker had wrong refusal: {exc}",
+                )
+            else:
+                raise Failure(f"{mode:o} marker was honoured")
+
+        marker.chmod(0o600)
+        require(runtime_module.adopted_root(root) == root, "safe untracked marker was refused")
+
+
+@test("orrery-init writes and normalises the marker mode")
+def test_init_normalises_adoption_marker_mode() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "repository"
+        root.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(Path(directory) / "home"),
+                "CODEX_HOME": str(Path(directory) / "codex"),
+                "XDG_STATE_HOME": str(Path(directory) / "state"),
+            }
+        )
+        command = ["bash", str(KIT_DIR / "scripts" / "init-project.sh"), str(root)]
+        first = subprocess.run(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        marker = root / ".orrery.json"
+        require(first.returncode == 0, f"initial adoption failed: {first.stderr}")
+        require(stat.S_IMODE(marker.stat().st_mode) == 0o600, "new marker is not 0600")
+        content = '{"personal": true}\n'
+        marker.write_text(content)
+        marker.chmod(0o664)
+        second = subprocess.run(command, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(second.returncode == 0, f"normalising adoption failed: {second.stderr}")
+        require(marker.read_text() == content, "normalising marker mode changed its content")
+        require(stat.S_IMODE(marker.stat().st_mode) == 0o600, "existing marker was not normalised to 0600")
+
+
+@test("an unrecorded marker warns and names the command")
+def test_unrecorded_marker_doctor_warning() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        environment = os.environ.copy()
+        environment["XDG_STATE_HOME"] = str(Path(directory) / "state")
+        doctor = subprocess.run(["bash", str(DOCTOR_SCRIPT)], cwd=root, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(runtime_module.adopted_root(root) == root, "unrecorded marker did not adopt")
+        require(
+            f"orrery-init {root}" in doctor.stdout,
+            f"doctor did not name the recording command: {doctor.stdout}\n{doctor.stderr}",
+        )
+
+
+@test("orrery-init --forget revokes adoption immediately")
+def test_init_forget_revokes_adoption() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        state = Path(directory) / "state"
+        environment = os.environ.copy()
+        environment["XDG_STATE_HOME"] = str(state)
+        environment.pop("ORRERY_ROLE", None)
+        environment.pop("ORRERY_SESSION", None)
+        saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            runtime_module.trust_adoption(root)
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+        forgotten = subprocess.run(["bash", str(KIT_DIR / "scripts" / "init-project.sh"), "--forget", str(root)], env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(forgotten.returncode == 0, f"forget failed: {forgotten.stderr}")
+        require(not (root / ".orrery.json").exists(), "forget did not remove marker")
+        payload = {"hook_event_name": "SessionStart", "source": "startup", "cwd": str(root), "model": "gpt-5.6-sol"}
+        session = subprocess.run([sys.executable, str(SESSION_START_SCRIPT), "openai"], input=json.dumps(payload), env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+        notice = json.loads(session.stdout)
+        require(
+            "repository not adopted" in notice.get("systemMessage", ""),
+            f"session start still treated forgotten repository as adopted: {notice}",
+        )
+
+
+@test("the trust store refuses insecure state")
+def test_trust_store_refuses_insecure_state() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        saved = os.environ.get("XDG_STATE_HOME")
+
+        def refused(state: str, reason: str) -> None:
+            os.environ["XDG_STATE_HOME"] = state
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require(reason in str(exc), f"wrong state refusal: {exc}")
+            else:
+                raise Failure(f"unsafe state was accepted: {state}")
+
+        try:
+            refused("relative-state", "relative")
+            refused(str(root / "state"), "inside repository")
+            real = Path(directory) / "real"
+            real.mkdir(mode=0o700)
+            linked = Path(directory) / "linked"
+            linked.symlink_to(real, target_is_directory=True)
+            refused(str(linked / "state"), "symlinked component")
+            insecure = Path(directory) / "insecure"
+            insecure.mkdir(mode=0o700)
+            insecure.chmod(0o770)
+            refused(str(insecure), "group- or world-writable")
+            state = Path(directory) / "state"
+            store_parent = state / "orrery"
+            store_parent.mkdir(parents=True, mode=0o700)
+            store_parent.chmod(0o700)
+            store = store_parent / "adopted.json"
+            store.write_text("not json\n")
+            store.chmod(0o600)
+            refused(str(state), "malformed trust record")
+            write_json(store, {"version": 1, "records": {str(Path(directory) / "other"): {"status": "adopted", "timestamp": "now"}}})
+            os.environ["XDG_STATE_HOME"] = str(state)
+            require(runtime_module.adopted_root(root) == root, "missing repository record was treated as malformed")
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+@test("a principal override naming an unknown endpoint is refused")
+def test_unknown_principal_endpoint_is_refused() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        write_json(root / ".orrery.json", {"orchestrator": {"endpoint": "unknown"}})
+        try:
+            runtime_module.load_role("orchestrator", cwd=root)
+        except runtime_module.RuntimeConfigError as exc:
+            require("does not define endpoint" in str(exc), f"wrong endpoint refusal: {exc}")
+        else:
+            raise Failure("unknown endpoint was accepted")
 
 
 def main() -> int:

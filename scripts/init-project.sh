@@ -7,7 +7,7 @@ KIT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 MODELS_FILE="$KIT_DIR/global/model-catalogue.json"
 
 usage() {
-    printf 'Usage: orrery-init [model] [directory]\n' >&2
+    printf 'Usage: orrery-init [model] [directory] | --forget <directory>\n' >&2
     printf 'A known model selects a private repository override; any other\n' >&2
     printf 'argument must be an existing directory. Known models:\n' >&2
     python3 - "$MODELS_FILE" <<'PY' >&2 || true
@@ -53,7 +53,18 @@ MODEL=""
 MODEL_SPEC=""
 REQUESTED_DIR="$PWD"
 DIRECTORY_CHOSEN=0
+FORGET=0
 
+if [ "${1:-}" = "--forget" ]; then
+    if [ "$#" -ne 2 ] || [ ! -d "$2" ]; then
+        usage
+        exit 2
+    fi
+    FORGET=1
+    REQUESTED_DIR="$2"
+fi
+
+if [ "$FORGET" -eq 0 ]; then
 for argument in "$@"; do
     if [ -z "$MODEL" ] && resolved="$(model_spec "$argument" 2>/dev/null)"; then
         MODEL="$argument"
@@ -67,6 +78,7 @@ for argument in "$@"; do
         exit 2
     fi
 done
+fi
 
 git_at() (
     unset \
@@ -125,6 +137,28 @@ PY
         git_at "$REQUESTED_DIR" rev-parse --show-toplevel
     )"
     printf 'Initialized Git repository: %s\n' "$PROJECT_ROOT"
+fi
+
+if [ "$FORGET" -eq 1 ]; then
+    if python3 - "$KIT_DIR/scripts" "$PROJECT_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from orrery_runtime import RuntimeConfigError, forget_adoption
+
+try:
+    removed = forget_adoption(Path(sys.argv[2]))
+except RuntimeConfigError as exc:
+    raise SystemExit(str(exc))
+if not removed:
+    print("Marker could not be removed; wrote a revocation tombstone.", file=sys.stderr)
+PY
+    then
+        printf 'Revoked Orrery adoption for %s\n' "$PROJECT_ROOT"
+        exit 0
+    fi
+    exit 1
 fi
 
 printf '\n=== Orrery project instructions ===\n'
@@ -228,10 +262,15 @@ done
 # The marker that adopts the repository: the SessionStart check and the
 # global policy apply Orrery's orchestration layer only where it exists.
 MARKER="$PROJECT_ROOT/.orrery.json"
-if [ ! -f "$MARKER" ]; then
+if [ -L "$MARKER" ] || { [ -e "$MARKER" ] && [ ! -f "$MARKER" ]; }; then
+    printf 'Refusing unsafe adoption marker: %s\n' "$MARKER" >&2
+    exit 1
+fi
+if [ ! -e "$MARKER" ]; then
     printf '{}\n' > "$MARKER"
     printf 'Created adoption marker %s\n' "$MARKER"
 fi
+chmod 600 "$MARKER"
 
 if [ -n "$MODEL" ]; then
     IFS=$'\t' read -r MODEL_PROVIDER MODEL_VALUE MODEL_THINKING <<< "$MODEL_SPEC"
@@ -277,6 +316,23 @@ print(
     f"{role['thinking'] or 'no thinking selector'}"
 )
 PY
+fi
+
+if ! python3 - "$KIT_DIR/scripts" "$PROJECT_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from orrery_runtime import RuntimeConfigError, trust_adoption
+
+try:
+    trust_adoption(Path(sys.argv[2]))
+except RuntimeConfigError as exc:
+    raise SystemExit(str(exc))
+PY
+then
+    printf 'Could not record trusted adoption; marker was not honoured.\n' >&2
+    exit 1
 fi
 
 printf '\n=== Conflict scan ===\n'

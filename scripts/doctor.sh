@@ -68,6 +68,31 @@ for command in git jq python3; do
     check_command "$command"
 done
 
+printf '\n=== Adoption trust ===\n'
+if TRUST_WARNING="$(python3 - "$KIT_DIR/scripts" "$PWD" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from orrery_runtime import RuntimeConfigError, _read_trust, _trusted_marker, _git_root
+
+try:
+    root = _git_root(Path(sys.argv[2]))
+    if root is not None and _trusted_marker(root) is not None and _read_trust(root) is None:
+        print(f"Run orrery-init {root} to record trusted adoption.")
+except RuntimeConfigError as exc:
+    print(str(exc))
+PY
+)"; then
+    if [ -n "$TRUST_WARNING" ]; then
+        warn "$TRUST_WARNING"
+    else
+        pass "Adoption trust is valid for this repository"
+    fi
+else
+    fail "Could not inspect adoption trust"
+fi
+
 if python3 - <<'PY'
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 11) else 1)

@@ -7,10 +7,15 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import tempfile
+from datetime import UTC, datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import fcntl
 
 
 KIT_DIR = Path(__file__).resolve().parent.parent
@@ -28,15 +33,24 @@ ROLE_IDS = frozenset(
 )
 ACCESS_LEVELS = frozenset({"principal", "workspace-write", "read-only"})
 THINKING_LEVEL = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
-MODEL_ID = re.compile(
-    r"^[A-Za-z0-9~][A-Za-z0-9._:@/+~\-\[\]]{0,119}$"
-)
+MODEL_ID = re.compile(r"^[A-Za-z0-9~][A-Za-z0-9._:@/+~\-\[\]]{0,119}$")
 ENDPOINT_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # Loopback hosts are the only plain-HTTP destinations allowed: a local
 # runtime such as Ollama has no certificate, while a remote endpoint
 # reached over HTTP would put the key on the wire in clear text.
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+GIT_TRUST_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+    }
+)
 
 
 class RuntimeConfigError(Exception):
@@ -98,30 +112,22 @@ def load_catalogue(
         data = json.loads(path.read_text())
         providers = data["providers"]
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise RuntimeConfigError(
-            f"the model catalogue is unreadable: {exc}"
-        ) from exc
+        raise RuntimeConfigError(f"the model catalogue is unreadable: {exc}") from exc
     if not isinstance(providers, dict):
-        raise RuntimeConfigError(
-            "the model catalogue providers must be an object"
-        )
+        raise RuntimeConfigError("the model catalogue providers must be an object")
     parsed: dict[str, list[dict[str, Any]]] = {}
     for provider, entries in providers.items():
         if provider not in PROVIDERS or not isinstance(entries, list):
             raise RuntimeConfigError(
                 f"the model catalogue has an invalid provider: {provider!r}"
             )
-        parsed[provider] = [
-            entry for entry in entries if isinstance(entry, dict)
-        ]
+        parsed[provider] = [entry for entry in entries if isinstance(entry, dict)]
     return parsed
 
 
 def load_endpoint(manifest: dict[str, Any], endpoint_id: Any) -> Endpoint:
     """Resolve and validate one endpoint named by a role."""
-    if not isinstance(endpoint_id, str) or not ENDPOINT_ID.fullmatch(
-        endpoint_id
-    ):
+    if not isinstance(endpoint_id, str) or not ENDPOINT_ID.fullmatch(endpoint_id):
         raise RuntimeConfigError(f"invalid endpoint name: {endpoint_id!r}")
     endpoints = manifest.get("endpoints")
     if not isinstance(endpoints, dict) or endpoint_id not in endpoints:
@@ -170,9 +176,7 @@ def load_endpoint(manifest: dict[str, Any], endpoint_id: Any) -> Endpoint:
     if key_env is not None and (
         not isinstance(key_env, str) or not ENV_NAME.fullmatch(key_env)
     ):
-        raise RuntimeConfigError(
-            f"endpoint {endpoint_id} has an invalid key_env name"
-        )
+        raise RuntimeConfigError(f"endpoint {endpoint_id} has an invalid key_env name")
     if key_env in {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"}:
         raise RuntimeConfigError(
             f"endpoint {endpoint_id}: a third-party endpoint must use its own variable"
@@ -186,48 +190,227 @@ def load_endpoint(manifest: dict[str, Any], endpoint_id: Any) -> Endpoint:
     )
 
 
-def adopted_root(cwd: Path) -> Path | None:
-    """The repository root holding the `.orrery.json` adoption marker.
+def _git_environment() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key not in GIT_TRUST_ENV}
 
-    Walks like project_override: upward from cwd, stopping at the first
-    git boundary. A repository without the marker has not been adopted,
-    and Orrery's orchestration layer does not apply there.
-    """
-    current = cwd.resolve(strict=False)
-    for directory in (current, *current.parents):
-        if (directory / ".orrery.json").is_file():
-            return directory
-        if (directory / ".git").exists():
-            break
-    return None
+
+def _git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(directory), *arguments],
+        env=_git_environment(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _git_root(cwd: Path) -> Path | None:
+    directory = cwd.resolve(strict=False)
+    if directory.is_file():
+        directory = directory.parent
+    inside = _git(directory, "rev-parse", "--is-inside-work-tree")
+    if inside.returncode or inside.stdout.strip() != "true":
+        return None
+    result = _git(directory, "rev-parse", "--show-toplevel")
+    return (
+        Path(result.stdout.strip()).resolve(strict=False)
+        if not result.returncode and result.stdout.strip()
+        else None
+    )
+
+
+def _marker_error(reason: str, marker: Path) -> RuntimeConfigError:
+    return RuntimeConfigError(
+        f"refusing {reason} adoption marker {marker}; run orrery-init"
+    )
+
+
+def _trusted_marker(root: Path) -> Path | None:
+    marker = root / ".orrery.json"
+    try:
+        details = os.lstat(marker)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _marker_error(f"unreadable ({exc})", marker) from exc
+    if stat.S_ISLNK(details.st_mode):
+        raise _marker_error("symlinked", marker)
+    if not stat.S_ISREG(details.st_mode):
+        raise _marker_error("non-regular", marker)
+    if details.st_uid != os.getuid():
+        raise _marker_error("foreign-owned", marker)
+    if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise _marker_error("group- or world-writable", marker)
+    if _git(root, "ls-files", "--error-unmatch", "--", ".orrery.json").returncode == 0:
+        raise _marker_error("tracked", marker)
+    return marker
+
+
+def _state_root() -> Path:
+    raw = os.environ.get("XDG_STATE_HOME")
+    if raw is not None:
+        if not raw or not Path(raw).is_absolute():
+            raise RuntimeConfigError("refusing relative XDG_STATE_HOME trust store")
+        return Path(raw)
+    return Path.home() / ".local" / "state"
+
+
+def _secure(path: Path, label: str, regular: bool = False) -> None:
+    try:
+        details = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeConfigError(f"refusing unreadable {label} {path}: {exc}") from exc
+    if stat.S_ISLNK(details.st_mode):
+        raise RuntimeConfigError(f"refusing symlinked {label} {path}")
+    if regular and not stat.S_ISREG(details.st_mode):
+        raise RuntimeConfigError(f"refusing non-regular {label} {path}")
+    if details.st_uid != os.getuid():
+        raise RuntimeConfigError(f"refusing foreign-owned {label} {path}")
+    if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeConfigError(f"refusing group- or world-writable {label} {path}")
+
+
+def _trust_paths(root: Path, create: bool = False) -> tuple[Path, Path]:
+    state = _state_root()
+    current = Path(state.anchor)
+    for part in state.parts[1:]:
+        current /= part
+        if os.path.lexists(current) and current.is_symlink():
+            raise RuntimeConfigError(
+                f"refusing trust store with symlinked component {current}"
+            )
+    if state.resolve(strict=False).is_relative_to(root.resolve(strict=False)):
+        raise RuntimeConfigError(f"refusing trust store inside repository {root}")
+    if create:
+        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(state, 0o700)
+    if not state.exists():
+        return state / "orrery", state / "orrery" / "adopted.json"
+    _secure(state, "trust state root")
+    parent = state / "orrery"
+    if create:
+        parent.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(parent, 0o700)
+    if parent.exists():
+        _secure(parent, "trust store parent")
+    return parent, parent / "adopted.json"
+
+
+def _read_trust(root: Path) -> str | None:
+    _parent, store = _trust_paths(root)
+    if not store.exists():
+        return None
+    _secure(store, "trust record", regular=True)
+    try:
+        data = json.loads(store.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeConfigError(f"refusing malformed trust record {store}") from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != 1
+        or not isinstance(data.get("records"), dict)
+    ):
+        raise RuntimeConfigError(f"refusing malformed trust record {store}")
+    record = data["records"].get(str(root.resolve(strict=False)))
+    if record is None:
+        # A store that does not list this repository is not corrupt: the
+        # repository simply has no record yet, which is the migration
+        # case a marker alone still covers for one release.
+        return None
+    if not isinstance(record, dict):
+        raise RuntimeConfigError(f"refusing malformed trust record {store}")
+    if record.get("status") not in {"adopted", "denied"} or not isinstance(
+        record.get("timestamp"), str
+    ):
+        raise RuntimeConfigError(f"refusing malformed trust record {store}")
+    return record["status"]
+
+
+def _write_trust(root: Path, status: str) -> None:
+    parent, store = _trust_paths(root, create=True)
+    lock = parent / ".adopted.lock"
+    with lock.open("a+") as handle:
+        os.chmod(lock, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        data: dict[str, Any] = {"version": 1, "records": {}}
+        if store.exists():
+            _secure(store, "trust record", regular=True)
+            try:
+                data = json.loads(store.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeConfigError(
+                    f"refusing malformed trust record {store}"
+                ) from exc
+            if (
+                not isinstance(data, dict)
+                or data.get("version") != 1
+                or not isinstance(data.get("records"), dict)
+            ):
+                raise RuntimeConfigError(f"refusing malformed trust record {store}")
+        data["records"][str(root.resolve(strict=False))] = {
+            "status": status,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        descriptor, name = tempfile.mkstemp(prefix=".adopted.", dir=parent)
+        temporary = Path(name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w") as output:
+                json.dump(data, output, sort_keys=True)
+                output.write("\n")
+                output.flush()
+                os.fsync(output.fileno())
+            temporary.replace(store)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+
+def trust_adoption(root: Path) -> None:
+    _write_trust(root.resolve(strict=False), "adopted")
+
+
+def forget_adoption(root: Path) -> bool:
+    root = root.resolve(strict=False)
+    try:
+        (root / ".orrery.json").unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        _write_trust(root, "denied")
+        return False
+    _write_trust(root, "denied")
+    return True
+
+
+def adopted_root(cwd: Path) -> Path | None:
+    root = _git_root(cwd)
+    if root is None or _trusted_marker(root) is None:
+        return None
+    return None if _read_trust(root) == "denied" else root
 
 
 def project_override(cwd: Path) -> dict[str, Any] | None:
-    current = cwd.resolve(strict=False)
-    for directory in (current, *current.parents):
-        candidate = directory / ".orrery.json"
-        if candidate.is_file():
-            try:
-                data = json.loads(candidate.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                raise RuntimeConfigError(
-                    f"the repository override is unreadable: {exc}"
-                ) from exc
-            if not isinstance(data, dict):
-                raise RuntimeConfigError(
-                    "the repository override must be a JSON object"
-                )
-            override = data.get("orchestrator")
-            if override is None:
-                return None
-            if not isinstance(override, dict):
-                raise RuntimeConfigError(
-                    "the repository orchestrator override must be an object"
-                )
-            return override
-        if (directory / ".git").exists():
-            break
-    return None
+    root = adopted_root(cwd)
+    if root is None:
+        return None
+    try:
+        data = json.loads((root / ".orrery.json").read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeConfigError(
+            f"the repository override is unreadable: {exc}"
+        ) from exc
+    if not isinstance(data, dict):
+        raise RuntimeConfigError("the repository override must be a JSON object")
+    override = data.get("orchestrator")
+    if override is None:
+        return None
+    if not isinstance(override, dict):
+        raise RuntimeConfigError(
+            "the repository orchestrator override must be an object"
+        )
+    return override
 
 
 def load_role(
@@ -251,8 +434,7 @@ def load_role(
     if not isinstance(steps, list):
         raise RuntimeConfigError("the orchestration manifest has no role list")
     matches = [
-        step for step in steps
-        if isinstance(step, dict) and step.get("id") == role_id
+        step for step in steps if isinstance(step, dict) and step.get("id") == role_id
     ]
     if len(matches) != 1:
         raise RuntimeConfigError(
@@ -286,19 +468,11 @@ def load_role(
     if not isinstance(model, str) or not model.strip():
         raise RuntimeConfigError(f"{role_id} has no model")
     if not MODEL_ID.fullmatch(model):
-        raise RuntimeConfigError(
-            f"{role_id} has an invalid model identifier"
-        )
-    if (
-        thinking is not None
-        and (
-            not isinstance(thinking, str)
-            or not THINKING_LEVEL.fullmatch(thinking)
-        )
+        raise RuntimeConfigError(f"{role_id} has an invalid model identifier")
+    if thinking is not None and (
+        not isinstance(thinking, str) or not THINKING_LEVEL.fullmatch(thinking)
     ):
-        raise RuntimeConfigError(
-            f"{role_id} has invalid thinking level: {thinking!r}"
-        )
+        raise RuntimeConfigError(f"{role_id} has invalid thinking level: {thinking!r}")
     if access not in ACCESS_LEVELS:
         raise RuntimeConfigError(f"{role_id} has invalid access: {access!r}")
     timeout_seconds = step.get("timeout_seconds")
@@ -308,8 +482,7 @@ def load_role(
         or not 30 <= timeout_seconds <= 7200
     ):
         raise RuntimeConfigError(
-            f"{role_id} timeout_seconds must be an integer between "
-            "30 and 7200"
+            f"{role_id} timeout_seconds must be an integer between 30 and 7200"
         )
     hard_timeout_seconds = step.get("hard_timeout_seconds")
     if hard_timeout_seconds is not None:
@@ -369,24 +542,17 @@ def load_role(
             f"{model} belongs to {known_providers[0]}, not {provider}"
         )
     known = next(
-        (
-            entry
-            for entry in catalogue.get(provider, [])
-            if entry.get("id") == model
-        ),
+        (entry for entry in catalogue.get(provider, []) if entry.get("id") == model),
         None,
     )
     if known is not None:
         levels = known.get("thinking_levels")
         if not isinstance(levels, list):
-            raise RuntimeConfigError(
-                f"{model} has no valid thinking-level catalogue"
-            )
+            raise RuntimeConfigError(f"{model} has no valid thinking-level catalogue")
         if thinking is not None and thinking not in levels:
             available = ", ".join(str(level) for level in levels) or "none"
             raise RuntimeConfigError(
-                f"{model} does not support thinking {thinking}; "
-                f"available: {available}"
+                f"{model} does not support thinking {thinking}; available: {available}"
             )
     return Role(
         id=role_id,
@@ -426,8 +592,7 @@ def load_verbosity(manifest: dict[str, Any] | None = None) -> int:
         raw = raw.strip()
         if not raw.isdigit() or int(raw) not in VERBOSITY_LEVELS:
             raise RuntimeConfigError(
-                "ORRERY_VERBOSITY must be 1 (terse), 2 (concise), or 3 "
-                "(unconstrained)"
+                "ORRERY_VERBOSITY must be 1 (terse), 2 (concise), or 3 (unconstrained)"
             )
         return int(raw)
     if manifest is None:
@@ -767,9 +932,7 @@ def sweep_claude_canaries(snapshot: dict[str, Any]) -> list[str]:
     if current is None or current == before:
         return removed
     prior_lines = (
-        []
-        if before is None
-        else before.decode("utf-8", "replace").splitlines()
+        [] if before is None else before.decode("utf-8", "replace").splitlines()
     )
     current_lines = current.decode("utf-8", "replace").splitlines()
     if current_lines[: len(prior_lines)] != prior_lines:
@@ -858,10 +1021,14 @@ def provider_environment(
         endpoint_keys = endpoint_key_names()
         for name in tuple(environment):
             if (
-                name in {
-                    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-                    "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
-                    "CLAUDE_CODE_USE_VERTEX", "OPENAI_BASE_URL",
+                name
+                in {
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX",
+                    "OPENAI_BASE_URL",
                     "OPENAI_API_KEY",
                 }
                 or name.startswith(("AWS_", "GOOGLE_", "GCLOUD_"))
