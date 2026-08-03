@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner.png" width="100%"
+  <img src="banner.svg" width="100%"
        alt="The Órrery banner: a clockwork orrery with a steel-blue central sphere and brass orbit rings, its orbits opening out to the right past worker spheres in the colours of the five roles">
 </p>
 

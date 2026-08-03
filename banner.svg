@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2064 512" width="2064" height="512" role="img" aria-label="Orrery: a clockwork orrery whose orbits open out to the right, each carrying a sphere in the colour of one role">
+  <defs>
+    <linearGradient id="o0" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#959179"/><stop offset="0.125" stop-color="#9b957a"/><stop offset="0.250" stop-color="#a29a7c"/><stop offset="0.375" stop-color="#a49d7e"/><stop offset="0.500" stop-color="#4e7a8d"/><stop offset="0.625" stop-color="#a59d7e"/><stop offset="0.750" stop-color="#a09778"/><stop offset="0.875" stop-color="#90886f"/><stop offset="1.000" stop-color="#51594f"/></linearGradient>
+    <linearGradient id="o1" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#525a52"/><stop offset="0.125" stop-color="#535d52"/><stop offset="0.250" stop-color="#555e53"/><stop offset="0.375" stop-color="#545d52"/><stop offset="0.500" stop-color="#556053"/><stop offset="0.625" stop-color="#525c52"/><stop offset="0.750" stop-color="#50594f"/><stop offset="0.875" stop-color="#4b554c"/><stop offset="1.000" stop-color="#3d4a44"/></linearGradient>
+    <linearGradient id="o2" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#555c52"/><stop offset="0.125" stop-color="#575e54"/><stop offset="0.250" stop-color="#5b6256"/><stop offset="0.375" stop-color="#696c5f"/><stop offset="0.500" stop-color="#717262"/><stop offset="0.625" stop-color="#717362"/><stop offset="0.750" stop-color="#686c5c"/><stop offset="0.875" stop-color="#5b6053"/><stop offset="1.000" stop-color="#454f48"/></linearGradient>
+    <linearGradient id="o3" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#8a8772"/><stop offset="0.125" stop-color="#948f75"/><stop offset="0.250" stop-color="#9a9378"/><stop offset="0.375" stop-color="#a49b7e"/><stop offset="0.500" stop-color="#8b9571"/><stop offset="0.625" stop-color="#a49c7e"/><stop offset="0.750" stop-color="#9a9175"/><stop offset="0.875" stop-color="#7e7b66"/><stop offset="1.000" stop-color="#52594e"/></linearGradient>
+    <linearGradient id="o4" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#404c47"/><stop offset="0.125" stop-color="#454f48"/><stop offset="0.250" stop-color="#4a554c"/><stop offset="0.375" stop-color="#4d574d"/><stop offset="0.500" stop-color="#525b51"/><stop offset="0.625" stop-color="#50594f"/><stop offset="0.750" stop-color="#50594f"/><stop offset="0.875" stop-color="#4b554b"/><stop offset="1.000" stop-color="#3f4943"/></linearGradient>
+    <linearGradient id="o5" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#5b6258"/><stop offset="0.125" stop-color="#65695c"/><stop offset="0.250" stop-color="#767866"/><stop offset="0.375" stop-color="#8a8872"/><stop offset="0.500" stop-color="#a6a6ba"/><stop offset="0.625" stop-color="#989279"/><stop offset="0.750" stop-color="#86826e"/><stop offset="0.875" stop-color="#68695a"/><stop offset="1.000" stop-color="#424b48"/></linearGradient>
+    <linearGradient id="o6" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#374442"/><stop offset="0.125" stop-color="#3e4944"/><stop offset="0.250" stop-color="#424d47"/><stop offset="0.375" stop-color="#454e48"/><stop offset="0.500" stop-color="#48514a"/><stop offset="0.625" stop-color="#49514a"/><stop offset="0.750" stop-color="#474f48"/><stop offset="0.875" stop-color="#3b4441"/><stop offset="1.000" stop-color="#283738"/></linearGradient>
+    <linearGradient id="o7" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#94937c"/><stop offset="0.125" stop-color="#9b977d"/><stop offset="0.250" stop-color="#a29d80"/><stop offset="0.375" stop-color="#a19b80"/><stop offset="0.500" stop-color="#a69f81"/><stop offset="0.625" stop-color="#a49d7f"/><stop offset="0.750" stop-color="#a0987c"/><stop offset="0.875" stop-color="#8e8971"/><stop offset="1.000" stop-color="#666a5c"/></linearGradient>
+    <linearGradient id="o8" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#1e3133"/><stop offset="0.125" stop-color="#283938"/><stop offset="0.250" stop-color="#2e3e3c"/><stop offset="0.375" stop-color="#33423f"/><stop offset="0.500" stop-color="#36443f"/><stop offset="0.625" stop-color="#3a4844"/><stop offset="0.750" stop-color="#394642"/><stop offset="0.875" stop-color="#2c3c3b"/><stop offset="1.000" stop-color="#1b2e32"/></linearGradient>
+    <linearGradient id="o9" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#324241"/><stop offset="0.125" stop-color="#3e4c47"/><stop offset="0.250" stop-color="#4a564c"/><stop offset="0.375" stop-color="#4c584d"/><stop offset="0.500" stop-color="#b36d98"/><stop offset="0.625" stop-color="#4d574d"/><stop offset="0.750" stop-color="#49534a"/><stop offset="0.875" stop-color="#3a4744"/><stop offset="1.000" stop-color="#233736"/></linearGradient>
+    <linearGradient id="o10" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="512"><stop offset="0.000" stop-color="#1c2e32"/><stop offset="0.125" stop-color="#263638"/><stop offset="0.250" stop-color="#2d3b3c"/><stop offset="0.375" stop-color="#334040"/><stop offset="0.500" stop-color="#354242"/><stop offset="0.625" stop-color="#374342"/><stop offset="0.750" stop-color="#33403f"/><stop offset="0.875" stop-color="#283739"/><stop offset="1.000" stop-color="#192b31"/></linearGradient>
+    <radialGradient id="s4" cx="50%" cy="50%" r="50%" fx="34%" fy="30%"><stop offset="0" stop-color="#53819b"/><stop offset="0.55" stop-color="#215470"/><stop offset="1" stop-color="#1c4860"/></radialGradient>
+    <radialGradient id="s5" cx="50%" cy="50%" r="50%" fx="34%" fy="30%"><stop offset="0" stop-color="#799266"/><stop offset="0.55" stop-color="#537144"/><stop offset="1" stop-color="#47613a"/></radialGradient>
+    <radialGradient id="s6" cx="50%" cy="50%" r="50%" fx="34%" fy="30%"><stop offset="0" stop-color="#b6b8c8"/><stop offset="0.55" stop-color="#8b8da2"/><stop offset="1" stop-color="#78798b"/></radialGradient>
+    <radialGradient id="s7" cx="50%" cy="50%" r="50%" fx="34%" fy="30%"><stop offset="0" stop-color="#dbac41"/><stop offset="0.55" stop-color="#b58612"/><stop offset="1" stop-color="#9c730f"/></radialGradient>
+    <radialGradient id="s8" cx="50%" cy="50%" r="50%" fx="34%" fy="30%"><stop offset="0" stop-color="#c076a4"/><stop offset="0.55" stop-color="#974b7d"/><stop offset="1" stop-color="#82406c"/></radialGradient>
+    <radialGradient id="m_core" cx="50%" cy="50%" r="50%" fx="31%" fy="28%">
+      <stop offset="0%" stop-color="#6d8ba6"/>
+      <stop offset="38%" stop-color="#4a6c88"/>
+      <stop offset="78%" stop-color="#395770"/>
+      <stop offset="100%" stop-color="#324c63"/>
+    </radialGradient>
+    <radialGradient id="m_lav" cx="50%" cy="50%" r="50%" fx="35%" fy="26%">
+      <stop offset="0%" stop-color="#c5c7d6"/>
+      <stop offset="55%" stop-color="#9aa0b3"/>
+      <stop offset="100%" stop-color="#868da1"/>
+    </radialGradient>
+    <radialGradient id="m_amb" cx="50%" cy="50%" r="50%" fx="39%" fy="31%">
+      <stop offset="0%" stop-color="#d2a75d"/>
+      <stop offset="55%" stop-color="#ad7a2f"/>
+      <stop offset="100%" stop-color="#9b6d29"/>
+    </radialGradient>
+    <radialGradient id="m_grn" cx="50%" cy="50%" r="50%" fx="30%" fy="31%">
+      <stop offset="0%" stop-color="#83996f"/>
+      <stop offset="55%" stop-color="#5b734c"/>
+      <stop offset="100%" stop-color="#516746"/>
+    </radialGradient>
+    <radialGradient id="m_sag" cx="50%" cy="50%" r="50%" fx="36%" fy="31%">
+      <stop offset="0%" stop-color="#a9afa2"/>
+      <stop offset="55%" stop-color="#88907f"/>
+      <stop offset="100%" stop-color="#7a8172"/>
+    </radialGradient>
+    <radialGradient id="m_gloss">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity=".10"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="2064" height="512" fill="#0c2029"/>
+  <path d="M298.7 -120.7A375.0 375.0 0 0 1 672.0 218.8M671.8 292.0A375.0 375.0 0 0 1 298.7 629.3" fill="none" stroke="url(#o0)" stroke-width="3.0"/>
+  <path d="M302.2 -188.2A440.8 440.8 0 0 1 302.2 693.4" fill="none" stroke="url(#o1)" stroke-width="3.0"/>
+  <path d="M312.5 -243.2A495.3 495.3 0 0 1 312.5 747.4" fill="none" stroke="url(#o2)" stroke-width="3.0"/>
+  <path d="M330.0 -297.6A550.1 550.1 0 0 1 879.6 228.9M879.3 281.9A550.1 550.1 0 0 1 330.0 802.6" fill="none" stroke="url(#o3)" stroke-width="3.0"/>
+  <path d="M398.1 -335.2A585.2 585.2 0 0 1 398.1 835.2" fill="none" stroke="url(#o4)" stroke-width="3.0"/>
+  <path d="M474.6 -415.2A671.8 671.8 0 0 1 1145.9 230.2M1146.0 280.6A671.8 671.8 0 0 1 474.6 928.4" fill="none" stroke="url(#o5)" stroke-width="3.0"/>
+  <path d="M479.8 -452.4A709.1 709.1 0 0 1 479.8 965.8" fill="none" stroke="url(#o6)" stroke-width="3.0"/>
+  <path d="M682.4 -525.8A780.4 780.4 0 0 1 1462.4 229.7M1462.3 281.3A780.4 780.4 0 0 1 682.4 1035.0" fill="none" stroke="url(#o7)" stroke-width="3.0"/>
+  <path d="M802.9 -665.1A920.9 920.9 0 0 1 802.9 1176.7" fill="none" stroke="url(#o8)" stroke-width="3.0"/>
+  <path d="M830.6 -725.5A982.2 982.2 0 0 1 1812.4 230.3M1812.5 280.7A982.2 982.2 0 0 1 830.6 1238.9" fill="none" stroke="url(#o9)" stroke-width="3.0"/>
+  <path d="M954.9 -753.9A1007.0 1007.0 0 0 1 954.9 1260.1" fill="none" stroke="url(#o10)" stroke-width="3.0"/>
+  <circle cx="672.4" cy="255.4" r="29.5" fill="url(#s4)"/>
+  <ellipse cx="663.5" cy="245.4" rx="13.0" ry="9.4" fill="url(#m_gloss)" transform="rotate(-30 663.5 245.4)"/>
+  <circle cx="879.1" cy="255.4" r="21.4" fill="url(#s5)"/>
+  <ellipse cx="872.7" cy="248.1" rx="9.4" ry="6.8" fill="url(#m_gloss)" transform="rotate(-30 872.7 248.1)"/>
+  <circle cx="1146.2" cy="255.4" r="20.3" fill="url(#s6)"/>
+  <ellipse cx="1140.1" cy="248.5" rx="8.9" ry="6.5" fill="url(#m_gloss)" transform="rotate(-30 1140.1 248.5)"/>
+  <circle cx="1462.7" cy="255.5" r="20.8" fill="url(#s7)"/>
+  <ellipse cx="1456.5" cy="248.4" rx="9.2" ry="6.7" fill="url(#m_gloss)" transform="rotate(-30 1456.5 248.4)"/>
+  <circle cx="1812.8" cy="255.5" r="20.3" fill="url(#s8)"/>
+  <ellipse cx="1806.7" cy="248.6" rx="8.9" ry="6.5" fill="url(#m_gloss)" transform="rotate(-30 1806.7 248.6)"/>
+  <g transform="translate(80.17 43.27) scale(0.27472)">
+
+  <!-- the disc the mark is cut to -->
+
+  <!-- Four orbits, each broken just short of the sphere riding on it, so
+       the sphere reads as being in front of the line rather than on it.
+       The break clears the sphere by a quarter of its radius, which is what
+       the drawing does. The knots are not broken around: the orbit runs
+       straight through them. -->
+  <g fill="none" stroke="#ac8f5f" stroke-width="9.5">
+    <path d="M1072.1 549.6A374 374 0 1 1 1002.2 476.8"/>
+    <path d="M249.5 719.4A523 523 0 1 1 1176.1 1099.6M1088.5 1184.8A523 523 0 0 1 249.4 819.6"/>
+    <path d="M395.9 268.1A626 626 0 1 1 304.7 351.2"/>
+    <circle cx="770" cy="770" r="722"/>
+  </g>
+
+  <!-- knots on the orbits -->
+  <g fill="#0c2029" stroke="#b6955f" stroke-width="7.5">
+    <circle cx="1144" cy="770" r="16.5"/>
+    <circle cx="396" cy="770" r="16.5"/>
+    <circle cx="770" cy="1144" r="16.5"/>
+    <circle cx="770" cy="247" r="16.5"/>
+  </g>
+
+  <!-- the escapement: the visible arc of the gear under the sphere,
+       traced from the drawing, since it is one flat shape -->
+  <path d="M 654 1035 L 656 1040 L 666 1051 L 671 1051 L 687 1044 L 703 1057 L 700 1077 L 702 1079 L 719 1086 L 733 1071 L 753 1075 L 759 1095 L 763 1096 L 780 1095 L 785 1077 L 787 1075 L 807 1072 L 820 1086 L 830 1083 L 839 1078 L 837 1057 L 852 1044 L 855 1044 L 869 1051 L 873 1051 L 885 1037 L 882 1030 L 878 1026 L 848 1038 L 820 1044 L 814 1048 L 797 1054 L 782 1057 L 766 1058 L 742 1054 L 730 1050 L 719 1044 L 692 1038 L 661 1026 Z" fill="#b7945c"/>
+
+  <!-- the principal -->
+  <circle cx="770" cy="770" r="265" fill="url(#m_core)"/>
+  <ellipse cx="672" cy="654" rx="118" ry="88" fill="url(#m_gloss)"
+           transform="rotate(-28 672 654)"/>
+
+  <!-- the roles, each on its orbit -->
+  <circle cx="348.5" cy="307.7" r="49.8" fill="url(#m_lav)"/>
+  <circle cx="1133" cy="1142.9" r="49.3" fill="url(#m_amb)"/>
+  <circle cx="1037.9" cy="512.5" r="40.7" fill="url(#m_grn)"/>
+  <circle cx="247.7" cy="769.5" r="40.4" fill="url(#m_sag)"/>
+  <ellipse cx="332.6" cy="287.8" rx="21.9" ry="15.9" fill="url(#m_gloss)" transform="rotate(-30 332.6 287.8)"/>
+  <ellipse cx="1117.2" cy="1123.2" rx="21.7" ry="15.8" fill="url(#m_gloss)" transform="rotate(-30 1117.2 1123.2)"/>
+  <ellipse cx="1024.9" cy="496.2" rx="17.9" ry="13.0" fill="url(#m_gloss)" transform="rotate(-30 1024.9 496.2)"/>
+  <ellipse cx="234.8" cy="753.3" rx="17.8" ry="12.9" fill="url(#m_gloss)" transform="rotate(-30 234.8 753.3)"/>
+</g>
+</svg>

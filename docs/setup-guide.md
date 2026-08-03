@@ -624,10 +624,13 @@ verify that paths and labels do not intersect unrelated nodes.
 
 The maintained artefacts are:
 
-- `README.md`, `LICENSE`, `logo.png`, `banner.png`, and `flowchart.svg` —
+- `README.md`, `LICENSE`, `logo.svg`, `banner.svg`, and `flowchart.svg` —
   project overview, licence, logo, the banner the README opens with, and
-  the flowchart it shows, which is generated from `global/orchestration.json`
-  rather than drawn by hand.
+  the flowchart it shows. All three drawings are vector: the flowchart is
+  generated from `global/orchestration.json` rather than drawn by hand, and
+  the mark and banner are drawn rather than exported, so they stay sharp at
+  any size and cost 56KB between them. The banner embeds the mark, so the
+  two cannot disagree.
 - `docs/setup-guide.md` — this operational reference.
 - `global/AGENTS.md` — canonical shared policy.
 - `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.

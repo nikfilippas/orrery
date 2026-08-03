@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1540 1540" width="1540" height="1540" role="img" aria-label="Orrery: a clockwork orrery with a steel-blue central sphere and brass orbit rings carrying worker spheres">
+  <defs>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%" fx="31%" fy="28%">
+      <stop offset="0%" stop-color="#6d8ba6"/>
+      <stop offset="38%" stop-color="#4a6c88"/>
+      <stop offset="78%" stop-color="#395770"/>
+      <stop offset="100%" stop-color="#324c63"/>
+    </radialGradient>
+    <radialGradient id="lav" cx="50%" cy="50%" r="50%" fx="35%" fy="26%">
+      <stop offset="0%" stop-color="#c5c7d6"/>
+      <stop offset="55%" stop-color="#9aa0b3"/>
+      <stop offset="100%" stop-color="#868da1"/>
+    </radialGradient>
+    <radialGradient id="amb" cx="50%" cy="50%" r="50%" fx="39%" fy="31%">
+      <stop offset="0%" stop-color="#d2a75d"/>
+      <stop offset="55%" stop-color="#ad7a2f"/>
+      <stop offset="100%" stop-color="#9b6d29"/>
+    </radialGradient>
+    <radialGradient id="grn" cx="50%" cy="50%" r="50%" fx="30%" fy="31%">
+      <stop offset="0%" stop-color="#83996f"/>
+      <stop offset="55%" stop-color="#5b734c"/>
+      <stop offset="100%" stop-color="#516746"/>
+    </radialGradient>
+    <radialGradient id="sag" cx="50%" cy="50%" r="50%" fx="36%" fy="31%">
+      <stop offset="0%" stop-color="#a9afa2"/>
+      <stop offset="55%" stop-color="#88907f"/>
+      <stop offset="100%" stop-color="#7a8172"/>
+    </radialGradient>
+    <radialGradient id="gloss">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".30"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity=".10"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- the disc the mark is cut to -->
+  <circle cx="770" cy="770" r="770" fill="#181c20"/>
+
+  <!-- Four orbits, each broken just short of the sphere riding on it, so
+       the sphere reads as being in front of the line rather than on it.
+       The break clears the sphere by a quarter of its radius, which is what
+       the drawing does. The knots are not broken around: the orbit runs
+       straight through them. -->
+  <g fill="none" stroke="#ac8f5f" stroke-width="9.5">
+    <path d="M1072.1 549.6A374 374 0 1 1 1002.2 476.8"/>
+    <path d="M249.5 719.4A523 523 0 1 1 1176.1 1099.6M1088.5 1184.8A523 523 0 0 1 249.4 819.6"/>
+    <path d="M395.9 268.1A626 626 0 1 1 304.7 351.2"/>
+    <circle cx="770" cy="770" r="722"/>
+  </g>
+
+  <!-- knots on the orbits -->
+  <g fill="#181c20" stroke="#b6955f" stroke-width="7.5">
+    <circle cx="1144" cy="770" r="16.5"/>
+    <circle cx="396" cy="770" r="16.5"/>
+    <circle cx="770" cy="1144" r="16.5"/>
+    <circle cx="770" cy="247" r="16.5"/>
+  </g>
+
+  <!-- the escapement: the visible arc of the gear under the sphere,
+       traced from the drawing, since it is one flat shape -->
+  <path d="M 654 1035 L 656 1040 L 666 1051 L 671 1051 L 687 1044 L 703 1057 L 700 1077 L 702 1079 L 719 1086 L 733 1071 L 753 1075 L 759 1095 L 763 1096 L 780 1095 L 785 1077 L 787 1075 L 807 1072 L 820 1086 L 830 1083 L 839 1078 L 837 1057 L 852 1044 L 855 1044 L 869 1051 L 873 1051 L 885 1037 L 882 1030 L 878 1026 L 848 1038 L 820 1044 L 814 1048 L 797 1054 L 782 1057 L 766 1058 L 742 1054 L 730 1050 L 719 1044 L 692 1038 L 661 1026 Z" fill="#b7945c"/>
+
+  <!-- the principal -->
+  <circle cx="770" cy="770" r="265" fill="url(#core)"/>
+  <ellipse cx="672" cy="654" rx="118" ry="88" fill="url(#gloss)"
+           transform="rotate(-28 672 654)"/>
+
+  <!-- the roles, each on its orbit -->
+  <circle cx="348.5" cy="307.7" r="49.8" fill="url(#lav)"/>
+  <circle cx="1133" cy="1142.9" r="49.3" fill="url(#amb)"/>
+  <circle cx="1037.9" cy="512.5" r="40.7" fill="url(#grn)"/>
+  <circle cx="247.7" cy="769.5" r="40.4" fill="url(#sag)"/>
+  <ellipse cx="332.6" cy="287.8" rx="21.9" ry="15.9" fill="url(#gloss)" transform="rotate(-30 332.6 287.8)"/>
+  <ellipse cx="1117.2" cy="1123.2" rx="21.7" ry="15.8" fill="url(#gloss)" transform="rotate(-30 1117.2 1123.2)"/>
+  <ellipse cx="1024.9" cy="496.2" rx="17.9" ry="13.0" fill="url(#gloss)" transform="rotate(-30 1024.9 496.2)"/>
+  <ellipse cx="234.8" cy="753.3" rx="17.8" ry="12.9" fill="url(#gloss)" transform="rotate(-30 234.8 753.3)"/>
+</svg>
