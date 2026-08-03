@@ -27,6 +27,14 @@ as a normal single-provider session with the model chosen in its own
 interface, governed by the engineering-baseline half of the shared policy
 alone, and the SessionStart check says so explicitly.
 
+Adoption trust is rooted at the repository top level: only its `.orrery.json`
+marker is considered. The marker must be an untracked, user-owned regular file
+with mode `0600`; the developer umask made markers created before this change
+group-writable, so they are refused. For one release, `orrery-doctor` warns
+existing users with the exact `orrery-init` command to re-run it and record the
+worktree in the machine-local user state store. Revoke adoption with
+`orrery-init --forget /path/to/repository`.
+
 ## How a request flows
 
 <p align="center">
@@ -416,6 +424,14 @@ that must span calls, sweeps session-owned residue, registers rollbacks, and
 performs final teardown. The provider-neutral agent runner separately contains
 every delegated process tree and cleans its private prompt, settings, log, and
 result state.
+
+Accepted residual: delegate confinement closes what a hostile repository can
+write, not what it can read. With the provider CLI sandbox disabled and no
+hook-suppression flag, repository hooks running inside a delegate can read the
+provider credentials that `HOME` and `CODEX_HOME` expose and exfiltrate them
+over an unconfined network. Closing it needs upstream hook suppression or
+unit-level egress control, both currently unavailable. Delegate confinement is
+not complete while this remains.
 
 Pre-existing user processes and data are never guessed about or removed.
 Codex-principal sessions still follow the same cleanup policy through

@@ -180,6 +180,14 @@ correct for that directory only. A principal routed at a custom
 endpoint is refused, because first-party model names must not reach a
 third-party service.
 
+Adoption trust uses only the private, untracked `.orrery.json` marker at the
+repository root. It must be a user-owned regular file with mode `0600`, with a
+machine-local trust record in the user state store. The developer umask made
+markers created before this change group-writable, so they are refused. For one
+release, `orrery-doctor` warns existing users to re-run `orrery-init` and names
+the command for that repository. Revoke a repository with `orrery-init --forget
+/path/to/repository`.
+
 What the ladder actually covers was measured against the installed CLI
 rather than inferred, and the distinction matters: an **overloaded**
 service (HTTP 529) is retried a few times and then answered by
@@ -516,6 +524,14 @@ runtime-state cleanup path in `orrery-agent`. Claude lifecycle cleanup remains
 Claude-specific. Principal-mismatch notification is installed for both Claude
 and Codex, while both receive the same cleanup requirements through
 `AGENTS.md`.
+
+Accepted residual: delegate confinement closes what a hostile repository can
+write, not what it can read. With the provider CLI sandbox disabled and no
+hook-suppression flag, repository hooks running inside a delegate can read the
+provider credentials that `HOME` and `CODEX_HOME` expose and exfiltrate them
+over an unconfined network. Closing it needs upstream hook suppression or
+unit-level egress control, both currently unavailable. Delegate confinement is
+not complete while this remains.
 
 ## Provider exhaustion and failures
 
