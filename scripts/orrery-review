@@ -27,6 +27,7 @@ from orrery_runtime import (  # noqa: E402
     load_role,
     load_verbosity,
     provider_environment,
+    endpoint_environment,
     role_handoff,
     sweep_claude_canaries,
 )
@@ -71,11 +72,20 @@ STOP_SETTLE_SECONDS = 10.0
 # Claude runs print only their final JSON, never grow mid-run, and so
 # keep plain base-deadline behaviour. Deliberately constants, not
 # configuration.
-STALL_WINDOW_SECONDS = 180.0
+# Widened from 180s on live evidence: a reviewer at ultra effort was
+# recorded timing out with stalled_seconds 287 while demonstrably
+# working, because a reasoning model can think for minutes between
+# tool calls and emits nothing meanwhile. The window must exceed a
+# plausible silent reasoning turn, or productive runs are cut off at
+# their deadline.
+STALL_WINDOW_SECONDS = 360.0
 EXTEND_STEP_SECONDS = 120.0
-# The delegate's own newest log line is echoed to stderr at most this
-# often: a few lines every couple of minutes, not a scroll.
-CONTENT_ECHO_SECONDS = 120.0
+# The delegate's own output is mirrored to stderr as it arrives. A
+# review can emit hundreds of kilobytes, so the default caps how many
+# lines each poll may print and says how many it dropped; `--stream`
+# lifts the cap and `--no-stream` leaves only the byte counters.
+STREAM_LINES_PER_POLL = 4
+STREAM_LINE_LIMIT = 200
 # Explicitly supplied hard caps (flag, environment, manifest) must sit
 # in this range; a cap derived from the base inherits the base's
 # freedom.
@@ -87,8 +97,30 @@ class UsageError(Exception):
     pass
 
 
+class PlainUsageError(UsageError):
+    pass
+
+
 class CleanupError(Exception):
     pass
+
+
+def receipt_path_is_safe(path: Path) -> bool:
+    """Reject a receipts path when any existing component is a symlink."""
+    current = Path(path.anchor) if path.is_absolute() else Path(".")
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    for part in parts:
+        current /= part
+        try:
+            if current.is_symlink():
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def receipt_open(path: Path, flags: int) -> int:
+    return os.open(path, flags | os.O_NOFOLLOW, 0o600)
 
 
 class Invocation:
@@ -105,7 +137,13 @@ class Invocation:
         revoke: bool = False,
         timeout_is_default: bool = False,
         hard_timeout_seconds: int | None = None,
+        log_path: Path | None = None,
+        stream_mode: str = "lines",
+        workspace: Path | None = None,
+        receipts: Path | None = None,
     ) -> None:
+        self.log_path = log_path
+        self.stream_mode = stream_mode
         self.timeout_seconds = timeout_seconds
         self.output_path = output_path
         self.prompt = prompt
@@ -116,6 +154,8 @@ class Invocation:
         self.revoke = revoke
         self.timeout_is_default = timeout_is_default
         self.hard_timeout_seconds = hard_timeout_seconds
+        self.workspace = workspace
+        self.receipts = receipts
 
 
 class DelegationState:
@@ -213,13 +253,16 @@ def usage() -> str:
     return (
         "Usage:\n"
         f"  {PROGRAM_NAME} [--timeout SECONDS] [--hard-timeout SECONDS]\n"
-        "                 [--output PATH]\n"
+        "                 [--output PATH] [--log PATH] [--workspace DIR]\n"
+        "                 [--receipts DIR]\n"
+        "                 [--stream | --no-stream]\n"
         "                 [--approve-fallback PROVIDER:MODEL]\n"
         "                 [--approval-scope run|session|until:ISO8601]\n"
         "                 [--no-fallback] [--role NAME] -- PROMPT...\n"
         f"  {PROGRAM_NAME} --revoke-fallbacks\n"
         f"  printf '%s\\n' \"PROMPT\" | {PROGRAM_NAME} "
-        "[--role NAME] [--timeout SECONDS] [--output PATH]\n\n"
+        "[--role NAME] [--timeout SECONDS] [--output PATH] [--workspace DIR]\n"
+        "[--receipts DIR]\n\n"
         "Runs one configured Orrery role in a separate provider process. "
         "Reviewer roles are read-only and fresh; worker roles are "
         "workspace-write. The compatibility command orrery-review defaults "
@@ -257,12 +300,16 @@ def parse_args(argv: list[str]) -> Invocation:
         ) from exc
 
     output_path: Path | None = None
+    log_destination: Path | None = None
+    stream_mode = "lines"
     prompt_parts: list[str] | None = None
     role: str | None = "reviewer" if PROGRAM_NAME == "orrery-review" else None
     approval: tuple[str, str] | None = None
     no_fallback = False
     approval_scope_raw: str | None = None
     revoke = False
+    workspace: Path | None = None
+    receipts: Path | None = None
 
     index = 0
     while index < len(argv):
@@ -312,6 +359,22 @@ def parse_args(argv: list[str]) -> Invocation:
                 raise UsageError(
                     "--hard-timeout must be a positive integer"
                 ) from exc
+        elif argument == "--log":
+            if index + 1 >= len(argv):
+                raise UsageError("missing value for --log")
+            index += 1
+            if not argv[index]:
+                raise UsageError("--log requires a non-empty path")
+            log_destination = Path(argv[index])
+        elif argument.startswith("--log="):
+            value = argument.split("=", 1)[1]
+            if not value:
+                raise UsageError("--log requires a non-empty path")
+            log_destination = Path(value)
+        elif argument == "--stream":
+            stream_mode = "full"
+        elif argument == "--no-stream":
+            stream_mode = "off"
         elif argument == "--output":
             if index + 1 >= len(argv):
                 raise UsageError("missing value for --output")
@@ -324,6 +387,25 @@ def parse_args(argv: list[str]) -> Invocation:
             if not value:
                 raise UsageError("--output requires a non-empty path")
             output_path = Path(value)
+        elif argument in ("--workspace", "--receipts"):
+            if index + 1 >= len(argv):
+                raise UsageError(f"missing value for {argument}")
+            index += 1
+            value = argv[index]
+            if not value:
+                raise PlainUsageError(f"{argument} requires a non-empty path")
+            if argument == "--workspace":
+                workspace = Path(value)
+            else:
+                receipts = Path(value)
+        elif argument.startswith("--workspace=") or argument.startswith("--receipts="):
+            option, value = argument.split("=", 1)
+            if not value:
+                raise PlainUsageError(f"{option} requires a non-empty path")
+            if option == "--workspace":
+                workspace = Path(value)
+            else:
+                receipts = Path(value)
         elif argument == "--approve-fallback":
             if index + 1 >= len(argv):
                 raise UsageError("missing value for --approve-fallback")
@@ -379,6 +461,8 @@ def parse_args(argv: list[str]) -> Invocation:
             or approval_scope_raw is not None
             or no_fallback
             or output_path is not None
+            or workspace is not None
+            or receipts is not None
             or prompt_parts
         ):
             raise UsageError(
@@ -414,6 +498,22 @@ def parse_args(argv: list[str]) -> Invocation:
         raise UsageError(
             "--no-fallback and --approve-fallback cannot be combined"
         )
+    if workspace is not None:
+        try:
+            workspace = workspace.resolve(strict=True)
+        except OSError as exc:
+            raise PlainUsageError(f"--workspace is not an existing directory: {exc}") from exc
+        if not workspace.is_dir() or git_workspace_fingerprint(workspace) is None:
+            raise PlainUsageError("--workspace must be an existing git worktree")
+    if receipts is not None:
+        if not receipt_path_is_safe(receipts):
+            raise PlainUsageError("--receipts must not be or contain a symlink")
+        try:
+            receipts = receipts.resolve(strict=True)
+        except OSError as exc:
+            raise PlainUsageError(f"--receipts is not an existing writable directory: {exc}") from exc
+        if not receipts.is_dir() or not os.access(receipts, os.W_OK):
+            raise PlainUsageError("--receipts must be an existing writable directory")
     approval_scope: tuple[str, float | None] | None = None
     if approval_scope_raw is not None:
         if approval is None:
@@ -433,6 +533,10 @@ def parse_args(argv: list[str]) -> Invocation:
         approval_scope=approval_scope,
         timeout_is_default=timeout_is_default,
         hard_timeout_seconds=hard_timeout_seconds,
+        log_path=log_destination,
+        stream_mode=stream_mode,
+        workspace=workspace,
+        receipts=receipts,
     )
 
 
@@ -516,6 +620,57 @@ def effective_budgets(invocation: Invocation, role: Role) -> tuple[int, int]:
             else base
         )
     return base, hard
+
+
+def role_availability(role: Role):
+    """Endpoint roles bypass first-party login and model visibility checks."""
+    if role.endpoint is None:
+        return provider_status(role.provider)
+    executable = shutil.which("claude" if role.provider == "anthropic" else "codex")
+    if executable is None:
+        return provider_status(role.provider)
+    endpoint_environment(role.endpoint)
+    from orrery_fallback import ProviderStatus
+    return ProviderStatus(role.provider, Availability.READY, executable, "endpoint adapter ready")
+
+
+def stream_new_lines(path: Path, offset: int, mode: str) -> int:
+    """Mirror complete new lines to stderr; return the new offset.
+
+    Only whole lines are consumed, so a partially written line is left
+    for the next poll rather than being split. Every line goes through
+    the same sanitiser as the diagnostics tail and is prefixed, so
+    provider text is visibly the delegate's and cannot forge Orrery's
+    own protocol markers.
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        return offset
+    end = chunk.rfind(b"\n")
+    if end == -1:
+        return offset
+    complete = chunk[: end + 1]
+    lines = [
+        line
+        for line in complete.decode("utf-8", "replace").splitlines()
+        if line.strip()
+    ]
+    if mode != "full" and len(lines) > STREAM_LINES_PER_POLL:
+        dropped = len(lines) - STREAM_LINES_PER_POLL
+        lines = lines[-STREAM_LINES_PER_POLL:]
+        print(
+            f"  | ... {dropped} earlier line(s) not shown",
+            file=sys.stderr,
+            flush=True,
+        )
+    for line in lines:
+        rendered = sanitise_provider_text(line)[:STREAM_LINE_LIMIT]
+        if rendered.strip():
+            print(f"  | {rendered}", file=sys.stderr, flush=True)
+    return offset + len(complete)
 
 
 def newest_log_line(path: Path) -> str:
@@ -633,15 +788,12 @@ def unit_status(unit: str) -> tuple[bool, str]:
     return True, active_state
 
 
-def read_only_paths_enforced(target: Path) -> bool:
-    """Whether the user manager can actually apply ReadOnlyPaths.
-
-    Some environments restrict the unprivileged user namespaces that
-    mount sandboxing needs, and systemd then drops the option silently
-    rather than failing the unit. A quick probe unit answers the
-    question, so a missing guarantee is announced instead of assumed.
-    """
+def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
+    """Whether systemd behaviorally enforces the composed write allowlist."""
+    inside = probe_root / ".containment-probe-inside"
+    outside = probe_root.parent / f".containment-probe-outside-{uuid.uuid4().hex}"
     try:
+        inside.mkdir(mode=0o700)
         result = subprocess.run(
             [
                 "systemd-run",
@@ -650,12 +802,24 @@ def read_only_paths_enforced(target: Path) -> bool:
                 "--wait",
                 "--collect",
                 "--pipe",
-                f"--property=ReadOnlyPaths={target}",
+                # ProtectSystem=strict makes the whole hierarchy
+                # read-only while leaving /dev, /proc and /sys alone.
+                # A bare ReadOnlyPaths=/ also froze /proc, which broke
+                # the provider's own bubblewrap sandbox ("setting up
+                # uid map: Read-only file system") in a live run.
+                "--property=ProtectSystem=strict",
+                "--property=ProtectHome=read-only",
+                *[
+                    f"--property=ReadWritePaths={path}"
+                    for path in dict.fromkeys(writable_paths)
+                ],
+                "--property=NoNewPrivileges=yes",
                 "/bin/sh",
                 "-c",
-                'test ! -w "$1"',
+                'touch "$1/inside" && ! touch "$2/outside"',
                 "probe",
-                str(target),
+                str(inside),
+                str(outside),
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -665,7 +829,32 @@ def read_only_paths_enforced(target: Path) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
+    finally:
+        shutil.rmtree(inside, ignore_errors=True)
+        try:
+            outside.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
     return result.returncode == 0
+
+
+def read_only_paths_enforced(target: Path) -> bool:
+    """Compatibility wrapper for tests of the former single-path probe."""
+    with tempfile.TemporaryDirectory(prefix="orrery-containment-") as directory:
+        probe_root = Path(directory)
+        return confinement_enforced([probe_root], probe_root)
+
+
+def workspace_overlap(workspace: Path, trusted: dict[str, Path]) -> str | None:
+    """Return the trusted path a writable workspace would contain."""
+    resolved_workspace = workspace.resolve(strict=True)
+    for label, path in trusted.items():
+        resolved = path.resolve(strict=False)
+        if resolved == resolved_workspace or resolved_workspace in resolved.parents:
+            return f"workspace and {label}"
+    return None
 
 
 def unit_is_loaded(unit: str) -> bool:
@@ -828,6 +1017,7 @@ def write_service_launcher(
     provider: str,
     role_id: str = "",
     endpoint: Any = None,
+    receipts: Path | None = None,
 ) -> tuple[Path, Path]:
     environment_path = run_dir / "service-environment.json"
     environment_fd = os.open(
@@ -845,7 +1035,7 @@ def write_service_launcher(
         os.fsync(handle.fileno())
 
     launcher_path = run_dir / "service-launcher.py"
-    launcher_path.write_text(
+    launcher = (
         "#!/usr/bin/env python3\n"
         "import json\n"
         "import os\n"
@@ -854,10 +1044,98 @@ def write_service_launcher(
         "environment_path = Path(sys.argv[1])\n"
         "environment = json.loads(environment_path.read_text())\n"
         "environment_path.unlink(missing_ok=True)\n"
-        "os.execvpe(sys.argv[2], sys.argv[2:], environment)\n"
     )
+    if receipts is None:
+        launcher += "os.execvpe(sys.argv[2], sys.argv[2:], environment)\n"
+    else:
+        launcher += (
+            "import threading\n"
+            "from datetime import datetime, timezone\n"
+            f"receipts = Path({str(receipts)!r})\n"
+            "started = datetime.now(timezone.utc).isoformat()\n"
+            "try:\n"
+            "    stdout_log = os.open(receipts / 'stdout.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n"
+            "    stderr_log = os.open(receipts / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n"
+            "except OSError as exc:\n"
+            "    print(f'orrery-review: could not write receipts: {exc}', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "child = __import__('subprocess').Popen(sys.argv[2:], env=environment, stdout=__import__('subprocess').PIPE, stderr=__import__('subprocess').PIPE)\n"
+            "counts = [0, 0]\n"
+            "def write_all(fd, chunk):\n"
+            "    while chunk:\n"
+            "        written = os.write(fd, chunk)\n"
+            "        chunk = chunk[written:]\n"
+            "def copy(source, log_fd, output_fd, index):\n"
+            "    while True:\n"
+            "        chunk = source.read(65536)\n"
+            "        if not chunk:\n"
+            "            return\n"
+            "        counts[index] += len(chunk)\n"
+            "        write_all(log_fd, chunk)\n"
+            "        os.fsync(log_fd)\n"
+            "        write_all(output_fd, chunk)\n"
+            "threads = [threading.Thread(target=copy, args=(child.stdout, stdout_log, 1, 0)), threading.Thread(target=copy, args=(child.stderr, stderr_log, 2, 1))]\n"
+            "[thread.start() for thread in threads]\n"
+            "status = child.wait()\n"
+            "[thread.join() for thread in threads]\n"
+            "os.close(stdout_log)\n"
+            "os.close(stderr_log)\n"
+            "receipt = {'v': 1, 'exit_status': status, 'started': started, 'ended': datetime.now(timezone.utc).isoformat(), 'stdout_bytes': counts[0], 'stderr_bytes': counts[1]}\n"
+            "try:\n"
+            "    fd = os.open(receipts / 'receipt.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n"
+            "    with os.fdopen(fd, 'w', encoding='utf-8') as handle:\n"
+            "        json.dump(receipt, handle, separators=(',', ':'))\n"
+            "        handle.flush()\n"
+            "        os.fsync(handle.fileno())\n"
+            "except OSError as exc:\n"
+            "    print(f'orrery-review: could not write receipt: {exc}', file=sys.stderr)\n"
+            "    raise SystemExit(1)\n"
+            "raise SystemExit(status)\n"
+        )
+    launcher_path.write_text(launcher)
     launcher_path.chmod(0o700)
     return launcher_path, environment_path
+
+
+def provider_state_paths(provider: str) -> list[Path]:
+    """Directories a provider CLI must write to start at all.
+
+    Measured, not assumed: a live Codex delegate fails at app-server
+    initialisation when its own home is read-only. Only the running
+    provider's own directory is granted, so a delegate still cannot
+    reach the other provider's credentials, the adoption or standing
+    stores, or anything on PATH.
+    """
+    paths: list[Path] = []
+    if provider == "openai":
+        candidate = codex_home()
+    else:
+        raw = os.environ.get("CLAUDE_CONFIG_DIR")
+        candidate = Path(raw).expanduser() if raw else Path.home() / ".claude"
+    try:
+        resolved = candidate.resolve(strict=False)
+    except OSError:
+        return paths
+    if resolved.is_dir():
+        paths.append(resolved)
+    return paths
+
+
+def write_receipt_unit(receipts: Path, unit: str | None, pgid: int | None = None) -> None:
+    payload: dict[str, Any] = {
+        "v": 1,
+        "unit": unit,
+        "owner_pid": os.getpid(),
+        "owner_start": process_start_time(os.getpid()),
+    }
+    if pgid is not None:
+        payload["pgid"] = pgid
+    path = receipts / "unit.json"
+    fd = receipt_open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def process_start_time(pid: int) -> int | None:
@@ -890,16 +1168,17 @@ def process_alive(pid: int) -> bool:
     return True
 
 
-def record_runtime_owner(run_dir: Path, unit: str = "") -> None:
+def record_runtime_owner(run_dir: Path, unit: str = "", task_owned: bool = False) -> None:
     # No numeric sentinel for an unknown start time. It has to read back as
     # unattributable rather than as a match for any owner.
     start = process_start_time(os.getpid())
     (run_dir / "owner").write_text(
-        f"{os.getpid()} {start if start is not None else 'unknown'} {unit}\n"
+        f"{os.getpid()} {start if start is not None else 'unknown'} {unit or ('-' if task_owned else '')}"
+        f"{' task' if task_owned else ''}\n"
     )
 
 
-def read_runtime_owner(run_dir: Path) -> tuple[int | None, str]:
+def read_runtime_owner(run_dir: Path) -> tuple[int | None, str, bool]:
     """The recorded start time and unit name, parsed independently.
 
     An unparseable start time must not also discard the unit name, or an
@@ -908,7 +1187,7 @@ def read_runtime_owner(run_dir: Path) -> tuple[int | None, str]:
     try:
         fields = (run_dir / "owner").read_text().split()
     except OSError:
-        return None, ""
+        return None, "", False
 
     start: int | None = None
     if len(fields) > 1:
@@ -917,7 +1196,7 @@ def read_runtime_owner(run_dir: Path) -> tuple[int | None, str]:
         except ValueError:
             start = None
 
-    return start, fields[2] if len(fields) > 2 else ""
+    return start, fields[2] if len(fields) > 2 else "", len(fields) > 3 and fields[3] == "task"
 
 
 def force_remove(path: Path) -> bool:
@@ -985,7 +1264,9 @@ def sweep_stale_runtime(root: Path) -> None:
             continue
 
         owner = int(parts[1])
-        recorded, unit = read_runtime_owner(entry)
+        recorded, unit, task_owned = read_runtime_owner(entry)
+        if task_owned or unit.startswith("orrery-task-"):
+            continue
         live_start = process_start_time(owner)
 
         if (
@@ -1401,6 +1682,9 @@ def main(
     try:
         if invocation is None:
             invocation = parse_args(sys.argv[1:])
+    except PlainUsageError as exc:
+        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+        return 2
     except UsageError as exc:
         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
         print(usage(), file=sys.stderr, end="")
@@ -1535,7 +1819,11 @@ def main(
         )
         return 2
 
-    availability = provider_status(role_config.provider)
+    try:
+        availability = role_availability(role_config)
+    except RuntimeConfigError as exc:
+        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+        return 2
     if availability.state is Availability.UNAVAILABLE:
         return handle_failed_attempt(
             invocation,
@@ -1559,7 +1847,7 @@ def main(
             role=role_config,
             detail=availability.reason,
         )
-    elif availability.state is Availability.READY:
+    elif availability.state is Availability.READY and role_config.endpoint is None:
         visibility, visibility_reason = model_status(role_config, availability)
         if visibility is Availability.UNAVAILABLE:
             return handle_failed_attempt(
@@ -1579,6 +1867,32 @@ def main(
     output_path = invocation.output_path
     prompt = invocation.prompt
     role_id = invocation.role_id
+    workspace = (invocation.workspace or Path.cwd()).resolve(strict=True)
+    receipts = invocation.receipts
+
+    runtime_base = Path(
+        os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache"))
+    )
+    # Keep the established internal runtime namespace so interrupted runs
+    # from older Orrery versions are reclaimed by the same sweeper.
+    runtime_root = runtime_base / "orrery-review"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    runtime_root.chmod(0o700)
+    trusted_paths = {
+        "real home": Path.home(),
+        "CODEX_HOME": codex_home(),
+        "Claude configuration directory": Path(
+            os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+        ),
+        "XDG state root": Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+        ),
+        "run directory root": runtime_root,
+    }
+    overlap = workspace_overlap(workspace, trusted_paths)
+    if overlap is not None:
+        print(f"{PROGRAM_NAME}: refusing overlapping {overlap}", file=sys.stderr)
+        return 2
 
     # systemd gives the run control-group containment and a RuntimeMaxSec
     # backstop. Where it does not exist, such as on macOS, the run degrades
@@ -1588,44 +1902,6 @@ def main(
     use_systemd = all(
         shutil.which(tool) is not None for tool in ("systemd-run", "systemctl")
     )
-    if use_systemd and role_config.read_only:
-        if not read_only_paths_enforced(Path.cwd()):
-            print(
-                f"{PROGRAM_NAME}: this environment cannot enforce "
-                "ReadOnlyPaths; workspace write protection for this "
-                "read-only role is tool-level only.",
-                file=sys.stderr,
-            )
-            incident_log.record(
-                "containment-degraded",
-                program=PROGRAM_NAME,
-                role=role_config,
-                detail=(
-                    "ReadOnlyPaths unenforceable; workspace write "
-                    "protection is tool-level only"
-                ),
-            )
-    if not use_systemd:
-        print(
-            f"{PROGRAM_NAME}: systemd is unavailable; running without "
-            "control-group containment.",
-            file=sys.stderr,
-        )
-        incident_log.record(
-            "containment-degraded",
-            program=PROGRAM_NAME,
-            role=role_config,
-            detail="systemd unavailable; process-group containment only",
-        )
-        if role_config.read_only:
-            # ReadOnlyPaths exists only on the systemd path, so here the
-            # workspace is guarded by tool permissions alone.
-            print(
-                f"{PROGRAM_NAME}: workspace write protection for this "
-                "read-only role is tool-level only without systemd.",
-                file=sys.stderr,
-            )
-
     display, purpose = role_label(role_id)
     print(
         (
@@ -1649,17 +1925,9 @@ def main(
         flush=True,
     )
 
-    runtime_base = Path(
-        os.environ.get("XDG_RUNTIME_DIR", str(Path.home() / ".cache"))
-    )
-    # Keep the established internal runtime namespace so interrupted runs
-    # from older Orrery versions are reclaimed by the same sweeper.
-    runtime_root = runtime_base / "orrery-review"
-    runtime_root.mkdir(parents=True, exist_ok=True)
-    runtime_root.chmod(0o700)
-
+    unit_prefix = "orrery-task" if receipts is not None else "orrery-review"
     unit_base = (
-        f"orrery-review-{os.getpid()}-"
+        f"{unit_prefix}-{os.getpid()}-"
         f"{uuid.uuid4().hex[:10]}"
     )
     unit = f"{unit_base}.service"
@@ -1667,7 +1935,6 @@ def main(
     unit_may_exist = False
     control_returned = False
     canary_snapshot = None
-
     def return_control() -> None:
         nonlocal control_returned
         if not control_returned:
@@ -1689,6 +1956,9 @@ def main(
     # state at garbage collection even when the unit could not be confirmed
     # stopped, which is exactly the case where the state has to survive.
     run_dir: Path | None = None
+    # Held outside the try so the cleanup block can publish the log
+    # even when the run failed before reaching its normal exit.
+    published_log_path: Path | None = None
     unit_stopped = True
     handled_signals: set[signal.Signals] = set()
 
@@ -1714,12 +1984,64 @@ def main(
         )
         # mkdtemp's mode is masked by the umask, so it is set explicitly.
         run_dir.chmod(0o700)
-        record_runtime_owner(run_dir, unit if use_systemd else "")
+        writable_paths = [run_dir]
+        if not role_config.read_only:
+            writable_paths.append(workspace)
+        if receipts is not None:
+            writable_paths.append(receipts)
+        # The provider CLIs write working state of their own outside the
+        # run directory and refuse to start without it: Codex 0.104 dies
+        # in "failed to initialize in-process app-server client" when its
+        # own home is read-only. The provider's own directory is therefore
+        # writable; every other user path, including the launcher's PATH,
+        # the adoption and standing stores, and the other provider's
+        # configuration, stays read-only.
+        writable_paths.extend(provider_state_paths(role_config.provider))
+        confinement_ok = use_systemd and confinement_enforced(
+            writable_paths, run_dir
+        )
+        if not confinement_ok:
+            detail = (
+                "composed filesystem confinement unenforceable"
+                if use_systemd
+                else "systemd unavailable; composed filesystem confinement unenforceable"
+            )
+            incident_log.record(
+                "containment-degraded",
+                program=PROGRAM_NAME,
+                role=role_config,
+                detail=detail,
+            )
+            if os.environ.get("ORRERY_ALLOW_UNCONFINED") != "1":
+                print(
+                    f"{PROGRAM_NAME}: confinement is unavailable; set "
+                    "ORRERY_ALLOW_UNCONFINED=1 to proceed.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"{PROGRAM_NAME}: confinement is not enforced "
+                "(ORRERY_ALLOW_UNCONFINED=1).",
+                file=sys.stderr,
+            )
+        record_runtime_owner(run_dir, unit if use_systemd else "", receipts is not None)
         tmp_dir = run_dir / "tmp"
         tmp_dir.mkdir()
         tmp_dir.chmod(0o700)
-        verdict_path = run_dir / "verdict.txt"
+        verdict_path = (
+            receipts / "result.txt" if receipts is not None else run_dir / "verdict.txt"
+        )
+        if receipts is not None:
+            try:
+                descriptor = receipt_open(
+                    verdict_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                )
+                os.close(descriptor)
+            except OSError as exc:
+                print(f"{PROGRAM_NAME}: could not write receipt: {exc}", file=sys.stderr)
+                return 1
         log_path = run_dir / "agent.log"
+        published_log_path = log_path
         prompt_path = run_dir / "assignment.txt"
         prompt_path.write_text(role_handoff(role_config, prompt, verbosity))
         prompt_path.chmod(0o600)
@@ -1728,7 +2050,7 @@ def main(
             settings_path = run_dir / "claude-settings.json"
             settings_path.write_text(
                 json.dumps(
-                    claude_sandbox_settings(role_config, Path.cwd()),
+                    claude_sandbox_settings(role_config, workspace),
                     indent=2,
                 )
                 + "\n"
@@ -1737,7 +2059,7 @@ def main(
             if canary_snapshot is None:
                 # First attempt only: a retried attempt must not mistake
                 # the previous attempt's litter for pre-existing files.
-                canary_snapshot = claude_canary_snapshot(Path.cwd())
+                canary_snapshot = claude_canary_snapshot(workspace)
         try:
             provider_arguments = delegated_command(
                 role_config,
@@ -1764,6 +2086,7 @@ def main(
                 role_config.provider,
                 role_config.id,
                 role_config.endpoint,
+                receipts,
             )
             command = [
                 "systemd-run",
@@ -1787,16 +2110,19 @@ def main(
                 # at most to the hard cap, fires first and reports
                 # diagnostics.
                 f"--property=RuntimeMaxSec={hard_timeout_seconds + 60}s",
-                # Kernel-level write protection for read-only roles. The
-                # Claude sandbox no longer carries denyWrite (its
-                # filesystem layer is disabled to keep shell execution
-                # alive); the unit enforces it for every provider.
-                *(
-                    [f"--property=ReadOnlyPaths={Path.cwd()}"]
-                    if role_config.read_only
-                    else []
-                ),
-                f"--working-directory={Path.cwd()}",
+                # ProtectSystem=strict makes the whole hierarchy
+                # read-only while leaving /dev, /proc and /sys alone.
+                # A bare ReadOnlyPaths=/ also froze /proc, which broke
+                # the provider's own bubblewrap sandbox ("setting up
+                # uid map: Read-only file system") in a live run.
+                "--property=ProtectSystem=strict",
+                "--property=ProtectHome=read-only",
+                *[
+                    f"--property=ReadWritePaths={path}"
+                    for path in dict.fromkeys(writable_paths)
+                ],
+                "--property=NoNewPrivileges=yes",
+                f"--working-directory={workspace}",
                 sys.executable,
                 str(launcher_path),
                 str(environment_path),
@@ -1805,7 +2131,23 @@ def main(
         else:
             # The provider runs as a direct child in its own session, with the
             # same scrubbed environment the launcher would have applied.
-            command = provider_arguments
+            if receipts is not None:
+                launcher_path, environment_path = write_service_launcher(
+                    run_dir,
+                    tmp_dir,
+                    role_config.provider,
+                    role_config.id,
+                    role_config.endpoint,
+                    receipts,
+                )
+                command = [
+                    sys.executable,
+                    str(launcher_path),
+                    str(environment_path),
+                    *provider_arguments,
+                ]
+            else:
+                command = provider_arguments
 
         started = time.monotonic()
         deadline = started + timeout_seconds
@@ -1813,13 +2155,13 @@ def main(
         workspace_before = (
             None
             if role_config.read_only
-            else git_workspace_fingerprint()
+            else git_workspace_fingerprint(workspace)
         )
 
         def workspace_requires_inspection() -> bool:
             if role_config.read_only:
                 return False
-            workspace_after = git_workspace_fingerprint()
+            workspace_after = git_workspace_fingerprint(workspace)
             return (
                 workspace_before is None
                 or workspace_after is None
@@ -1843,8 +2185,16 @@ def main(
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
+                        cwd=workspace,
                     )
-                    wait_for_unit_registration(process, unit)
+                    registered = wait_for_unit_registration(process, unit)
+                    if receipts is not None and registered:
+                        try:
+                            write_receipt_unit(receipts, unit)
+                        except OSError as exc:
+                            terminate_group(process)
+                            print(f"{PROGRAM_NAME}: could not write receipt: {exc}", file=sys.stderr)
+                            return 1
                 else:
                     process = subprocess.Popen(
                         command,
@@ -1852,13 +2202,28 @@ def main(
                         stdout=log_handle,
                         stderr=subprocess.STDOUT,
                         start_new_session=True,
-                        env=provider_environment(
-                            role_config.provider,
-                            tmp_dir,
-                            role_config.id,
-                            role_config.endpoint,
+                        cwd=workspace,
+                        env=(
+                            None
+                            if receipts is not None
+                            else provider_environment(
+                                role_config.provider,
+                                tmp_dir,
+                                role_config.id,
+                                role_config.endpoint,
+                            )
                         ),
                     )
+                    if receipts is not None:
+                        try:
+                            write_receipt_unit(receipts, None, process.pid)
+                        except OSError as exc:
+                            terminate_group(process)
+                            print(
+                                f"{PROGRAM_NAME}: could not write receipt: {exc}",
+                                file=sys.stderr,
+                            )
+                            return 1
             finally:
                 signal.pthread_sigmask(
                     signal.SIG_SETMASK,
@@ -1868,7 +2233,7 @@ def main(
             timed_out = False
             final_growth_age: float | None = None
             last_size = 0
-            last_echo_at: float | None = None
+            stream_offset = 0
             extension_recorded = False
             while True:
                 now = time.monotonic()
@@ -1916,21 +2281,25 @@ def main(
                     elapsed = int(time.monotonic() - started)
                     line = f"  still running · {elapsed}s elapsed"
                     if grew:
-                        delta = size - last_size
+                        line += f" · +{size - last_size} B output"
                         last_size = size
-                        line += f" · +{delta} B output"
-                        if (
-                            last_echo_at is None
-                            or time.monotonic() - last_echo_at
-                            >= CONTENT_ECHO_SECONDS
-                        ):
-                            content = sanitise_provider_text(
-                                newest_log_line(log_path)
-                            )[:140]
-                            if content:
-                                line += f" · {content}"
-                                last_echo_at = time.monotonic()
                     print(line, file=sys.stderr, flush=True)
+                    if grew and invocation.stream_mode != "off":
+                        stream_offset = stream_new_lines(
+                            log_path,
+                            stream_offset,
+                            invocation.stream_mode,
+                        )
+
+            # A run that finishes inside the first poll never reaches
+            # the streaming branch above, and every run has a tail
+            # written after its last poll, so the remainder is flushed
+            # once the process is done. A timed-out run is excluded:
+            # its diagnostics tail already prints the same bytes.
+            if not timed_out and invocation.stream_mode != "off":
+                stream_offset = stream_new_lines(
+                    log_path, stream_offset, invocation.stream_mode
+                )
 
             if timed_out:
                 # Reported before the stop, so a wedged user bus or an
@@ -2185,6 +2554,26 @@ def main(
 
         # Only once the provider tree is provably stopped; sweeping under
         # a live CLI would race its own graceful cleanup.
+        # Published before the run directory is reclaimed, on every
+        # path: a timed out or interrupted run is exactly when the
+        # delegate's own working output is most worth keeping. A
+        # failure here is reported, never fatal, because the log is a
+        # diagnostic and not the run's product.
+        if invocation.log_path is not None and published_log_path is not None:
+            try:
+                publish_atomically(published_log_path, invocation.log_path)
+            except OSError as exc:
+                report(
+                    "the delegate log could not be written to "
+                    f"{invocation.log_path}: {exc}"
+                )
+                incident_log.record(
+                    "output-failure",
+                    program=PROGRAM_NAME,
+                    role=state.role if state is not None else None,
+                    detail=f"the delegate log could not be published: {exc}",
+                )
+
         if canary_snapshot is not None and unit_stopped:
             swept = sweep_claude_canaries(canary_snapshot)
             if swept:

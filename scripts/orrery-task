@@ -1,0 +1,922 @@
+#!/usr/bin/env python3
+"""Create, dispatch, and verify durable Orrery task contracts."""
+
+from __future__ import annotations
+
+import json
+import os
+import hashlib
+import random
+import signal
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from orrery_fallback import git_workspace_fingerprint  # noqa: E402
+from orrery_ledger import (  # noqa: E402
+    LedgerError,
+    _atomic_write,
+    amend_task,
+    append_record,
+    control_lock,
+    create_task,
+    ensure_worktree,
+    load_contract,
+    merge_branch,
+    remove_worktree,
+    read_ledger,
+    repository_root,
+    repair_ledger,
+    task_ids,
+    worktree_path,
+)
+from orrery_runtime import RuntimeConfigError, load_role  # noqa: E402
+
+LATER = frozenset()
+
+
+def usage() -> int:
+    print(
+        "usage: orrery-task create|list|show|status|amend|run|verify|resume|merge|cancel|close", file=sys.stderr
+    )
+    return 2
+
+
+def read_contract(path: str) -> dict:
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LedgerError(f"contract file is unreadable: {path}") from exc
+    if not isinstance(value, dict):
+        raise LedgerError("$: must be an object")
+    return value
+
+
+def git(root: Path, *arguments: str, text: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        check=False,
+    )
+
+
+def rel(root: Path, path: Path) -> str:
+    return os.path.relpath(path, root)
+
+
+def role_data(role: object) -> dict:
+    endpoint = getattr(role, "endpoint", None)
+    return {
+        "id": role.id,
+        "provider": role.provider,
+        "model": role.model,
+        "thinking": role.thinking,
+        "endpoint": endpoint.id if endpoint else None,
+    }
+
+
+def handoff(contract: dict) -> str:
+    scope = contract["scope"]
+    criteria = "\n".join(
+        f"- {entry['id']}: {entry['statement']}\n  Verify: {entry['verification']['command']}"
+        for entry in contract["acceptance_criteria"]
+    )
+    return (
+        f"Goal:\n{contract['goal']}\n\nInclude: {scope['include']}\nExclude: {scope['exclude']}\n"
+        "Changes outside the include set, or within the exclude set, will be rejected at merge.\n\n"
+        f"Acceptance criteria:\n{criteria}\n\nDo not run git commit. Stop and report instead of improvising if judgement beyond the specification is required.\n"
+    )
+
+
+def process_start_time(pid: int) -> int | None:
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def launch_alive(attempt: Path) -> bool:
+    try:
+        launch = json.loads((attempt.parent / "launch.json").read_text())
+        pid, start = launch["controller_pid"], launch["controller_start"]
+    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(pid, int) and process_start_time(pid) == start
+
+
+def parse_run_flags(flags: list[str]) -> tuple[bool, bool, list[str]]:
+    local = {"--allow-dirty-baseline", "--accept-changed-worktree"}
+    forwarded: list[str] = []
+    index = 0
+    while index < len(flags):
+        flag = flags[index]
+        if flag in local:
+            index += 1
+            continue
+        if flag == "--no-fallback":
+            forwarded.append(flag)
+            index += 1
+            continue
+        if flag in {"--timeout", "--hard-timeout", "--approve-fallback", "--approval-scope"}:
+            if index + 1 >= len(flags):
+                raise LedgerError(f"invalid run argument: {flag}")
+            forwarded.extend((flag, flags[index + 1]))
+            index += 2
+            continue
+        if any(flag.startswith(prefix + "=") for prefix in ("--timeout", "--hard-timeout", "--approve-fallback", "--approval-scope")):
+            forwarded.append(flag)
+            index += 1
+            continue
+        raise LedgerError(f"invalid run argument: {flag}")
+    return "--allow-dirty-baseline" in flags, "--accept-changed-worktree" in flags, forwarded
+
+
+def current(store: Path, task_id: str) -> tuple[list[dict], str]:
+    records, torn, _ = read_ledger(store, task_id)
+    if torn:
+        raise LedgerError("ledger has a torn tail; run status --repair")
+    return records, records[-1]["to"]
+
+
+def evidence_path(root: Path, task_id: str, sequence: int) -> Path:
+    path = root / ".orrery" / "evidence"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path / task_id / f"{sequence}.json"
+
+
+def verification_timeout() -> float:
+    """The per-command verification budget, overridable for tests."""
+    try:
+        value = float(os.environ.get("ORRERY_VERIFY_TIMEOUT_SECONDS", "600"))
+    except ValueError:
+        return 600.0
+    return value if value > 0 else 600.0
+
+
+def run_verification(command: str, workdir: Path) -> tuple[int, str]:
+    """Run one contract verification command under the containment ladder."""
+    budget = verification_timeout()
+    use_systemd = all(
+        shutil.which(tool) is not None for tool in ("systemd-run", "systemctl")
+    )
+    if use_systemd:
+        unit = f"orrery-verify-{os.getpid()}-{random.randrange(1 << 30):x}"
+        wrapped = [
+            "systemd-run",
+            "--user",
+            "--wait",
+            "--collect",
+            "--pipe",
+            f"--unit={unit}",
+            f"--property=RuntimeMaxSec={int(budget) + 60}",
+            f"--working-directory={workdir}",
+            "/bin/sh",
+            "-c",
+            command,
+        ]
+        timed_out = False
+        try:
+            result = subprocess.run(
+                wrapped,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=budget + 30,
+                check=False,
+            )
+            return result.returncode, result.stdout
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            captured = exc.stdout or ""
+            if isinstance(captured, bytes):
+                captured = captured.decode(errors="replace")
+            return 124, captured
+        finally:
+            if timed_out:
+                subprocess.run(["systemctl", "--user", "stop", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["systemctl", "--user", "kill", "--kill-who=all", "--signal=KILL", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    print("orrery-task: systemd is unavailable; verification uses process-group containment.", file=sys.stderr)
+    process: subprocess.Popen[str] | None = None
+    timed_out = False
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=workdir,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        output, _ = process.communicate(timeout=budget)
+        return process.returncode, output
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        captured = exc.stdout or ""
+        if isinstance(captured, bytes):
+            captured = captured.decode(errors="replace")
+        return 124, captured
+    finally:
+        if timed_out and process is not None:
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+
+
+def write_evidence(root: Path, task_id: str, sequence: int, data: dict) -> str:
+    path = evidence_path(root, task_id, sequence)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    _atomic_write(
+        path, (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode(), 0o600
+    )
+    return rel(root, path)
+
+
+def evidence_digest(root: Path, proof: str) -> str:
+    return hashlib.sha256((root / proof).read_bytes()).hexdigest()
+
+
+def dispatch_alive(attempt: Path) -> bool:
+    """Return whether the unit or process group recorded for an attempt lives."""
+    try:
+        unit = json.loads((attempt / "unit.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    name = unit.get("unit")
+    if name:
+        return subprocess.run(
+            ["systemctl", "--user", "is-active", str(name)], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, check=False,
+        ).returncode == 0
+    pgid = unit.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 0:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def receipt_failure(attempt: Path, returncode: int | None = None) -> str | None:
+    receipt_path = attempt / "receipt.json"
+    if not receipt_path.exists():
+        if returncode == 124:
+            return "timeout"
+        return "spawn-failure" if not (attempt / "unit.json").exists() else "provider-exit"
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except json.JSONDecodeError:
+        return "provider-exit"
+    if receipt.get("exit_status") != 0:
+        return "provider-exit"
+    result = attempt / "result.txt"
+    if not result.exists() or not result.read_text().strip():
+        try:
+            for line in reversed((attempt / "stdout.log").read_text().splitlines()):
+                value = json.loads(line)
+                if isinstance(value, dict) and isinstance(value.get("result"), str):
+                    _atomic_write(result, (value["result"] + "\n").encode(), 0o600)
+                    return None
+        except (OSError, json.JSONDecodeError):
+            pass
+        return "missing-result"
+    return None
+
+
+def verify(
+    root: Path,
+    store: Path,
+    task_id: str,
+    contract: dict,
+    sequence: int,
+    worktree: Path,
+    base: str,
+    commit: str,
+    packet: dict,
+    no_change: bool,
+) -> int:
+    outcomes = []
+    failed = None
+    for criterion in contract["acceptance_criteria"]:
+        workdir = (worktree / criterion["verification"].get("workdir", "")).resolve()
+        if workdir != worktree.resolve() and worktree.resolve() not in workdir.parents:
+            failed = f"workdir {workdir} is outside the task worktree"
+            outcomes.append({"criterion": criterion["id"], "command": criterion["verification"]["command"], "exit_status": 1, "duration_seconds": 0, "log": ""})
+            break
+        log = (
+            root
+            / ".orrery"
+            / "evidence"
+            / task_id
+            / f"{sequence}-{criterion['id']}.log"
+        )
+        log.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        started = time.monotonic()
+        command = criterion["verification"]["command"]
+        status, output = run_verification(command, workdir)
+        _atomic_write(
+            log, output.encode() if isinstance(output, str) else output, 0o600
+        )
+        outcome = {
+            "criterion": criterion["id"],
+            "command": command,
+            "exit_status": status,
+            "duration_seconds": round(time.monotonic() - started, 3),
+            "log": rel(root, log),
+        }
+        outcomes.append(outcome)
+        clean = git(worktree, "status", "--porcelain").stdout == ""
+        unchanged = git(worktree, "rev-parse", "HEAD").stdout.strip() == commit
+        if not clean or not unchanged:
+            failed = "verifier-mutated-tree"
+            break
+        if status != 0:
+            failed = f"criterion {criterion['id']}"
+            break
+    packet["verification"] = outcomes
+    proof = write_evidence(root, task_id, sequence, packet)
+    proof_digest = evidence_digest(root, proof)
+    with control_lock(root) as locked:
+        records, state = current(locked, task_id)
+        digest = records[-1]["contract_digest"]
+        if no_change:
+            append_record(locked, task_id, {
+                "from": state, "to": "NO_CHANGE", "actor": "runner",
+                "reason": "verification-passed" if not failed else f"verification-failed: {failed}",
+                "contract_digest": digest, "evidence": proof,
+                "evidence_sha256": proof_digest,
+            })
+            return 1 if failed else 0
+        if failed:
+            append_record(
+                locked,
+                task_id,
+                {
+                    "from": state,
+                    "to": "VERIFICATION_FAILED",
+                    "actor": "runner",
+                    "reason": failed,
+                    "contract_digest": digest,
+                    "evidence": proof,
+                    "evidence_sha256": proof_digest,
+                },
+            )
+            return 1
+        append_record(
+            locked,
+            task_id,
+            {
+                "from": state,
+                "to": "VERIFICATION_PASSED",
+                "actor": "runner",
+                "contract_digest": digest,
+                "evidence": proof,
+                "evidence_sha256": proof_digest,
+            },
+        )
+        append_record(
+            locked,
+            task_id,
+            {
+                "from": "VERIFICATION_PASSED",
+                "to": "AWAITING_MERGE",
+                "actor": "runner",
+                "contract_digest": digest,
+                "evidence": proof,
+                "evidence_sha256": proof_digest,
+            },
+        )
+    return 0
+
+
+def complete_dispatch(
+    root: Path, task_id: str, contract: dict, dispatch_record: dict,
+    attempt: Path, worktree: Path, role: object, returncode: int,
+    stderr_tail: list[str] | None = None,
+) -> int:
+    """Classify a completed receipt and record its commit and verification path."""
+    store = root / ".orrery"
+    sequence = dispatch_record["dispatch"]["seq"]
+    digest = dispatch_record["contract_digest"]
+    base = dispatch_record["gate"]["base_head"]
+    gate = dispatch_record["gate"]
+    reason = receipt_failure(attempt, returncode)
+    if reason:
+        partial = None
+        if git(worktree, "status", "--porcelain").stdout:
+            partial_path = attempt.parent / "partial.patch"
+            _atomic_write(partial_path, git(worktree, "diff").stdout.encode(), 0o600)
+            partial = rel(root, partial_path)
+        if reason == "approval-required" and stderr_tail is not None:
+            _atomic_write(attempt.parent / "consent.txt", "".join(stderr_tail).encode(), 0o600)
+        with control_lock(root) as locked:
+            state = current(locked, task_id)[1]
+            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial})
+        return returncode or 1
+    changed = git(worktree, "status", "--porcelain").stdout != ""
+    if changed:
+        git(worktree, "add", "-A")
+        message = f"{task_id} {contract['title']} (dispatch {sequence})\n\nOrrery-Role: {role.id} {role.provider}/{role.model}"
+        committed = git(worktree, "-c", "user.name=Orrery", "-c", "user.email=orrery@localhost", "commit", "-m", message)
+        if committed.returncode:
+            raise LedgerError(committed.stderr.strip())
+        commit, next_state = git(worktree, "rev-parse", "HEAD").stdout.strip(), "IMPLEMENTED"
+    else:
+        commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
+        next_state = "IMPLEMENTED" if commit != base else "NO_CHANGE"
+    with control_lock(root) as locked:
+        state = current(locked, task_id)[1]
+        record = {"from": state, "to": next_state, "actor": "runner", "contract_digest": digest}
+        if next_state == "IMPLEMENTED":
+            record["commit"] = commit
+        implemented = next((entry for entry in reversed(current(locked, task_id)[0]) if entry.get("commit") == commit), None)
+        if next_state != "IMPLEMENTED" or implemented is None:
+            append_record(locked, task_id, record)
+    receipt = json.loads((attempt / "receipt.json").read_text())
+    diff = None
+    if next_state == "IMPLEMENTED":
+        patch = attempt.parent / "change.patch"
+        _atomic_write(patch, git(worktree, "diff", f"{base}..{commit}").stdout.encode(), 0o600)
+        lines = git(worktree, "diff", "--name-status", f"{base}..{commit}").stdout.splitlines()
+        files = [{"path": x.split("\t", 1)[-1], "status": x.split("\t", 1)[0]} for x in lines]
+        include, exclude = contract["scope"]["include"], contract["scope"]["exclude"]
+        out = [x["path"] for x in files if not any(x["path"] == p or x["path"].startswith(p + "/") for p in include) or any(x["path"] == p or x["path"].startswith(p + "/") for p in exclude)]
+        diff = {"files": files, "stat": git(worktree, "diff", "--stat", f"{base}..{commit}").stdout, "patch": rel(root, patch)}
+    else:
+        out = []
+    packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": [{"attempt": 1, "receipt": receipt}], "diff": diff, "out_of_scope": out, "usage": {"unavailable": "unrecognised attempt artefacts"}, "worker_claim": (attempt / "result.txt").read_text()}
+    return verify(root, store, task_id, contract, sequence, worktree, base, commit, packet, next_state == "NO_CHANGE")
+
+
+def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
+    allow_dirty, accept_changed, forwarded = parse_run_flags(flags)
+    store = root / ".orrery"
+    tracked = git(root, "ls-files", ".orrery").stdout.strip()
+    if tracked:
+        raise LedgerError("the .orrery ledger must not be tracked")
+    records, state = current(store, task_id)
+    if state in {"DISPATCH_FAILED", "INTERRUPTED", "VERIFICATION_FAILED"}:
+        previous = next((r for r in reversed(records) if r.get("worktree_fingerprint")), None)
+        candidate = worktree_path(root, task_id)
+        if previous and candidate.exists() and git_workspace_fingerprint(candidate) != previous["worktree_fingerprint"] and not accept_changed:
+            raise LedgerError("task worktree changed; use --accept-changed-worktree")
+        with control_lock(root) as locked:
+            state = current(locked, task_id)[1]
+            append_record(locked, task_id, {"from": state, "to": "READY", "actor": "user", "reason": "retry", "contract_digest": records[-1]["contract_digest"]})
+        records, state = current(store, task_id)
+    if state != "READY":
+        raise LedgerError(f"task {task_id} is {state}")
+    previous = next(
+        (r for r in reversed(records) if r.get("worktree_fingerprint")), None
+    )
+    candidate_worktree = worktree_path(root, task_id)
+    if (
+        previous
+        and candidate_worktree.exists()
+        and git_workspace_fingerprint(candidate_worktree)
+        != previous["worktree_fingerprint"]
+        and not accept_changed
+    ):
+        raise LedgerError("task worktree changed; use --accept-changed-worktree")
+    dirty = git(root, "status", "--porcelain").stdout
+    if dirty and not allow_dirty:
+        raise LedgerError("baseline worktree is dirty; use --allow-dirty-baseline")
+    base = git(root, "rev-parse", "HEAD").stdout.strip()
+    symbolic = git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip() or "detached"
+    fingerprint = git_workspace_fingerprint(root)
+    with control_lock(root) as locked:
+        records, state = current(locked, task_id)
+        if state != "READY":
+            raise LedgerError(f"task {task_id} is {state}")
+        for other in task_ids(locked):
+            if other != task_id and current(locked, other)[1] in {
+                "DISPATCHED",
+                "IN_PROGRESS",
+            }:
+                raise LedgerError(f"task {other} is busy")
+        sequence = 1 + sum(r["to"] == "DISPATCHED" for r in records)
+        dispatch_root = root / ".orrery" / "dispatch"
+        sequence_dir = dispatch_root / task_id / str(sequence)
+        for component in (root / ".orrery", dispatch_root, dispatch_root / task_id, sequence_dir):
+            if component.is_symlink():
+                raise LedgerError(f"dispatch path is a symlink: {component}")
+        if sequence_dir.exists():
+            raise LedgerError(f"dispatch attempt already exists: {sequence_dir}")
+        sequence_dir.mkdir(mode=0o700, parents=True)
+        attempt = sequence_dir / "attempt-1"
+        try:
+            attempt.mkdir(mode=0o700)
+        except FileExistsError as exc:
+            raise LedgerError(f"dispatch attempt already exists: {attempt}") from exc
+        digest = records[-1]["contract_digest"]
+        contract_path = locked / "contracts" / f"{task_id}.json"
+        try:
+            contract_bytes = contract_path.read_bytes()
+            contract = json.loads(contract_bytes)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LedgerError("task contract is unreadable") from exc
+        if hashlib.sha256(contract_bytes).hexdigest() != digest:
+            raise LedgerError("task contract digest differs from READY record; amend the task")
+        from orrery_ledger import validate_contract  # noqa: E402
+        contract = validate_contract(contract, task_id)
+        role = load_role(contract["assigned_role"], cwd=root)
+        prompt = attempt.parent / "prompt.txt"
+        _atomic_write(prompt, handoff(contract).encode(), 0o600)
+        _atomic_write(
+            attempt.parent / "launch.json",
+            (
+                json.dumps(
+                    {
+                        "v": 1,
+                        "controller_pid": os.getpid(),
+                        "controller_start": process_start_time(os.getpid()),
+                    }
+                )
+                + "\n"
+            ).encode(),
+            0o600,
+        )
+        branch = f"orrery/{task_id}"
+        append_record(
+            locked,
+            task_id,
+            {
+                "from": "READY",
+                "to": "DISPATCHED",
+                "actor": "user",
+                "reason": None,
+                "gate": {
+                    "base_head": base,
+                    "symbolic_ref": symbolic,
+                    "dirty_fingerprint": fingerprint,
+                    "dirty_baseline": allow_dirty,
+                },
+                "dispatch": {
+                    "seq": sequence,
+                    "receipts": str(attempt),
+                    "worktree": str(candidate_worktree),
+                    "branch": branch,
+                },
+                "contract_digest": digest,
+            },
+        )
+    worktree = ensure_worktree(root, task_id, base)
+    with control_lock(root) as locked:
+        append_record(
+            locked,
+            task_id,
+            {
+                "from": "DISPATCHED",
+                "to": "IN_PROGRESS",
+                "actor": "runner",
+                "reason": "attempt",
+                "attempt": 1,
+                **role_data(role),
+                "contract_digest": digest,
+            },
+        )
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("orrery-review")),
+        "--role",
+        role.id,
+        "--workspace",
+        str(worktree),
+        "--receipts",
+        str(attempt),
+    ]
+    if (
+        "--timeout" not in forwarded
+        and not any(x.startswith("--timeout=") for x in forwarded)
+        and contract.get("budget", {}).get("timeout_seconds")
+    ):
+        command += ["--timeout", str(contract["budget"]["timeout_seconds"])]
+    if (
+        "--hard-timeout" not in forwarded
+        and not any(x.startswith("--hard-timeout=") for x in forwarded)
+        and contract.get("budget", {}).get("hard_timeout_seconds")
+    ):
+        command += ["--hard-timeout", str(contract["budget"]["hard_timeout_seconds"])]
+    process = subprocess.Popen(
+        command + forwarded,
+        cwd=root,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stderr_tail: list[str] = []
+
+    def tee_stderr() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+            stderr_tail.append(line)
+            if len(stderr_tail) > 80:
+                del stderr_tail[0]
+
+    reader = threading.Thread(target=tee_stderr)
+    reader.start()
+    try:
+        assert process.stdin is not None
+        process.stdin.write(handoff(contract))
+        process.stdin.close()
+    except OSError:
+        pass
+    returncode = process.wait()
+    reader.join(timeout=10)
+    dispatch_record = next(record for record in reversed(current(store, task_id)[0]) if "dispatch" in record)
+    if returncode == 2:
+        return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, 2, stderr_tail)
+    if returncode == 75:
+        # The receipt wrapper intentionally has no receipt for a consent stop.
+        with control_lock(root) as locked:
+            append_record(locked, task_id, {"from": "IN_PROGRESS", "to": "DISPATCH_FAILED", "actor": "runner", "reason": "approval-required", "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": None})
+        return returncode
+    return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, returncode, stderr_tail)
+
+
+def rerun_verify(root: Path, task_id: str) -> int:
+    store = root / ".orrery"
+    contract = load_contract(store, task_id)
+    records, state = current(store, task_id)
+    if state not in {"IMPLEMENTED", "VERIFICATION_FAILED", "NO_CHANGE"}:
+        raise LedgerError(f"task {task_id} is {state}")
+    dispatch = next(r["dispatch"] for r in reversed(records) if "dispatch" in r)
+    sequence = dispatch["seq"]
+    worktree = Path(dispatch["worktree"])
+    base = next(
+        (r["commit"] for r in reversed(records) if r.get("commit")),
+        git(worktree, "rev-parse", "HEAD").stdout.strip(),
+    )
+    existing = evidence_path(root, task_id, sequence)
+    try:
+        packet = json.loads(existing.read_text())
+    except (OSError, json.JSONDecodeError):
+        packet = {
+            "v": 1,
+            "task_id": task_id,
+            "dispatch_seq": sequence,
+            "contract_digest": records[-1]["contract_digest"],
+            "verification": [],
+            "worker_claim": "",
+        }
+    return verify(
+        root,
+        store,
+        task_id,
+        contract,
+        sequence,
+        worktree,
+        base,
+        base,
+        packet,
+        state == "NO_CHANGE",
+    )
+
+
+def resume_task(root: Path, task_id: str) -> int:
+    store = root / ".orrery"
+    records, state = current(store, task_id)
+    if state not in {"DISPATCHED", "IN_PROGRESS"}:
+        print(f"{task_id} {state}")
+        return 0
+    dispatch_record = next(record for record in reversed(records) if "dispatch" in record)
+    dispatch = dispatch_record["dispatch"]
+    attempt = Path(dispatch["receipts"])
+    worktree = Path(dispatch["worktree"])
+    if dispatch_alive(attempt):
+        print(f"{task_id} still running")
+        return 0
+    if not (attempt / "unit.json").exists() and launch_alive(attempt):
+        print(f"{task_id} still starting")
+        return 0
+    contract = load_contract(store, task_id)
+    digest = dispatch_record["contract_digest"]
+    if (attempt / "receipt.json").exists():
+        if state == "DISPATCHED":
+            role = load_role(contract["assigned_role"], cwd=root)
+            with control_lock(root) as locked:
+                append_record(locked, task_id, {"from": "DISPATCHED", "to": "IN_PROGRESS", "actor": "runner", "reason": "attempt", "attempt": 1, **role_data(role), "contract_digest": digest})
+        else:
+            role = load_role(contract["assigned_role"], cwd=root)
+        result = complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, 0)
+        print(f"{task_id} {'completed' if result == 0 else 'dispatch failed'}")
+        return result
+    partial = None
+    if worktree.exists() and git(worktree, "status", "--porcelain").stdout:
+        path = attempt.parent / "partial.patch"
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _atomic_write(path, git(worktree, "diff").stdout.encode(), 0o600)
+        partial = rel(root, path)
+    with control_lock(root) as locked:
+        latest = current(locked, task_id)[1]
+        append_record(locked, task_id, {"from": latest, "to": "INTERRUPTED", "actor": "runner", "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial})
+    print(f"{task_id} interrupted")
+    return 0
+
+
+def merge_task(root: Path, task_id: str, flags: list[str]) -> int:
+    store = root / ".orrery"
+    records, state = current(store, task_id)
+    if state != "AWAITING_MERGE":
+        raise LedgerError(f"task {task_id} is {state}; merge requires AWAITING_MERGE")
+    substantive = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("reason") != "ledger-repaired"
+        ),
+        None,
+    )
+    if substantive is not None and substantive.get("reason") == "merge-started":
+        expected = substantive.get("expected", {})
+        parents = git(root, "show", "-s", "--format=%P", "HEAD").stdout.split()
+        if parents == [expected.get("base"), expected.get("commit")]:
+            with control_lock(root) as locked:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": git(root, "rev-parse", "HEAD").stdout.strip(), "contract_digest": substantive["contract_digest"]})
+            return 0
+    evidence = next((r.get("evidence") for r in reversed(records) if r.get("evidence")), None)
+    if not evidence:
+        raise LedgerError("latest evidence packet is missing")
+    try:
+        packet = json.loads((root / evidence).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LedgerError("latest evidence packet is unreadable") from exc
+    contract = load_contract(store, task_id)
+    digest = records[-1]["contract_digest"]
+    if hashlib.sha256((store / "contracts" / f"{task_id}.json").read_bytes()).hexdigest() != digest:
+        raise LedgerError("current contract does not match the ledger; amend the task")
+    if packet.get("contract_digest") != digest:
+        raise LedgerError("evidence contract digest does not match current contract")
+    verified = next((record for record in reversed(records) if record.get("to") == "VERIFICATION_PASSED"), None)
+    if not verified or verified.get("evidence") != evidence:
+        raise LedgerError("latest evidence was not verified")
+    if verified.get("evidence_sha256") != evidence_digest(root, evidence):
+        raise LedgerError("evidence packet digest does not match verification record")
+    dispatched = next(record for record in reversed(records) if "dispatch" in record)
+    base = dispatched["gate"]["base_head"]
+    implemented = next((record for record in reversed(records) if record.get("commit")), None)
+    if not implemented:
+        raise LedgerError("implemented commit is missing")
+    commit = implemented["commit"]
+    lines = git(root, "diff", "--name-status", f"{base}..{commit}").stdout.splitlines()
+    include, exclude = contract["scope"]["include"], contract["scope"]["exclude"]
+    out = [line.split("\t", 1)[-1] for line in lines if not any(line.split("\t", 1)[-1] == path or line.split("\t", 1)[-1].startswith(path + "/") for path in include) or any(line.split("\t", 1)[-1] == path or line.split("\t", 1)[-1].startswith(path + "/") for path in exclude)]
+    if out and "--accept-out-of-scope" not in flags:
+        raise LedgerError("evidence has out-of-scope changes; use --accept-out-of-scope")
+    target = contract["target_ref"]
+    if git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip() != target:
+        raise LedgerError("target branch is not checked out")
+    if git(root, "status", "--porcelain").stdout:
+        raise LedgerError("target worktree is dirty")
+    if git(root, "rev-parse", "HEAD").stdout.strip() != base:
+        raise LedgerError("target moved; task must be re-run on the new base")
+    branch = f"orrery/{task_id}"
+    if git(root, "rev-parse", branch).stdout.strip() != commit:
+        raise LedgerError("task branch no longer matches evidence")
+    with control_lock(root) as locked:
+        append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-started", "expected": {"base": base, "commit": commit}, "contract_digest": digest})
+    premerge = git_workspace_fingerprint(root)
+    merge_commit, stderr = merge_branch(root, commit)
+    if merge_commit is None:
+        if git_workspace_fingerprint(root) != premerge:
+            print("orrery-task: merge abort did not restore the target worktree", file=sys.stderr)
+        detail = stderr.splitlines()[0] if stderr.splitlines() else "merge failed"
+        with control_lock(root) as locked:
+            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-failed", "detail": detail, "contract_digest": digest})
+        return 1
+    with control_lock(root) as locked:
+        append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": merge_commit, "accepted_out_of_scope": "--accept-out-of-scope" in flags, "contract_digest": digest, "evidence": evidence})
+    return 0
+
+
+def close_task(root: Path, task_id: str, flags: list[str]) -> int:
+    with control_lock(root) as store:
+        records, state = current(store, task_id)
+        if state == "NO_CHANGE" and "--accept-no-change" not in flags:
+            raise LedgerError("NO_CHANGE requires --accept-no-change")
+        if state == "NO_CHANGE" and records[-1].get("reason") != "verification-passed":
+            raise LedgerError("NO_CHANGE requires successful verification; run orrery-task verify")
+        if state == "MERGED":
+            record = {"from": state, "to": "CLOSED", "actor": "user", "contract_digest": records[-1]["contract_digest"]}
+        elif state == "NO_CHANGE":
+            record = {"from": state, "to": "CLOSED", "actor": "user", "reason": "accepted-no-change", "contract_digest": records[-1]["contract_digest"]}
+        else:
+            raise LedgerError(f"task {task_id} is {state}")
+        append_record(store, task_id, record)
+    return 0
+
+
+def cancel_task(root: Path, task_id: str, flags: list[str]) -> int:
+    store = root / ".orrery"
+    records, state = current(store, task_id)
+    if state in {"MERGED", "CLOSED"} or (state == "CANCELLED" and "--discard" not in flags):
+        raise LedgerError(f"task {task_id} is {state}")
+    if state in {"DISPATCHED", "IN_PROGRESS"}:
+        attempt = Path(next(r["dispatch"]["receipts"] for r in reversed(records) if "dispatch" in r))
+        if dispatch_alive(attempt):
+            raise LedgerError("task is still running; resume first")
+    if state != "CANCELLED":
+        with control_lock(root) as locked:
+            latest = current(locked, task_id)[1]
+            append_record(locked, task_id, {"from": latest, "to": "CANCELLED", "actor": "user", "contract_digest": records[-1]["contract_digest"]})
+    if "--discard" in flags:
+        remaining = remove_worktree(root, task_id)
+        if remaining:
+            raise LedgerError("discard failed; remains: " + ", ".join(remaining))
+    else:
+        print(f"worktree remains at {worktree_path(root, task_id)}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        return usage()
+    command = arguments.pop(0)
+    try:
+        root = repository_root()
+        if command == "create" and len(arguments) == 1:
+            print(create_task(root, read_contract(arguments[0])))
+            return 0
+        if command == "amend" and len(arguments) == 2:
+            amend_task(root, arguments[0], read_contract(arguments[1]))
+            return 0
+        if command == "run" and arguments:
+            return dispatch(root, arguments.pop(0), arguments)
+        if command == "verify" and len(arguments) == 1:
+            return rerun_verify(root, arguments[0])
+        if command == "resume" and len(arguments) <= 1:
+            store = root / ".orrery"
+            identifiers = arguments or (task_ids(store) if store.exists() else [])
+            result = 0
+            for task_id in identifiers:
+                result = max(result, resume_task(root, task_id))
+            return result
+        if command == "merge" and arguments:
+            return merge_task(root, arguments.pop(0), arguments)
+        if command == "close" and arguments:
+            return close_task(root, arguments.pop(0), arguments)
+        if command == "cancel" and arguments:
+            return cancel_task(root, arguments.pop(0), arguments)
+        store = root / ".orrery"
+        if command == "list" and not arguments:
+            if not store.exists():
+                return 0
+            for task_id in task_ids(store):
+                contract = load_contract(store, task_id)
+                records, torn, _ = read_ledger(store, task_id)
+                print(
+                    f"{task_id} {'TORN' if torn else records[-1]['to']} {contract['title']}"
+                )
+            return 0
+        if command == "show" and len(arguments) == 1:
+            contract = load_contract(store, arguments[0])
+            records, torn, _ = read_ledger(store, arguments[0])
+            print(json.dumps(contract, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    {"history": records, "torn_tail": torn},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        if command == "status" and arguments in ([], ["--repair"]):
+            if not store.exists():
+                return 0
+            if arguments:
+                with control_lock(root) as locked:
+                    for task_id in task_ids(locked):
+                        if repair_ledger(locked, task_id):
+                            print(f"{task_id} repaired")
+                        print(f"{task_id} {read_ledger(locked, task_id)[0][-1]['to']}")
+            else:
+                for task_id in task_ids(store):
+                    records, torn, _ = read_ledger(store, task_id)
+                    print(f"{task_id} {records[-1]['to']}")
+                    if torn:
+                        print(f"warning: {task_id} has a torn ledger tail")
+            return 0
+        return usage()
+    except (LedgerError, RuntimeConfigError) as exc:
+        print(f"orrery-task: {exc}", file=sys.stderr)
+        return 2 if command == "run" and str(exc).startswith("invalid run argument:") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

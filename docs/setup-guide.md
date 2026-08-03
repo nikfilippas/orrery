@@ -130,6 +130,79 @@ The manifest's top-level `verbosity` steers how delegated roles write:
 prompts only; principal and direct sessions take the static
 communication-style rule in `global/AGENTS.md`.
 
+## Watch and capture a delegated run
+
+```bash
+orrery-agent --role reviewer --log review.log -- "review the final diff"
+orrery-agent --role reviewer --stream -- "..."      # uncapped mirror
+orrery-agent --role reviewer --no-stream -- "..."   # counters only
+```
+
+The delegate's own output is mirrored to stderr as it arrives, prefixed
+with `|` so it is visibly the delegate's rather than Orrery's, and put
+through the same sanitiser as the diagnostics tail so it cannot forge a
+consent marker or inject terminal escapes. By default each burst is
+capped at a few lines and says how many it withheld, because a review
+can emit hundreds of kilobytes; `--stream` lifts the cap and
+`--no-stream` leaves only the byte counters.
+
+`--log PATH` publishes the complete working transcript, atomically and
+on every path including timeout and interruption, which is exactly when
+it is most useful. Note the provider asymmetry: `codex exec` streams its
+work, so an OpenAI role's log holds the real transcript of tool calls
+and messages, while a delegated Claude role currently runs
+`--print --output-format json` and produces only its final result
+object. The log is untrusted provider output written verbatim, so treat
+it as data; it never enters the incident log, which deliberately stores
+no provider text.
+
+## Align the principal's own surface
+
+```bash
+orrery-sync
+orrery-sync --check
+```
+
+Most sessions start from a provider's IDE extension or bare CLI, which
+Orrery never launches. `scripts/orrery-sync` therefore projects the
+configured principal onto that provider's own configuration: `model`,
+the thinking level, and the same-provider fallback ladder into
+`~/.claude/settings.json` for an Anthropic principal, or `model` and
+`model_reasoning_effort` into `$CODEX_HOME/config.toml` for an OpenAI
+one. Only the principal's own surface is written; the other must keep
+reporting a genuine mismatch.
+
+It runs automatically from `orrery-init`, from `scripts/install.sh`,
+and after a successful configuration apply. Those files are
+machine-wide, so one adoption aligns every repository. A repository's
+`.orrery.json` principal override is deliberately ignored here: it is
+correct for that directory only. A principal routed at a custom
+endpoint is refused, because first-party model names must not reach a
+third-party service.
+
+What the ladder actually covers was measured against the installed CLI
+rather than inferred, and the distinction matters: an **overloaded**
+service (HTTP 529) is retried a few times and then answered by
+substituting the next model in `fallbackModel`, while a **rate or usage
+limit** (HTTP 429) is retried against the configured model and never
+substituted. Exhausting a plan therefore still requires a deliberate
+model change; the ladder rescues a busy service, not an empty
+allowance. `tests/run-tests.py` pins both behaviours against a loopback
+stub, so a change in the CLI surfaces as a failure rather than as a
+false promise.
+
+Thinking is written in the one representation Claude accepts: `max`
+travels in `env.CLAUDE_CODE_EFFORT_LEVEL`, `low` through `xhigh` in
+`effortLevel`, never both. The Codex rewrite is fail-closed: it parses
+the file before and after, changes only the two root assignments, and
+writes nothing when they cannot be located unambiguously, so comments
+and `[projects.*]` trust entries survive untouched.
+
+`--check` reports drift and exits non-zero without writing; the doctor
+uses it and warns rather than failing, because a deliberate in-session
+model change is legitimate and Orrery reports it instead of fighting
+it.
+
 ## Start and delegate
 
 Start the configured principal in the current repository:
@@ -382,6 +455,46 @@ Do not add empty `.mcp.json`, Gemini, Cursor, or Copilot instruction files.
 Tool-specific MCP, hook, permission, and execution settings belong in their
 native configuration only when actually used.
 
+## Task control plane
+
+An adopted repository keeps its task-control state in `.orrery/`:
+`contracts/` holds sealed contracts, `ledger/` the append-only transitions,
+`dispatch/` receipts and patches, `evidence/` verification packets, `counter`
+the next identifier, and `lock` the control lock. Task worktrees are outside
+the repository at `$XDG_STATE_HOME/orrery/worktrees` (default
+`~/.local/state/orrery/worktrees`).
+
+Create a contract without `task_id`; the command allocates it and seals the
+stored copy. A minimal contract is:
+
+```json
+{
+  "title": "Rename one symbol",
+  "goal": "Replace the old symbol in the parser.",
+  "acceptance_criteria": [{"id": "tests", "statement": "Tests pass.", "verification": {"command": "pytest -q"}}],
+  "scope": {"include": ["parser"], "exclude": []},
+  "risk": {"level": "low", "reasons": []},
+  "assigned_role": "implementer",
+  "target_ref": "refs/heads/main"
+}
+```
+
+Run `orrery-task create contract.json`, then `orrery-task run T-1`. The
+runner works in the dedicated branch worktree, records receipts, commits a
+verified change, and writes an evidence packet. `verify` reruns the recorded
+criteria; `merge` is explicit; `close` finishes a merged task. A dirty base
+needs `--allow-dirty-baseline`; retrying an altered task worktree needs
+`--accept-changed-worktree`. These flags are forwarded only with explicit
+user consent.
+
+`NO_CHANGE` is a real outcome and needs `close --accept-no-change`. Changes
+outside scope remain visible in evidence and require
+`merge --accept-out-of-scope`. If a controller dies, `resume` completes a
+receipt-backed dispatch, marks a receiptless dead dispatch interrupted, and
+leaves a live one alone. Merge refuses the wrong target branch, a dirty or
+moved target, a task branch that differs from evidence, a changed contract
+digest, and unaccepted out-of-scope changes.
+
 ## Leave No Trace
 
 Claude sessions receive lifecycle hooks from
@@ -511,7 +624,10 @@ verify that paths and labels do not intersect unrelated nodes.
 
 The maintained artefacts are:
 
-- `README.md`, `LICENSE`, and `logo.png` — project overview, licence, and logo.
+- `README.md`, `LICENSE`, `logo.png`, `banner.png`, and `flowchart.svg` —
+  project overview, licence, logo, the banner the README opens with, and
+  the flowchart it shows, which is generated from `global/orchestration.json`
+  rather than drawn by hand.
 - `docs/setup-guide.md` — this operational reference.
 - `global/AGENTS.md` — canonical shared policy.
 - `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.
@@ -540,6 +656,11 @@ The maintained artefacts are:
   entry point.
 - `scripts/orrery_incidents.py` and `scripts/orrery-incidents` — the
   incident log writer/reader module and its reporting command.
+- `scripts/orrery_ledger.py` and `scripts/orrery-task` — the durable task
+  ledger, contracts, and state machine, and the task command surface
+  (Phase 1 control plane).
+- `scripts/orrery-sync` — projects the configured principal onto its
+  provider's own configuration for IDE and bare-CLI sessions.
 - `scripts/orrery-config`, `scripts/orrery-usage`, `scripts/init-project.sh`,
   `scripts/doctor.sh`, and `scripts/install.sh` — configuration, accounting,
   adoption, diagnostics, and installation.

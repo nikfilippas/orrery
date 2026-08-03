@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -172,6 +173,10 @@ def load_endpoint(manifest: dict[str, Any], endpoint_id: Any) -> Endpoint:
         raise RuntimeConfigError(
             f"endpoint {endpoint_id} has an invalid key_env name"
         )
+    if key_env in {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"}:
+        raise RuntimeConfigError(
+            f"endpoint {endpoint_id}: a third-party endpoint must use its own variable"
+        )
     return Endpoint(
         id=endpoint_id,
         label=label.strip(),
@@ -230,7 +235,15 @@ def load_role(
     path: Path = MANIFEST_PATH,
     *,
     cwd: Path | None = None,
+    apply_override: bool = True,
 ) -> Role:
+    """The validated role, optionally ignoring repository overrides.
+
+    `apply_override=False` is for callers that write global state: a
+    repository's `.orrery.json` principal is correct for that
+    directory only, so projecting it into a machine-wide setting would
+    silently change every other repository's default.
+    """
     if role_id not in ROLE_IDS:
         raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
     manifest = load_manifest(path)
@@ -246,7 +259,7 @@ def load_role(
             f"the orchestration manifest must define {role_id} exactly once"
         )
     step = dict(matches[0])
-    if role_id == "orchestrator" and path == MANIFEST_PATH:
+    if role_id == "orchestrator" and path == MANIFEST_PATH and apply_override:
         override = project_override(cwd or Path.cwd())
         if override is not None:
             unknown = set(override) - {
@@ -472,7 +485,12 @@ def thinking_override(thinking: str) -> str:
     return f"model_reasoning_effort={json.dumps(thinking)}"
 
 
-def principal_command(role: Role, extra: list[str]) -> list[str]:
+def principal_command(
+    role: Role,
+    extra: list[str],
+    *,
+    suppress_native_fallback: bool = False,
+) -> list[str]:
     if role.id != "orchestrator":
         raise RuntimeConfigError("only the orchestrator can start a principal")
     executable = provider_executable(role.provider)
@@ -485,6 +503,19 @@ def principal_command(role: Role, extra: list[str]) -> list[str]:
         ]
         if role.thinking:
             command.extend(["--effort", role.thinking])
+        # An endpoint-backed principal must never carry a first-party
+        # ladder: the process runs with that endpoint's base URL and
+        # credential, so a substitution would send first-party model
+        # names to a third party. The user's settings may still hold a
+        # ladder from an earlier first-party principal.
+        if suppress_native_fallback or role.endpoint is not None:
+            # --no-fallback pins the exact configured model, so the
+            # ladder written into the user's settings by orrery-sync is
+            # cleared for this run. The flag form of this option is
+            # print-only and cannot be used for an interactive session;
+            # a settings override can. Merging replaces fallbackModel
+            # rather than concatenating it, so an empty array disarms.
+            command.extend(["--settings", json.dumps({"fallbackModel": []})])
     else:
         command = [
             executable,
@@ -624,6 +655,12 @@ def claude_sandbox_settings(role: Role, cwd: Path) -> dict[str, Any]:
     return {
         "sandbox": {"enabled": False},
         "permissions": permissions,
+        # A delegated run reads the user's settings too, so it would
+        # otherwise inherit the principal's native fallback ladder and
+        # silently substitute a model for a bounded role. Delegated
+        # substitution is Orrery's own decision and requires consent,
+        # so the ladder is cleared for every worker and reviewer.
+        "fallbackModel": [],
     }
 
 
@@ -655,7 +692,7 @@ CLAUDE_SANDBOX_CANARIES = (
 
 def claude_canary_snapshot(cwd: Path) -> dict[str, Any]:
     """What the workspace looked like before a delegated Claude run."""
-    exclude = cwd / ".git" / "info" / "exclude"
+    exclude = claude_canary_exclude(cwd)
     try:
         exclude_bytes: bytes | None = exclude.read_bytes()
     except OSError:
@@ -669,6 +706,24 @@ def claude_canary_snapshot(cwd: Path) -> dict[str, Any]:
             if (cwd / name).exists() or (cwd / name).is_symlink()
         },
     }
+
+
+def claude_canary_exclude(cwd: Path) -> Path:
+    """Resolve Git's exclude file, including linked-worktree indirection."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--git-path", "info/exclude"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            value = Path(os.fsdecode(result.stdout.rstrip(b"\n")))
+            return value if value.is_absolute() else cwd / value
+    except OSError:
+        pass
+    return cwd / ".git" / "info" / "exclude"
 
 
 def sweep_claude_canaries(snapshot: dict[str, Any]) -> list[str]:
@@ -703,7 +758,7 @@ def sweep_claude_canaries(snapshot: dict[str, Any]) -> list[str]:
         except OSError:
             continue
 
-    exclude = cwd / ".git" / "info" / "exclude"
+    exclude = claude_canary_exclude(cwd)
     before = snapshot["exclude"]
     try:
         current: bytes | None = exclude.read_bytes()
@@ -760,7 +815,6 @@ def provider_environment(
     exact_names = {
         "ALL_PROXY",
         "CURL_CA_BUNDLE",
-        "DBUS_SESSION_BUS_ADDRESS",
         "GIT_ASKPASS",
         "HTTPS_PROXY",
         "HTTP_PROXY",
@@ -771,7 +825,6 @@ def provider_environment(
         "REQUESTS_CA_BUNDLE",
         "SHELL",
         "SSH_ASKPASS",
-        "SSH_AUTH_SOCK",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",
         "TERM",
@@ -779,7 +832,6 @@ def provider_environment(
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
-        "XDG_RUNTIME_DIR",
         "all_proxy",
         "http_proxy",
         "https_proxy",
@@ -803,6 +855,19 @@ def provider_environment(
     if provider == "openai":
         environment["CODEX_HOME"] = str(codex_home())
     if endpoint is not None:
+        endpoint_keys = endpoint_key_names()
+        for name in tuple(environment):
+            if (
+                name in {
+                    "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                    "CLAUDE_CODE_USE_VERTEX", "OPENAI_BASE_URL",
+                    "OPENAI_API_KEY",
+                }
+                or name.startswith(("AWS_", "GOOGLE_", "GCLOUD_"))
+                or name in endpoint_keys - {endpoint.key_env}
+            ):
+                environment.pop(name, None)
         environment.update(endpoint_environment(endpoint))
     # A delegated role is an independent context contained by this runner,
     # not a child of the invoking Claude Code session. Forwarding the
@@ -852,6 +917,20 @@ def endpoint_environment(endpoint: Endpoint) -> dict[str, str]:
             "ANTHROPIC_API_KEY": "",
         }
     return {endpoint.key_env: key} if endpoint.key_env else {}
+
+
+def endpoint_key_names() -> set[str]:
+    try:
+        endpoints = load_manifest().get("endpoints", {})
+    except RuntimeConfigError:
+        return set()
+    if not isinstance(endpoints, dict):
+        return set()
+    return {
+        entry["key_env"]
+        for entry in endpoints.values()
+        if isinstance(entry, dict) and isinstance(entry.get("key_env"), str)
+    }
 
 
 def codex_home() -> Path:

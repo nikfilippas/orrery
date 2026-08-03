@@ -214,6 +214,10 @@ link_file \
     "$HOME/.local/bin/orrery-incidents"
 
 link_file \
+    "$KIT_DIR/scripts/orrery-task" \
+    "$HOME/.local/bin/orrery-task"
+
+link_file \
     "$KIT_DIR/scripts/orrery-config" \
     "$HOME/.local/bin/orrery-config"
 
@@ -226,6 +230,19 @@ link_file \
     --hooks \
     --source "$KIT_DIR/global/codex-hooks.json" \
     --target "$CODEX_HOME/hooks.json"
+
+link_file \
+    "$KIT_DIR/scripts/orrery-sync" \
+    "$HOME/.local/bin/orrery-sync"
+
+# Align the principal's own surface so a session started from an IDE
+# extension or a bare CLI begins on the configured model and thinking
+# level. Never fatal: an installation must still complete on a machine
+# whose provider configuration cannot be written.
+if ! python3 "$KIT_DIR/scripts/orrery-sync"; then
+    printf '\nWARNING: the principal surface could not be aligned.\n' >&2
+    printf 'Run orrery-sync after resolving the reported problem.\n' >&2
+fi
 
 printf "\nInstallation complete.\n"
 

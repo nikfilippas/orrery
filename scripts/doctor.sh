@@ -275,17 +275,19 @@ if (
     or ("plan-review-step", "plan") not in pairs
 ):
     raise SystemExit("chart omits the bounded plan-review cycle")
-reverse = next(
+# The cycle is drawn as a bounded loop rather than as two arrows, so what
+# has to hold is that both directions are named and the loop is marked.
+cycle = [
     edge for edge in edges
-    if edge.get("from") == "plan-review-step" and edge.get("to") == "plan"
-)
-return_offset = reverse.get("offset")
-if (
-    isinstance(return_offset, bool)
-    or not isinstance(return_offset, (int, float))
-    or return_offset == 0
+    if {edge.get("from"), edge.get("to")} == {"plan", "plan-review-step"}
+]
+if len(cycle) != 2 or not all(
+    isinstance(edge.get("label"), str) and edge["label"].strip()
+    for edge in cycle
 ):
-    raise SystemExit("plan-review return curve does not separate the cycle")
+    raise SystemExit("the plan-review cycle does not name both directions")
+if not chart.get("loopMark"):
+    raise SystemExit("the chart does not mark the plan-review loop")
 required_nodes = {
     "investigation-result", "review-gate", "review", "findings",
     "correct", "done", "plan-escalation",
@@ -305,6 +307,7 @@ claude_settings = json.loads(
 if (
     "model" in claude_settings
     or "effortLevel" in claude_settings
+    or "fallbackModel" in claude_settings
     or "CLAUDE_CODE_EFFORT_LEVEL" in claude_settings.get("env", {})
 ):
     raise SystemExit("Claude settings duplicate the role manifest")
@@ -471,7 +474,9 @@ for entry in \
     "orrery-doctor:scripts/doctor.sh" \
     "orrery-config:scripts/orrery-config" \
     "orrery-usage:scripts/orrery-usage" \
-    "orrery-incidents:scripts/orrery-incidents"
+    "orrery-incidents:scripts/orrery-incidents" \
+    "orrery-task:scripts/orrery-task" \
+    "orrery-sync:scripts/orrery-sync"
 do
     name="${entry%%:*}"
     relative="${entry#*:}"
@@ -722,6 +727,21 @@ else
     fail "The standing-approval store could not be read"
 fi
 
+printf '\n=== Principal surface ===\n'
+# A drifted surface is legitimate: a deliberate in-session model change
+# persists here, and Orrery reports it rather than fighting it.
+SURFACE_OUTPUT="$(python3 "$KIT_DIR/scripts/orrery-sync" --check 2>&1)"
+SURFACE_STATUS=$?
+if [ "$SURFACE_STATUS" -eq 0 ]; then
+    pass "The principal's own surface matches the manifest"
+elif [ "$SURFACE_STATUS" -eq 1 ]; then
+    warn "The principal's surface differs from the manifest:"
+    printf '%s\n' "$SURFACE_OUTPUT" | sed -n '2,6p'
+    printf 'Align it with: orrery-sync\n'
+else
+    warn "The principal surface could not be checked: $SURFACE_OUTPUT"
+fi
+
 printf '\n=== Incident log ===\n'
 if INCIDENT_SUMMARY="$(
     python3 - "$KIT_DIR" <<'PY'
@@ -755,6 +775,66 @@ PY
     fi
 else
     warn "The incident log could not be read"
+fi
+
+printf '\n=== Task worktrees ===\n'
+TASK_WORKTREE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/orrery/worktrees"
+if [ ! -d "$TASK_WORKTREE_ROOT" ]; then
+    pass "No task worktrees"
+else
+    FOUND_TASK_WORKTREE=0
+    for task_worktree in "$TASK_WORKTREE_ROOT"/*/*; do
+        [ -d "$task_worktree" ] || continue
+        FOUND_TASK_WORKTREE=1
+        common_dir="$(git -C "$task_worktree" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || {
+            warn "orphaned task worktree: $task_worktree"
+            continue
+        }
+        case "$common_dir" in
+            */.git) repository="${common_dir%/.git}" ;;
+            *)
+                repository="$(git -C "$task_worktree" rev-parse --show-toplevel 2>/dev/null)" || {
+                    warn "orphaned task worktree: $task_worktree"
+                    continue
+                }
+                ;;
+        esac
+        task_id="${task_worktree##*/}"
+        ledger="$repository/.orrery/ledger/$task_id.jsonl"
+        if [ ! -f "$ledger" ]; then
+            warn "task worktree without a ledger: $task_worktree"
+            continue
+        fi
+        task_state="$(python3 - "$ledger" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    lines = Path(sys.argv[1]).read_text().splitlines()
+    if not lines:
+        raise ValueError
+    record = json.loads(lines[-1])
+    state = record.get("to")
+    if not isinstance(state, str):
+        raise ValueError
+except (OSError, ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+print(state)
+PY
+)" || {
+            warn "torn ledger tail: $ledger"
+            continue
+        }
+        case "$task_state" in
+            MERGED|CLOSED|CANCELLED)
+                warn "task worktree outlives its task: $task_worktree"
+                ;;
+        esac
+    done
+    if [ "$FOUND_TASK_WORKTREE" -eq 0 ]; then
+        pass "No task worktrees"
+    fi
 fi
 
 printf '\n=== Kit repository ===\n'

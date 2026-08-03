@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="logo.png" width="240"
-       alt="The Órrery logo: a clockwork orrery with a steel-blue central sphere and brass orbit rings carrying small worker spheres">
+  <img src="banner.png" width="100%"
+       alt="The Órrery banner: a clockwork orrery with a steel-blue central sphere and brass orbit rings, its orbits opening out to the right past worker spheres in the colours of the five roles">
 </p>
 
 # Órrery
@@ -29,67 +29,10 @@ alone, and the SessionStart check says so explicitly.
 
 ## How a request flows
 
-```mermaid
-%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 48, "rankSpacing": 72}}}%%
-flowchart TB
-    U["ordinary development request"] --> C{"classify once"}
-
-    subgraph ROUTES["classification result · ordered left to right"]
-      direction LR
-      I0["investigation"] ~~~ T0["trivial"] ~~~ M0["mechanical"] ~~~ S0["standard"] ~~~ X0["complex"]
-    end
-    style ROUTES fill:#f7f8f9,stroke:#b8c0c7,color:#4c5a63,stroke-width:1px
-
-    C ---->|investigation| I0
-    C ---->|trivial| T0
-    C ---->|mechanical| M0
-    C ---->|standard| S0
-    C ---->|complex| X0
-
-    I0 --> INV["principal performs<br/>read-only analysis"]
-    INV --> REPORT["report observed facts,<br/>inferences, and uncertainty"]
-
-    T0 --> TRI["principal implements<br/>and inspects"]
-    M0 --> MEC["mechanical worker edits"]
-    S0 --> STD["implementation worker edits<br/>workspace-write"]
-
-    X0 --> PLAN["principal writes plan<br/>and acceptance criteria"]
-    PLAN -->|fresh independent challenge| PLAN_REVIEW["fresh plan-review session<br/>blocking versus advisory"]
-    PLAN_REVIEW -->|supported blocking objections<br/>and a round remains| PLAN
-    PLAN_REVIEW -->|none remain| STD
-    PLAN_REVIEW -->|repeated objection<br/>or round cap| ESCALATE["stop before implementation<br/>and ask the user"]
-
-    MEC --> INSPECT["principal inspects the real diff,<br/>never the worker summary"]
-    STD --> INSPECT
-
-    TRI --> VERIFY["proportionate verification:<br/>tests, lint, types, and build"]
-    INSPECT --> VERIFY
-
-    VERIFY --> REVIEW_GATE{"independent final review<br/>warranted?"}
-    REVIEW_GATE -->|no| DONE["done:<br/>external actions require approval"]
-    REVIEW_GATE -->|yes; always for complex,<br/>otherwise when materially useful| REVIEW["fresh final-review session<br/>read-only and ephemeral"]
-
-    REVIEW --> FINDINGS{"does a material finding survive<br/>principal verification?"}
-    FINDINGS -->|none| DONE
-    FINDINGS -->|yes| CORRECT["principal corrects the defect<br/>and adds regression coverage"]
-    CORRECT -->|rerun affected checks| VERIFY
-
-    classDef principal fill:#38617f,stroke:#2a4a62,color:#ffffff
-    classDef mechanic fill:#98a2b8,stroke:#737d94,color:#1b2226
-    classDef implementer fill:#587b50,stroke:#44603e,color:#ffffff
-    classDef planreviewer fill:#8a6a9c,stroke:#6d5279,color:#ffffff
-    classDef reviewer fill:#b07e28,stroke:#8c641f,color:#ffffff
-    classDef quiet fill:#e8ebee,stroke:#b8c0c7,color:#1b2226
-    classDef route fill:#f4f5f6,stroke:#b8c0c7,color:#1b2226
-
-    class C,INV,TRI,PLAN,INSPECT,CORRECT principal
-    class MEC mechanic
-    class STD implementer
-    class PLAN_REVIEW planreviewer
-    class REVIEW reviewer
-    class U,REPORT,ESCALATE,VERIFY,REVIEW_GATE,FINDINGS,DONE quiet
-    class I0,T0,M0,S0,X0 route
-```
+<p align="center">
+  <img src="flowchart.svg" width="100%"
+       alt="How a request flows: classify once, then one of five routes - read-only investigation, the principal implementing directly, a mechanical worker, an implementation worker, or a bounded plan-review loop. Worker edits are inspected as a real diff, verified, and where warranted put through a fresh final review before completion.">
+</p>
 
 The five classifier outcomes are ordered exactly as shown: investigation,
 trivial, mechanical, standard, complex.
@@ -123,6 +66,12 @@ The shipped configuration:
 
 The timeout is the role's base budget for one delegated run; a `--timeout`
 flag or an `ORRERY_AGENT_TIMEOUT_SECONDS` environment variable still wins.
+The same-provider ladder answers an overloaded service, not an exhausted
+plan: measured against the installed CLI, HTTP 529 substitutes the next
+model after a few retries, while HTTP 429 is retried without
+substitution. Running out of allowance still needs a deliberate model
+change.
+
 The hard cap makes the budget progress-aware: at its base deadline a run
 whose merged output grew within the last three minutes keeps running, in
 two-minute steps, up to the cap (`hard_timeout_seconds` in the manifest,
@@ -148,6 +97,26 @@ permissions provides session independence. A different provider or model adds
 diversity, but same-provider and same-model operation remains valid and is
 reported honestly.
 
+### Which parts run where
+
+Orrery is not only the `orrery` launcher. Most of it applies to any
+session in an adopted repository, however that session was started:
+
+| Capability | IDE extension or bare CLI | `orrery` launcher |
+| --- | --- | --- |
+| Policy, skill, classification, delegation to every role | yes | yes |
+| SessionStart adoption gate and principal comparison | yes | yes |
+| Containment, timeouts, consent, incident log | yes | yes |
+| Starts on the configured model and thinking level | yes, after `orrery-sync` | yes |
+| Same-provider automatic fallback | yes, after `orrery-sync` | yes |
+| Pre-flight authentication check, exit-status fallback | no | yes |
+
+`orrery-sync` projects the configured principal onto its own provider's
+configuration, so an extension session begins on the right model at the
+right thinking level. It runs automatically from `orrery-init`, from
+the installer, and after a configuration apply; because those files are
+machine-wide, doing it once aligns every repository.
+
 ## Runtime commands
 
 Start the configured principal:
@@ -172,6 +141,20 @@ orrery-agent --role reviewer -- "review the final diff; remain read-only"
 
 `orrery-review` remains a compatibility alias that defaults to the final
 reviewer.
+
+A delegated run is watchable and recordable:
+
+```bash
+orrery-agent --role reviewer --log review.log -- "review the final diff"
+```
+
+The delegate's output is mirrored to stderr as it arrives, prefixed and
+sanitised, capped per burst by default with an honest count of what was
+withheld; `--stream` lifts the cap and `--no-stream` leaves only byte
+counters. `--log` publishes the full working transcript atomically, on
+every path including timeout. OpenAI roles stream their real working
+transcript; a delegated Claude role currently emits only its final
+result object.
 
 Fallback approval is exact, and any standing lifetime is explicit:
 
@@ -217,6 +200,32 @@ Delegated runs are synchronous. On systemd systems they live in a transient
 user service with `KillMode=control-group` and a runtime backstop. Timeout,
 interrupt, and cleanup act on the complete process tree. Other platforms use a
 dedicated process group and announce the weaker containment.
+
+## Task control plane
+
+A task contract is a sealed JSON description of one bounded change: its goal,
+acceptance criteria, permitted scope, risk, role, and target branch.
+
+Create a task, run it in an isolated worktree under the same containment,
+then let the runner observe the contract verification. It writes an evidence
+packet before the task can be explicitly merged or closed. A controller that
+is interrupted can be resumed from its receipts; a failed or interrupted task
+can be run again with the required consent flags.
+
+```bash
+orrery-task create contract.json
+orrery-task run T-1
+orrery-task status
+orrery-task show T-1
+orrery-task verify T-1
+orrery-task merge T-1
+orrery-task close T-1
+orrery-task cancel T-1 --discard
+orrery-task resume
+```
+
+The ledger under `.orrery/` is authoritative and is excluded from tracking by
+default.
 
 ## Visual configuration
 
@@ -484,6 +493,7 @@ request.
 | `scripts/orrery-incidents` | incident aggregation and reporting command |
 | `scripts/orrery-config` | atomic visual configuration surface |
 | `scripts/orrery-usage` | local token-usage accounting from provider session logs |
+| `scripts/orrery-sync` | projects the configured principal onto its provider's own configuration |
 | `scripts/init-project.sh` | safe project adoption and Git initialization |
 | `scripts/install.sh` | user-level instruction, skill, hook, and command links |
 | `scripts/doctor.sh` | installation and configuration diagnostics |
