@@ -1997,6 +1997,16 @@ def main(
         # the adoption and standing stores, and the other provider's
         # configuration, stays read-only.
         writable_paths.extend(provider_state_paths(role_config.provider))
+        # The provider CLIs build their own sandbox mount points under
+        # /tmp and fail with "bwrap: Can't mkdir /tmp/.git: Read-only
+        # file system" without it. A first live run missed this because
+        # its workspace happened to sit under /tmp and was writable for
+        # that reason alone. /tmp is world-writable scratch that holds no
+        # Orrery control state, so granting it costs nothing the system
+        # did not already allow.
+        writable_paths.extend(
+            path for path in (Path("/tmp"), Path("/var/tmp")) if path.is_dir()
+        )
         confinement_ok = use_systemd and confinement_enforced(
             writable_paths, run_dir
         )
