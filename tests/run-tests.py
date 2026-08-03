@@ -32,6 +32,7 @@ import tomllib
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any, Callable
 
 # Loading the entry points as modules would otherwise leave __pycache__
@@ -224,6 +225,51 @@ def runtime_residue() -> list[str]:
 # run for any test that bypasses finish_review or run_principal.
 STATE_DIRS: list[str] = []
 FAKE_BIN_DIRS: list[str] = []
+
+
+@contextlib.contextmanager
+def confinable_scratch() -> Iterator[Path]:
+    """A scratch directory the delegate confinement can actually cover.
+
+    The runner deliberately grants /tmp and /var/tmp, because the provider
+    CLIs build their own bubblewrap mount points there and fail without
+    them. A fixture made with the ordinary temporary directory therefore
+    lands inside the write allowlist whenever TMPDIR points at /tmp, and a
+    test asserting that a delegate cannot write its workspace proves
+    nothing at all. Whether that happens depends only on where TMPDIR
+    points, which is why these passed on a developer machine and failed on
+    a CI runner. Home is outside the granted set on every host, and
+    ProtectHome=read-only covers it, so the guarantee is real there.
+    """
+    root = Path(tempfile.mkdtemp(prefix=".orrery-confinement-", dir=Path.home()))
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def provider_binaries_on_path() -> Iterator[Path]:
+    """Put the stub provider binaries on this process's own PATH.
+
+    `review_environment` does the same for a subprocess, but a test that
+    calls the runtime module directly resolves provider commands through
+    `shutil.which`, which reads the PATH of the running interpreter. On a
+    machine without the real CLIs installed, which is every CI runner,
+    such a test raises rather than exercising the logic it was written
+    for. Lending it the stubs keeps the coverage instead of skipping it.
+    """
+    bin_dir = Path(tempfile.mkdtemp(prefix="kit-fake-bin."))
+    FAKE_BIN_DIRS.append(str(bin_dir))
+    for name, source in (("codex", FAKE_CODEX), ("claude", FAKE_CLAUDE)):
+        shutil.copy2(source, bin_dir / name)
+        (bin_dir / name).chmod(0o755)
+    saved = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{bin_dir}{os.pathsep}{saved}"
+    try:
+        yield bin_dir
+    finally:
+        os.environ["PATH"] = saved
 
 
 def review_environment(
@@ -9405,7 +9451,7 @@ def test_claude_canary_sweep_end_to_end() -> None:
 def test_read_only_unit_workspace_guard() -> None:
     with until_store_only() as state_dir:
         seed_standing_reviewer()
-        with tempfile.TemporaryDirectory() as directory:
+        with confinable_scratch() as directory:
             workspace = Path(directory) / "workspace"
             workspace.mkdir()
             subprocess.run(
@@ -9495,12 +9541,21 @@ def test_worker_confinement_real_configuration() -> None:
         / "orrery"
         / "probe",
     }
-    with tempfile.TemporaryDirectory() as directory:
+    with confinable_scratch() as directory:
         root = Path(directory)
         workspace = root / "workspace"
         provider_home = root / "codex-home"
         workspace.mkdir()
         provider_home.mkdir()
+        # This test proves the guarantee by having a delegate attempt the
+        # writes for real, against the developer's own configuration.
+        # Where the host cannot enforce confinement, those writes would
+        # land: the probe would damage the machine it runs on and then
+        # report the damage as a failure. Establish enforcement first and
+        # attempt nothing when it is absent.
+        if not review_module.read_only_paths_enforced(root):
+            print("      (skipped: this host cannot enforce confinement)")
+            return
         result_path = provider_home / "writes.json"
         environment = review_environment("success")
         environment["CODEX_HOME"] = str(provider_home)
@@ -9529,12 +9584,18 @@ def test_worker_confinement_real_configuration() -> None:
 
 @test("a read-only delegate cannot write outside its run directory")
 def test_read_only_delegate_confinement() -> None:
-    with tempfile.TemporaryDirectory() as directory:
+    with confinable_scratch() as directory:
         root = Path(directory)
         workspace = root / "workspace"
         provider_home = root / "codex-home"
         workspace.mkdir()
         provider_home.mkdir()
+        # As above: where the host cannot enforce confinement the wrapper
+        # announces tool-level protection only, and the writes this asserts
+        # against are expected to land. Nothing is proved by running it.
+        if not review_module.read_only_paths_enforced(root):
+            print("      (skipped: this host cannot enforce confinement)")
+            return
         result_path = provider_home / "writes.json"
         environment = review_environment("success")
         environment["CODEX_HOME"] = str(provider_home)
@@ -11528,82 +11589,84 @@ def test_codex_root_rewrite() -> None:
 
 @test("--no-fallback disarms the native ladder for that run")
 def test_no_fallback_disarms_native_ladder() -> None:
-    principal = runtime_module.load_role("orchestrator")
-    plain = runtime_module.principal_command(principal, [])
-    require(
-        "--settings" not in plain,
-        f"a default launch injected a settings override: {plain}",
-    )
-    pinned = runtime_module.principal_command(
-        principal, [], suppress_native_fallback=True
-    )
-    require(
-        "--settings" in pinned
-        and json.loads(pinned[pinned.index("--settings") + 1])
-        == {"fallbackModel": []},
-        f"--no-fallback did not disarm the ladder: {pinned}",
-    )
+    with provider_binaries_on_path():
+        principal = runtime_module.load_role("orchestrator")
+        plain = runtime_module.principal_command(principal, [])
+        require(
+            "--settings" not in plain,
+            f"a default launch injected a settings override: {plain}",
+        )
+        pinned = runtime_module.principal_command(
+            principal, [], suppress_native_fallback=True
+        )
+        require(
+            "--settings" in pinned
+            and json.loads(pinned[pinned.index("--settings") + 1])
+            == {"fallbackModel": []},
+            f"--no-fallback did not disarm the ladder: {pinned}",
+        )
 
 
 @test("no native ladder survives into endpoint or delegated runs")
 def test_ladder_never_leaks() -> None:
-    principal = runtime_module.load_role("orchestrator")
-    endpoint = runtime_module.Endpoint(
-        id="kimi",
-        label="Kimi",
-        adapter="anthropic",
-        base_url="https://api.example.invalid",
-        key_env="EXAMPLE_KEY",
-    )
-    routed = dataclasses.replace(principal, endpoint=endpoint)
-    command = runtime_module.principal_command(routed, [])
-    require(
-        "--settings" in command
-        and json.loads(command[command.index("--settings") + 1])
-        == {"fallbackModel": []},
-        "an endpoint-backed principal kept a first-party ladder: "
-        f"{command}",
-    )
-
-    for role_id in ("reviewer", "implementer"):
-        role = runtime_module.load_role(role_id)
-        if role.provider != "anthropic":
-            role = dataclasses.replace(role, provider="anthropic")
-        settings = runtime_module.claude_sandbox_settings(role, Path.cwd())
+    with provider_binaries_on_path():
+        principal = runtime_module.load_role("orchestrator")
+        endpoint = runtime_module.Endpoint(
+            id="kimi",
+            label="Kimi",
+            adapter="anthropic",
+            base_url="https://api.example.invalid",
+            key_env="EXAMPLE_KEY",
+        )
+        routed = dataclasses.replace(principal, endpoint=endpoint)
+        command = runtime_module.principal_command(routed, [])
         require(
-            settings.get("fallbackModel") == [],
-            f"a delegated {role_id} could inherit the principal's "
-            f"ladder: {settings}",
+            "--settings" in command
+            and json.loads(command[command.index("--settings") + 1])
+            == {"fallbackModel": []},
+            "an endpoint-backed principal kept a first-party ladder: "
+            f"{command}",
         )
 
-    # A principal that moves to an endpoint withdraws the ladder an
-    # earlier first-party principal left behind.
-    with tempfile.TemporaryDirectory() as directory:
-        home = Path(directory)
-        (home / ".claude").mkdir()
-        settings_path = home / ".claude" / "settings.json"
-        write_json(
-            settings_path,
-            {"model": "fable", "fallbackModel": ["opus", "sonnet"]},
-        )
-        saved = os.environ.get("HOME")
-        try:
-            os.environ["HOME"] = str(home)
-            sync_module.withdraw_claude_ladder(
-                settings_path,
-                {"surface": "anthropic", "fallbackModel": ["opus", "sonnet"]},
-                principal,
+        for role_id in ("reviewer", "implementer"):
+            role = runtime_module.load_role(role_id)
+            if role.provider != "anthropic":
+                role = dataclasses.replace(role, provider="anthropic")
+            settings = runtime_module.claude_sandbox_settings(role, Path.cwd())
+            require(
+                settings.get("fallbackModel") == [],
+                f"a delegated {role_id} could inherit the principal's "
+                f"ladder: {settings}",
             )
-        finally:
-            if saved is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = saved
-        live = read_json(settings_path)
-        require(
-            "fallbackModel" not in live and live.get("model") == "fable",
-            f"the stale ladder was not withdrawn cleanly: {live}",
-        )
+
+        # A principal that moves to an endpoint withdraws the ladder an
+        # earlier first-party principal left behind.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            settings_path = home / ".claude" / "settings.json"
+            write_json(
+                settings_path,
+                {"model": "fable", "fallbackModel": ["opus", "sonnet"]},
+            )
+            saved = os.environ.get("HOME")
+            try:
+                os.environ["HOME"] = str(home)
+                sync_module.withdraw_claude_ladder(
+                    settings_path,
+                    {"surface": "anthropic", "fallbackModel": ["opus", "sonnet"]},
+                    principal,
+                )
+            finally:
+                if saved is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = saved
+            live = read_json(settings_path)
+            require(
+                "fallbackModel" not in live and live.get("model") == "fable",
+                f"the stale ladder was not withdrawn cleanly: {live}",
+            )
 
 
 @test("the Codex writer preserves comments and refuses a raced file")
@@ -13502,12 +13565,26 @@ def main() -> int:
             "XDG_STATE_HOME",
             "CLAUDE_CODE_EFFORT_LEVEL",
             "CLAUDE_EFFORT",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
         )
     }
     suite_state = tempfile.mkdtemp(prefix="kit-suite-state.")
     os.environ["XDG_STATE_HOME"] = suite_state
     os.environ.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     os.environ.pop("CLAUDE_EFFORT", None)
+
+    # Fixtures are built with a plain `git init`, which takes its branch
+    # name from the developer's own init.defaultBranch. A contract fixture
+    # names refs/heads/main, so on a machine that leaves the setting unset
+    # the fixture lands on master and every check comparing HEAD against
+    # the contract's target_ref fails. Pin it for the whole suite rather
+    # than at each of the two dozen call sites, so a fixture added later
+    # cannot reintroduce the dependence.
+    os.environ["GIT_CONFIG_COUNT"] = "1"
+    os.environ["GIT_CONFIG_KEY_0"] = "init.defaultBranch"
+    os.environ["GIT_CONFIG_VALUE_0"] = "main"
 
     # The suite must never touch the developer's own configuration.
     # Every test that exercises a writer is supposed to isolate HOME or

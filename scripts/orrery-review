@@ -841,10 +841,54 @@ def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
 
 
 def read_only_paths_enforced(target: Path) -> bool:
-    """Compatibility wrapper for tests of the former single-path probe."""
+    """Whether a read-only mapping over `target` is actually enforced.
+
+    This answers the question a caller asks before relying on the
+    guarantee: is a write into *this* path blocked? The former shim
+    probed a throwaway directory instead and ignored its argument, so it
+    reported whether the host can enforce an allowlist somewhere. A
+    runner that manages the first but not the second then claimed
+    enforcement while the delegate's write landed in the workspace.
+    """
     with tempfile.TemporaryDirectory(prefix="orrery-containment-") as directory:
-        probe_root = Path(directory)
-        return confinement_enforced([probe_root], probe_root)
+        writable = Path(directory)
+        probe = target / f".containment-probe-{uuid.uuid4().hex}"
+        try:
+            result = subprocess.run(
+                [
+                    "systemd-run",
+                    "--user",
+                    "--quiet",
+                    "--wait",
+                    "--collect",
+                    "--pipe",
+                    "--property=ProtectSystem=strict",
+                    "--property=ProtectHome=read-only",
+                    f"--property=ReadWritePaths={writable}",
+                    "--property=NoNewPrivileges=yes",
+                    "/bin/sh",
+                    "-c",
+                    'touch "$1/inside" && ! touch "$2"',
+                    "probe",
+                    str(writable),
+                    str(probe),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        finally:
+            try:
+                probe.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
+        return result.returncode == 0
 
 
 def workspace_overlap(workspace: Path, trusted: dict[str, Path]) -> str | None:

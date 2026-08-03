@@ -108,9 +108,9 @@ rounds and defaults to two.
 
 Delegated budgets are progress-aware. A role's `timeout_seconds` is its
 base budget; an optional `hard_timeout_seconds` (30 to 14400, at least
-the base; implementer and both reviewers ship with 1800) lets a run
-whose merged output grew within the last three minutes extend in
-two-minute steps up to the cap. `codex exec` streams its work
+the base; the implementer ships with 1800 and both reviewers with 3600)
+lets a run whose merged output grew within the last three minutes extend
+in two-minute steps up to the cap. `codex exec` streams its work
 continuously, so growth is a live progress signal; delegated Claude
 runs print only their final JSON and therefore keep plain base-deadline
 behaviour. A stalled, silent, or capped run times out exactly as

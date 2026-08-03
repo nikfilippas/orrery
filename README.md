@@ -69,8 +69,8 @@ The shipped configuration:
 | Principal orchestrator | Anthropic | `fable` | `max` | interactive principal | none | none |
 | Mechanical worker | OpenAI | `gpt-5.6-luna` | `low` | workspace-write | 600 s | none |
 | Implementation worker | OpenAI | `gpt-5.6-terra` | `medium` | workspace-write | 900 s | 1800 s |
-| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s | 1800 s |
-| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 900 s | 1800 s |
+| Plan reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 1800 s | 3600 s |
+| Final reviewer | OpenAI | `gpt-5.6-sol` | `ultra` | read-only | 1800 s | 3600 s |
 
 The timeout is the role's base budget for one delegated run; a `--timeout`
 flag or an `ORRERY_AGENT_TIMEOUT_SECONDS` environment variable still wins.
