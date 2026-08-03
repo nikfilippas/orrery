@@ -42,6 +42,7 @@ SESSION_CAP_SECONDS = 24 * 3600
 STORE_VERSION = 1
 STORE_NAME = "standing.json"
 LOCK_NAME = "standing.lock"
+GLOBAL_LOCK_NAME = "standing-all.lock"
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _FAILURE_SCOPES = frozenset({"provider", "model", "transient"})
 
@@ -130,7 +131,12 @@ def parse_approval_scope(value: str) -> tuple[str, float | None]:
 
 
 def _fingerprint(role: Role) -> list[str | None]:
-    return [role.provider, role.model, role.thinking]
+    endpoint = role.endpoint
+    return [
+        "v2", role.provider, role.model, role.thinking, role.access,
+        endpoint.id if endpoint else None,
+        endpoint.base_url if endpoint else None,
+    ]
 
 
 @contextlib.contextmanager
@@ -198,7 +204,8 @@ def _valid_record(entry: Any) -> dict[str, Any] | None:
             and not isinstance(expires_at, bool)
         )
         and isinstance(fingerprint, list)
-        and len(fingerprint) == 3
+        and len(fingerprint) == 7
+        and fingerprint[0] == "v2"
         and isinstance(entry.get("created_at"), (int, float))
     ):
         return None
@@ -283,15 +290,16 @@ def record_approval(
         "created_at": time.time(),
     }
     path = _store_for_scope(scope)
-    with _locked_store(path):
-        records = _read_records(path)
-        if _test_hook is not None:
-            _test_hook()
-        records = [
-            entry for entry in records if entry["role_id"] != configured.id
-        ]
-        records.append(record)
-        _write_records(path, records)
+    with _locked_all_stores():
+        with _locked_store(path):
+            records = _read_records(path)
+            if _test_hook is not None:
+                _test_hook()
+            records = [
+                entry for entry in records if entry["role_id"] != configured.id
+            ]
+            records.append(record)
+            _write_records(path, records)
     return record
 
 
@@ -302,6 +310,21 @@ def _candidate_paths() -> list[Path]:
         paths.append(session)
     paths.append(until_store_path())
     return paths
+
+
+@contextlib.contextmanager
+def _locked_all_stores() -> Iterator[None]:
+    """Serialise approval writes with a whole cross-store revocation."""
+    directory = until_store_path().parent
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    descriptor = os.open(directory / GLOBAL_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def match(configured: Role) -> dict[str, Any] | None:
@@ -375,14 +398,15 @@ def revoke_all(
     _test_hook: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     removed: list[dict[str, Any]] = []
-    for path in _candidate_paths():
-        with _locked_store(path):
-            records = _read_records(path)
-            if _test_hook is not None:
-                _test_hook()
-            if records:
-                removed.extend(records)
-                _write_records(path, [])
+    with _locked_all_stores():
+        for path in _candidate_paths():
+            with _locked_store(path):
+                records = _read_records(path)
+                if _test_hook is not None:
+                    _test_hook()
+                if records:
+                    removed.extend(records)
+                    _write_records(path, [])
     return removed
 
 

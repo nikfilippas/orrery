@@ -13,6 +13,7 @@ import contextlib
 import copy
 import dataclasses
 import fcntl
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,6 +48,9 @@ SESSION_START_SCRIPT = KIT_DIR / "scripts" / "orrery-session-start"
 CONFIG_SCRIPT = KIT_DIR / "scripts" / "orrery-config"
 INSTALL_SCRIPT = KIT_DIR / "scripts" / "install.sh"
 DOCTOR_SCRIPT = KIT_DIR / "scripts" / "doctor.sh"
+SYNC_SCRIPT = KIT_DIR / "scripts" / "orrery-sync"
+TASK_SCRIPT = KIT_DIR / "scripts" / "orrery-task"
+LEDGER_SCRIPT = KIT_DIR / "scripts" / "orrery_ledger.py"
 FAKE_CODEX = Path(__file__).resolve().parent / "fake-codex"
 FAKE_CLAUDE = Path(__file__).resolve().parent / "fake-claude"
 
@@ -90,6 +95,8 @@ settings_module = load_script(SETTINGS_SCRIPT, "kit_apply_claude_settings")
 review_module = load_script(REVIEW_SCRIPT, "kit_orrery_review")
 runtime_module = sys.modules["orrery_runtime"]
 fallback_module = sys.modules["orrery_fallback"]
+ledger_module = load_script(LEDGER_SCRIPT, "kit_orrery_ledger")
+task_module = load_script(TASK_SCRIPT, "kit_orrery_task")
 import orrery_incidents as incidents_module  # noqa: E402
 import orrery_standing as standing_module  # noqa: E402
 
@@ -2499,6 +2506,7 @@ def fallback_environment(mode: str) -> dict[str, str]:
     environment["PATH"] = os.pathsep.join(
         [environment["KIT_FAKE_BIN"], str(isolated)]
     )
+    environment["ORRERY_ALLOW_UNCONFINED"] = "1"
     environment["KIT_NO_SYSTEMD_BIN"] = str(isolated)
     return environment
 
@@ -2526,13 +2534,12 @@ def test_fallback_completion() -> None:
         require("# PASS" in stdout, f"verdict not printed: {stdout!r}")
         require(output.exists(), "verdict was not published")
         require(
-            "without control-group containment" in stderr,
+            "confinement is not enforced" in stderr,
             f"the degraded mode was not announced: {stderr!r}",
         )
         require(
-            "write protection for this read-only role is tool-level only"
-            in stderr,
-            f"the weaker read-only guarantee was not announced: {stderr!r}",
+            "ORRERY_ALLOW_UNCONFINED=1" in stderr,
+            f"the override was not disclosed: {stderr!r}",
         )
         own_units = [
             line
@@ -2547,6 +2554,47 @@ def test_fallback_completion() -> None:
             "a transient unit appeared despite systemd being unavailable",
         )
         assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("unenforceable confinement refuses unless explicitly overridden")
+def test_unenforceable_confinement_refusal() -> None:
+    environment = fallback_environment("success")
+    environment.pop("ORRERY_ALLOW_UNCONFINED")
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    stdout, stderr = finish_review(process, environment)
+    require(
+        process.returncode != 0
+        and "ORRERY_ALLOW_UNCONFINED=1" in stderr
+        and not stdout,
+        f"unenforceable confinement proceeded: {stderr!r}",
+    )
+
+
+@test("workspace overlap resolves every trusted path through symlinks")
+def test_workspace_overlap_refusal_matrix() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        workspace.mkdir()
+        trusted = {}
+        for label in (
+            "real home",
+            "CODEX_HOME",
+            "Claude configuration directory",
+            "XDG state root",
+            "run directory root",
+        ):
+            target = workspace / label.replace(" ", "-")
+            target.mkdir()
+            link = root / f"{target.name}-link"
+            link.symlink_to(target, target_is_directory=True)
+            trusted[label] = link
+            require(
+                review_module.workspace_overlap(workspace, trusted)
+                == f"workspace and {label}",
+                f"{label} overlap was not refused",
+            )
+            trusted.pop(label)
 
 
 @test("without systemd a timeout still kills the run and leaves no residue")
@@ -2649,10 +2697,13 @@ def test_proc_fallback() -> None:
 def test_codex_invocation_contract() -> None:
     """The wrapper's central promises live in the argv it hands to Codex."""
     with tempfile.TemporaryDirectory() as directory:
-        arguments_path = Path(directory) / "argv.txt"
-        stdin_path = Path(directory) / "stdin.txt"
-        environment_path = Path(directory) / "environment.json"
+        provider_home = Path(directory) / "codex-home"
+        provider_home.mkdir()
+        arguments_path = provider_home / "argv.txt"
+        stdin_path = provider_home / "stdin.txt"
+        environment_path = provider_home / "environment.json"
         environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
         environment["CODEX_FAKE_ARGS"] = str(arguments_path)
         environment["CODEX_FAKE_STDIN"] = str(stdin_path)
         environment["CODEX_FAKE_ENV"] = str(environment_path)
@@ -2735,11 +2786,14 @@ def test_claude_invocation_contract() -> None:
         )
         write_json(manifest_path, manifest)
 
-        arguments_path = root / "argv.txt"
-        stdin_path = root / "stdin.txt"
-        settings_path = root / "settings.json"
-        environment_path = root / "environment.json"
+        provider_home = root / "claude-home"
+        provider_home.mkdir()
+        arguments_path = provider_home / "argv.txt"
+        stdin_path = provider_home / "stdin.txt"
+        settings_path = provider_home / "settings.json"
+        environment_path = provider_home / "environment.json"
         environment = review_environment("success")
+        environment["CLAUDE_CONFIG_DIR"] = str(provider_home)
         environment["CLAUDE_FAKE_ARGS"] = str(arguments_path)
         environment["CLAUDE_FAKE_STDIN"] = str(stdin_path)
         environment["CLAUDE_FAKE_SETTINGS"] = str(settings_path)
@@ -3512,8 +3566,13 @@ def test_failing_run() -> None:
 @test("an approved delegated quota fallback crosses providers once")
 def test_delegated_quota_fallback() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        codex_arguments = Path(directory) / "codex-args"
+        codex_home = Path(directory) / "codex-home"
+        claude_home = Path(directory) / "claude-home"
+        codex_home.mkdir()
+        claude_home.mkdir()
+        codex_arguments = codex_home / "codex-args"
         failed_environment = review_environment("success")
+        failed_environment["CODEX_HOME"] = str(codex_home)
         failed_environment["CODEX_FAKE_MODE"] = "quota"
         failed_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
         failed = start_review(
@@ -3533,6 +3592,7 @@ def test_delegated_quota_fallback() -> None:
         assert_no_review_residue(f"orrery-review-{failed.pid}-")
 
         approved_environment = review_environment("success")
+        approved_environment["CLAUDE_CONFIG_DIR"] = str(claude_home)
         approved_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
         approved = start_review(
             approved_environment,
@@ -3580,9 +3640,12 @@ def test_model_failure_prefers_same_provider() -> None:
 @test("a transient delegated failure retries exactly once")
 def test_transient_failure_retries_once() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        attempts = Path(directory) / "attempts"
+        provider_home = Path(directory) / "codex-home"
+        provider_home.mkdir()
+        attempts = provider_home / "attempts"
         attempts.write_text("0")
         environment = review_environment("transient-once")
+        environment["CODEX_HOME"] = str(provider_home)
         environment["CODEX_FAKE_ATTEMPTS"] = str(attempts)
         process = start_review(environment, "--timeout", "60", "--", "prompt")
         stdout, stderr = finish_review(process, environment)
@@ -3995,8 +4058,11 @@ def test_lnt_umask() -> None:
 @test("the transient review unit is given a private umask")
 def test_service_umask() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        marker = Path(directory) / "marker"
+        provider_home = Path(directory) / "codex-home"
+        provider_home.mkdir()
+        marker = provider_home / "marker"
         environment = review_environment("success", marker=marker)
+        environment["CODEX_HOME"] = str(provider_home)
 
         process = subprocess.Popen(
             [
@@ -5612,10 +5678,17 @@ def test_orchestration_manifest() -> None:
         f"invalid manifest verbosity: {verbosity!r}",
     )
 
-    for role_id in ("implementer", "plan-reviewer", "reviewer"):
+    # Reviewer budgets were raised on recorded evidence: repeated
+    # sol-at-ultra timeouts at 900s against successes at 1800s.
+    for role_id, base, hard in (
+        ("implementer", 900, 1800),
+        ("plan-reviewer", 1800, 3600),
+        ("reviewer", 1800, 3600),
+    ):
         require(
-            steps[role_id].get("hard_timeout_seconds") == 1800,
-            f"{role_id} lost its default hard cap",
+            steps[role_id].get("timeout_seconds") == base
+            and steps[role_id].get("hard_timeout_seconds") == hard,
+            f"{role_id} lost its budget pair: {steps[role_id]}",
         )
 
 
@@ -5897,16 +5970,22 @@ def test_manifest_chart() -> None:
         and ("plan-review-step", "plan") in edge_pairs,
         "the chart does not show the bounded plan-review cycle",
     )
-    return_edge = next(
+    # The cycle is drawn as a bounded loop rather than as two bowed arrows,
+    # so what has to hold is that both directions are named and the loop
+    # itself is marked.
+    cycle = [
         edge
         for edge in chart["edges"]
-        if edge["from"] == "plan-review-step" and edge["to"] == "plan"
+        if {edge["from"], edge["to"]} == {"plan", "plan-review-step"}
+    ]
+    require(
+        len(cycle) == 2
+        and all(str(edge.get("label", "")).strip() for edge in cycle),
+        "the chart does not name both directions of the plan-review cycle",
     )
     require(
-        not isinstance(return_edge.get("offset"), bool)
-        and isinstance(return_edge.get("offset"), (int, float))
-        and return_edge["offset"] != 0,
-        "the chart paints both directions of the plan-review cycle together",
+        bool(chart.get("loopMark")),
+        "the chart does not mark the plan-review loop",
     )
     require(
         ("plan-review-step", "plan-escalation") in edge_pairs,
@@ -5947,269 +6026,103 @@ def test_manifest_chart() -> None:
         )
         require(gap >= 24, f"classifier nodes are only {gap}px apart")
 
-    # Sample the same cubic geometry the browser uses and ensure no wire
-    # travels through an unrelated node. A generous eight-pixel moat keeps
-    # arrowheads and labels from reading as tangled with a box.
-    def boundary(node: dict[str, Any], towards: dict[str, Any]) -> tuple[float, float]:
-        dx = towards["x"] - node["x"]
-        dy = towards["y"] - node["y"]
-        a = node["w"] / 2
-        b = node["h"] / 2
-        if node.get("shape") == "diamond":
-            scale = 1 / (abs(dx) / a + abs(dy) / b)
-        else:
-            scale = min(
-                a / abs(dx) if abs(dx) > 1e-6 else float("inf"),
-                b / abs(dy) if abs(dy) > 1e-6 else float("inf"),
-            )
-        return node["x"] + dx * scale, node["y"] + dy * scale
+    # Check the wires the page actually paints. Every edge carries the exact
+    # path it is drawn with, so the clearances below are measured against
+    # that rather than against a curve re-derived here.
+    path_command = re.compile(r"([MLHVCZ])([^MLHVCZ]*)", re.I)
+    path_number = re.compile(r"-?\d*\.?\d+")
 
-    def segment_distance(
-        point: tuple[float, float],
-        start: tuple[float, float],
-        end: tuple[float, float],
-    ) -> float:
-        dx, dy = end[0] - start[0], end[1] - start[1]
-        squared = dx * dx + dy * dy
-        along = (
-            max(
-                0.0,
-                min(
-                    1.0,
-                    (
-                        (point[0] - start[0]) * dx
-                        + (point[1] - start[1]) * dy
-                    )
-                    / squared,
-                ),
-            )
-            if squared
-            else 0.0
-        )
-        return (
-            (point[0] - start[0] - along * dx) ** 2
-            + (point[1] - start[1] - along * dy) ** 2
-        ) ** 0.5
+    def path_points(data):
+        points = []
+        cursor = origin = (0.0, 0.0)
+        for letter, payload in path_command.findall(data):
+            values = [float(value) for value in path_number.findall(payload)]
+            if letter == "M":
+                cursor = origin = (values[0], values[1])
+                points.append(cursor)
+            elif letter == "L":
+                cursor = (values[0], values[1])
+                points.append(cursor)
+            elif letter == "H":
+                cursor = (values[0], cursor[1])
+                points.append(cursor)
+            elif letter == "V":
+                cursor = (cursor[0], values[0])
+                points.append(cursor)
+            elif letter == "C":
+                for at in range(0, len(values), 6):
+                    x0, y0 = cursor
+                    x1, y1, x2, y2, x3, y3 = values[at:at + 6]
+                    for step in range(1, 13):
+                        t = step / 12
+                        m = 1 - t
+                        points.append((
+                            m ** 3 * x0 + 3 * m * m * t * x1
+                            + 3 * m * t * t * x2 + t ** 3 * x3,
+                            m ** 3 * y0 + 3 * m * m * t * y1
+                            + 3 * m * t * t * y2 + t ** 3 * y3,
+                        ))
+                    cursor = (x3, y3)
+            elif letter.upper() == "Z":
+                cursor = origin
+        return points
 
-    def shape_distance(
-        point: tuple[float, float],
-        node: dict[str, Any],
-    ) -> float:
-        dx = abs(point[0] - node["x"])
-        dy = abs(point[1] - node["y"])
-        half_width, half_height = node["w"] / 2, node["h"] / 2
-        if node.get("shape") != "diamond":
-            if dx <= half_width and dy <= half_height:
-                return 0.0
-            return (
-                max(dx - half_width, 0) ** 2
-                + max(dy - half_height, 0) ** 2
-            ) ** 0.5
-        if dx / half_width + dy / half_height <= 1:
-            return 0.0
-        corners = (
-            (node["x"], node["y"] - half_height),
-            (node["x"] + half_width, node["y"]),
-            (node["x"], node["y"] + half_height),
-            (node["x"] - half_width, node["y"]),
-        )
+    def depth(point, box):
+        """How far inside a box a point sits; negative when outside."""
         return min(
-            segment_distance(point, corner, corners[(index + 1) % 4])
-            for index, corner in enumerate(corners)
+            box["w"] / 2 - abs(point[0] - box["x"]),
+            box["h"] / 2 - abs(point[1] - box["y"]),
         )
 
-    def move_away(
-        point: tuple[float, float],
-        node: dict[str, Any],
-        minimum: float,
-    ) -> tuple[float, float]:
-        dx, dy = point[0] - node["x"], point[1] - node["y"]
-        length = (dx * dx + dy * dy) ** 0.5
-        travel = minimum
-        while True:
-            moved = (
-                point[0] + dx / length * travel,
-                point[1] + dy / length * travel,
-            )
-            if shape_distance(moved, node) >= minimum:
-                return moved
-            travel *= 1.5
-
-    faces = {
-        "top": (0, -1),
-        "bottom": (0, 1),
-        "left": (-1, 0),
-        "right": (1, 0),
-    }
+    cluster = chart.get("cluster")
+    drawn_edges = 0
     for edge in chart["edges"]:
-        source = nodes[edge["from"]]
+        drawn = edge.get("d")
+        if not drawn:
+            # The plan-review cycle is shown by its loop, not by a wire.
+            continue
+        drawn_edges += 1
+        points = path_points(drawn)
+        require(bool(points), f"{edge['from']} → {edge['to']} draws nothing")
+        for node_id, node in nodes.items():
+            if node_id in (edge["from"], edge["to"]):
+                continue
+            intruding = max(depth(point, node) for point in points)
+            require(
+                intruding < -2,
+                f"{edge['from']} → {edge['to']} passes within "
+                f"{intruding + 2:.1f}px of {node_id}",
+            )
+        # A wire meets the box it points at rather than burying its head
+        # inside it, so the arrowhead stays visible.
         target = nodes[edge["to"]]
-        raw_via = edge.get("via")
-        vias = []
-        if isinstance(raw_via, list):
-            vias = raw_via if isinstance(raw_via[0], list) else [raw_via]
-            vias = [tuple(point) for point in vias]
-        aim_start = (
-            {"x": vias[0][0], "y": vias[0][1]} if vias else target
-        )
-        aim_end = (
-            {"x": vias[-1][0], "y": vias[-1][1]} if vias else source
-        )
-        start = boundary(source, aim_start)
-        entry_face = faces.get(edge.get("enter", ""))
-        if entry_face is not None:
-            nx, ny = entry_face
-            end = (
-                target["x"] + nx * (target["w"] / 2 + 19),
-                target["y"] + ny * (target["h"] / 2 + 19),
-            )
-        else:
-            end = move_away(boundary(target, aim_end), target, 19)
-        dx_total = end[0] - start[0]
-        dy_total = end[1] - start[1]
-        is_horizontal = abs(dx_total) >= abs(dy_total)
-        lift = max(
-            26,
-            (abs(dx_total) if is_horizontal else abs(dy_total)) * 0.35,
-        )
-        along_x = (1 if dx_total >= 0 else -1) if is_horizontal else 0
-        along_y = 0 if is_horizontal else (1 if dy_total >= 0 else -1)
-        offset = edge.get("offset", 0)
-        c1 = (
-            start[0] + along_x * lift + (0 if is_horizontal else offset),
-            start[1] + along_y * lift + (offset if is_horizontal else 0),
-        )
-        if entry_face is not None:
-            nx, ny = entry_face
-            reach = min(lift, 44)
-            c2 = (end[0] + nx * reach, end[1] + ny * reach)
-        else:
-            c2 = (
-                end[0] - along_x * lift
-                + (0 if is_horizontal else offset * 0.25),
-                end[1] - along_y * lift
-                + (offset * 0.25 if is_horizontal else 0),
-            )
-        aligned = (
-            abs(end[1] - start[1]) <= 14
-            if is_horizontal
-            else abs(end[0] - start[0]) <= 14
-        )
-        if not offset and aligned:
-            third = (
-                start[0] + (end[0] - start[0]) / 3,
-                start[1] + (end[1] - start[1]) / 3,
-            )
-            two_thirds = (
-                start[0] + 2 * (end[0] - start[0]) / 3,
-                start[1] + 2 * (end[1] - start[1]) / 3,
-            )
-            c1, c2 = third, two_thirds
-        segments = [(start, c1, c2, end)]
-        if vias:
-            def bend(seg_from, seg_to):
-                wide = (
-                    abs(seg_to[0] - seg_from[0])
-                    >= abs(seg_to[1] - seg_from[1])
-                )
-                reach = max(
-                    22,
-                    (
-                        abs(seg_to[0] - seg_from[0])
-                        if wide
-                        else abs(seg_to[1] - seg_from[1])
-                    ) * 0.4,
-                )
-                if wide:
-                    step = reach if seg_to[0] >= seg_from[0] else -reach
-                    return (seg_from[0] + step, seg_from[1])
-                step = reach if seg_to[1] >= seg_from[1] else -reach
-                return (seg_from[0], seg_from[1] + step)
-
-            points = [start, *vias, end]
-            segments = [
-                (
-                    points[i - 1],
-                    bend(points[i - 1], points[i]),
-                    bend(points[i], points[i - 1]),
-                    points[i],
-                )
-                for i in range(1, len(points))
-            ]
-        for seg_start, seg_c1, seg_c2, seg_end in segments:
-          for index in range(1, 500):
-            t = index / 500
-            point = tuple(
-                (1 - t) ** 3 * seg_start[axis]
-                + 3 * (1 - t) ** 2 * t * seg_c1[axis]
-                + 3 * (1 - t) * t ** 2 * seg_c2[axis]
-                + t ** 3 * seg_end[axis]
-                for axis in (0, 1)
-            )
-            for node_id, node in nodes.items():
-                if node_id in (edge["from"], edge["to"]):
-                    continue
-                if (
-                    node["x"] - node["w"] / 2 - 8 < point[0]
-                    < node["x"] + node["w"] / 2 + 8
-                    and node["y"] - node["h"] / 2 - 8 < point[1]
-                    < node["y"] + node["h"] / 2 + 8
-                ):
-                    raise Failure(
-                        f"{edge['from']} → {edge['to']} tangles with {node_id}"
-                    )
-
-        # The complete fixed-size arrow marker, not merely its tip, must
-        # remain visibly outside the opaque target node.
-        tangent = (end[0] - c2[0], end[1] - c2[1])
-        tangent_length = (tangent[0] ** 2 + tangent[1] ** 2) ** 0.5
-        along = (
-            tangent[0] / tangent_length,
-            tangent[1] / tangent_length,
-        )
-        across = (-along[1], along[0])
-        triangle = (
-            end,
-            (
-                end[0] - 11 * along[0] - 5.5 * across[0],
-                end[1] - 11 * along[1] - 5.5 * across[1],
-            ),
-            (
-                end[0] - 11 * along[0] + 5.5 * across[0],
-                end[1] - 11 * along[1] + 5.5 * across[1],
-            ),
-        )
-        marker_gap = min(
-            shape_distance(
-                (
-                    a * triangle[0][0]
-                    + b * triangle[1][0]
-                    + (1 - a - b) * triangle[2][0],
-                    a * triangle[0][1]
-                    + b * triangle[1][1]
-                    + (1 - a - b) * triangle[2][1],
-                ),
-                target,
-            )
-            for row in range(11)
-            for column in range(11 - row)
-            for a, b in ((row / 10, column / 10),)
-        )
+        arrival = max(depth(point, target) for point in points)
         require(
-            marker_gap >= 8,
-            f"{edge['from']} → {edge['to']} hides its arrowhead "
-            f"{marker_gap:.1f}px from the target",
+            arrival <= 1,
+            f"{edge['from']} → {edge['to']} buries its arrowhead "
+            f"{arrival:.1f}px inside {edge['to']}",
         )
+        # and it reaches either that box or the loop border drawn round it.
+        touches = arrival >= -1
+        if not touches and cluster:
+            touches = max(depth(point, cluster) for point in points) >= -1
+        require(
+            touches,
+            f"{edge['from']} → {edge['to']} stops short of what it points at",
+        )
+    require(
+        drawn_edges == len(chart["edges"]) - 2,
+        f"only {drawn_edges} of the chart's wires are drawn",
+    )
+
 
     config_source = CONFIG_SCRIPT.read_text()
     require(
-        'const ARROW_CLEARANCE = 19;' in config_source
-        and 'refX: "0.5"' in config_source
-        and 'markerUnits: "userSpaceOnUse"' in config_source
-        and 'class: "edge", "marker-end": "url(#arrow)"' in config_source
-        and ".wires marker path { fill: var(--wire); stroke: none; }"
-        in config_source,
-        "the config no longer joins fixed-size arrowheads at their base",
+        'element("path", { d: link.d, fill: CHART.wire })' in config_source
+        and 'viewBox: `0 0 ${CHART.width} ${CHART.height}`' in config_source
+        and 'text.setAttribute("textLength", line.w)' in config_source
+        and '"color-interpolation-filters": "sRGB"' in config_source,
+        "the config no longer paints the exported chart as it was drawn",
     )
     plan_rounds = manifest["settings"]["plan_review_rounds"]
     require(
@@ -6217,12 +6130,37 @@ def test_manifest_chart() -> None:
         "the round bound does not sit inside the plan-review loop",
     )
 
-    # The chart is the README's flowchart, so its shape must not drift
-    # from the documented one.
+    # The README's drawing is generated from this very chart, so rather
+    # than checking that two hand-maintained diagrams still agree, check
+    # that the drawing shipped alongside really is this one.
     readme = (KIT_DIR / "README.md").read_text()
-    diagram_start = readme.index("flowchart TB")
-    diagram = readme[diagram_start:readme.index("```", diagram_start)]
-    diagram_lower = diagram.lower()
+    require(
+        "flowchart.svg" in readme,
+        "the README no longer shows the generated flowchart",
+    )
+    drawing = (KIT_DIR / "flowchart.svg").read_text()
+    require(
+        drawing.lstrip().startswith("<svg"),
+        "flowchart.svg is not an SVG",
+    )
+    for node in chart["nodes"]:
+        for line in node["lines"]:
+            require(
+                f'>{line["t"]}</text>' in drawing,
+                f"the drawing omits {line['t']!r}, which the chart shows",
+            )
+    for edge in chart["edges"]:
+        for line in edge.get("lines", []):
+            require(
+                f'>{line["t"]}</text>' in drawing,
+                f"the drawing omits the caption {line['t']!r}",
+            )
+    for card in chart["legend"]["cards"]:
+        require(
+            f'>{card["title"]["t"]}</text>' in drawing,
+            f"the drawing omits the {card['title']['t']!r} tile",
+        )
+    # and the vocabulary the prose around it relies on is still in the chart
     for token in (
         "classify",
         "findings",
@@ -6233,28 +6171,13 @@ def test_manifest_chart() -> None:
         "round cap",
     ):
         require(
-            token in diagram_lower,
-            f"the README flowchart no longer mentions {token}",
-        )
-        require(
-            any(token in node["label"] or token in node["id"] for node in nodes.values())
+            any(
+                token in node["label"] or token in node["id"]
+                for node in nodes.values()
+            )
             or any(token in edge.get("label", "") for edge in chart["edges"]),
             f"the chart omits {token}, which the README documents",
         )
-    require(
-        "direction LR" in diagram
-        and 'I0["investigation"] ~~~ T0["trivial"]' in diagram
-        and 'S0["standard"] ~~~ X0["complex"]' in diagram,
-        "the README does not constrain the classifier results left to right",
-    )
-    readme_branch_positions = [
-        diagram.index(f"C ---->|{label}|")
-        for label, _target in expected_branches
-    ]
-    require(
-        readme_branch_positions == sorted(readme_branch_positions),
-        "the README classifier branches are not declared in the required order",
-    )
 
 
 @test("the plan-review cap accepts only bounded integer rounds")
@@ -6501,13 +6424,33 @@ def exercise_provider_neutral_config_surface() -> None:
                     f"the configuration page still contains {forbidden!r}",
                 )
             require(
-                'data-kind="thinking"' in page
-                and '["anthropic", "openai"].map(provider =>' in page
-                and 'provider === "anthropic" ? "Anthropic" : "OpenAI"'
-                in page
-                and "const kin = Boolean(chosen && !self" in page
-                and 'box.classList.toggle("self", self)' in page,
-                "the page lacks provider-neutral controls or tandem hover logic",
+                'data-kind="endpoint"' in page
+                and 'data-kind="model"' in page
+                and 'data-kind="thinking"' in page
+                and 'for (const name of ["anthropic", "openai"])' in page
+                and '"Anthropic" : "OpenAI"' in page,
+                "the page lacks provider-neutral controls",
+            )
+            # Pointing at a step lights the shortest way to it and fades
+            # the rest: the steps off that route, the wires off it, the
+            # loop's own furniture, and the legend entries that configure
+            # none of it.
+            require(
+                "function routeTo(nodeId)" in page
+                and "state.nodes.has(id)" in page
+                and "state.edges.has(part.dataset.edge)" in page
+                and 'querySelectorAll(".art [data-part]")' in page
+                and "state.cards.has(part.dataset.card)" in page,
+                "the page no longer lights the route to a hovered step",
+            )
+            # Where two branches rejoin, both are shown rather than one
+            # being picked, and a step can be pinned so the highlight
+            # survives the trip to the legend entry that configures it.
+            require(
+                "DEPTH.get(link.from) !== DEPTH.get(at) - 1" in page
+                and "let pinned = null" in page
+                and "pinned = pinned === node.id ? null : node.id" in page,
+                "the page no longer shows every shortest route, or cannot pin one",
             )
             require(
                 "Models and thinking levels were discovered from the installed "
@@ -6515,9 +6458,11 @@ def exercise_provider_neutral_config_surface() -> None:
                 "the page did not report its live capability source",
             )
             require(
-                ".cnode.self { box-shadow:" in page
-                and ".cnode.kin { box-shadow:" not in page,
-                "a tandem node receives the hovered node's outline",
+                ".art g[data-node].self rect" in page
+                and 'group.classList.toggle("self", engaged && state.self === id)'
+                in page
+                and "g[data-node].kin" not in page,
+                "the step being pointed at is not marked out from the route",
             )
 
             state_match = re.search(
@@ -7290,7 +7235,17 @@ def test_session_start_missing_model() -> None:
             "source": "startup",
             "cwd": str(repository),
         }
+        # HOME is isolated: the hook now consults the surface's own
+        # configuration, so without this the result would depend on the
+        # developer's live settings rather than the fixture.
+        surface_home = Path(directory) / "home"
+        (surface_home / ".claude").mkdir(parents=True)
+        write_json(
+            surface_home / ".claude" / "settings.json",
+            {"model": "some-other-model"},
+        )
         environment = os.environ.copy()
+        environment["HOME"] = str(surface_home)
         environment["XDG_STATE_HOME"] = str(state_home)
         environment["CLAUDE_CODE_EFFORT_LEVEL"] = "max"
         result = subprocess.run(
@@ -7313,17 +7268,20 @@ def test_session_start_missing_model() -> None:
             "additionalContext", ""
         )
         require(
-            "interface-asserted" in message
-            and "not an error" in message
+            "unverified" in message
             and "Anthropic / fable" in message
-            and "thinking level max matches" in message
-            and "could not verify" not in message,
-            f"the missing-model disclosure is wrong: {message}",
+            and "drifted from the manifest" in message
+            and "orrery-sync" in message,
+            f"the drifted-default disclosure is wrong: {message}",
         )
+        # The hook must never let a stored default be reported as the
+        # running model: the interface's own selection overrides it and
+        # is invisible here.
         require(
             "one short line" in context
-            and "not a failure" in context
-            and "without framing it as an error" in context
+            and "Never state that the configured model is the one running"
+            in context
+            and "authoritative" in context
             and "APPROVAL REQUIRED" not in context,
             f"the missing-model instruction is wrong: {context}",
         )
@@ -7334,7 +7292,7 @@ def test_session_start_missing_model() -> None:
         ]
         require(
             len(events) == 1
-            and events[0]["kind"] == "principal-unverified"
+            and events[0]["kind"] == "principal-drift"
             and events[0]["program"] == "orrery-session-start"
             and events[0]["role"] == "orchestrator"
             and events[0]["provider"] == "anthropic"
@@ -7360,6 +7318,56 @@ def test_session_start_missing_model() -> None:
             not in openai_notice.get("systemMessage", ""),
             "a Claude effort variable was used to verify an OpenAI "
             f"surface: {openai_notice}",
+        )
+
+        # Once the surface's own configuration pins the principal, the
+        # session is demonstrably running it: the hook says so and
+        # records nothing, because an unreported model is a property of
+        # the surface, not a failure.
+        write_json(
+            surface_home / ".claude" / "settings.json",
+            {
+                "model": "fable",
+                "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"},
+            },
+        )
+        before = (store.read_text().count("\n")) if store.exists() else 0
+        pinned = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=json.dumps(payload),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        pinned_notice = json.loads(pinned.stdout)
+        pinned_message = pinned_notice.get("systemMessage", "")
+        pinned_context = pinned_notice["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        # An aligned stored default is still not evidence of the running
+        # model, so the hook must report it as unverified and must not
+        # instruct the session to assert it.
+        require(
+            "unverified" in pinned_message
+            and "drifted" not in pinned_message
+            and "orrery-sync" not in pinned_message,
+            f"an aligned default was reported as drift: {pinned_message}",
+        )
+        require(
+            "Never state that the configured model is the one running"
+            in pinned_context
+            and "authoritative" in pinned_context,
+            f"the aligned instruction invites a false claim: "
+            f"{pinned_context}",
+        )
+        after = (store.read_text().count("\n")) if store.exists() else 0
+        require(
+            after == before,
+            "a pinned surface recorded an incident; this fires once per "
+            "session start and would bury real failures",
         )
 
 
@@ -7464,6 +7472,7 @@ def test_installer_covers_doctor_commands() -> None:
         "orrery-usage",
         "orrery-config",
         "orrery-incidents",
+        "orrery-task",
     ):
         require(
             f"$HOME/.local/bin/{command}" in installer,
@@ -7610,12 +7619,37 @@ def exercise_green_path_install() -> None:
         require(
             settings.get("enabledPlugins", {}).get("codex@openai-codex")
             is False
-            and "SessionStart" in settings.get("hooks", {})
-            and "model" not in settings
-            and "effortLevel" not in settings
-            and "CLAUDE_CODE_EFFORT_LEVEL"
-            not in settings.get("env", {}),
-            "installation duplicated role model settings into Claude settings",
+            and "SessionStart" in settings.get("hooks", {}),
+            "installation did not install hooks or companion state",
+        )
+        # Deliberately revised when surface projection landed. This once
+        # asserted that installation writes no live role model, which
+        # encoded the older rule that the manifest is the only place a
+        # model may appear. That rule still holds for the canonical
+        # file, asserted separately, but the live file is now derived
+        # state: an IDE extension reads it, so a session there has to
+        # start on the configured principal. The projection must equal
+        # the manifest, and the thinking level must use exactly one
+        # representation.
+        principal = runtime_module.load_role(
+            "orchestrator", apply_override=False
+        )
+        recorded_effort = settings.get("env", {}).get(
+            "CLAUDE_CODE_EFFORT_LEVEL"
+        ) or settings.get("effortLevel")
+        require(
+            settings.get("model") == principal.model
+            and recorded_effort == principal.thinking
+            and not (
+                "effortLevel" in settings
+                and "CLAUDE_CODE_EFFORT_LEVEL" in settings.get("env", {})
+            ),
+            f"installation did not project the principal: {settings}",
+        )
+        require(
+            settings.get("fallbackModel")
+            == fallback_module.same_provider_ladder(principal),
+            f"installation did not arm the ladder: {settings}",
         )
         codex_hooks = read_json(codex_home_path / "hooks.json")
         codex_commands = {
@@ -8291,6 +8325,21 @@ def test_parse_reset_time() -> None:
     )
 
 
+@test("workspace fingerprints include committed state")
+def test_workspace_fingerprint_includes_head() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        before = fallback_module.git_workspace_fingerprint(root)
+        subprocess.run(
+            ["git", "-C", str(root), "commit", "--allow-empty", "-q", "-m", "next"],
+            check=True,
+        )
+        after = fallback_module.git_workspace_fingerprint(root)
+        require(before != after, "a commit did not change the workspace fingerprint")
+        require(after == fallback_module.git_workspace_fingerprint(root), "an unchanged checkout was not stable")
+
+
 @test("standing approvals round-trip with scoped lifetimes and modes")
 def test_standing_round_trip() -> None:
     with standing_stores() as (runtime_dir, state_dir):
@@ -8452,6 +8501,25 @@ def test_standing_corruption_and_revoke() -> None:
             tolerated is None and "unusable" in errors.getvalue(),
             "an unusable store crashed the consult instead of degrading",
         )
+
+
+@test("standing approvals bind access, endpoint, and fingerprint version")
+def test_standing_identity_binding() -> None:
+    with standing_stores() as (_runtime, state_dir):
+        configured = runtime_module.load_role("reviewer")
+        candidate = standing_candidate(configured)
+        standing_module.record_approval(
+            configured=configured, candidate=candidate, scope="until",
+            expires_at=time.time() + 3600, reason="limit", failure_scope="provider",
+        )
+        require(standing_module.match(dataclasses.replace(configured, access="workspace-write")) is None, "an approval survived an access change")
+        endpoint = runtime_module.Endpoint("test", "Test", "anthropic", "https://example.test", "TEST_KEY")
+        require(standing_module.match(dataclasses.replace(configured, endpoint=endpoint)) is None, "an approval survived an endpoint change")
+        store = state_dir / "orrery" / "standing.json"
+        data = read_json(store)
+        data["approvals"][0]["fingerprint"] = [configured.provider, configured.model, configured.thinking]
+        write_json(store, data)
+        require(standing_module.match(configured) is None, "an old-format approval was honoured")
 
 
 @test("a concurrent record cannot resurrect revoked standing approvals")
@@ -8775,6 +8843,7 @@ def test_standing_adoption_end_to_end() -> None:
             environment = review_environment(
                 "success", standing_state=state_dir
             )
+            environment["ORRERY_ALLOW_UNCONFINED"] = "1"
             environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
             process = start_review(
                 environment, "--timeout", "60", "--", "prompt"
@@ -9124,6 +9193,9 @@ def test_delegated_environment_drops_session_markers() -> None:
         "CLAUDE_CODE_SESSION_ID": "parent-session",
         "CLAUDE_CODE_SSE_PORT": "12345",
         "CLAUDE_CONFIG_DIR": str(Path.home() / ".claude"),
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/tmp/test-bus",
+        "SSH_AUTH_SOCK": "/tmp/test-agent",
+        "XDG_RUNTIME_DIR": "/tmp/test-runtime",
     }
     saved = {name: os.environ.get(name) for name in markers}
     os.environ.update(markers)
@@ -9350,16 +9422,11 @@ def test_read_only_unit_workspace_guard() -> None:
                     not (workspace / "blocked.txt").exists(),
                     "a read-only unit wrote into the workspace",
                 )
-                require(
-                    "cannot enforce ReadOnlyPaths" not in stderr,
-                    "enforced protection was reported as unavailable",
-                )
+                require("confinement is not enforced" not in stderr, stderr)
             else:
                 require(
-                    "cannot enforce ReadOnlyPaths" in stderr
-                    and "tool-level only" in stderr,
-                    "degraded read-only protection was not announced: "
-                    f"{stderr[-500:]}",
+                    "confinement is not enforced" in stderr,
+                    f"degraded confinement was not announced: {stderr[-500:]}",
                 )
 
     with tempfile.TemporaryDirectory() as directory:
@@ -9372,6 +9439,7 @@ def test_read_only_unit_workspace_guard() -> None:
             stderr=subprocess.DEVNULL,
         )
         environment = review_environment("success")
+        environment["ORRERY_ALLOW_UNCONFINED"] = "1"
         environment["CLAUDE_FAKE_WRITE"] = str(workspace / "allowed.txt")
         process = start_review(
             environment,
@@ -9390,6 +9458,147 @@ def test_read_only_unit_workspace_guard() -> None:
             process.returncode == 0
             and (workspace / "allowed.txt").exists(),
             f"a write-capable unit lost workspace access: {stderr[-600:]}",
+        )
+
+
+@test("a worker delegate cannot write the user's real configuration")
+def test_worker_confinement_real_configuration() -> None:
+    real_paths = {
+        "claude_settings": Path.home() / ".claude" / "settings.json",
+        "local_bin": Path.home() / ".local" / "bin" / "orrery-probe",
+        "runtime": Path(
+            os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".cache")
+        )
+        / "orrery"
+        / "probe",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        provider_home = root / "codex-home"
+        workspace.mkdir()
+        provider_home.mkdir()
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps(
+            {**{name: str(path) for name, path in real_paths.items()},
+             "workspace": str(workspace / "allowed.txt")}
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--role", "implementer", "--timeout", "60", "--", "prompt",
+            cwd=workspace,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        writes = read_json(result_path)
+        require(
+            process.returncode == 0
+            and writes == {
+                "claude_settings": False,
+                "local_bin": False,
+                "runtime": False,
+                "workspace": True,
+            },
+            f"worker confinement was incomplete: {writes}; {stderr[-600:]}",
+        )
+
+
+@test("a read-only delegate cannot write outside its run directory")
+def test_read_only_delegate_confinement() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        provider_home = root / "codex-home"
+        workspace.mkdir()
+        provider_home.mkdir()
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps(
+            {
+                "outside": str(root / "outside.txt"),
+                "workspace": str(workspace / "blocked.txt"),
+            }
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=workspace
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"read-only run failed: {stderr[-600:]}")
+        writes = read_json(result_path)
+        require(
+            writes == {"outside": False, "workspace": False},
+            f"read-only confinement was incomplete: {writes}; {stderr[-600:]}",
+        )
+
+
+@test("a workspace under /tmp runs normally")
+def test_tmp_workspace_confinement() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        provider_home = root / "codex-home"
+        workspace.mkdir()
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=workspace
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"a /tmp workspace did not run: {stderr[-600:]}",
+        )
+
+
+@test("delegated environments drop session sockets")
+def test_delegated_environment_drops_session_sockets() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        provider_home = Path(directory) / "codex-home"
+        provider_home.mkdir()
+        environment_path = provider_home / "environment.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_ENV"] = str(environment_path)
+        process = start_review(environment, "--timeout", "60", "--", "prompt")
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"delegated run failed: {stderr[-600:]}")
+        captured = read_json(environment_path)
+        forbidden = {
+            "DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR",
+        }
+        require(
+            not forbidden & set(captured),
+            f"delegated environment retained a session socket: {captured}; {stderr[-600:]}",
+        )
+
+
+@test("a task dispatch completes under confinement")
+def test_task_dispatch_receipts_under_confinement() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        provider_home = root / "codex-home"
+        provider_home.mkdir()
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+            remove_helper_state(environment)
+        records = task_records(root)
+        attempt = root / next(record["dispatch"]["receipts"] for record in records if "dispatch" in record)
+        require(
+            result.returncode == 0
+            and (attempt / "receipt.json").exists()
+            and (attempt / "result.txt").exists(),
+            f"confined task dispatch did not write receipts: {result.stderr[-600:]}",
         )
 
 
@@ -9425,6 +9634,7 @@ def test_endpoint_validation() -> None:
         ("credentials in the URL", endpoint(base_url="https://k@api.example.com"), "probe"),
         ("a query string", endpoint(base_url="https://api.example.com/?k=1"), "probe"),
         ("an invalid key variable", endpoint(key_env="not a name"), "probe"),
+        ("a first-party key variable", endpoint(key_env="ANTHROPIC_API_KEY"), "probe"),
         ("an unknown endpoint", endpoint(), "missing"),
         ("an invalid endpoint id", endpoint(), "Bad Name"),
         ("an unknown field", endpoint(secret="x"), "probe"),
@@ -9528,6 +9738,41 @@ def test_endpoint_routing_contract() -> None:
             os.environ["ORRERY_TEST_KEY"] = saved
 
 
+@test("endpoint environments exclude alternate routes and credentials")
+def test_endpoint_environment_exclusivity() -> None:
+    endpoint = runtime_module.Endpoint("test", "Test", "anthropic", "https://example.test", "ORRERY_TEST_KEY")
+    saved = dict(os.environ)
+    try:
+        os.environ.update({
+            "ORRERY_TEST_KEY": "endpoint", "ANTHROPIC_API_KEY": "first", "ANTHROPIC_AUTH_TOKEN": "first",
+            "ANTHROPIC_BASE_URL": "https://first.test", "AWS_SECRET_ACCESS_KEY": "aws",
+            "GOOGLE_APPLICATION_CREDENTIALS": "google", "GCLOUD_TOKEN": "gcloud",
+            "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": "1",
+            "OPENAI_API_KEY": "openai", "OPENAI_BASE_URL": "https://openai.test",
+        })
+        environment = runtime_module.provider_environment("anthropic", Path(tempfile.gettempdir()), endpoint=endpoint)
+        forbidden = {"AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "OPENAI_API_KEY", "OPENAI_BASE_URL"}
+        require(not forbidden & set(environment), f"alternate endpoint route leaked: {environment}")
+        require(environment["ANTHROPIC_AUTH_TOKEN"] == "endpoint" and environment["ANTHROPIC_API_KEY"] == "", str(environment))
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+@test("endpoint roles skip first-party availability and model checks")
+def test_endpoint_role_preflight() -> None:
+    endpoint = runtime_module.Endpoint("local", "Local", "openai", "http://localhost:11434/v1")
+    role = dataclasses.replace(runtime_module.load_role("implementer"), endpoint=endpoint)
+    original_review = review_module.provider_status
+    try:
+        def unavailable(_provider: str) -> Any:
+            raise Failure("endpoint preflight queried first-party login")
+        review_module.provider_status = unavailable
+        require(review_module.role_availability(role).state is fallback_module.Availability.READY, "review endpoint preflight was unavailable")
+    finally:
+        review_module.provider_status = original_review
+
+
 @test("a delegated run reaches its endpoint with the routed credential")
 def test_endpoint_delegated_run() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -9559,13 +9804,16 @@ def test_endpoint_delegated_run() -> None:
         )
         write_json(manifest_path, manifest)
 
-        # The reviewer is read-only, so its unit mounts the workspace
-        # read-only: the capture files must live outside it.
+        # The reviewer is read-only, so captures live in its writable
+        # provider home rather than in the read-only workspace.
         workspace = root / "workspace"
         workspace.mkdir()
-        captured_env = root / "env.json"
-        captured_args = root / "args.txt"
+        provider_home = root / "claude-home"
+        provider_home.mkdir()
+        captured_env = provider_home / "env.json"
+        captured_args = provider_home / "args.txt"
         environment = review_environment("success")
+        environment["CLAUDE_CONFIG_DIR"] = str(provider_home)
         environment["ORRERY_TEST_KEY"] = "secret-token"
         environment["CLAUDE_FAKE_ENV"] = str(captured_env)
         environment["CLAUDE_FAKE_ARGS"] = str(captured_args)
@@ -9686,7 +9934,7 @@ def test_fallback_drops_endpoint() -> None:
 def test_role_timeout_budgets() -> None:
     role = runtime_module.load_role("reviewer")
     require(
-        role.timeout_seconds == 900,
+        role.timeout_seconds == 1800,
         f"the reviewer manifest budget did not load: {role.timeout_seconds}",
     )
 
@@ -10222,8 +10470,11 @@ def test_verbosity_dial() -> None:
 @test("delegated prompts carry the verbosity style end to end")
 def test_verbosity_delegated_prompt() -> None:
     with tempfile.TemporaryDirectory() as directory:
-        stdin_path = Path(directory) / "stdin.txt"
+        provider_home = Path(directory) / "codex-home"
+        provider_home.mkdir()
+        stdin_path = provider_home / "stdin.txt"
         environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
         environment["CODEX_FAKE_STDIN"] = str(stdin_path)
         process = start_review(
             environment, "--timeout", "60", "--", "the assignment"
@@ -10241,7 +10492,11 @@ def test_verbosity_delegated_prompt() -> None:
         )
 
         stdin_path.unlink()
+        second_provider_home = Path(directory) / "second-codex-home"
+        second_provider_home.mkdir()
+        stdin_path = second_provider_home / "stdin.txt"
         environment = review_environment("success")
+        environment["CODEX_HOME"] = str(second_provider_home)
         environment["CODEX_FAKE_STDIN"] = str(stdin_path)
         environment["ORRERY_VERBOSITY"] = "3"
         process = start_review(
@@ -10850,6 +11105,82 @@ def test_progress_extends_run() -> None:
         assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
+@test("the delegate's own output is streamed and can be captured")
+def test_delegate_log_and_stream() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        captured = Path(directory) / "agent.log"
+        environment = review_environment("drip")
+        environment["CODEX_FAKE_DRIP_SECONDS"] = "5"
+        environment["CODEX_FAKE_DRIP_TEXT"] = "inspected the diff"
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--log",
+            str(captured),
+            "--",
+            "prompt",
+        )
+        stdout, stderr = finish_review(process, environment, timeout=120)
+        require(
+            process.returncode == 0 and "fake verdict" in stdout,
+            f"the captured run failed: {stderr}",
+        )
+        require(
+            captured.is_file()
+            and captured.read_text().count("inspected the diff") >= 4,
+            "the delegate log was not published in full",
+        )
+        require(
+            "| inspected the diff" in stderr,
+            f"streaming was not on by default: {stderr}",
+        )
+        # The default caps each burst and says what it withheld rather
+        # than silently truncating.
+        require(
+            "line(s) not shown" in stderr,
+            f"the default stream did not bound its output: {stderr}",
+        )
+
+        quiet = review_environment("drip")
+        quiet["CODEX_FAKE_DRIP_SECONDS"] = "5"
+        process = start_review(
+            quiet, "--timeout", "60", "--no-stream", "--", "prompt"
+        )
+        _, quiet_stderr = finish_review(process, quiet, timeout=120)
+        require(
+            process.returncode == 0
+            and "examined a hunk" not in quiet_stderr,
+            f"--no-stream still mirrored the delegate: {quiet_stderr}",
+        )
+
+        # A timed-out run is when the working output matters most, so
+        # the log must survive that path too.
+        expiring = Path(directory) / "timeout.log"
+        environment = review_environment("drip")
+        environment["CODEX_FAKE_DRIP_SECONDS"] = "3"
+        environment["CODEX_FAKE_AFTER"] = "sleep"
+        process = start_review(
+            environment,
+            "--timeout",
+            "8",
+            "--log",
+            str(expiring),
+            "--",
+            "prompt",
+        )
+        _, expiring_stderr = finish_review(process, environment, timeout=120)
+        require(
+            process.returncode == 124,
+            f"the expiring run did not time out: {expiring_stderr}",
+        )
+        require(
+            expiring.is_file() and "examined a hunk" in expiring.read_text(),
+            "a timed-out run lost the delegate's working output",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
 @test("a silent run still times out at its base budget")
 def test_silent_run_times_out_at_base() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -10966,8 +11297,1869 @@ def test_provider_text_cannot_forge_markers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Principal surface projection
+# ---------------------------------------------------------------------------
+
+
+sync_module = load_script(SYNC_SCRIPT, "kit_orrery_sync")
+
+
+@test("the same-provider ladder is pure, first-party, and bounded")
+def test_same_provider_ladder() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    require(
+        fallback_module.same_provider_ladder(principal) == ["opus", "sonnet"],
+        "Fable did not ladder to Opus then Sonnet",
+    )
+
+    # Purity: no authentication probe and no picker discovery may run.
+    # discover_live=False is not offline, which is why the ranking path
+    # is not reused here.
+    calls: list[str] = []
+    saved_status = fallback_module.provider_status
+    saved_claude = fallback_module.discover_claude_models
+    saved_codex = fallback_module.discover_codex_models
+    try:
+        fallback_module.provider_status = lambda *a, **k: calls.append("auth")
+        fallback_module.discover_claude_models = (
+            lambda *a, **k: calls.append("discover")
+        )
+        fallback_module.discover_codex_models = (
+            lambda *a, **k: calls.append("discover")
+        )
+        fallback_module.same_provider_ladder(principal)
+    finally:
+        fallback_module.provider_status = saved_status
+        fallback_module.discover_claude_models = saved_claude
+        fallback_module.discover_codex_models = saved_codex
+    require(not calls, f"the ladder was not pure: {calls}")
+
+    endpoint = runtime_module.Endpoint(
+        id="kimi",
+        label="Kimi",
+        adapter="anthropic",
+        base_url="https://api.example.invalid",
+        key_env="EXAMPLE_KEY",
+    )
+    routed = dataclasses.replace(principal, endpoint=endpoint)
+    require(
+        fallback_module.same_provider_ladder(routed) == [],
+        "an endpoint-backed role was given a first-party ladder",
+    )
+
+    unknown = dataclasses.replace(principal, model="not-in-catalogue")
+    require(
+        fallback_module.same_provider_ladder(unknown) == [],
+        "a model outside the catalogue was placed on the tier scale",
+    )
+
+
+@test("a repository principal override never reaches global projection")
+def test_sync_ignores_repository_override() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = Path(directory)
+        (repository / ".git").mkdir()
+        write_json(
+            repository / ".orrery.json",
+            {"orchestrator": {"provider": "openai", "model": "gpt-5.6-sol"}},
+        )
+        overridden = runtime_module.load_role(
+            "orchestrator", cwd=repository
+        )
+        require(
+            overridden.provider == "openai",
+            "the override was not applied when requested",
+        )
+        global_role = runtime_module.load_role(
+            "orchestrator", cwd=repository, apply_override=False
+        )
+        require(
+            (global_role.provider, global_role.model)
+            == ("anthropic", "fable"),
+            f"the global manifest was overridden: {global_role}",
+        )
+
+
+@test("orrery-sync projects the principal onto the Claude surface")
+def test_sync_claude_projection() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / ".claude").mkdir()
+        settings = home / ".claude" / "settings.json"
+        write_json(
+            settings,
+            {
+                "permissions": {"allow": ["Bash(ls:*)"]},
+                "unrelatedSetting": {"keep": True},
+                # The contradictory pair a live machine can accumulate.
+                "effortLevel": "xhigh",
+                "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max", "OTHER": "keep"},
+            },
+        )
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_STATE_HOME"] = str(home / "state")
+
+        result = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            result.returncode == 0,
+            f"sync failed: {result.stdout} {result.stderr}",
+        )
+        live = read_json(settings)
+        require(
+            live["model"] == "fable"
+            and live["fallbackModel"] == ["opus", "sonnet"],
+            f"the principal was not projected: {live}",
+        )
+        require(
+            live["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "max"
+            and "effortLevel" not in live,
+            "max thinking must live only in the environment key: "
+            f"{live}",
+        )
+        require(
+            live["permissions"]["allow"] == ["Bash(ls:*)"]
+            and live["unrelatedSetting"] == {"keep": True}
+            and live["env"]["OTHER"] == "keep",
+            f"unrelated settings were lost: {live}",
+        )
+
+        # Idempotent, and --check agrees once aligned.
+        checked = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT), "--check"],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            checked.returncode == 0,
+            f"--check reported drift after syncing: {checked.stdout}",
+        )
+        record = read_json(home / "state" / "orrery" / "projection.json")
+        require(
+            record["surface"] == "anthropic"
+            and record["fallbackModel"] == ["opus", "sonnet"],
+            f"the projection record is wrong: {record}",
+        )
+
+
+@test("the Codex root rewrite preserves everything else or refuses")
+def test_codex_root_rewrite() -> None:
+    original = (
+        "# leading comment\n"
+        'model = "gpt-5.6-sol"\n'
+        'model_reasoning_effort = "xhigh"\n'
+        "\n"
+        '[projects."/home/nick/Desktop/tz"]\n'
+        'trust_level = "trusted"\n'
+        "model = \"should-not-change\"\n"
+    )
+    updated = sync_module.rewrite_codex_root(
+        original,
+        {"model": "gpt-5.6-terra", "model_reasoning_effort": "medium"},
+    )
+    require(
+        '# leading comment' in updated
+        and 'model = "gpt-5.6-terra"' in updated
+        and 'model_reasoning_effort = "medium"' in updated
+        and 'trust_level = "trusted"' in updated
+        and 'model = "should-not-change"' in updated,
+        f"the rewrite damaged the file: {updated!r}",
+    )
+    parsed = tomllib.loads(updated)
+    require(
+        parsed["model"] == "gpt-5.6-terra"
+        and parsed["projects"]["/home/nick/Desktop/tz"]["model"]
+        == "should-not-change",
+        f"the table's own model was altered: {parsed}",
+    )
+
+    # A missing root key in a file that already has tables must refuse
+    # rather than append a line that would land inside the last table.
+    try:
+        sync_module.rewrite_codex_root(
+            '[projects."/x"]\ntrust_level = "trusted"\n',
+            {"model": "gpt-5.6-terra"},
+        )
+    except sync_module.SyncError as exc:
+        require(
+            "inside a table" in str(exc),
+            f"the wrong refusal was raised: {exc}",
+        )
+    else:
+        raise Failure("a root key was appended after a table header")
+
+
+@test("--no-fallback disarms the native ladder for that run")
+def test_no_fallback_disarms_native_ladder() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    plain = runtime_module.principal_command(principal, [])
+    require(
+        "--settings" not in plain,
+        f"a default launch injected a settings override: {plain}",
+    )
+    pinned = runtime_module.principal_command(
+        principal, [], suppress_native_fallback=True
+    )
+    require(
+        "--settings" in pinned
+        and json.loads(pinned[pinned.index("--settings") + 1])
+        == {"fallbackModel": []},
+        f"--no-fallback did not disarm the ladder: {pinned}",
+    )
+
+
+@test("no native ladder survives into endpoint or delegated runs")
+def test_ladder_never_leaks() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    endpoint = runtime_module.Endpoint(
+        id="kimi",
+        label="Kimi",
+        adapter="anthropic",
+        base_url="https://api.example.invalid",
+        key_env="EXAMPLE_KEY",
+    )
+    routed = dataclasses.replace(principal, endpoint=endpoint)
+    command = runtime_module.principal_command(routed, [])
+    require(
+        "--settings" in command
+        and json.loads(command[command.index("--settings") + 1])
+        == {"fallbackModel": []},
+        "an endpoint-backed principal kept a first-party ladder: "
+        f"{command}",
+    )
+
+    for role_id in ("reviewer", "implementer"):
+        role = runtime_module.load_role(role_id)
+        if role.provider != "anthropic":
+            role = dataclasses.replace(role, provider="anthropic")
+        settings = runtime_module.claude_sandbox_settings(role, Path.cwd())
+        require(
+            settings.get("fallbackModel") == [],
+            f"a delegated {role_id} could inherit the principal's "
+            f"ladder: {settings}",
+        )
+
+    # A principal that moves to an endpoint withdraws the ladder an
+    # earlier first-party principal left behind.
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / ".claude").mkdir()
+        settings_path = home / ".claude" / "settings.json"
+        write_json(
+            settings_path,
+            {"model": "fable", "fallbackModel": ["opus", "sonnet"]},
+        )
+        saved = os.environ.get("HOME")
+        try:
+            os.environ["HOME"] = str(home)
+            sync_module.withdraw_claude_ladder(
+                settings_path,
+                {"surface": "anthropic", "fallbackModel": ["opus", "sonnet"]},
+                principal,
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved
+        live = read_json(settings_path)
+        require(
+            "fallbackModel" not in live and live.get("model") == "fable",
+            f"the stale ladder was not withdrawn cleanly: {live}",
+        )
+
+
+@test("the Codex writer preserves comments and refuses a raced file")
+def test_codex_writer_safety() -> None:
+    kept = sync_module.rewrite_codex_root(
+        'model = "old" # managed by dotfiles\n',
+        {"model": "gpt-5.6-terra"},
+    )
+    require(
+        '# managed by dotfiles' in kept
+        and 'model = "gpt-5.6-terra"' in kept,
+        f"a trailing comment was destroyed: {kept!r}",
+    )
+    quoted = sync_module.rewrite_codex_root(
+        'model = "has#hash"\n', {"model": "x"}
+    )
+    require(
+        quoted.strip() == 'model = "x"',
+        f"a hash inside a value was mistaken for a comment: {quoted!r}",
+    )
+
+    role = dataclasses.replace(
+        runtime_module.load_role("orchestrator"),
+        provider="openai",
+        model="gpt-5.6-terra",
+        thinking="medium",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        codex = Path(directory)
+        config = codex / "config.toml"
+        config.write_text('model = "gpt-5.6-sol"\n')
+        saved = os.environ.get("CODEX_HOME")
+        try:
+            os.environ["CODEX_HOME"] = str(codex)
+            # A file that changes between snapshot and publication must
+            # be refused, not overwritten with the stale copy.
+            original_reader = sync_module.tomllib.loads
+
+            def racing(text: str) -> Any:
+                config.write_text(
+                    'model = "gpt-5.6-sol"\n[projects."/x"]\n'
+                    'trust_level = "trusted"\n'
+                )
+                sync_module.tomllib.loads = original_reader
+                return original_reader(text)
+
+            sync_module.tomllib.loads = racing
+            try:
+                sync_module.sync_codex(role, dry_run=False)
+            except sync_module.SyncError as exc:
+                require(
+                    "changed while it was being prepared" in str(exc),
+                    f"the wrong refusal was raised: {exc}",
+                )
+            else:
+                raise Failure("a raced Codex configuration was overwritten")
+            finally:
+                sync_module.tomllib.loads = original_reader
+            require(
+                'trust_level = "trusted"' in config.read_text(),
+                "the concurrent trust entry was discarded",
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("CODEX_HOME", None)
+            else:
+                os.environ["CODEX_HOME"] = saved
+
+
+@test("drift detection distinguishes the two thinking representations")
+def test_thinking_representation_drift() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    require(principal.thinking == "max", "the fixture assumes max thinking")
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / ".claude").mkdir()
+        settings_path = home / ".claude" / "settings.json"
+        saved = os.environ.get("HOME")
+        try:
+            os.environ["HOME"] = str(home)
+            # max in the persisted key reads as the right level but is
+            # not honoured there, so it must count as drift.
+            write_json(
+                settings_path,
+                {
+                    "model": "fable",
+                    "effortLevel": "max",
+                    "fallbackModel": ["opus", "sonnet"],
+                },
+            )
+            wrong = sync_module.claude_drift(principal, ["opus", "sonnet"])
+            require(
+                any("thinking" in line for line in wrong),
+                f"effortLevel: max was accepted as aligned: {wrong}",
+            )
+            write_json(
+                settings_path,
+                {
+                    "model": "fable",
+                    "env": {"CLAUDE_CODE_EFFORT_LEVEL": "max"},
+                    "fallbackModel": ["opus", "sonnet"],
+                },
+            )
+            require(
+                sync_module.claude_drift(principal, ["opus", "sonnet"]) == [],
+                "the correct representation was reported as drift",
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved
+
+
+@test("the native ladder answers overload but not an exhausted plan")
+def test_native_ladder_live_behaviour() -> None:
+    """Pins what the installed CLI actually does with `fallbackModel`.
+
+    Reading the binary suggested that a 429 triggers substitution; a
+    loopback probe showed it does not, and only an overloaded service
+    does. That difference decides whether the ladder rescues the case
+    a user actually hits, so it is measured here rather than assumed.
+    No credits are spent: the CLI talks to a stub on 127.0.0.1.
+    """
+    executable = shutil.which("claude")
+    if executable is None:
+        print("      (skipped: the Claude CLI is not installed)")
+        return
+
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    def run_against(status: int, error_type: str, budget: float) -> list[str]:
+        seen: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("content-length", 0))
+                try:
+                    body = json.loads(self.rfile.read(length))
+                except Exception:  # noqa: BLE001 - stub tolerance
+                    body = {}
+                model = str(body.get("model", "?"))
+                seen.append(model)
+                if "fable" in model:
+                    payload = json.dumps(
+                        {"type": "error", "error": {"type": error_type,
+                                                    "message": "stub"}}
+                    ).encode()
+                    self.send_response(status)
+                    self.send_header("content-type", "application/json")
+                    self.send_header("content-length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                for name, data in (
+                    ("message_start", {"type": "message_start", "message": {
+                        "id": "m", "type": "message", "role": "assistant",
+                        "model": model, "content": [], "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+                    ("content_block_start", {
+                        "type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}}),
+                    ("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": "ok"}}),
+                    ("content_block_stop", {
+                        "type": "content_block_stop", "index": 0}),
+                    ("message_delta", {"type": "message_delta", "delta": {
+                        "stop_reason": "end_turn", "stop_sequence": None},
+                        "usage": {"output_tokens": 1}}),
+                    ("message_stop", {"type": "message_stop"}),
+                ):
+                    self.wfile.write(
+                        f"event: {name}\ndata: {json.dumps(data)}\n\n".encode()
+                    )
+                    self.wfile.flush()
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                (home / ".claude").mkdir()
+                write_json(
+                    home / ".claude" / "settings.json",
+                    {"model": "fable", "fallbackModel": ["opus"]},
+                )
+                environment = os.environ.copy()
+                environment.update({
+                    "HOME": str(home),
+                    "ANTHROPIC_BASE_URL":
+                        f"http://127.0.0.1:{server.server_address[1]}",
+                    "ANTHROPIC_AUTH_TOKEN": "stub",
+                    "ANTHROPIC_API_KEY": "",
+                })
+                for marker in (
+                    "CLAUDECODE",
+                    "CLAUDE_CODE_ENTRYPOINT",
+                    "CLAUDE_CODE_SESSION_ID",
+                    "CLAUDE_CODE_CHILD_SESSION",
+                ):
+                    environment.pop(marker, None)
+                process = subprocess.Popen(
+                    [executable, "--print", "--output-format", "json",
+                     "--strict-mcp-config", "--no-session-persistence", "hi"],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                try:
+                    process.wait(timeout=budget)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    with contextlib.suppress(Exception):
+                        process.wait(timeout=10)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        return seen
+
+    overloaded = run_against(529, "overloaded_error", 60.0)
+    require(
+        any("opus" in model for model in overloaded),
+        "an overloaded service did not reach the fallback ladder: "
+        f"{overloaded}",
+    )
+    require(
+        overloaded[0].endswith("fable-5") or "fable" in overloaded[0],
+        f"the configured principal was not tried first: {overloaded}",
+    )
+
+    limited = run_against(429, "rate_limit_error", 20.0)
+    require(
+        limited and not any("opus" in model for model in limited),
+        "a rate limit substituted a model; the documented contract "
+        f"says it is retried instead: {limited}",
+    )
+
+
+@test("the canonical settings file may not carry a fallback ladder")
+def test_canonical_forbids_fallback() -> None:
+    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+    require(
+        "fallbackModel" not in canonical
+        and "model" not in canonical
+        and "effortLevel" not in canonical,
+        "the canonical file carries role state",
+    )
+    doctor = DOCTOR_SCRIPT.read_text()
+    require(
+        '"fallbackModel" in claude_settings' in doctor,
+        "the doctor does not forbid a canonical fallback ladder",
+    )
+
+
+def task_contract(task_id: str = "") -> dict[str, Any]:
+    contract: dict[str, Any] = {
+        "title": "Durable task",
+        "goal": "Exercise the task ledger.",
+        "acceptance_criteria": [
+            {
+                "id": "ready",
+                "statement": "The task is ready.",
+                "verification": {"command": "true", "workdir": "tests"},
+            }
+        ],
+        "scope": {"include": ["scripts"], "exclude": []},
+        "risk": {"level": "low", "reasons": []},
+        "assigned_role": "implementer",
+        "target_ref": "refs/heads/main",
+    }
+    if task_id:
+        contract["task_id"] = task_id
+    return contract
+
+
+def run_task(
+    directory: Path,
+    *arguments: str,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(TASK_SCRIPT), *arguments],
+        cwd=directory,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        timeout=90,
+        check=False,
+    )
+
+
+def git_output(directory: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(directory), *arguments], stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, check=True,
+    ).stdout.strip()
+
+
+def init_task_repository(root: Path) -> None:
+    subprocess.run(["git", "init", "-q", root], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(root), "-c", "user.email=kit@test",
+            "-c", "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "init",
+        ],
+        check=True,
+    )
+
+
+def task_records(root: Path, task_id: str = "T-1") -> list[dict[str, Any]]:
+    return [
+        json.loads(line)
+        for line in (root / ".orrery" / "ledger" / f"{task_id}.jsonl").read_text().splitlines()
+    ]
+
+
+def task_evidence(root: Path, records: list[dict[str, Any]]) -> dict[str, Any]:
+    evidence = next(
+        (record["evidence"] for record in reversed(records) if "evidence" in record),
+        None,
+    )
+    if evidence is not None:
+        return read_json(root / evidence)
+    sequence = next(record["dispatch"]["seq"] for record in records if "dispatch" in record)
+    return read_json(root / ".orrery" / "evidence" / "T-1" / f"{sequence}.json")
+
+
+def create_dispatch_task(root: Path, contract: dict[str, Any]) -> str:
+    write_json(root / ".orrery.json", {})
+    (root / "edited.txt").write_text("base\n")
+    subprocess.run(
+        ["git", "-C", str(root), "add", ".orrery.json", "edited.txt"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "-m", "tracked base"],
+        check=True,
+    )
+    source = root / "contract.json"
+    write_json(source, contract)
+    created = run_task(root, "create", str(source))
+    require(created.returncode == 0, created.stderr)
+    source.unlink()
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"], stdout=subprocess.PIPE,
+        text=True, check=True,
+    ).stdout.strip()
+
+
+def dispatch_contract(
+    task_id: str = "T-1", *, include: list[str] | None = None,
+    command: str = "true",
+) -> dict[str, Any]:
+    contract = task_contract(task_id)
+    contract["scope"] = {"include": include or ["edited.txt"], "exclude": []}
+    contract["acceptance_criteria"][0]["verification"] = {"command": command}
+    return contract
+
+
+def discard_task_environment(environment: dict[str, str]) -> None:
+    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+    remove_helper_state(environment)
+    if environment.get("KIT_TASK_STANDING"):
+        shutil.rmtree(environment["KIT_TASK_STANDING"], ignore_errors=True)
+    if environment.get("KIT_NO_SYSTEMD_BIN"):
+        shutil.rmtree(environment["KIT_NO_SYSTEMD_BIN"], ignore_errors=True)
+    if environment.get("KIT_TASK_RUNTIME"):
+        shutil.rmtree(environment["KIT_TASK_RUNTIME"], ignore_errors=True)
+
+
+def task_review_environment(mode: str) -> dict[str, str]:
+    environment = fallback_environment(mode)
+    runtime = Path(tempfile.mkdtemp(prefix="kit-task-runtime."))
+    environment["XDG_RUNTIME_DIR"] = str(runtime)
+    environment["KIT_TASK_RUNTIME"] = str(runtime)
+    return environment
+
+
+def stable_task_review_environment(mode: str) -> dict[str, str]:
+    """Use fake providers without moving the task worktree state home."""
+    environment = task_review_environment(mode)
+    environment["KIT_TASK_STANDING"] = environment["XDG_STATE_HOME"]
+    environment["XDG_STATE_HOME"] = os.environ["XDG_STATE_HOME"]
+    return environment
+
+
+@test("task contracts reach ready with a durable attributed ledger")
+def test_task_create_and_amend() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        source = root / "contract.json"
+        write_json(source, task_contract("T-1"))
+        created = run_task(root, "create", str(source))
+        require(created.returncode == 0 and created.stdout.strip() == "T-1", created.stderr)
+        stored = root / ".orrery" / "contracts" / "T-1.json"
+        ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+        records = [json.loads(line) for line in ledger.read_text().splitlines()]
+        require([entry["to"] for entry in records] == ["NEW", "READY"], str(records))
+        require(records[1]["actor"] == "user" and records[1]["contract_digest"], str(records))
+        require(stat.S_IMODE(stored.stat().st_mode) == 0o400, "contract is not sealed")
+        replacement = task_contract("T-1")
+        replacement["title"] = "Amended task"
+        write_json(source, replacement)
+        amended = run_task(root, "amend", "T-1", str(source))
+        require(amended.returncode == 0, amended.stderr)
+        final = [json.loads(line) for line in ledger.read_text().splitlines()][-1]
+        require(final["from"] == final["to"] == "READY", str(final))
+        require(final["reason"] == "AMENDED" and final["contract_digest"], str(final))
+        require(".orrery/" in (root / ".git" / "info" / "exclude").read_text(), "exclude missing")
+
+
+@test("task validators name paths and status repairs only torn tails")
+def test_task_validation_and_repair() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        source = root / "contract.json"
+        invalid = task_contract("T-1")
+        invalid["scope"]["include"] = ["../outside"]
+        invalid["unexpected"] = True
+        write_json(source, invalid)
+        rejected = run_task(root, "create", str(source))
+        require(rejected.returncode == 1 and "$.unexpected" in rejected.stderr, rejected.stderr)
+        write_json(source, task_contract("T-2"))
+        require(run_task(root, "create", str(source)).returncode == 0, "create failed")
+        ledger = root / ".orrery" / "ledger" / "T-2.jsonl"
+        with ledger.open("ab") as handle:
+            handle.write(b'{"broken"')
+        status = run_task(root, "status")
+        require(status.returncode == 0 and "torn ledger tail" in status.stdout, status.stdout)
+        repaired = run_task(root, "status", "--repair")
+        require(repaired.returncode == 0 and "repaired" in repaired.stdout, repaired.stderr)
+        records = [json.loads(line) for line in ledger.read_text().splitlines()]
+        require(records[-1]["reason"] == "ledger-repaired", str(records[-1]))
+        malformed = run_task(root, "run")
+        require(malformed.returncode == 2 and "usage:" in malformed.stderr, malformed.stderr)
+
+
+@test("task run arguments and sealed contract snapshots are enforced")
+def test_task_run_arguments_and_contract_snapshot() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        invalid = run_task(root, "run", "T-1", "--workspace", "/tmp")
+        require(invalid.returncode == 2 and "--workspace" in invalid.stderr, invalid.stderr)
+        require(not any(record["to"] == "DISPATCHED" for record in task_records(root)), "invalid argument dispatched")
+        stored = root / ".orrery" / "contracts" / "T-1.json"
+        stored.chmod(0o600)
+        contract = read_json(stored)
+        contract["title"] = "rewritten"
+        write_json(stored, contract)
+        refused = run_task(root, "run", "T-1")
+        require(refused.returncode == 1 and "digest" in refused.stderr, refused.stderr)
+        require(not any(record["to"] == "DISPATCHED" for record in task_records(root)), "rewritten contract dispatched")
+
+
+@test("task ledger rejects completed garbage and edited torn contracts")
+def test_task_strict_torn_ledger_repair() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        source = root / "contract.json"
+        contract = task_contract("T-1")
+        contract["acceptance_criteria"][0]["id"] = "../bad"
+        write_json(source, contract)
+        require(run_task(root, "create", str(source)).returncode == 1, "traversal id was accepted")
+        write_json(source, task_contract("T-2"))
+        require(run_task(root, "create", str(source)).returncode == 0, "create failed")
+        ledger = root / ".orrery" / "ledger" / "T-2.jsonl"
+        with ledger.open("ab") as handle:
+            handle.write(b"garbage\n")
+        require(run_task(root, "status").returncode == 1, "completed garbage was treated as torn")
+
+
+@test("task creation refuses a repository without commits")
+def test_task_unborn_head_refused() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(["git", "init", "-q", root], check=True)
+        source = root / "contract.json"
+        write_json(source, task_contract())
+        refused = run_task(root, "create", str(source))
+        require(
+            refused.returncode == 1 and "no commits" in refused.stderr,
+            refused.stderr,
+        )
+        require(not (root / ".orrery").exists(), "store created despite refusal")
+
+
+@test("task identifiers stay unique under contention and a held lock times out")
+def test_task_concurrent_creation_and_lock() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        source = root / "contract.json"
+        write_json(source, task_contract())
+        launched = [
+            subprocess.Popen(
+                [sys.executable, str(TASK_SCRIPT), "create", str(source)],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(6)
+        ]
+        outputs = [process.communicate() for process in launched]
+        require(
+            all(process.returncode == 0 for process in launched),
+            str([error for _stdout, error in outputs]),
+        )
+        identifiers = sorted(stdout.strip() for stdout, _error in outputs)
+        require(identifiers == [f"T-{n}" for n in range(1, 7)], str(identifiers))
+        listing = run_task(root, "status")
+        require(
+            listing.returncode == 0 and listing.stdout.count("READY") == 6,
+            listing.stdout,
+        )
+        lock_descriptor = os.open(root / ".orrery" / "lock", os.O_RDWR)
+        try:
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            held = subprocess.run(
+                [sys.executable, str(TASK_SCRIPT), "create", str(source)],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env={**os.environ, "ORRERY_TASK_LOCK_TIMEOUT": "0.3"},
+                check=False,
+            )
+            require(
+                held.returncode == 1 and "control lock" in held.stderr,
+                held.stderr,
+            )
+        finally:
+            os.close(lock_descriptor)
+
+
+@test("task dispatch commits verified work and awaits merge")
+def test_task_dispatch_commits_verified_work() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(result.returncode == 0, result.stderr)
+        require(
+            [record["to"] for record in records][-3:] == [
+                "IMPLEMENTED", "VERIFICATION_PASSED", "AWAITING_MERGE",
+            ],
+            str(records),
+        )
+        branch = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "orrery/T-1"],
+            stdout=subprocess.PIPE, text=True, check=True,
+        ).stdout.strip()
+        ahead = subprocess.run(
+            ["git", "-C", str(root), "rev-list", "--count", f"{base}..{branch}"],
+            stdout=subprocess.PIPE, text=True, check=True,
+        ).stdout.strip()
+        commit = subprocess.run(
+            ["git", "-C", str(root), "show", "-s", "--format=%an%x00%B", branch],
+            stdout=subprocess.PIPE, text=True, check=True,
+        ).stdout
+        evidence = task_evidence(root, records)
+        require(ahead == "1" and commit.startswith("Orrery\x00"), commit)
+        require("Orrery-Role: implementer" in commit, commit)
+        require(
+            not evidence["no_change"]
+            and evidence["diff"]["files"] == [{"path": "edited.txt", "status": "M"}]
+            and evidence["out_of_scope"] == [],
+            str(evidence),
+        )
+        require(
+            evidence["verification"][0]["exit_status"] == 0
+            and evidence["worker_claim"].strip()
+            and evidence["attempts"][0]["receipt"]["exit_status"] == 0,
+            str(evidence),
+        )
+
+
+@test("task dispatch preserves partial edits from a failing provider")
+def test_task_dispatch_preserves_provider_partial_edit() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit-fail")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        failed = records[-1]
+        require(result.returncode == 7, result.stderr)
+        require(
+            failed["to"] == "DISPATCH_FAILED"
+            and failed["reason"] == "provider-exit"
+            and failed.get("worktree_fingerprint")
+            and failed.get("partial"),
+            str(failed),
+        )
+        require("fake Codex edit" in (root / failed["partial"]).read_text(), str(failed))
+        branch = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "orrery/T-1"],
+            stdout=subprocess.PIPE, text=True, check=True,
+        ).stdout.strip()
+        require(branch == base, f"provider failure committed work: {branch} != {base}")
+
+
+@test("task dispatch records no change truthfully")
+def test_task_dispatch_records_no_change() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("success")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        evidence = task_evidence(root, records)
+        require(result.returncode == 0 and records[-1]["to"] == "NO_CHANGE", str(records))
+        require(
+            evidence["no_change"]
+            and evidence["commit"] == base
+            and evidence["verification"][0]["command"] == "true"
+            and evidence["verification"][0]["exit_status"] == 0,
+            str(evidence),
+        )
+
+
+@test("task dispatch classifies a missing result")
+def test_task_dispatch_classifies_missing_result() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("empty")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(result.returncode != 0, result.stderr)
+        require(
+            records[-1]["to"] == "DISPATCH_FAILED"
+            and records[-1]["reason"] == "missing-result",
+            str(records[-1]),
+        )
+
+
+@test("task dispatch maps a timeout to its exit code")
+def test_task_dispatch_maps_timeout() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("sleep")
+        try:
+            result = run_task(
+                root, "run", "T-1", "--timeout", "1", environment=environment,
+            )
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(result.returncode == 124, result.stderr)
+        require(
+            records[-1]["to"] == "DISPATCH_FAILED"
+            and records[-1]["reason"] == "timeout",
+            str(records[-1]),
+        )
+
+
+@test("task verification rejects a tree-mutating command")
+def test_task_verification_rejects_tree_mutation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(command="echo x >> edited.txt"))
+        environment = task_review_environment("edit")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(result.returncode == 1, result.stderr)
+        require(
+            records[-1]["to"] == "VERIFICATION_FAILED"
+            and records[-1]["reason"] == "verifier-mutated-tree",
+            str(records[-1]),
+        )
+
+
+@test("task verify reruns flip a failed criterion when it passes")
+def test_task_verify_rerun_preserves_evidence() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(command="test -f flag.txt"))
+        environment = task_review_environment("edit")
+        try:
+            first = run_task(root, "run", "T-1", environment=environment)
+            records = task_records(root)
+            require(first.returncode == 1, first.stderr)
+            require(
+                records[-1]["to"] == "VERIFICATION_FAILED"
+                and records[-1]["reason"] == "criterion ready",
+                str(records[-1]),
+            )
+            worktree = Path(next(record["dispatch"]["worktree"] for record in records if "dispatch" in record))
+            exclude = subprocess.run(
+                ["git", "-C", str(worktree), "rev-parse", "--git-path", "info/exclude"],
+                stdout=subprocess.PIPE, text=True, check=True,
+            ).stdout.strip()
+            exclude_path = Path(exclude)
+            if not exclude_path.is_absolute():
+                exclude_path = worktree / exclude_path
+            with exclude_path.open("a", encoding="utf-8") as handle:
+                handle.write("flag.txt\n")
+            (worktree / "flag.txt").touch()
+            second = run_task(root, "verify", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        evidence = task_evidence(root, records)
+        require(second.returncode == 0, second.stderr)
+        require([record["to"] for record in records][-2:] == ["VERIFICATION_PASSED", "AWAITING_MERGE"], str(records))
+        require(
+            evidence.get("role")
+            and evidence.get("gate")
+            and evidence.get("diff")
+            and evidence.get("worker_claim"),
+            str(evidence),
+        )
+
+
+@test("task admission refuses a busy repository")
+def test_task_admission_refuses_busy_repository() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        source = root / "second.json"
+        write_json(source, dispatch_contract("T-2"))
+        require(run_task(root, "create", str(source)).returncode == 0, "second task failed")
+        source.unlink()
+        records = task_records(root)
+        digest = records[-1]["contract_digest"]
+        with ledger_module.control_lock(root) as store:
+            ledger_module.append_record(
+                store, "T-1", {"from": "READY", "to": "DISPATCHED", "actor": "user", "contract_digest": digest},
+            )
+            ledger_module.append_record(
+                store, "T-1", {"from": "DISPATCHED", "to": "IN_PROGRESS", "actor": "runner", "contract_digest": digest},
+            )
+        environment = task_review_environment("success")
+        try:
+            refused = run_task(root, "run", "T-2", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(refused.returncode == 1 and "T-1 is busy" in refused.stderr, refused.stderr)
+        require(
+            all(record["to"] != "DISPATCHED" for record in task_records(root, "T-2")),
+            str(task_records(root, "T-2")),
+        )
+
+
+@test("task out-of-scope changes are named in evidence")
+def test_task_dispatch_names_out_of_scope_changes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "outside.txt"
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        evidence = task_evidence(root, records)
+        require(result.returncode == 0 and records[-1]["to"] == "AWAITING_MERGE", str(records))
+        require(evidence["out_of_scope"] == ["outside.txt"], str(evidence))
+
+
+@test("task dirty baseline needs its explicit override")
+def test_task_dispatch_requires_dirty_baseline_override() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        (root / "untracked.txt").write_text("dirty\n")
+        environment = task_review_environment("success")
+        try:
+            refused = run_task(root, "run", "T-1", environment=environment)
+            require(refused.returncode == 1 and "--allow-dirty-baseline" in refused.stderr, refused.stderr)
+            require(
+                all(record["to"] != "DISPATCHED" for record in task_records(root)),
+                str(task_records(root)),
+            )
+            accepted = run_task(root, "run", "T-1", "--allow-dirty-baseline", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        evidence = task_evidence(root, records)
+        dispatch = next(record for record in records if record["to"] == "DISPATCHED")
+        require(accepted.returncode == 0, accepted.stderr)
+        require(dispatch["gate"]["dirty_baseline"] and evidence["gate"]["dirty_baseline"], str(records))
+
+
+@test("task dispatch refuses tracked ledgers and symlinked receipts")
+def test_task_dispatch_receipt_safety() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        (root / ".orrery" / "tracked").write_text("x")
+        subprocess.run(["git", "-C", str(root), "add", "-f", ".orrery/tracked"], check=True)
+        refused = run_task(root, "run", "T-1")
+        require(refused.returncode == 1 and "ledger must not be tracked" in refused.stderr, refused.stderr)
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        attempt = root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"
+        attempt.mkdir(parents=True)
+        target = root / "target"
+        target.write_text("intact")
+        (attempt / "unit.json").symlink_to(target)
+        try:
+            review_module.write_receipt_unit(attempt, None, 1)
+        except OSError:
+            pass
+        else:
+            raise Failure("a symlinked receipt was accepted")
+        require(target.read_text() == "intact", "a receipt symlink target was truncated")
+
+
+@test("task merge lands only a clean fast-forwardable branch")
+def test_task_merge_and_close() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0, "dispatch failed")
+        finally:
+            discard_task_environment(environment)
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 0, merged.stderr)
+        record = task_records(root)[-1]
+        parents = subprocess.run(["git", "-C", str(root), "show", "-s", "--format=%P", "HEAD"], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+        require(record["to"] == "MERGED" and len(parents) == 2 and base in parents, str(record))
+        closed = run_task(root, "close", "T-1")
+        require(closed.returncode == 0 and task_records(root)[-1]["to"] == "CLOSED", closed.stderr)
+
+
+@test("task cancel discards the worktree but never the ledger")
+def test_task_cancel_discards_worktree() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0, "dispatch failed")
+        finally:
+            discard_task_environment(environment)
+        worktree = ledger_module.worktree_path(root, "T-1")
+        cancelled = run_task(root, "cancel", "T-1", "--discard")
+        require(cancelled.returncode == 0 and task_records(root)[-1]["to"] == "CANCELLED", cancelled.stderr)
+        require(not worktree.exists() and (root / ".orrery" / "ledger" / "T-1.jsonl").exists(), "discard removed retained data")
+
+
+@test("task close accepts no-change only explicitly")
+def test_task_close_no_change() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("success")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0, "dispatch failed")
+        finally:
+            discard_task_environment(environment)
+        refused = run_task(root, "close", "T-1")
+        accepted = run_task(root, "close", "T-1", "--accept-no-change")
+        require(refused.returncode == 1 and "--accept-no-change" in refused.stderr, refused.stderr)
+        require(accepted.returncode == 0 and task_records(root)[-1]["to"] == "CLOSED", accepted.stderr)
+
+
+def craft_dead_dispatch(root: Path, *, receipt: bool) -> tuple[str, Path, Path]:
+    """Record a controllerless first dispatch with a dead process group."""
+    base = create_dispatch_task(root, dispatch_contract())
+    attempt = root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"
+    attempt.mkdir(mode=0o700, parents=True)
+    worktree = ledger_module.ensure_worktree(root, "T-1", base)
+    departed = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    departed.wait(timeout=10)
+    if receipt:
+        write_json(
+            attempt / "receipt.json",
+            {
+                "v": 1, "exit_status": 0,
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:01Z",
+                "stdout_bytes": 0, "stderr_bytes": 0,
+            },
+        )
+        (attempt / "result.txt").write_text("done\n")
+    write_json(
+        attempt / "unit.json",
+        {"v": 1, "unit": None, "owner_pid": 1, "owner_start": None, "pgid": departed.pid},
+    )
+    with ledger_module.control_lock(root) as store:
+        digest = task_records(root)[-1]["contract_digest"]
+        ledger_module.append_record(
+            store, "T-1",
+            {
+                "from": "READY", "to": "DISPATCHED", "actor": "user", "reason": None,
+                "gate": {"base_head": base, "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"), "dirty_fingerprint": "", "dirty_baseline": False},
+                "dispatch": {"seq": 1, "receipts": str(attempt), "worktree": str(worktree), "branch": "orrery/T-1"},
+                "contract_digest": digest,
+            },
+        )
+    return base, attempt, worktree
+
+
+@test("task resume completes a dispatch that outlived its controller")
+def test_task_resume_completes_dead_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base, _attempt, worktree = craft_dead_dispatch(root, receipt=True)
+        with (worktree / "edited.txt").open("a") as handle:
+            handle.write("resumed\n")
+        environment = stable_task_review_environment("success")
+        try:
+            resumed = run_task(root, "resume", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        evidence = task_evidence(root, records)
+        branch = git_output(root, "rev-parse", "orrery/T-1")
+        ahead = git_output(root, "rev-list", "--count", f"{base}..{branch}")
+        require(resumed.returncode == 0 and resumed.stdout.strip() == "T-1 completed", f"{resumed.stdout!r} {resumed.stderr!r} {records!r}")
+        require([record["to"] for record in records][-3:] == ["IMPLEMENTED", "VERIFICATION_PASSED", "AWAITING_MERGE"], str(records))
+        require(evidence["worker_claim"] == "done\n" and ahead == "1", str(evidence))
+
+
+@test("task resume marks a receiptless dead dispatch interrupted")
+def test_task_resume_interrupts_receiptless_dead_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, _attempt, worktree = craft_dead_dispatch(root, receipt=False)
+        with (worktree / "edited.txt").open("a") as handle:
+            handle.write("interrupted\n")
+        resumed = run_task(root, "resume")
+        interrupted = task_records(root)[-1]
+        require(resumed.returncode == 0 and resumed.stdout.strip() == "T-1 interrupted", f"{resumed.stdout!r} {resumed.stderr!r}")
+        require(interrupted["to"] == "INTERRUPTED" and interrupted["partial"], str(interrupted))
+        require("interrupted" in (root / interrupted["partial"]).read_text() and worktree.exists(), str(interrupted))
+        environment = stable_task_review_environment("edit")
+        try:
+            retried = run_task(root, "run", "T-1", "--accept-changed-worktree", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(retried.returncode == 0 and task_records(root)[-1]["to"] == "AWAITING_MERGE", retried.stderr)
+
+
+@test("task resume leaves a live dispatch alone")
+def test_task_resume_keeps_live_dispatch() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        attempt = root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"
+        attempt.mkdir(mode=0o700, parents=True)
+        worktree = ledger_module.ensure_worktree(root, "T-1", base)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            write_json(attempt / "unit.json", {"v": 1, "unit": None, "owner_pid": 1, "owner_start": None, "pgid": process.pid})
+            with ledger_module.control_lock(root) as store:
+                digest = task_records(root)[-1]["contract_digest"]
+                ledger_module.append_record(store, "T-1", {"from": "READY", "to": "DISPATCHED", "actor": "user", "reason": None, "gate": {"base_head": base, "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"), "dirty_fingerprint": "", "dirty_baseline": False}, "dispatch": {"seq": 1, "receipts": str(attempt), "worktree": str(worktree), "branch": "orrery/T-1"}, "contract_digest": digest})
+            before = len(task_records(root))
+            resumed = run_task(root, "resume")
+            require(resumed.returncode == 0 and resumed.stdout.strip() == "T-1 still running", resumed.stderr)
+            require(len(task_records(root)) == before, "resume appended a live dispatch record")
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+
+
+@test("task resume waits for a live launch marker then interrupts it")
+def test_task_resume_launch_marker_liveness() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        attempt = root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"
+        attempt.mkdir(mode=0o700, parents=True)
+        worktree = ledger_module.ensure_worktree(root, "T-1", base)
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
+        try:
+            write_json(attempt.parent / "launch.json", {"v": 1, "controller_pid": process.pid, "controller_start": task_module.process_start_time(process.pid)})
+            with ledger_module.control_lock(root) as store:
+                digest = task_records(root)[-1]["contract_digest"]
+                ledger_module.append_record(store, "T-1", {"from": "READY", "to": "DISPATCHED", "actor": "user", "gate": {"base_head": base, "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"), "dirty_fingerprint": "", "dirty_baseline": False}, "dispatch": {"seq": 1, "receipts": str(attempt), "worktree": str(worktree), "branch": "orrery/T-1"}, "contract_digest": digest})
+            waiting = run_task(root, "resume")
+            require(waiting.returncode == 0 and "still starting" in waiting.stdout, waiting.stderr)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+        resumed = run_task(root, "resume")
+        require(resumed.returncode == 0 and task_records(root)[-1]["to"] == "INTERRUPTED", resumed.stderr)
+
+
+@test("task resume adopts a commit made before its ledger record")
+def test_task_resume_adopts_crash_committed_work() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base, attempt, worktree = craft_dead_dispatch(root, receipt=True)
+        (worktree / "edited.txt").write_text("crash commit\n")
+        subprocess.run(["git", "-C", str(worktree), "add", "edited.txt"], check=True)
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.name=Orrery", "-c", "user.email=orrery@localhost", "commit", "-qm", "crash window"], check=True)
+        committed = git_output(worktree, "rev-parse", "HEAD")
+        with ledger_module.control_lock(root) as store:
+            digest = task_records(root)[-1]["contract_digest"]
+            ledger_module.append_record(store, "T-1", {"from": "DISPATCHED", "to": "IN_PROGRESS", "actor": "runner", "reason": "attempt", "attempt": 1, "contract_digest": digest})
+        environment = stable_task_review_environment("success")
+        try:
+            resumed = run_task(root, "resume", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(resumed.returncode == 0 and git_output(worktree, "rev-parse", "HEAD") == committed and git_output(root, "rev-list", "--count", f"{base}..orrery/T-1") == "1", resumed.stderr)
+        require([record["to"] for record in records][-3:] == ["IMPLEMENTED", "VERIFICATION_PASSED", "AWAITING_MERGE"], str(records))
+
+
+def awaiting_merge(root: Path, *, outside: bool = False) -> None:
+    environment = stable_task_review_environment("edit")
+    if outside:
+        environment["CODEX_FAKE_EDIT_PATH"] = "outside.txt"
+    try:
+        result = run_task(root, "run", "T-1", environment=environment)
+    finally:
+        discard_task_environment(environment)
+    require(result.returncode == 0 and task_records(root)[-1]["to"] == "AWAITING_MERGE", result.stderr)
+
+
+@test("task merge refuses a tampered evidence packet")
+def test_task_merge_refuses_evidence_tamper() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        awaiting_merge(root)
+        before = len(task_records(root))
+        packet_path = root / task_records(root)[-1]["evidence"]
+        packet = read_json(packet_path)
+        packet["worker_claim"] = "tampered\n"
+        write_json(packet_path, packet)
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 1 and "evidence packet digest" in merged.stderr and len(task_records(root)) == before, merged.stderr)
+
+
+@test("task merge recomputes out-of-scope changes")
+def test_task_merge_recomputes_out_of_scope() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        awaiting_merge(root, outside=True)
+        records = task_records(root)
+        packet_path = root / records[-1]["evidence"]
+        packet = read_json(packet_path)
+        packet["out_of_scope"] = []
+        write_json(packet_path, packet)
+        digest = hashlib.sha256(packet_path.read_bytes()).hexdigest()
+        ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+        rewritten = []
+        for record in records:
+            if record.get("evidence") == str(packet_path.relative_to(root)):
+                record["evidence_sha256"] = digest
+            rewritten.append(json.dumps(record, separators=(",", ":")))
+        ledger.write_text("\n".join(rewritten) + "\n")
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 1 and "out-of-scope" in merged.stderr, merged.stderr)
+
+
+@test("read-only linked worktrees protect their common git directory")
+def test_read_only_linked_worktree_command_paths() -> None:
+    with until_store_only() as state_dir:
+        seed_standing_reviewer()
+        with tempfile.TemporaryDirectory() as directory:
+            root, linked = Path(directory) / "main", Path(directory) / "linked"
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / "tracked").write_text("x\n")
+            subprocess.run(["git", "-C", str(root), "add", "tracked"], check=True)
+            subprocess.run(["git", "-C", str(root), "-c", "user.name=Kit", "-c", "user.email=kit@test", "commit", "-qm", "initial"], check=True)
+            subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", str(linked)], check=True)
+            bin_dir = Path(tempfile.mkdtemp(prefix="kit-systemd-capture."))
+            capture = bin_dir / "argv.json"
+            (bin_dir / "systemctl").write_text(
+                "#!/bin/sh\ncase \"$*\" in *show*) printf 'LoadState=inactive\\nActiveState=inactive\\n' ;; esac\n"
+            )
+            (bin_dir / "systemctl").chmod(0o755)
+            (bin_dir / "systemd-run").write_text("#!/usr/bin/env python3\nimport json, os, sys\nopen(os.environ['KIT_CAPTURE'], 'w').write(json.dumps(sys.argv[1:]))\ni = next(i for i, x in enumerate(sys.argv) if x.endswith('service-launcher.py'))\nos.execvp(sys.argv[i], sys.argv[i:])\n")
+            (bin_dir / "systemd-run").chmod(0o755)
+            environment = review_environment("success", standing_state=state_dir)
+            runtime = Path(tempfile.mkdtemp(prefix="kit-linked-runtime."))
+            # The seeded standing approval starts the Anthropic candidate
+            # directly, so the provider home that must be writable is
+            # Claude's, not Codex's.
+            provider_home = Path(directory) / "claude-home"
+            provider_home.mkdir()
+            environment.update({"PATH": f"{bin_dir}{os.pathsep}{environment['PATH']}", "KIT_CAPTURE": str(capture), "XDG_RUNTIME_DIR": str(runtime), "ORRERY_ALLOW_UNCONFINED": "1", "CLAUDE_CONFIG_DIR": str(provider_home)})
+            process = start_review(environment, "--workspace", str(linked), "--timeout", "60", "--", "prompt", cwd=linked)
+            _stdout, stderr = finish_review(process, environment)
+            try:
+                arguments = json.loads(capture.read_text())
+                common_git = subprocess.run(
+                    ["git", "-C", str(linked), "rev-parse", "--git-common-dir"],
+                    check=True, stdout=subprocess.PIPE, text=True,
+                ).stdout.strip()
+                if not Path(common_git).is_absolute():
+                    common_git = str((linked / common_git).resolve())
+                require(
+                    process.returncode == 0
+                    and "--property=ProtectSystem=strict" in arguments
+                    and "--property=ProtectHome=read-only" in arguments
+                    and f"--property=ReadWritePaths={provider_home}" in arguments
+                    and f"--property=ReadWritePaths={linked}" not in arguments
+                    and f"--property=ReadWritePaths={common_git}" not in arguments
+                    and "--property=NoNewPrivileges=yes" in arguments,
+                    stderr,
+                )
+            finally:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+                shutil.rmtree(runtime, ignore_errors=True)
+
+
+@test("no-change close requires a passing verification")
+def test_task_no_change_close_verification_gate() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(command="false"))
+        environment = task_review_environment("success")
+        try:
+            failed = run_task(root, "run", "T-1", environment=environment)
+            refused = run_task(root, "close", "T-1", "--accept-no-change")
+            contract = root / ".orrery" / "contracts" / "T-1.json"
+            contract.chmod(0o600)
+            updated = read_json(contract)
+            updated["acceptance_criteria"][0]["verification"]["command"] = "true"
+            write_json(contract, updated)
+            digest = hashlib.sha256(contract.read_bytes()).hexdigest()
+            records = task_records(root)
+            ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+            ledger.write_text("\n".join(json.dumps({**record, **({"contract_digest": digest} if record.get("contract_digest") else {})}, separators=(",", ":")) for record in records) + "\n")
+            contract.chmod(0o400)
+            verified = run_task(root, "verify", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        closed = run_task(root, "close", "T-1", "--accept-no-change")
+        require(failed.returncode == 1 and task_records(root)[-2]["reason"] == "verification-passed" and refused.returncode == 1 and verified.returncode == 0 and closed.returncode == 0, str(task_records(root)))
+
+
+@test("task merge reconciles a merge completed after merge-started")
+def test_task_merge_reconciles_crash_after_merge() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        awaiting_merge(root)
+        records = task_records(root)
+        commit = next(record["commit"] for record in reversed(records) if record.get("commit"))
+        with ledger_module.control_lock(root) as store:
+            ledger_module.append_record(store, "T-1", {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-started", "expected": {"base": base, "commit": commit}, "contract_digest": records[-1]["contract_digest"]})
+        subprocess.run(["git", "-C", str(root), "-c", "user.name=Orrery", "-c", "user.email=orrery@localhost", "merge", "--no-ff", "--no-edit", commit], check=True)
+        head = git_output(root, "rev-parse", "HEAD")
+        reconciled = run_task(root, "merge", "T-1")
+        require(reconciled.returncode == 0 and task_records(root)[-1]["to"] == "MERGED" and git_output(root, "rev-parse", "HEAD") == head and len(git_output(root, "show", "-s", "--format=%P", "HEAD").split()) == 2, reconciled.stderr)
+
+
+@test("task resume recovers a Claude JSON result line")
+def test_task_resume_recovers_claude_result() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, _worktree = craft_dead_dispatch(root, receipt=True)
+        (attempt / "result.txt").unlink()
+        (attempt / "stdout.log").write_text('{"type":"result","result":"Claude recovered"}\n')
+        environment = stable_task_review_environment("success")
+        try:
+            resumed = run_task(root, "resume", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(resumed.returncode == 0 and (attempt / "result.txt").read_text() == "Claude recovered\n" and task_evidence(root, task_records(root))["worker_claim"] == "Claude recovered\n", resumed.stderr)
+
+
+@test("task resume preserves provider exits and discard reports residue")
+def test_task_resume_exit_and_discard_residue() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, worktree = craft_dead_dispatch(root, receipt=True)
+        receipt = read_json(attempt / "receipt.json")
+        receipt["exit_status"] = 7
+        write_json(attempt / "receipt.json", receipt)
+        resumed = run_task(root, "resume")
+        require(resumed.returncode == 1 and task_records(root)[-1]["reason"] == "provider-exit", repr((resumed.returncode, resumed.stdout, resumed.stderr, task_records(root))))
+        parent = worktree.parent
+        parent.chmod(0o500)
+        try:
+            discarded = run_task(root, "cancel", "T-1", "--discard")
+        finally:
+            parent.chmod(0o700)
+        again = run_task(root, "cancel", "T-1", "--discard")
+        require(discarded.returncode == 1 and "remains" in discarded.stderr and task_records(root)[-1]["to"] == "CANCELLED" and again.returncode == 0 and not worktree.exists(), f"discard={discarded.returncode}:{discarded.stderr!r}; again={again.returncode}:{again.stderr!r}; records={task_records(root)}")
+
+
+@test("task merge refuses every gate violation")
+def test_task_merge_gate_matrix() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        base = create_dispatch_task(root, dispatch_contract())
+        environment = stable_task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0, "dispatch failed")
+        finally:
+            discard_task_environment(environment)
+        packet_path = root / next(record["evidence"] for record in reversed(task_records(root)) if "evidence" in record)
+        packet = read_json(packet_path)
+        target = git_output(root, "symbolic-ref", "--short", "HEAD")
+
+        def refused(phrase: str) -> None:
+            before = len(task_records(root))
+            result = run_task(root, "merge", "T-1")
+            require(result.returncode == 1 and phrase in result.stderr, result.stderr)
+            require(len(task_records(root)) == before, f"{phrase}: refusal appended a record")
+
+        subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "elsewhere"], check=True)
+        refused("target branch")
+        subprocess.run(["git", "-C", str(root), "checkout", "-q", target], check=True)
+        (root / "untracked").write_text("x\n")
+        refused("dirty")
+        (root / "untracked").unlink()
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "target moved"], check=True)
+        refused("target moved")
+        subprocess.run(["git", "-C", str(root), "reset", "--hard", "-q", base], check=True)
+        subprocess.run(["git", "-C", str(ledger_module.worktree_path(root, "T-1")), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "task moved"], check=True)
+        refused("task branch")
+        subprocess.run(["git", "-C", str(ledger_module.worktree_path(root, "T-1")), "reset", "--hard", "-q", packet["commit"]], check=True)
+        original_packet = json.loads(json.dumps(packet))
+        packet["contract_digest"] = "incorrect"
+        write_json(packet_path, packet)
+        refused("digest")
+        write_json(packet_path, original_packet)
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 0 and task_records(root)[-1]["to"] == "MERGED", merged.stderr)
+
+
+@test("task merge aborts and restores on a manufactured conflict")
+def test_merge_branch_aborts_conflict() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        (root / "conflict.txt").write_text("base\n")
+        subprocess.run(["git", "-C", str(root), "add", "conflict.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "-m", "base"], check=True)
+        target = git_output(root, "symbolic-ref", "--short", "HEAD")
+        before = git_output(root, "rev-parse", "HEAD")
+        subprocess.run(["git", "-C", str(root), "checkout", "-q", "-b", "topic"], check=True)
+        (root / "conflict.txt").write_text("topic\n")
+        subprocess.run(["git", "-C", str(root), "commit", "-am", "topic", "-q"], check=True)
+        subprocess.run(["git", "-C", str(root), "checkout", "-q", target], check=True)
+        (root / "conflict.txt").write_text("main\n")
+        subprocess.run(["git", "-C", str(root), "commit", "-am", "main", "-q"], check=True)
+        head = git_output(root, "rev-parse", "HEAD")
+        merged, stderr = ledger_module.merge_branch(root, "topic")
+        require(merged is None and isinstance(stderr, str), repr((merged, stderr)))
+        require(git_output(root, "status", "--porcelain") == "" and git_output(root, "rev-parse", "HEAD") == head and head != before, "merge abort did not restore HEAD and index")
+        merge_head = Path(git_output(root, "rev-parse", "--git-path", "MERGE_HEAD"))
+        if not merge_head.is_absolute():
+            merge_head = root / merge_head
+        require(not merge_head.exists(), "MERGE_HEAD survived merge --abort")
+
+
+@test("merge reconciliation sees through repair records")
+def test_merge_reconciliation_after_repair() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        awaiting_merge(root)
+        records = task_records(root)
+        digest = records[-1]["contract_digest"]
+        base = next(r["gate"]["base_head"] for r in records if "gate" in r)
+        commit = next(r["commit"] for r in records if r.get("commit"))
+        with ledger_module.control_lock(root) as store:
+            ledger_module.append_record(
+                store,
+                "T-1",
+                {
+                    "from": "AWAITING_MERGE",
+                    "to": "AWAITING_MERGE",
+                    "actor": "user",
+                    "reason": "merge-started",
+                    "expected": {"base": base, "commit": commit},
+                    "contract_digest": digest,
+                },
+            )
+        subprocess.run(
+            [
+                "git", "-C", str(root), "-c", "user.name=Orrery",
+                "-c", "user.email=orrery@localhost", "merge", "--no-ff",
+                "--no-edit", commit,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        merged_head = git_output(root, "rev-parse", "HEAD")
+        with ledger_module.control_lock(root) as store:
+            ledger_module.append_record(
+                store,
+                "T-1",
+                {
+                    "from": "AWAITING_MERGE",
+                    "to": "AWAITING_MERGE",
+                    "actor": "user",
+                    "reason": "ledger-repaired",
+                    "contract_digest": digest,
+                },
+            )
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 0, merged.stderr)
+        require(
+            task_records(root)[-1]["to"] == "MERGED",
+            str(task_records(root)[-1]),
+        )
+        require(
+            git_output(root, "rev-parse", "HEAD") == merged_head,
+            "reconciliation created a new commit",
+        )
+
+
+@test("a real dispatch flows through the task lifecycle when enabled")
+def test_live_task_dispatch() -> None:
+    """Runs the configured mechanic for real, end to end, on request.
+
+    The default suite stays deterministic and credit-free, so this test
+    skips unless ORRERY_LIVE_TESTS=1. When enabled it proves the wire
+    the fakes cannot: a real provider process inside the containment,
+    real receipts, and a real merge. The fake-provider dispatch tests
+    passed while live wiring was never exercised; this closes that gap
+    on demand.
+    """
+    if os.environ.get("ORRERY_LIVE_TESTS") != "1":
+        print(
+            "      (skipped: set ORRERY_LIVE_TESTS=1 to run a real, "
+            "credit-spending dispatch)"
+        )
+        return
+    role = runtime_module.load_role("mechanic")
+    provider_command = {"anthropic": "claude", "openai": "codex"}[role.provider]
+    if shutil.which(provider_command) is None:
+        print(f"      (skipped: the {provider_command} CLI is not installed)")
+        return
+    with tempfile.TemporaryDirectory() as directory:
+        base_dir = Path(directory)
+        root = base_dir / "repo"
+        root.mkdir()
+        init_task_repository(root)
+        (root / "notes.txt").write_text("start\n")
+        subprocess.run(["git", "-C", str(root), "add", "notes.txt"], check=True)
+        subprocess.run(
+            [
+                "git", "-C", str(root), "-c", "user.email=kit@test",
+                "-c", "user.name=Kit", "commit", "-qm", "seed",
+            ],
+            check=True,
+        )
+        contract = {
+            "title": "Live smoke",
+            "goal": (
+                "Append exactly one line containing the word smoke to "
+                "notes.txt. Change nothing else."
+            ),
+            "acceptance_criteria": [
+                {
+                    "id": "appended",
+                    "statement": "notes.txt gains a line containing smoke.",
+                    "verification": {"command": "grep -q smoke notes.txt"},
+                }
+            ],
+            "scope": {"include": ["notes.txt"], "exclude": []},
+            "risk": {"level": "low", "reasons": ["trivial live smoke"]},
+            "assigned_role": "mechanic",
+        }
+        source = base_dir / "contract.json"
+        write_json(source, contract)
+        created = run_task(root, "create", str(source))
+        require(created.returncode == 0, created.stderr)
+        result = run_task(root, "run", "T-1")
+        require(result.returncode == 0, result.stderr[-2000:])
+        records = task_records(root)
+        require(
+            records[-1]["to"] == "AWAITING_MERGE",
+            str([record["to"] for record in records]),
+        )
+        attempt = Path(
+            next(r["dispatch"]["receipts"] for r in reversed(records) if "dispatch" in r)
+        )
+        require((attempt / "receipt.json").exists(), "no live receipt")
+        require((attempt / "result.txt").exists(), "no live result")
+        merged = run_task(root, "merge", "T-1")
+        require(merged.returncode == 0, merged.stderr)
+        require("smoke" in (root / "notes.txt").read_text(), "merge lost the edit")
+        require(task_records(root)[-1]["to"] == "MERGED", "not merged")
+
+
+@test("verifier fallback containment kills the process tree on timeout")
+def test_verifier_fallback_containment() -> None:
+    module = load_script(TASK_SCRIPT, "orrery_task_containment")
+    with tempfile.TemporaryDirectory() as directory:
+        workdir = Path(directory)
+        empty = workdir / "empty-bin"
+        empty.mkdir()
+        marker = workdir / "late.txt"
+        original_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(empty)
+        os.environ["ORRERY_VERIFY_TIMEOUT_SECONDS"] = "1"
+        try:
+            status, _output = module.run_verification(
+                "(/bin/sleep 3; /bin/touch late.txt) & exec /bin/sleep 30",
+                workdir,
+            )
+        finally:
+            os.environ["PATH"] = original_path
+            del os.environ["ORRERY_VERIFY_TIMEOUT_SECONDS"]
+        require(status == 124, str(status))
+        time.sleep(4)
+        require(not marker.exists(), "background verifier survived the timeout")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+
+@test("receipt arguments validate and task units survive stale sweeping")
+def test_receipt_arguments_and_task_sweep() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        dead = root / "run.999999.task"
+        dead.mkdir()
+        (dead / "owner").write_text("999999 unknown orrery-task-1.service\n")
+        review_module.sweep_stale_runtime(root)
+        require(dead.exists(), "the stale sweep removed a task-owned run")
+        fallback_task = root / "run.999997.fallback"
+        fallback_task.mkdir()
+        (fallback_task / "owner").write_text("999997 unknown - task\n")
+        review_module.sweep_stale_runtime(root)
+        require(fallback_task.exists(), "the stale sweep removed a unitless task run")
+        ordinary = root / "run.999998.old"
+        ordinary.mkdir()
+        (ordinary / "owner").write_text("999998 unknown ordinary.service\n")
+        original_stop = review_module.stop_unit
+        try:
+            review_module.stop_unit = lambda _unit: None
+            review_module.sweep_stale_runtime(root)
+        finally:
+            review_module.stop_unit = original_stop
+        require(not ordinary.exists(), "the stale sweep kept an ordinary run")
+
+
+@test("canary exclude plumbing follows linked worktrees")
+def test_linked_worktree_canary_exclude() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "main"
+        linked = Path(directory) / "linked"
+        subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+        (root / "tracked").write_text("x\n")
+        subprocess.run(
+            ["git", "-C", str(root), "add", "tracked"], check=True
+        )
+        subprocess.run(
+            [
+                "git", "-C", str(root), "-c", "user.name=Kit",
+                "-c", "user.email=kit@test", "commit", "--quiet", "-m", "initial",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "worktree", "add", "--quiet", str(linked)],
+            check=True,
+        )
+        exclude_value = subprocess.run(
+            ["git", "-C", str(linked), "rev-parse", "--git-path", "info/exclude"],
+            check=True,
+            stdout=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        exclude = Path(exclude_value)
+        if not exclude.is_absolute():
+            exclude = linked / exclude
+        snapshot = runtime_module.claude_canary_snapshot(linked)
+        prior = exclude.read_bytes() if exclude.exists() else None
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a") as handle:
+            handle.write("/.env\n")
+        (linked / ".env").touch()
+        runtime_module.sweep_claude_canaries(snapshot)
+        require(not (linked / ".env").exists(), "linked canary was not removed")
+        current = exclude.read_bytes() if exclude.exists() else None
+        require(
+            current == prior,
+            f"linked worktree exclude was not restored: {current!r} != {prior!r}",
+        )
+
+
+@test("receipt launcher duplicates output and records its child")
+def test_receipt_launcher() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        run_dir = root / "run"
+        tmp_dir = run_dir / "tmp"
+        receipts = root / "receipts"
+        tmp_dir.mkdir(parents=True)
+        receipts.mkdir()
+        launcher, environment = review_module.write_service_launcher(
+            run_dir, tmp_dir, "openai", receipts=receipts
+        )
+        process = subprocess.run(
+            [
+                sys.executable, str(launcher), str(environment), "/bin/sh", "-c",
+                "printf out; printf err >&2; exit 7",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        receipt = json.loads((receipts / "receipt.json").read_text())
+        require(process.returncode == 7, "the launcher did not return child status")
+        require(process.stdout == b"out" and process.stderr == b"err", "output was not passed through")
+        require((receipts / "stdout.log").read_bytes() == b"out", "stdout was not duplicated")
+        require((receipts / "stderr.log").read_bytes() == b"err", "stderr was not duplicated")
+        require(receipt["exit_status"] == 7 and receipt["stdout_bytes"] == 3 and receipt["stderr_bytes"] == 3, "receipt counters are wrong")
 
 
 def main() -> int:
@@ -10995,6 +13187,22 @@ def main() -> int:
     os.environ["XDG_STATE_HOME"] = suite_state
     os.environ.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     os.environ.pop("CLAUDE_EFFORT", None)
+
+    # The suite must never touch the developer's own configuration.
+    # Every test that exercises a writer is supposed to isolate HOME or
+    # pass an explicit target, but a single missed one silently
+    # rewrites the live principal, so the invariant is asserted rather
+    # than assumed. HOME is deliberately not overridden globally:
+    # doctor tests legitimately inspect the real installation.
+    def live_settings_digest() -> str | None:
+        try:
+            return hashlib.sha256(
+                (Path.home() / ".claude" / "settings.json").read_bytes()
+            ).hexdigest()
+        except OSError:
+            return None
+
+    live_settings_before = live_settings_digest()
 
     try:
         for name, function in TESTS:
@@ -11027,6 +13235,13 @@ def main() -> int:
         shutil.rmtree(suite_state, ignore_errors=True)
         for leftover in (*STATE_DIRS, *FAKE_BIN_DIRS):
             shutil.rmtree(leftover, ignore_errors=True)
+        if live_settings_digest() != live_settings_before:
+            failures += 1
+            print(
+                "FAIL  the suite modified the developer's own "
+                "~/.claude/settings.json\n      a test is missing HOME "
+                "isolation or an explicit --target"
+            )
 
     total = len(TESTS) - skipped
     print()

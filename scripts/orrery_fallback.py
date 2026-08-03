@@ -534,6 +534,49 @@ def nearest_fallback(
     )
 
 
+def same_provider_ladder(role: Role, *, limit: int = 2) -> list[str]:
+    """Nearest same-provider models, for the CLI's own fallback setting.
+
+    Deliberately pure: it reads only the bundled first-party catalogue,
+    so it spawns no process, performs no picker discovery, and makes no
+    authentication probe. `discover_live=False` is not offline
+    (`_ranked_candidates` still calls `provider_status`), so the
+    ranking path must not be reused here.
+
+    Configured custom identifiers are excluded: one may belong to
+    another role's third-party endpoint, and a name that only exists
+    there must never be armed against a first-party account. An
+    endpoint-backed role gets no ladder at all, because its process
+    carries that endpoint's base URL and credentials.
+    """
+    if role.endpoint is not None:
+        return []
+    try:
+        entries = load_catalogue().get(role.provider, [])
+    except RuntimeConfigError:
+        return []
+    tiers = {
+        entry["id"]: entry["fallback_tier"]
+        for entry in entries
+        if isinstance(entry.get("id"), str)
+        and isinstance(entry.get("fallback_tier"), int)
+        and not isinstance(entry.get("fallback_tier"), bool)
+    }
+    source_tier = tiers.get(role.model)
+    if source_tier is None:
+        # A model outside the first-party catalogue cannot be placed on
+        # the tier scale, so no ladder can be justified for it.
+        return []
+    ranked = sorted(
+        (
+            (abs(tier - source_tier), index, model)
+            for index, (model, tier) in enumerate(tiers.items())
+            if model != role.model and abs(tier - source_tier) <= 1
+        )
+    )
+    return [model for _distance, _index, model in ranked][:limit]
+
+
 def proposal_for_approval(
     original: Role,
     approval: tuple[str, str],
@@ -620,6 +663,8 @@ def git_workspace_fingerprint(
         return None
     digest = sha256()
     commands = (
+        ["rev-parse", "HEAD"],
+        ["symbolic-ref", "--quiet", "HEAD"],
         ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
         ["diff", "--no-ext-diff", "--binary"],
         ["diff", "--no-ext-diff", "--binary", "--cached"],
@@ -637,10 +682,19 @@ def git_workspace_fingerprint(
                 check=False,
             )
             if result.returncode != 0:
-                return None
-            outputs.append(result.stdout)
+                if arguments[0] == "rev-parse":
+                    output = b"unborn\n"
+                elif arguments[0] == "symbolic-ref":
+                    output = b"detached\n"
+                else:
+                    return None
+            else:
+                output = result.stdout
+            outputs.append(output)
             digest.update(b"\0command\0")
-            digest.update(result.stdout)
+            digest.update(" ".join(arguments).encode())
+            digest.update(b"\0")
+            digest.update(output)
 
         for encoded_name in outputs[-1].split(b"\0"):
             if not encoded_name:

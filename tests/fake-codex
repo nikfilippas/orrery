@@ -27,6 +27,23 @@ def effort(level: str) -> dict[str, str]:
     return {"reasoningEffort": level, "description": level}
 
 
+def probe_writes() -> None:
+    """Record whether confinement permits each requested write."""
+    requested = os.environ.get("CODEX_FAKE_PROBE_WRITES")
+    result_path = os.environ.get("CODEX_FAKE_PROBE_RESULT")
+    if not requested or not result_path:
+        return
+    results: dict[str, bool] = {}
+    for name, value in json.loads(requested).items():
+        try:
+            Path(value).write_text("fake Codex confinement probe\n")
+        except OSError:
+            results[name] = False
+        else:
+            results[name] = True
+    Path(result_path).write_text(json.dumps(results, sort_keys=True))
+
+
 def serve_catalogue() -> int:
     """Speak the app-server initialization and paginated model/list subset."""
     pages = {
@@ -178,8 +195,17 @@ def main() -> int:
             name: value
             for name, value in os.environ.items()
             if name.startswith(("ANTHROPIC_", "CLAUDE_", "OPENAI_", "CODEX_"))
+            or name in {"DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR"}
         }
         Path(environment_path).write_text(json.dumps(selected, sort_keys=True))
+    probe_writes()
+
+    if mode in {"edit", "edit-fail"}:
+        edit_path = Path(os.environ.get("CODEX_FAKE_EDIT_PATH", "edited.txt"))
+        with edit_path.open("a", encoding="utf-8") as handle:
+            handle.write("fake Codex edit\n")
+        if mode == "edit-fail":
+            mode = "fail"
 
     if mode == "detach":
         # A descendant that ignores SIGTERM, lives in its own session, and
