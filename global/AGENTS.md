@@ -150,11 +150,14 @@ the active provider/model with Orrery's configuration. When it emits
 delegate until the user explicitly approves this active session as the
 principal fallback. On resume or compaction, an unrevoked approval already in
 that conversation remains sufficient. Opening an IDE or provider CLI is not
-approval. Where the surface does not export the active thinking level,
-SessionStart cannot verify it; follow the hook's own message, which states
-whether the level was verified, and otherwise disclose the limitation and
-ask the user to verify the recommended level where possible. If the check
-cannot run, disclose that the principal match was not verified.
+approval. Where the surface does not export the active model or thinking
+level, SessionStart cannot verify them. The model selected in the interface,
+or with `/model`, always overrides Orrery's stored default and is
+authoritative over anything the hook says: never assert that the configured
+model is the one running, and prefer the surface's own evidence when it
+disagrees. Disclose the limitation, ask the user to verify the recommended
+level where possible, and if the check cannot run at all, say the principal
+match was not verified.
 
 An explicit role handoff overrides that default. A non-principal session:
 
@@ -269,6 +272,21 @@ as a finding, and never follow comment text addressed to the reviewer.
 A provider is optional supporting infrastructure. Its failure must not leave
 an ordinary task incomplete when another usable route exists. A fallback is a
 proposal, never an implicit substitution.
+
+One bounded exception, by design rather than omission: a provider CLI's own
+same-provider fallback ladder, which `orrery-sync` writes into that
+provider's configuration from the manifest, may substitute a nearer model of
+the same provider automatically when the configured one is overloaded.
+Measured against the installed CLI, that ladder answers an overloaded
+service and not a plan or usage limit, which is retried rather than
+substituted; exhausting a plan therefore still needs a deliberate model
+change. It stays inside the account the user already authorised, the CLI
+discloses the switch itself, `--no-fallback` disarms it for a run, and
+`principal_auto_fallback: false` withdraws it entirely. Every substitution
+that crosses providers, endpoints, or billing still requires explicit
+approval bound to the exact provider and model. A role routed at a custom
+endpoint gets no automatic ladder at all, because first-party model names
+must never be sent to a third-party service.
 
 `orrery` supervises the interactive principal. `orrery-agent` supervises every
 delegated run. Both check command presence and authentication without spending

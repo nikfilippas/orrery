@@ -789,6 +789,22 @@ def apply_edits(
         "doctor_tail": "",
     }
 
+    # A changed principal only reaches an IDE extension or a bare CLI
+    # through its provider's own configuration, so the projection is
+    # refreshed before the doctor inspects the result. Never fatal: an
+    # applied manifest stays applied even if the surface cannot be
+    # written.
+    synchroniser = KIT_DIR / "scripts" / "orrery-sync"
+    if synchroniser.exists():
+        try:
+            sync_status, sync_output = run_kit(
+                [sys.executable, str(synchroniser), "--quiet"], timeout=120
+            )
+        except subprocess.TimeoutExpired:
+            sync_status, sync_output = 1, "the surface sync timed out"
+        result["sync_pass"] = sync_status == 0
+        result["sync_tail"] = "\n".join(sync_output.splitlines()[-4:])
+
     doctor = KIT_DIR / "scripts" / "doctor.sh"
     if doctor.exists():
         try:
@@ -828,164 +844,197 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     margin: 0; background: var(--ground); color: var(--ink);
     font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
   }
-  .wrap { max-width: 1880px; margin: 0 auto; padding: 12px 20px 10px; }
-  .layout { display: flex; gap: 16px; align-items: flex-start; }
-  h1 { font-family: ui-monospace, monospace; font-size: 22px; margin: 0 0 2px; }
-  .sub { color: var(--soft); margin: 0 0 8px; font-size: 14px; }
+  /* The whole surface is meant to sit in one tab: the drawing is scaled to
+     whatever room is left, and only a long preview scrolls, inside itself. */
+  html, body { height: 100%; }
+  body { overflow: hidden; }
+  .wrap {
+    max-width: 1880px; margin: 0 auto; padding: 10px 20px;
+    height: 100%; display: flex; flex-direction: column; gap: 6px;
+  }
+  .layout {
+    flex: 1 1 auto; min-height: 0; display: flex; justify-content: center;
+    align-items: flex-start;
+  }
   .chartwrap {
-    flex: 1 1 auto; min-width: 0;
-    overflow-x: auto; overflow-y: visible; padding: 4px 0 4px;
+    flex: 1 1 auto; min-width: 0; height: 100%; border-radius: 10px;
+    display: flex; justify-content: center; align-items: center;
+    overflow: hidden;
   }
-  .canvas { position: relative; margin: 0 auto; }
-  .canvas svg.wires { position: absolute; inset: 0; overflow: visible; }
-  .canvas svg.marks { position: absolute; inset: 0; overflow: visible;
-    z-index: 40; pointer-events: none; }
-  .wires > path.edge { fill: none; stroke: var(--wire); stroke-width: 1.3; }
-  .wires marker path { fill: var(--wire); stroke: none; }
-  .canvas svg text {
-    font-family: system-ui, sans-serif; font-size: 11px; fill: var(--soft);
-    text-anchor: middle; dominant-baseline: middle;
-    paint-order: stroke; stroke: var(--ground); stroke-width: 4px;
-    stroke-linejoin: round;
+  .canvasfit { position: relative; }
+  .canvas {
+    position: absolute; top: 0; left: 0;
+    transform-origin: 0 0; overflow: hidden;
   }
-  .cluster {
-    position: absolute; border: 1.5px solid var(--edge);
-    border-radius: 14px;
+  .canvas svg.art { position: absolute; inset: 0; display: block; }
+  .art g[data-node], .art g[data-card], .art [data-edge], .art [data-part] {
+    transition: opacity .16s;
   }
-  .cnode {
-    position: absolute; box-sizing: border-box; border-radius: 9px;
-    padding: 8px 10px; z-index: 1; transition: box-shadow .16s, opacity .16s;
-    display: flex; flex-direction: column; gap: 4px;
-    justify-content: center; scroll-margin-block: 92px;
+  .art g[data-node].dim, .art g[data-card].dim, .art [data-edge].dim,
+  .art [data-part].dim {
+    opacity: .26;
   }
-  .cnode.diamond { border-radius: 0; clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%); }
-  .cnode.dim { opacity: 0.26; }
-  .cnode.self { box-shadow: 0 0 0 2.5px var(--ink), 0 10px 28px rgba(0,0,0,.34); }
-  .cnode:hover, .cnode:focus-within { z-index: 90; opacity: 1; }
-  .cnode .title {
-    font-size: 12px; font-weight: 600; line-height: 1.32;
-    white-space: pre-line;
+  .cardctl { transition: opacity .16s; }
+  .cardctl.dim { opacity: .3; }
+  /* The step being pointed at is outlined, so it is clear which of the
+     lit ones is the subject. */
+  .art g[data-node].self rect, .art g[data-node].self polygon {
+    stroke: #ffffff; stroke-width: 2.4;
   }
-  .cnode .nodemodel {
-    font-family: ui-monospace, monospace; font-size: 10.5px; opacity: .85;
+  /* Pinning sweeps a light along the route, each part starting a moment
+     after the one before it, so it leaves the entry and arrives at the
+     step just pinned. */
+  @keyframes sweep {
+    0% { filter: none; }
+    30% {
+      filter: brightness(1.7)
+        drop-shadow(0 0 5px rgba(255, 255, 255, .55));
+    }
+    100% { filter: none; }
   }
-  .cnode.has-info .title { padding-right: 16px; }
-  .cnode.diamond .title { padding: 0 26px; text-align: center; margin: auto; }
-  .cnode .info {
-    position: absolute; top: 5px; right: 6px; width: 17px; height: 17px;
-    border: 0; border-radius: 50%; background: rgba(255,255,255,.22);
-    color: inherit; font-size: 11px; line-height: 1; cursor: help;
-    display: grid; place-items: center; padding: 0; opacity: .75;
+  .art .sweep { animation: sweep 480ms ease-out both; }
+  .hot { cursor: pointer; }
+  @media (prefers-reduced-motion: reduce) {
+    .art .sweep { animation: none; }
+    .art g[data-node], .art g[data-card], .art [data-edge],
+    .art [data-part], .cardctl { transition: none; }
   }
-  .cnode .info:hover, .cnode .info:focus-visible { opacity: 1; background: rgba(255,255,255,.4); }
+  /* Transparent hit areas over the drawn nodes: the artwork stays exactly
+     as exported, and only hovering and tooltips live in the DOM. */
+  .hot { position: absolute; z-index: 5; }
+  .hot.has-tip { z-index: 25; }
+  .hot.has-tip { cursor: help; }
   .tip {
-    position: absolute; top: 22px; right: 0; width: 250px; z-index: 60;
+    position: absolute; top: 100%; left: 0; margin-top: 7px;
+    width: 250px; z-index: 60; text-align: left; white-space: normal;
     background: var(--panel); color: var(--ink); border: 1px solid var(--edge);
-    border-radius: 8px; padding: 10px 12px; font-size: 11.5px; line-height: 1.45;
-    box-shadow: 0 8px 24px rgba(0,0,0,.28); font-weight: 400;
-    display: none; text-align: left; white-space: normal;
-    opacity: 1; isolation: isolate;
+    border-radius: 8px; padding: 10px 12px; font-size: 11.5px;
+    line-height: 1.45; box-shadow: 0 10px 28px rgba(0,0,0,.45);
+    font-weight: 400; display: none;
   }
-  .info:hover + .tip, .info:focus-visible + .tip { display: block; }
+  .tip.flip-x { left: auto; right: 0; }
+  .tip.flip-y { top: auto; bottom: 100%; margin: 0 0 7px; }
+  .hot:hover > .tip, .hot:focus-within > .tip { display: block; }
   .tip b { display: block; margin-bottom: 3px; }
-  .legend {
-    display: flex; flex-direction: column; gap: 7px;
-    flex: none; width: 302px;
+  /* The card's control layer covers the whole card, so it must let a
+     pointer through everywhere except on the controls themselves. */
+  .cardctl { position: absolute; z-index: 20; pointer-events: none; }
+  .cardctl .ctl { pointer-events: auto; }
+  .cardctl .ctl {
+    position: absolute; box-sizing: border-box; line-height: 1;
+    appearance: none; -webkit-appearance: none;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px; font-weight: 500; letter-spacing: .01em;
+    color: #fff; background-color: rgba(255,255,255,.14);
+    border: 1px solid rgba(255,255,255,.28); border-radius: 8px;
+    padding: 0 9px; cursor: pointer;
+    transition: background .16s ease, border-color .16s ease,
+      box-shadow .16s ease;
   }
-  .legend-row {
-    display: flex; flex-direction: column; gap: 4px; background: var(--panel);
-    border: 1px solid var(--edge); border-radius: 10px; padding: 7px 10px;
+  .cardctl select.ctl {
+    padding-right: 22px; background-repeat: no-repeat;
+    background-position: right 8px center; background-size: 9px 9px;
+    background-image: url("data:image/svg+xml;utf8,\\
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>\\
+<path d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%23ffffff' \\
+stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   }
-  .legend-head { display: flex; align-items: center; gap: 8px; }
-  .roledot { width: 11px; height: 11px; border-radius: 50%; flex: none; }
-  .legend-name { font-size: 12.5px; font-weight: 600; }
-  .accesschip {
-    margin-left: auto; font-size: 9.5px; font-weight: 500;
-    letter-spacing: .05em; text-transform: uppercase; color: var(--soft);
+  .cardctl input.ctl { cursor: text; }
+  .cardctl .ctl:hover:not(:disabled) {
+    background-color: rgba(255,255,255,.22);
+    border-color: rgba(255,255,255,.46);
   }
-  .legend-group {
-    display: flex; flex-direction: column; gap: 6px;
-    border: 1px solid var(--edge); border-left: 3px solid var(--accent);
-    border-radius: 10px; padding: 7px 9px; background: var(--panel);
+  .cardctl .ctl:focus-visible {
+    outline: none; border-color: rgba(255,255,255,.9);
+    box-shadow: 0 0 0 3px rgba(255,255,255,.22);
   }
-  .legend-caption {
-    font-size: 9.5px; font-weight: 600; letter-spacing: .06em;
-    text-transform: uppercase; color: var(--soft);
+  .cardctl .ctl:disabled { opacity: .5; cursor: default; }
+  .cardctl .ctl::placeholder { color: rgba(255,255,255,.5); }
+  .cardctl select.ctl option { background: #16232d; color: #eaf1f5; }
+  /* A pale card needs the same controls drawn in ink rather than light. */
+  .cardctl.on-light .ctl {
+    color: #10161a; background-color: rgba(0,0,0,.05);
+    border-color: rgba(0,0,0,.22);
   }
-  .legend-group .legend-row { border: 0; padding: 0; background: transparent; }
-  .legend .control-row {
-    grid-template-columns: minmax(150px, 1fr) minmax(84px, auto);
+  .cardctl.on-light select.ctl {
+    background-image: url("data:image/svg+xml;utf8,\\
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>\\
+<path d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%2310161a' \\
+stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   }
-  .role-controls { display: flex; flex-direction: column; gap: 3px; }
-  .pick.endpoint { grid-column: 1 / -1; }
-  .endpointnote { font-size: 9px; color: var(--soft); line-height: 1.35; }
-  .control-row {
-    display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(72px, 1fr);
-    gap: 4px 5px; align-items: start;
+  .cardctl.on-light .ctl:hover:not(:disabled) {
+    background-color: rgba(0,0,0,.09); border-color: rgba(0,0,0,.38);
   }
-  .pick { display: flex; min-width: 0; flex-direction: column; gap: 1px; }
-  .pick label { font-size: 9.5px; letter-spacing: .04em; text-transform: uppercase; opacity: .8; }
-  .legend select, .legend input[type=text] {
-    width: 100%; box-sizing: border-box; border: 1px solid var(--edge);
-    border-radius: 5px; padding: 3px 6px; font-size: 11.5px;
-    font-family: ui-monospace, monospace;
-    background: var(--ground); color: var(--ink);
+  .cardctl.on-light .ctl:focus-visible {
+    border-color: rgba(0,0,0,.7); box-shadow: 0 0 0 3px rgba(0,0,0,.16);
   }
-  .legend select:focus-visible, .legend input:focus-visible {
-    outline: 2px solid var(--accent); outline-offset: 1px;
+  .cardctl.on-light .ctl::placeholder { color: rgba(0,0,0,.42); }
+  .cardctl.on-light select.ctl option { background: #ffffff; color: #10161a; }
+  /* The buttons live in the drawing's clear top-right band. */
+  .actions { display: none; }
+  .actionbar {
+    position: absolute; z-index: 30; display: flex; align-items: center;
+    justify-content: flex-end; gap: 8px;
   }
-  .actions {
-    display: flex; gap: 10px;
-    align-items: center; padding: 8px 0; margin-top: 4px;
-    border-top: 1px solid var(--edge);
+  .actionbar .btn {
+    appearance: none; height: 100%; box-sizing: border-box;
+    border: 1px solid rgba(255,255,255,.26); border-radius: 999px;
+    background-color: rgba(255,255,255,.11); color: #eef4f7;
+    padding: 0 18px; font-family: inherit; font-weight: 600;
+    letter-spacing: .012em; line-height: 1; cursor: pointer; white-space: nowrap;
+    transition: background-color .16s ease, border-color .16s ease,
+      box-shadow .16s ease, color .16s ease, transform .07s ease;
   }
-  .btn {
-    appearance: none; border: 1px solid transparent; border-radius: 8px;
-    padding: 9px 17px; font-size: 13.5px; font-weight: 550; cursor: pointer;
-    font-family: inherit; letter-spacing: .01em;
-    transition: background .15s, border-color .15s, box-shadow .15s, transform .06s, opacity .15s;
+  .actionbar .btn:hover:not(:disabled) {
+    background-color: rgba(255,255,255,.19); border-color: rgba(255,255,255,.44);
   }
-  .btn:active:not(:disabled) { transform: translateY(1px); }
-  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .btn-primary {
-    background: var(--accent); color: var(--accent-ink);
-    box-shadow: 0 1px 2px rgba(0,0,0,.2);
+  .actionbar .btn:active:not(:disabled) { transform: translateY(1px); }
+  .actionbar .btn:focus-visible {
+    outline: none; box-shadow: 0 0 0 3px rgba(255,255,255,.3);
   }
-  .btn-primary:hover:not(:disabled) { filter: brightness(1.09); box-shadow: 0 3px 12px rgba(0,0,0,.24); }
-  .btn-primary:disabled { opacity: .4; cursor: default; box-shadow: none; }
-  .btn-ghost { background: transparent; color: var(--ink); border-color: var(--edge); }
-  .btn-ghost:hover:not(:disabled) { background: var(--panel); border-color: var(--soft); }
-  .hint { font-size: 12px; color: var(--soft); margin-left: auto; }
+  .actionbar .btn-primary {
+    background-color: #e9f1f5; border-color: transparent; color: #0c1c25;
+    box-shadow: 0 2px 12px rgba(0,0,0,.35);
+  }
+  .actionbar .btn-primary:hover:not(:disabled) {
+    background-color: #ffffff; border-color: transparent;
+  }
+  .actionbar .btn-go {
+    background-color: #2f7d43; border-color: transparent; color: #fff;
+    box-shadow: 0 2px 12px rgba(0,0,0,.35);
+  }
+  .actionbar .btn-go:hover:not(:disabled) {
+    background-color: #379150; border-color: transparent;
+  }
+  .actionbar .btn:disabled {
+    background-color: rgba(255,255,255,.07); color: rgba(255,255,255,.38);
+    border-color: rgba(255,255,255,.13); box-shadow: none; cursor: default;
+  }
 
   .scopenote {
-    border-left: 3px solid var(--accent); padding: 5px 12px;
-    font-size: 13px; color: var(--soft); margin: 6px 0;
+    border-left: 3px solid var(--accent); padding: 4px 12px;
+    font-size: 12.5px; color: var(--soft); margin: 0;
+  }
+  /* Whatever a preview turns out to be, it scrolls inside itself so the
+     page as a whole never does. */
+  #result { overflow: auto; max-height: 30vh; }
+  #result pre {
+    white-space: pre-wrap; word-break: break-word; margin: 6px 0;
+    background: var(--code); color: var(--code-ink);
+    border-radius: 8px; padding: 10px 12px; font-size: 12px;
   }
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>Órrery configuration</h1>
-  <p class="sub">The pipeline as it runs. Choose each role's model in the
-     legend; the boxes show the live assignment, and nothing is saved until
-     you apply.</p>
   <div class="layout">
-    <div class="legend" id="legend"></div>
     <div class="chartwrap" id="chart"></div>
-  </div>
-  <div class="scopenote">
-    Saving sets the defaults for <strong>new Orrery sessions</strong>;
-    running sessions keep theirs, and a repository's private
-    <code>.orrery.json</code> override still wins.
-    __CATALOGUE_NOTE__
-    A custom model needs its provider picked too.
   </div>
   __STANDING__
   <div class="actions">
     <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
-    <button id="apply" class="btn btn-primary" type="button" disabled>Apply</button>
+    <button id="apply" class="btn btn-go" type="button" disabled>Apply</button>
     <button id="revert" class="btn btn-ghost" type="button">Revert edits</button>
-    <span class="hint">Nothing is written until you apply.</span>
   </div>
   <div id="result"></div>
 </div>
@@ -993,12 +1042,20 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 const STATE = __STATE__;
 const SETTINGS = __SETTINGS__;
 const CHART = __CHART__;
+const SCOPE = "Saving sets the defaults for new Orrery sessions; running " +
+  "sessions keep theirs, and a repository\u2019s private .orrery.json " +
+  "still wins. " + __CATALOGUE_NOTE__;
+// Exposed so the drawing can be measured from a console, and by the
+// checks that verify its geometry against what is painted.
+window.CHART = CHART;
+window.SETTINGS = SETTINGS;
 const ENDPOINTS = __ENDPOINTS__;
 const TOKEN_PATH = __TOKEN_PATH__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
 const original = Object.fromEntries(
   STATE.map(s => [s.id, {
-    provider: s.provider, model: s.model, thinking: s.thinking || ""
+    provider: s.provider, model: s.model, thinking: s.thinking || "",
+    endpoint: s.endpoint || ""
   }])
 );
 const originalSettings = Object.fromEntries(SETTINGS.map(s => [s.id, s.value]));
@@ -1006,16 +1063,10 @@ const host = document.getElementById("chart");
 const result = document.getElementById("result");
 const applyButton = document.getElementById("apply");
 const SVGNS = "http://www.w3.org/2000/svg";
-const ARROW_SIZE = 12;
-// The path ends at the arrowhead's base and the head continues towards
-// the node, so the clearance is what keeps the tip itself off the box.
-const ARROW_CLEARANCE = 19;
-
-const FILL = {
-  orchestrator: ["#38617f", "#ffffff"], mechanic: ["#8891a8", "#ffffff"],
-  implementer: ["#4f7047", "#ffffff"], "plan-reviewer": ["#7d5d90", "#ffffff"],
-  reviewer: ["#a2711d", "#ffffff"], none: ["#e4e8eb", "#1b2226"],
-};
+// The drawing is authored at CHART.width x CHART.height and painted through
+// a viewBox, so every coordinate below is the exported one and the page can
+// take a fresh export unchanged.
+const S = CHART.scale || 1;
 
 function esc(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
@@ -1028,505 +1079,731 @@ function element(name, attributes) {
   return node;
 }
 
-function nodeInk(node) {
-  const role = node.roles.length ? node.roles[node.roles.length - 1] : "none";
-  return FILL[role] || FILL.none;
-}
-
 function stepsUsing(roleId) {
   return CHART.nodes.filter(n => n.roles.includes(roleId)).length;
 }
 
-function settingsForNode(nodeId) {
-  return SETTINGS.filter(setting => setting.node === nodeId);
+function boxLeft(item) { return item.x - item.w / 2; }
+function boxTop(item) { return item.y - item.h / 2; }
+
+function panel(item, extra) {
+  return element("rect", Object.assign({
+    x: boxLeft(item), y: boxTop(item), width: item.w, height: item.h,
+    rx: item.r || 0, ry: item.r || 0,
+    fill: item.fill || "none",
+    stroke: item.stroke, "stroke-width": item.width || 1.5,
+    "stroke-dasharray": item.dash || "none",
+  }, extra || {}));
 }
 
-function picker(step) {
-  const id = esc(step.id);
-  const knownChoices = (step.choices || []).filter(c => c.known);
-  const selectedKnown = knownChoices.some(
-    c => c.provider === step.provider && c.id === step.model
-  );
-  const grouped = ["anthropic", "openai"].map(provider => {
-    const options = knownChoices.filter(c => c.provider === provider).map(c => {
-      const selected = c.provider === step.provider && c.id === step.model;
-      return `<option value="${esc(c.provider + "::" + c.id)}" ` +
-        `${selected ? "selected" : ""}>${esc(c.label)}</option>`;
-    }).join("");
-    const label = provider === "anthropic" ? "Anthropic" : "OpenAI";
-    return `<optgroup label="${label}">${options}</optgroup>`;
-  }).join("");
-  const choice = knownChoices.find(
-    c => c.provider === step.provider && c.id === step.model
-  );
-  const levels = choice ? choice.thinking_levels : [];
-  const thinkingOptions = levels.length
-    ? levels.map(level =>
-        `<option value="${esc(level)}" ${level === step.thinking ? "selected" : ""}>` +
-        `${esc(level)}</option>`).join("")
-    : `<option value="">${choice ? "unavailable" : "manual setup"}</option>`;
+function textRun(line, size, fill, anchor, bold) {
+  const text = element("text", {
+    x: line.x, y: line.y, "font-size": size, fill,
+    "text-anchor": anchor, "font-weight": bold ? "700" : "400",
+  });
+  // Aptos is a Microsoft font and is usually absent, so every run is
+  // pinned to the width it was drawn at. The layout then holds whatever
+  // the browser substitutes, instead of spilling out of its box.
+  if (line.w) {
+    text.setAttribute("textLength", line.w);
+    text.setAttribute("lengthAdjust", line.fit || "spacingAndGlyphs");
+  }
+  text.textContent = line.t;
+  return text;
+}
+
+// A blurred patch of the background, laid under a caption so the wire it
+// sits on fades away rather than striking through the words.
+function halo(line, size) {
+  // Wide enough that the blur has faded out past the words, and tall
+  // enough that its middle is fully opaque where the letters sit.
+  const width = (line.haloW || line.w) + size * 1.1;
+  const height = size * (line.haloH || 1.9);
+  return element("rect", {
+    x: (line.haloX || line.x) - width / 2,
+    y: line.y - size * 0.32 - height / 2,
+    width, height,
+    fill: CHART.background,
+    filter: line.haloSoft ? "url(#soften-more)" : "url(#soften)",
+  });
+}
+
+function header() {
+  const own = CHART.header;
+  const group = element("g", { class: "header" });
+  const text = element("text", {
+    x: own.x, y: own.y, "text-anchor": "start",
+    "font-size": own.titleSize, "font-weight": "700", fill: "#ffffff",
+  });
+  const name = element("tspan", {});
+  name.textContent = own.title;
+  const stand = element("tspan", {
+    dx: own.gap, "font-size": own.subtitleSize,
+    "font-weight": "400", fill: CHART.wire,
+  });
+  stand.textContent = own.subtitle;
+  text.appendChild(name);
+  text.appendChild(stand);
+  group.appendChild(text);
+  const note = element("text", {
+    x: own.x, y: own.noteY, "text-anchor": "start", class: "scopeline",
+    "font-size": own.noteSize, "font-weight": "400", fill: CHART.wire,
+  });
+  note.textContent = SCOPE;
+  group.appendChild(note);
+  return group;
+}
+
+// The note shares its band with the buttons, so it is held to the room
+// left of them however wide their labels turn out to be.
+function fitHeaderNote(canvas) {
+  const note = canvas.querySelector("text.scopeline");
+  const bar = canvas.querySelector(".actionbar");
+  if (!note || !bar) return;
+  const taken = bar.getBoundingClientRect().width / S;
+  const room = CHART.actions.x - taken - CHART.header.x - 14;
+  note.removeAttribute("textLength");
+  if (note.getComputedTextLength() > room) {
+    note.setAttribute("textLength", room);
+    note.setAttribute("lengthAdjust", "spacingAndGlyphs");
+  }
+}
+
+function nodeShape(node) {
+  if (node.shape === "diamond") {
+    return element("polygon", {
+      points: node.points.map(point => point.join(",")).join(" "),
+      fill: node.fill, stroke: node.stroke, "stroke-width": 1.5,
+    });
+  }
+  return panel(node);
+}
+
+// Every control sits where the drawing left room for it, so the legend
+// keeps the spacing it was designed with.
+function place(host, card, slot, node, className) {
+  node.className = className;
+  node.style.cssText =
+    `left:${(slot[0] - boxLeft(card)) * S}px;top:${(slot[1] - boxTop(card)) * S}px;` +
+    `width:${slot[2] * S}px;height:${slot[3] * S}px`;
+  host.appendChild(node);
+  return node;
+}
+
+// A card whose caption is drawn in black is a pale one, and needs its
+// controls drawn the same way.
+function light(card) {
+  return card.ink === "#000000";
+}
+
+function option(value, label, selected) {
+  const node = document.createElement("option");
+  node.value = value;
+  node.textContent = label;
+  node.selected = Boolean(selected);
+  return node;
+}
+
+function settingControls(card) {
+  const setting = SETTINGS.find(entry => entry.id === card.target);
+  const box = document.createElement("div");
+  box.className = "cardctl" + (light(card) ? " on-light" : "");
+  box.dataset.card = card.target;
+  box.style.cssText =
+    `left:${boxLeft(card) * S}px;top:${boxTop(card) * S}px;` +
+    `width:${card.w * S}px;height:${card.h * S}px`;
+  if (!setting) return box;
+  const select = document.createElement("select");
+  select.dataset.setting = setting.id;
+  for (const value of setting.choices) {
+    select.appendChild(option(
+      value,
+      `${value} round${value === 1 ? "" : "s"}`,
+      value === setting.value,
+    ));
+  }
+  place(box, card, card.fields[0].slot, select, "ctl");
+  return box;
+}
+
+function roleControls(card) {
+  const step = STATE.find(entry => entry.id === card.target);
+  const box = document.createElement("div");
+  box.className = "cardctl" + (light(card) ? " on-light" : "");
+  box.dataset.card = card.target;
+  box.style.cssText =
+    `left:${boxLeft(card) * S}px;top:${boxTop(card) * S}px;` +
+    `width:${card.w * S}px;height:${card.h * S}px`;
+  if (!step) return box;
+
   const preset = ENDPOINTS.find(item => item.id === step.endpoint);
-  const endpointOptions = [
-    `<option value="">first-party (${
-      step.provider === "anthropic" ? "Anthropic" : "OpenAI"
-    })</option>`,
-  ].concat(ENDPOINTS.map(item =>
-    `<option value="${esc(item.id)}" ${
-      item.id === step.endpoint ? "selected" : ""
-    }>${esc(item.label)}${item.verified ? "" : " (unverified)"}</option>`
-  )).join("");
-  const endpointPick =
-    `<div class="pick endpoint"><label>endpoint</label>` +
-    `<select data-step="${id}" data-kind="endpoint">${endpointOptions}` +
-    `</select></div>`;
+  const known = (step.choices || []).filter(choice => choice.known);
+  const chosen = known.find(
+    choice => choice.provider === step.provider && choice.id === step.model
+  );
+  const listed = preset ? preset.models.includes(step.model) : Boolean(chosen);
+
+  const endpoint = document.createElement("select");
+  endpoint.dataset.step = step.id;
+  endpoint.dataset.kind = "endpoint";
+  for (const name of ["anthropic", "openai"]) {
+    endpoint.appendChild(option(
+      name,
+      `first-party (${name === "anthropic" ? "Anthropic" : "OpenAI"})`,
+      !preset && step.provider === name,
+    ));
+  }
+  for (const item of ENDPOINTS) {
+    endpoint.appendChild(option(
+      item.id,
+      item.label + (item.verified ? "" : " (unverified)"),
+      item.id === step.endpoint,
+    ));
+  }
+  if (preset) {
+    endpoint.title = `${preset.base_url} · ` +
+      (preset.key_env ? `key from ${preset.key_env}` : "no credential required");
+  }
+  place(box, card, card.fields[0].slot, endpoint, "ctl");
+
+  const model = document.createElement("select");
+  model.dataset.step = step.id;
+  model.dataset.kind = "model";
   if (preset) {
     // A third-party endpoint serves its own models, so the first-party
     // catalogue and its thinking levels do not apply here.
-    const suggestions = preset.models.map(model =>
-      `<option value="${esc(model)}" ${
-        model === step.model ? "selected" : ""
-      }>${esc(model)}</option>`).join("");
-    const listed = preset.models.includes(step.model);
-    const credential = preset.key_env
-      ? `key from ${esc(preset.key_env)}`
-      : "no credential required";
-    return `<div class="role-controls" data-role="${id}">` +
-      `<div class="control-row">` + endpointPick +
-      `<div class="pick"><label>model</label>` +
-      `<select data-step="${id}" data-kind="model">${suggestions}` +
-      `<option value="__custom__" ${listed ? "" : "selected"}>custom…` +
-      `</option></select>` +
-      `<input type="text" data-step="${id}" data-kind="custom" ` +
-      `value="${listed ? "" : esc(step.model)}" ` +
-      `style="display:${listed ? "none" : "block"}" ` +
-      `placeholder="exact identifier"></div>` +
-      `<div class="pick"><label>thinking</label>` +
-      `<select data-step="${id}" data-kind="thinking" disabled>` +
-      `<option value="">endpoint's</option></select></div>` +
-      `</div><div class="endpointnote">${esc(preset.base_url)} · ` +
-      `${credential}</div></div>`;
-  }
-  return `<div class="role-controls" data-role="${id}"><div class="control-row">` +
-    endpointPick +
-    `<div class="pick"><label>model</label>` +
-    `<select data-step="${id}" data-kind="model">${grouped}` +
-    `<option value="__custom__" ${selectedKnown ? "" : "selected"}>custom…</option></select>` +
-    `<select data-step="${id}" data-kind="provider" ` +
-    `style="display:${selectedKnown ? "none" : "block"}" aria-label="custom model provider">` +
-    `<option value="anthropic" ${step.provider === "anthropic" ? "selected" : ""}>Anthropic</option>` +
-    `<option value="openai" ${step.provider === "openai" ? "selected" : ""}>OpenAI</option>` +
-    `</select>` +
-    `<input type="text" data-step="${id}" data-kind="custom" ` +
-    `value="${selectedKnown ? "" : esc(step.model)}" ` +
-    `style="display:${selectedKnown ? "none" : "block"}" ` +
-    `placeholder="exact identifier"></div>` +
-    `<div class="pick"><label>thinking</label>` +
-    `<select data-step="${id}" data-kind="thinking" ` +
-    `${levels.length ? "" : "disabled"}>${thinkingOptions}</select></div>` +
-    `</div></div>`;
-}
-
-function settingPicker(setting) {
-  const options = setting.choices.map(value =>
-    `<option value="${value}" ${value === setting.value ? "selected" : ""}>` +
-    `${value} round${value === 1 ? "" : "s"}</option>`).join("");
-  return `<div class="pick"><label>${esc(setting.label)}</label>` +
-    `<select data-setting="${esc(setting.id)}">${options}</select></div>`;
-}
-
-function tip(node) {
-  const roleText = node.roles.map(id => {
-    const step = roles[id];
-    const count = stepsUsing(id);
-    const shared = count > 1
-      ? ` The ${count} highlighted steps share this role and change together.`
-      : "";
-    const access = step.access ? ` Access: ${esc(step.access)}.` : "";
-    return `<b>${esc(step.title)}</b>${esc(step.summary)}${shared}${access}`;
-  }).join('<div style="height:8px"></div>');
-  const settingText = settingsForNode(node.id).map(setting =>
-    `<div style="height:8px"></div><b>${esc(setting.label)}</b>` +
-    `${esc(setting.description)}`
-  ).join("");
-  return roleText + settingText;
-}
-
-function legendRow(step) {
-  const [fill] = FILL[step.id] || FILL.none;
-  return `<div class="legend-row"><div class="legend-head">` +
-    `<span class="roledot" style="background:${fill}"></span>` +
-    `<span class="legend-name">${esc(step.title)}</span>` +
-    `<span class="accesschip">${esc(step.access)}</span></div>` +
-    picker(step) +
-    `</div>`;
-}
-
-function renderLegend() {
-  const byId = Object.fromEntries(STATE.map(step => [step.id, step]));
-  // The principal and the plan reviewer form one organic loop, so their
-  // entries sit together with the loop's round bound.
-  const loop = `<div class="legend-group">` +
-    `<div class="legend-caption">bounded plan loop</div>` +
-    legendRow(byId["orchestrator"]) +
-    legendRow(byId["plan-reviewer"]) +
-    `<div class="legend-row"><div class="legend-head">` +
-    `<span class="roledot" style="background:${FILL.none[0]}"></span>` +
-    `<span class="legend-name">Workflow</span>` +
-    `<span class="accesschip">bounded loops</span></div>` +
-    SETTINGS.map(settingPicker).join("") +
-    `</div></div>`;
-  const rest = STATE
-    .filter(step => !["orchestrator", "plan-reviewer"].includes(step.id))
-    .map(legendRow)
-    .join("");
-  document.getElementById("legend").innerHTML = loop + rest;
-}
-
-function nodeModelText(roleId) {
-  const model = currentModel(roleId) || roles[roleId].model;
-  const thinking = currentThinking(roleId);
-  return model + (thinking ? ` · ${thinking}` : "");
-}
-
-function updateNodeText() {
-  document.querySelectorAll("[data-model-for]").forEach(element => {
-    element.textContent = nodeModelText(element.dataset.modelFor);
-  });
-  document.querySelectorAll("[data-setting-for]").forEach(element => {
-    const value = currentSetting(element.dataset.settingFor);
-    if (value !== null) {
-      element.textContent = `${value} round${value === 1 ? "" : "s"}`;
+    for (const name of preset.models) {
+      model.appendChild(option(name, name, name === step.model));
     }
+  } else {
+    // Seeded by the endpoint: a first-party endpoint is one provider, so
+    // only that provider's catalogue belongs in the list.
+    for (const choice of known.filter(item => item.provider === step.provider)) {
+      model.appendChild(option(choice.id, choice.label, choice.id === step.model));
+    }
+  }
+  model.appendChild(option("__custom__", "custom…", !listed));
+  place(box, card, card.fields[1].slot, model, "ctl");
+
+  const thinking = document.createElement("select");
+  thinking.dataset.step = step.id;
+  thinking.dataset.kind = "thinking";
+  const levels = preset ? [] : (chosen ? chosen.thinking_levels : []);
+  if (levels.length) {
+    for (const level of levels) {
+      thinking.appendChild(option(level, level, level === step.thinking));
+    }
+  } else {
+    thinking.appendChild(option(
+      "",
+      preset ? "endpoint's" : (chosen ? "unavailable" : "manual setup"),
+    ));
+    thinking.disabled = true;
+  }
+  place(box, card, card.fields[2].slot, thinking, "ctl");
+
+  // Naming a model by hand still needs somewhere to type it. The bottom row
+  // gives up its thinking picker -- which a hand-named model cannot offer
+  // anyway -- and model and identifier share the row.
+
+  const custom = document.createElement("input");
+  custom.type = "text";
+  custom.dataset.step = step.id;
+  custom.dataset.kind = "custom";
+  custom.placeholder = "exact identifier";
+  custom.value = listed ? "" : step.model;
+  place(box, card, card.fields[1].slot, custom, "ctl");
+
+  box.dataset.custom = String(!listed);
+  layoutRow(box, card, !listed);
+  return box;
+}
+
+// The bottom row in its two states: model and thinking as drawn, or model
+// and a typed identifier sharing the row while a model is named by hand.
+function layoutRow(box, card, custom) {
+  const model = box.querySelector('select[data-kind="model"]');
+  const typed = box.querySelector('input[data-kind="custom"]');
+  const thinking = box.querySelector('select[data-kind="thinking"]');
+  const label = document.querySelector(
+    `[data-field-label="${card.target}:THINKING"]`
+  );
+  if (!model) return;
+  const gap = 4;
+  const [x, y, , h] = card.fields[1].slot;
+  const full = card.fields[0].slot[2];
+
+  const put = (node, left, width) => {
+    node.style.left = `${(x + left - boxLeft(card)) * S}px`;
+    node.style.top = `${(y - boxTop(card)) * S}px`;
+    node.style.width = `${width * S}px`;
+    node.style.height = `${h * S}px`;
+    node.style.display = "block";
+  };
+
+  if (custom) {
+    const room = full - gap;
+    put(model, 0, room * 0.42);
+    put(typed, room * 0.42 + gap, room * 0.58);
+    if (thinking) thinking.style.display = "none";
+    if (label) label.style.opacity = "0";
+  } else {
+    put(model, 0, card.fields[1].slot[2]);
+    typed.style.display = "none";
+    if (thinking) thinking.style.display = "block";
+    if (label) label.style.opacity = "";
+  }
+}
+
+// What a card stands for, worded for the legend rather than for a step.
+function cardTip(card) {
+  if (card.kind === "setting") {
+    const setting = SETTINGS.find(entry => entry.id === card.target);
+    if (!setting) return "";
+    return `<b>${esc(setting.label)}</b>${esc(setting.description)}`;
+  }
+  const step = roles[card.target];
+  if (!step) return "";
+  const count = stepsUsing(card.target);
+  const shared = count > 1
+    ? ` The ${count} highlighted steps share this role and change together.`
+    : "";
+  const access = step.access ? ` Access: ${esc(step.access)}.` : "";
+  return `<b>${esc(step.title)}</b>${esc(step.summary)}${shared}${access}`;
+}
+
+// A hover target over the card's mark, so the legend explains each role
+// and lights up the steps that run it.
+function cardMarkHot(card) {
+  const detail = cardTip(card);
+  if (!detail) return null;
+  const [, , iw, ih] = card.icon ? card.icon.box : [0, 0, 1, 1];
+  const factor = CHART.iconSize / Math.sqrt(iw * ih);
+  const inset = CHART.iconInset;
+  const hot = document.createElement("div");
+  hot.className = "hot has-tip";
+  hot.tabIndex = 0;
+  hot.style.cssText =
+    `left:${(card.x + card.w / 2 - inset - iw * factor - 2) * S}px;` +
+    `top:${(card.y - card.h / 2 + inset - 2) * S}px;` +
+    `width:${(iw * factor + 4) * S}px;height:${(ih * factor + 4) * S}px`;
+  const bubble = document.createElement("div");
+  bubble.className = "tip flip-x" +
+    (card.y > CHART.height * 0.5 ? " flip-y" : "");
+  bubble.innerHTML = detail;
+  hot.appendChild(bubble);
+  hot.addEventListener("mouseenter", () => {
+    if (!pinned) hoverCard(card.target);
   });
+  hot.addEventListener("mouseleave", () => {
+    if (!pinned) applyHighlight(null);
+  });
+  hot.addEventListener("focusin", () => {
+    if (!pinned) hoverCard(card.target);
+  });
+  hot.addEventListener("focusout", event => {
+    if (!pinned && !hot.contains(event.relatedTarget)) applyHighlight(null);
+  });
+  return hot;
+}
+
+function cardControls(card) {
+  return card.kind === "setting" ? settingControls(card) : roleControls(card);
+}
+
+function renderLegend(canvas) {
+  for (const card of CHART.legend.cards) {
+    canvas.appendChild(cardControls(card));
+    const mark = cardMarkHot(card);
+    if (mark) canvas.appendChild(mark);
+  }
+}
+
+// One card's controls depend on its endpoint, so only that card is rebuilt.
+function replaceCard(target) {
+  const card = CHART.legend.cards.find(entry => entry.target === target);
+  const existing = document.querySelector(`.cardctl[data-card="${target}"]`);
+  if (!card || !existing) return;
+  existing.replaceWith(cardControls(card));
 }
 
 function render() {
-  renderLegend();
+  host.style.background = CHART.background;
   const canvas = document.createElement("div");
   canvas.className = "canvas";
-  canvas.style.width = CHART.width + "px";
-  canvas.style.height = CHART.height + "px";
+  canvas.style.cssText =
+    `width:${CHART.width * S}px;height:${CHART.height * S}px;` +
+    `background:${CHART.background}`;
 
-  // A decorative frame around the bounded plan loop, painted underneath
-  // the wires and nodes.
-  if (CHART.cluster && Array.isArray(CHART.cluster.nodes)) {
-    const members = CHART.nodes.filter(
-      node => CHART.cluster.nodes.includes(node.id),
-    );
-    if (members.length) {
-      const pad = Number(CHART.cluster.pad || 12);
-      const left = Math.min(...members.map(n => n.x - n.w / 2)) - pad;
-      const top = Math.min(...members.map(n => n.y - n.h / 2)) - pad;
-      const right = Math.max(...members.map(n => n.x + n.w / 2)) + pad;
-      const bottom = Math.max(...members.map(n => n.y + n.h / 2)) + pad;
-      const frame = document.createElement("div");
-      frame.className = "cluster";
-      frame.style.cssText = `left:${left}px;top:${top}px;` +
-        `width:${right - left}px;height:${bottom - top}px`;
-      canvas.appendChild(frame);
-    }
-  }
-
-  const svg = element("svg", {
-    class: "wires", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
-    width: CHART.width, height: CHART.height,
+  const art = element("svg", {
+    class: "art", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
+    width: CHART.width * S, height: CHART.height * S,
+    "font-family": CHART.font,
   });
+
+  // A wire passing under a caption is faded out behind it rather than
+  // crossing it, exactly as the drawing does.
   const defs = element("defs", {});
-  const marker = element("marker", {
-    id: "arrow", viewBox: "0 0 12 12", refX: "0.5", refY: "6",
-    markerWidth: String(ARROW_SIZE), markerHeight: String(ARROW_SIZE),
-    markerUnits: "userSpaceOnUse", orient: "auto",
+  // Filters work in linear light by default, so a blurred patch of the
+  // background comes back a different colour and prints as a pale box.
+  // Blurring in sRGB keeps it the same colour it started as.
+  const soften = element("filter", {
+    id: "soften", x: "-50%", y: "-100%", width: "200%", height: "300%",
+    "color-interpolation-filters": "sRGB",
   });
-  marker.appendChild(element("path", {
-    d: "M0.5,0.5 L11.5,6 L0.5,11.5 z", fill: "context-stroke",
-  }));
-  defs.appendChild(marker);
-  svg.appendChild(defs);
-  canvas.appendChild(svg);
+  soften.appendChild(element("feGaussianBlur", { stdDeviation: "1.6" }));
+  defs.appendChild(soften);
+  // A gentler version, for a caption too hemmed in to carry the usual fade.
+  const gentler = element("filter", {
+    id: "soften-more", x: "-60%", y: "-160%", width: "220%", height: "420%",
+    "color-interpolation-filters": "sRGB",
+  });
+  gentler.appendChild(element("feGaussianBlur", { stdDeviation: "2.8" }));
+  defs.appendChild(gentler);
+  art.appendChild(defs);
 
-  const marks = element("svg", {
-    class: "marks", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
-    width: CHART.width, height: CHART.height,
+  const caption = link => {
+    for (const line of link.lines || []) {
+      const key = `${link.from}>${link.to}`;
+      const patch = halo(line, CHART.wireSize);
+      patch.setAttribute("data-edge", key);
+      art.appendChild(patch);
+      const words = textRun(line, CHART.wireSize, CHART.wire, "middle", false);
+      words.setAttribute("data-edge", key);
+      art.appendChild(words);
+    }
+  };
+  // A caption marked to sit behind is drawn first, so the loop border and
+  // the box it runs into both cover it; the rest keep their place above.
+  for (const link of CHART.edges) if (link.back) caption(link);
+
+  const loopBorder = panel(CHART.cluster);
+  loopBorder.setAttribute("data-part", "cluster");
+  art.appendChild(loopBorder);
+  for (const link of CHART.edges) {
+    if (!link.d) continue;
+    const wire = element("path", { d: link.d, fill: CHART.wire });
+    wire.setAttribute("data-edge", `${link.from}>${link.to}`);
+    art.appendChild(wire);
+  }
+  const loopMark = element("path", {
+    d: CHART.loopMark.d, fill: CHART.loopMark.fill,
   });
-  canvas.appendChild(marks);
+  loopMark.setAttribute("data-part", "loop");
+  art.appendChild(loopMark);
 
   for (const node of CHART.nodes) {
-    const [fill, ink] = nodeInk(node);
-    const detail = tip(node);
-    const box = document.createElement("div");
-    box.className = "cnode" +
-      (node.shape === "diamond" ? " diamond" : "") +
-      (detail ? " has-info" : "");
-    box.dataset.node = node.id;
-    box.style.cssText =
-      `left:${node.x - node.w / 2}px;top:${node.y - node.h / 2}px;` +
-      `width:${node.w}px;min-height:${node.h}px;background:${fill};color:${ink}`;
-    const modelLine = node.roles.length
-      ? `<div class="nodemodel" data-model-for=` +
-        `"${esc(node.roles[node.roles.length - 1])}"></div>`
-      : "";
-    const settingLine = settingsForNode(node.id).map(setting =>
-      `<div class="nodemodel" data-setting-for="${esc(setting.id)}"></div>`
-    ).join("");
-    box.innerHTML =
-      `<div class="title">${esc(node.label)}</div>` +
-      modelLine + settingLine +
-      (detail ?
-        `<button class="info" type="button" aria-label="About this step">&#128712;</button>` +
-        `<div class="tip">${detail}</div>` : "");
-    box.addEventListener("mouseenter", () => highlight(node.id, node.roles));
-    box.addEventListener("mouseleave", () => highlight(null, null));
-    box.addEventListener("focusin", () => highlight(node.id, node.roles));
-    box.addEventListener("focusout", event => {
-      if (!box.contains(event.relatedTarget)) highlight(null, null);
-    });
-    canvas.appendChild(box);
+    const group = element("g", { "data-node": node.id });
+    group.appendChild(nodeShape(node));
+    for (const line of node.lines) {
+      group.appendChild(textRun(line, node.size, node.ink, "middle", true));
+    }
+    art.appendChild(group);
   }
 
-  host.appendChild(canvas);
-  updateNodeText();
-  drawWires(svg, marks, canvas);
-  window.addEventListener("resize", () => drawWires(svg, marks, canvas));
-  requestAnimationFrame(() => {
-    host.scrollLeft = Math.max(0, (CHART.width - host.clientWidth) / 2);
+  for (const link of CHART.edges) if (!link.back) caption(link);
+
+  const legend = CHART.legend;
+  art.appendChild(panel(legend.group));
+  for (const card of legend.cards) {
+    // One group per entry, so hovering a step can fade the entries that
+    // have nothing to do with it.
+    const entry = element("g", { "data-card": card.target });
+    art.appendChild(entry);
+    entry.appendChild(panel(card));
+    entry.appendChild(textRun(card.title, card.titleSize, card.ink, "start", false));
+    for (const field of card.fields) {
+      const drawn = textRun(
+        { t: field.label, x: field.x, y: field.y, w: field.w },
+        card.fieldSize, card.ink, "start", false,
+      );
+      drawn.setAttribute("data-field-label", `${card.target}:${field.label}`);
+      entry.appendChild(drawn);
+    }
+    if (card.icon) {
+      // The marks were drawn at different proportions, so matching one
+      // dimension would leave a wide one looking half the size of a tall
+      // one. Matching the area they cover is what reads as the same size.
+      const [ix, iy, iw, ih] = card.icon.box;
+      const side = CHART.iconSize;
+      const factor = side / Math.sqrt(iw * ih);
+      // One inset for every card, so the marks line up as a set rather
+      // than following each card's own inner rhythm.
+      const inset = CHART.iconInset;
+      const toX = card.x + card.w / 2 - inset - iw * factor;
+      const toY = card.y - card.h / 2 + inset;
+      const mark = element("g", {
+        transform: `translate(${toX - ix * factor} ${toY - iy * factor}) ` +
+          `scale(${factor})`,
+      });
+      mark.appendChild(element("path", { d: card.icon.d, fill: card.icon.fill }));
+      entry.appendChild(mark);
+    }
+  }
+  // The frame is drawn last so its border sits in front of the panel it
+  // encloses instead of disappearing behind it.
+  art.appendChild(panel(legend.frame));
+
+  art.appendChild(header());
+  canvas.appendChild(art);
+
+  // The steps light up their kin on hover; what a role actually does is
+  // explained by its mark in the legend instead.
+  for (const node of CHART.nodes) {
+    const hot = document.createElement("div");
+    hot.className = "hot";
+    hot.dataset.node = node.id;
+    hot.style.cssText =
+      `left:${boxLeft(node) * S}px;top:${boxTop(node) * S}px;` +
+      `width:${node.w * S}px;height:${node.h * S}px`;
+    hot.addEventListener("mouseenter", () => {
+      if (!pinned) hoverNode(node.id);
+    });
+    hot.addEventListener("mouseleave", () => {
+      if (!pinned) applyHighlight(null);
+    });
+    hot.addEventListener("click", event => {
+      event.stopPropagation();
+      pinned = pinned === node.id ? null : node.id;
+      if (pinned) hoverNode(node.id, true);
+      else hoverNode(node.id);
+    });
+    canvas.appendChild(hot);
+  }
+
+  renderLegend(canvas);
+
+  // Clicking the drawing itself releases a pin; the legend does not, so a
+  // pinned step survives while its model is changed.
+  canvas.addEventListener("click", event => {
+    if (event.target.closest(".cardctl") || event.target.closest(".hot")) return;
+    if (!pinned) return;
+    pinned = null;
+    applyHighlight(null);
+  });
+
+  const bar = document.createElement("div");
+  bar.className = "actionbar";
+  const box = CHART.actions;
+  bar.style.cssText =
+    `right:${(CHART.width - box.x) * S}px;top:${box.y * S}px;` +
+    `height:${box.h * S}px;font-size:${box.h * 0.44 * S}px`;
+  for (const button of [...document.querySelectorAll(".actions .btn")]) {
+    bar.appendChild(button);
+  }
+  canvas.appendChild(bar);
+
+  const frame = document.createElement("div");
+  frame.className = "canvasfit";
+  frame.appendChild(canvas);
+  host.appendChild(frame);
+  // Measured only once the canvas is in the document, or the buttons have
+  // no width yet and the note would be left running underneath them.
+  fitHeaderNote(canvas);
+  fitCanvas();
+  let pending = false;
+  window.addEventListener("resize", () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; fitCanvas(); });
   });
 }
 
-function drawWires(svg, marks, canvas) {
-  svg.querySelectorAll("path.edge").forEach(old => old.remove());
-  marks.querySelectorAll("text").forEach(old => old.remove());
-  const frame = canvas.getBoundingClientRect();
-  const rect = id => {
-    const element = canvas.querySelector(`[data-node="${id}"]`);
-    if (!element) return null;
-    const box = element.getBoundingClientRect();
-    return {
-      x: box.left + box.width / 2 - frame.left,
-      y: box.top + box.height / 2 - frame.top,
-      w: box.width, h: box.height,
-      diamond: element.classList.contains("diamond"),
-    };
-  };
-
-  const edge = (node, towards) => {
-    const dx = towards.x - node.x;
-    const dy = towards.y - node.y;
-    if (!dx && !dy) return { x: node.x, y: node.y };
-    const a = node.w / 2;
-    const b = node.h / 2;
-    const scale = node.diamond
-      ? 1 / (Math.abs(dx) / a + Math.abs(dy) / b)
-      : Math.min(Math.abs(dx) > 1e-6 ? a / Math.abs(dx) : Infinity,
-                 Math.abs(dy) > 1e-6 ? b / Math.abs(dy) : Infinity);
-    return { x: node.x + dx * scale, y: node.y + dy * scale };
-  };
-
-  const distanceToSegment = (point, start, end) => {
-    const dx = end.x - start.x;
-    const dy = end.y - start.y;
-    const lengthSquared = dx * dx + dy * dy;
-    const along = lengthSquared
-      ? Math.max(0, Math.min(1,
-          ((point.x - start.x) * dx + (point.y - start.y) * dy) /
-          lengthSquared))
-      : 0;
-    return Math.hypot(
-      point.x - (start.x + along * dx),
-      point.y - (start.y + along * dy),
-    );
-  };
-
-  const shapeDistance = (point, node) => {
-    if (!node.diamond) {
-      return Math.hypot(
-        Math.max(Math.abs(point.x - node.x) - node.w / 2, 0),
-        Math.max(Math.abs(point.y - node.y) - node.h / 2, 0),
-      );
-    }
-    const corners = [
-      { x: node.x, y: node.y - node.h / 2 },
-      { x: node.x + node.w / 2, y: node.y },
-      { x: node.x, y: node.y + node.h / 2 },
-      { x: node.x - node.w / 2, y: node.y },
-    ];
-    return Math.min(...corners.map((corner, index) =>
-      distanceToSegment(
-        point,
-        corner,
-        corners[(index + 1) % corners.length],
-      )
-    ));
-  };
-
-  const moveAway = (point, node, minimumGap) => {
-    const dx = point.x - node.x;
-    const dy = point.y - node.y;
-    const length = Math.hypot(dx, dy);
-    if (!length) return point;
-    let travel = minimumGap;
-    let moved;
-    do {
-      moved = {
-        x: point.x + dx / length * travel,
-        y: point.y + dy / length * travel,
-      };
-      travel *= 1.5;
-    } while (shapeDistance(moved, node) < minimumGap);
-    return moved;
-  };
-
-  const labels = [];
-  for (const link of CHART.edges) {
-    const a = rect(link.from);
-    const b = rect(link.to);
-    if (!a || !b) continue;
-    const vias = Array.isArray(link.via)
-      ? (Array.isArray(link.via[0]) ? link.via : [link.via])
-          .map(([x, y]) => ({ x, y }))
-      : [];
-    const start = edge(a, vias.length ? vias[0] : b);
-    // A declared entry face pins the arrival to that face's midpoint and
-    // makes the approach perpendicular; otherwise the arrival aims at the
-    // node from wherever the curve comes.
-    const face = link.enter && {
-      top: { x: b.x, y: b.y - b.h / 2, nx: 0, ny: -1 },
-      bottom: { x: b.x, y: b.y + b.h / 2, nx: 0, ny: 1 },
-      left: { x: b.x - b.w / 2, y: b.y, nx: -1, ny: 0 },
-      right: { x: b.x + b.w / 2, y: b.y, nx: 1, ny: 0 },
-    }[link.enter];
-    const end = face
-      ? {
-          x: face.x + face.nx * ARROW_CLEARANCE,
-          y: face.y + face.ny * ARROW_CLEARANCE,
-        }
-      : moveAway(
-          edge(b, vias.length ? vias[vias.length - 1] : a),
-          b,
-          ARROW_CLEARANCE,
-        );
-    const dxTotal = end.x - start.x;
-    const dyTotal = end.y - start.y;
-    const horizontal = Math.abs(dxTotal) >= Math.abs(dyTotal);
-    const lift = Math.max(
-      26,
-      (horizontal ? Math.abs(dxTotal) : Math.abs(dyTotal)) * 0.35,
-    );
-    const alongX = horizontal ? Math.sign(dxTotal) || 1 : 0;
-    const alongY = horizontal ? 0 : Math.sign(dyTotal) || 1;
-    // The manifest offset bends a curve perpendicular to its main
-    // direction; a cycle bows its two directions apart with opposite
-    // signs, so both arrows stay independently legible as one loop.
-    const offset = Number(link.offset || 0);
-    const c1 = {
-      x: start.x + alongX * lift + (horizontal ? 0 : offset),
-      y: start.y + alongY * lift + (horizontal ? offset : 0),
-    };
-    // The end control point carries only a quarter of the bow, so the
-    // arrowhead's final direction points at the node it lands on; the
-    // entry approach is capped so a hook cannot dive through a
-    // neighbouring node on its way in.
-    const c2 = face
-      ? {
-          x: end.x + face.nx * Math.min(lift, 44),
-          y: end.y + face.ny * Math.min(lift, 44),
-        }
-      : {
-          x: end.x - alongX * lift + (horizontal ? 0 : offset * 0.25),
-          y: end.y - alongY * lift + (horizontal ? offset * 0.25 : 0),
-        };
-    let d = `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ` +
-      `${c2.x} ${c2.y}, ${end.x} ${end.y}`;
-    // An aligned, unbowed pair gets a straight arrow; no curve for its
-    // own sake.
-    const aligned = horizontal
-      ? Math.abs(end.y - start.y) <= 14
-      : Math.abs(end.x - start.x) <= 14;
-    if (!offset && aligned) {
-      d = `M ${start.x} ${start.y} L ${end.x} ${end.y}`;
-    }
-    if (vias.length) {
-      // A routed elbow: chained curves through the waypoints, for the
-      // rare path that no single bow can keep clear of every node.
-      const bend = (from, to) => {
-        const wide = Math.abs(to.x - from.x) >= Math.abs(to.y - from.y);
-        const reach = Math.max(
-          22,
-          (wide ? Math.abs(to.x - from.x) : Math.abs(to.y - from.y)) * 0.4,
-        );
-        return {
-          x: from.x + (wide ? Math.sign(to.x - from.x) * reach : 0),
-          y: from.y + (wide ? 0 : Math.sign(to.y - from.y) * reach),
-        };
-      };
-      const points = [start, ...vias, end];
-      d = `M ${start.x} ${start.y}`;
-      for (let index = 1; index < points.length; index += 1) {
-        const from = points[index - 1];
-        const to = points[index];
-        const p1 = bend(from, to);
-        const p2 = bend(to, from);
-        d += ` C ${p1.x} ${p1.y}, ${p2.x} ${p2.y}, ${to.x} ${to.y}`;
-      }
-    }
-    svg.appendChild(element("path", {
-      class: "edge", "marker-end": "url(#arrow)",
-      "data-from": link.from, "data-to": link.to,
-      d,
-    }));
-    if (link.label) {
-      const t = 0.45;
-      const at = (p0, p1, p2, p3) =>
-        (1 - t) ** 3 * p0 + 3 * (1 - t) ** 2 * t * p1 +
-        3 * (1 - t) * t ** 2 * p2 + t ** 3 * p3;
-      let labelX = vias.length
-        ? vias[Math.floor(vias.length / 2)].x
-        : at(start.x, c1.x, c2.x, end.x);
-      let labelY = vias.length
-        ? vias[Math.floor(vias.length / 2)].y
-        : at(start.y, c1.y, c2.y, end.y);
-      let anchor = null;
-      if (!vias.length && !offset && aligned) {
-        // A straight edge wears its label beside the line, not on it; a
-        // vertical one carries it high, clear of anything mid-line.
-        if (horizontal) {
-          labelY -= 12;
-        } else {
-          labelX -= 8;
-          labelY = start.y + 0.28 * (end.y - start.y);
-          anchor = "end";
-        }
-      }
-      if (Array.isArray(link.labelAt)) {
-        [labelX, labelY] = link.labelAt;
-        anchor = null;
-      }
-      const text = element("text", { x: labelX, y: labelY });
-      if (anchor) text.setAttribute("style", `text-anchor: ${anchor}`);
-      const lines = String(link.label).split("\\n");
-      lines.forEach((line, index) => {
-        const part = element("tspan", {
-          x: labelX,
-          y: labelY + (index - (lines.length - 1) / 2) * 13,
-        });
-        part.textContent = line;
-        text.appendChild(part);
-      });
-      labels.push(text);
-    }
-  }
-  labels.forEach(label => marks.appendChild(label));
+// The drawing takes whatever room the tab has left once the page's own
+// furniture is measured, so nothing ever needs scrolling to be seen.
+function fitCanvas() {
+  const frame = document.querySelector(".canvasfit");
+  const canvas = frame.firstChild;
+  const width = CHART.width * S;
+  const height = CHART.height * S;
+  // The chart's box is whatever the column layout leaves it, so the two
+  // measurements below are already free of the page's own furniture.
+  const scale = Math.max(0.2, Math.min(
+    host.clientWidth / width,
+    host.clientHeight / height,
+  ));
+  canvas.style.transform = `scale(${scale})`;
+  frame.style.width = `${width * scale}px`;
+  frame.style.height = `${height * scale}px`;
 }
 
-function highlight(sourceId, active) {
-  const chosen = active && active.length ? active : null;
-  const engaged = sourceId !== null;
-  document.querySelectorAll(".cnode").forEach(box => {
-    const node = CHART.nodes.find(n => n.id === box.dataset.node);
-    const self = sourceId === node.id;
-    const kin = Boolean(chosen && !self && node.roles.some(r => chosen.includes(r)));
-    box.classList.toggle("self", self);
-    box.classList.toggle("kin", kin);
-    box.classList.toggle("dim", engaged && !self && !kin);
+// How far each step is from the chart's entry, which is the first one
+// listed, and which wires arrive at each step. Between them these give
+// every shortest way in, not merely one of them.
+const INTO = new Map();
+for (const link of CHART.edges) {
+  if (!INTO.has(link.to)) INTO.set(link.to, []);
+  INTO.get(link.to).push(link);
+}
+const ENTRY = CHART.nodes.length ? CHART.nodes[0].id : null;
+const DEPTH = new Map(ENTRY === null ? [] : [[ENTRY, 0]]);
+for (let frontier = [ENTRY]; frontier.length; ) {
+  const next = [];
+  for (const at of frontier) {
+    for (const link of CHART.edges) {
+      if (link.from !== at || DEPTH.has(link.to)) continue;
+      DEPTH.set(link.to, DEPTH.get(at) + 1);
+      next.push(link.to);
+    }
+  }
+  frontier = next;
+}
+const ROUTES = new Map();
+
+// The steps the loop's border is drawn around, taken from the border
+// itself rather than listed again, so moving a box in the drawing cannot
+// leave the two disagreeing.
+const ENCLOSED = new Set(
+  (CHART.cluster ? CHART.nodes : []).filter(node =>
+    boxLeft(node) >= boxLeft(CHART.cluster) &&
+    node.x + node.w / 2 <= CHART.cluster.x + CHART.cluster.w / 2 &&
+    boxTop(node) >= boxTop(CHART.cluster) &&
+    node.y + node.h / 2 <= CHART.cluster.y + CHART.cluster.h / 2
+  ).map(node => node.id)
+);
+
+// Every shortest way in, as the steps and the wires they use. Where two
+// branches rejoin -- a diff can arrive from either worker -- both are
+// shown, because naming one of them would be a claim the chart does not
+// make. A step with no way in is its own route.
+function routeTo(nodeId) {
+  if (ROUTES.has(nodeId)) return ROUTES.get(nodeId);
+  const found = { nodes: new Set([nodeId]), edges: new Set() };
+  if (DEPTH.has(nodeId)) {
+    const pending = [nodeId];
+    while (pending.length) {
+      const at = pending.pop();
+      for (const link of INTO.get(at) || []) {
+        if (DEPTH.get(link.from) !== DEPTH.get(at) - 1) continue;
+        found.edges.add(`${link.from}>${link.to}`);
+        if (found.nodes.has(link.from)) continue;
+        found.nodes.add(link.from);
+        pending.push(link.from);
+      }
+    }
+  }
+  ROUTES.set(nodeId, found);
+  return found;
+}
+
+// A step can be pinned so the highlight survives the trip to the legend
+// entry that configures it; until then hovering rules.
+let pinned = null;
+
+// One rule for the whole drawing: whatever the gesture names stays lit and
+// everything else recedes, the loop's border and its mark included.
+function applyHighlight(state, sweep) {
+  const engaged = Boolean(state);
+  const fade = (part, keep) => part.classList.toggle("dim", engaged && !keep);
+  document.querySelectorAll(".art .sweep").forEach(part => {
+    part.classList.remove("sweep");
+    part.style.animationDelay = "";
+  });
+
+  document.querySelectorAll(".art g[data-node]").forEach(group => {
+    const id = group.dataset.node;
+    fade(group, engaged && state.nodes.has(id));
+    group.classList.toggle("self", engaged && state.self === id);
+  });
+  document.querySelectorAll(".art [data-edge]").forEach(part => {
+    fade(part, engaged && state.edges.has(part.dataset.edge));
+  });
+  document.querySelectorAll(".art [data-part]").forEach(part => {
+    fade(part, engaged && state.parts.has(part.dataset.part));
+  });
+  document.querySelectorAll("[data-card]").forEach(part => {
+    fade(part, engaged && state.cards.has(part.dataset.card));
+  });
+
+  // Pinning runs a light along the route, leaving the entry and arriving at
+  // the step just pinned, so the way in reads in the order it happens.
+  if (!sweep || !engaged) return;
+  const step = 70;
+  const mark = (part, depth) => {
+    part.style.animationDelay = `${Math.max(0, depth) * step}ms`;
+    part.classList.add("sweep");
+  };
+  document.querySelectorAll(".art g[data-node]").forEach(part => {
+    if (state.nodes.has(part.dataset.node)) {
+      mark(part, depthOf(part.dataset.node));
+    }
+  });
+  document.querySelectorAll(".art [data-edge]").forEach(part => {
+    if (state.edges.has(part.dataset.edge)) {
+      mark(part, depthOf(part.dataset.edge.split(">")[1]) - 0.5);
+    }
+  });
+}
+
+// How far along the route something sits. Steps the chart leaves unwired
+// take their place from the loop's own order instead.
+function depthOf(nodeId) {
+  if (DEPTH.has(nodeId)) return DEPTH.get(nodeId);
+  const loop = CHART.loop;
+  const at = loop ? loop.steps.indexOf(nodeId) : -1;
+  if (at > 0 && DEPTH.has(loop.steps[0])) return DEPTH.get(loop.steps[0]) + at;
+  return 0;
+}
+
+// Pointing at a step lights the shortest way to it. The legend shows only
+// what configures that step itself, not everything met along the way.
+function hoverNode(nodeId, sweep) {
+  const route = routeTo(nodeId);
+  const nodes = new Set(route.nodes);
+  const edges = new Set(route.edges);
+
+  // Inside the plan-review loop the order is a prerequisite, not a path:
+  // reaching a later step means the earlier ones have happened, and the
+  // cycle's own captions belong to them.
+  const loop = CHART.loop;
+  if (loop) {
+    let reached = loop.steps.indexOf(nodeId);
+    if (reached < 0 && loop.after.includes(nodeId)) {
+      reached = loop.steps.length - 1;
+    }
+    if (reached >= 0) {
+      for (const id of routeTo(loop.steps[0]).nodes) nodes.add(id);
+      for (const key of routeTo(loop.steps[0]).edges) edges.add(key);
+      for (const step of loop.steps.slice(0, reached + 1)) {
+        nodes.add(step);
+        for (const key of loop.captions[step] || []) edges.add(key);
+      }
+    }
+  }
+
+  const node = CHART.nodes.find(entry => entry.id === nodeId);
+  const cards = new Set(node ? node.roles : []);
+  for (const setting of SETTINGS) {
+    if (setting.node === nodeId) cards.add(setting.id);
+  }
+  applyHighlight({
+    nodes, edges, cards, parts: loopParts(nodes), self: nodeId,
+  }, sweep);
+}
+
+// The border belongs to the loop as a whole; the mark belongs to the step
+// that counts the rounds.
+function loopParts(nodes) {
+  const parts = new Set();
+  if ([...nodes].some(id => ENCLOSED.has(id))) parts.add("cluster");
+  if (CHART.loop && nodes.has(CHART.loop.mark)) parts.add("loop");
+  return parts;
+}
+
+// Pointing at a legend entry lights the steps it configures. No single
+// route is implied, so the wires stay out of it.
+function hoverCard(target) {
+  const setting = SETTINGS.find(entry => entry.id === target);
+  const nodes = new Set(
+    setting
+      ? [setting.node]
+      : CHART.nodes
+          .filter(node => node.roles.includes(target))
+          .map(node => node.id)
+  );
+  applyHighlight({
+    nodes, edges: new Set(), cards: new Set([target]),
+    parts: loopParts(nodes), self: null,
   });
 }
 
@@ -1569,20 +1846,17 @@ function selectThinking(select, roleId, provider, model, preferred) {
 }
 
 function syncRole(roleId, provider, model, preferredThinking) {
-  const known = Boolean(choiceFor(roleId, provider, model));
+  const preset = ENDPOINTS.some(item => item.id === endpointChoice(roleId));
+  const known = preset || Boolean(choiceFor(roleId, provider, model));
   document.querySelectorAll(
     `select[data-step="${roleId}"][data-kind="model"]`
   ).forEach(select => {
-    select.value = known ? `${provider}::${model}` : "__custom__";
-    const custom = select.parentNode.querySelector('input[data-kind="custom"]');
-    if (custom) custom.style.display = known ? "none" : "block";
-    const customProvider = select.parentNode.querySelector(
-      'select[data-kind="provider"]'
+    select.value = known ? model : "__custom__";
+    const box = select.closest(".cardctl");
+    const card = CHART.legend.cards.find(
+      entry => entry.target === box.dataset.card
     );
-    if (customProvider) {
-      customProvider.value = provider;
-      customProvider.style.display = known ? "none" : "block";
-    }
+    if (card) layoutRow(box, card, select.value === "__custom__");
   });
   document.querySelectorAll(`input[data-step="${roleId}"][data-kind="custom"]`)
     .forEach(input => {
@@ -1595,23 +1869,24 @@ function syncRole(roleId, provider, model, preferredThinking) {
   ));
 }
 
-function currentProvider(id) {
-  const select = document.querySelector(
-    `select[data-step="${id}"][data-kind="model"]`
-  );
-  if (!select) return "";
-  if (select.value !== "__custom__") return select.value.split("::", 1)[0];
-  const customProvider = select.parentNode.querySelector(
-    'select[data-kind="provider"]'
-  );
-  return customProvider ? customProvider.value : "";
-}
-
-function currentEndpoint(id) {
+// The endpoint control carries both meanings: a named third-party endpoint,
+// or which first-party provider the role talks to.
+function endpointChoice(id) {
   const select = document.querySelector(
     `select[data-step="${id}"][data-kind="endpoint"]`
   );
   return select ? select.value : "";
+}
+
+function currentEndpoint(id) {
+  const value = endpointChoice(id);
+  return ENDPOINTS.some(item => item.id === value) ? value : "";
+}
+
+function currentProvider(id) {
+  const value = endpointChoice(id);
+  const preset = ENDPOINTS.find(item => item.id === value);
+  return preset ? preset.adapter : value;
 }
 
 function currentModel(id) {
@@ -1619,13 +1894,7 @@ function currentModel(id) {
     `select[data-step="${id}"][data-kind="model"]`
   );
   if (!select) return "";
-  if (select.value !== "__custom__") {
-    // Endpoint menus hold bare identifiers; first-party menus qualify
-    // each option with its provider.
-    return currentEndpoint(id)
-      ? select.value
-      : select.value.slice(select.value.indexOf("::") + 2);
-  }
+  if (select.value !== "__custom__") return select.value;
   const custom = select.parentNode.querySelector('input[data-kind="custom"]');
   return custom ? custom.value.trim() : "";
 }
@@ -1708,45 +1977,50 @@ document.addEventListener("input", event => {
     );
   }
   applyButton.disabled = true;
-  updateNodeText();
 });
 
 document.addEventListener("change", event => {
   const data = event.target.dataset || {};
   if (data.kind === "endpoint" && data.step) {
-    // The row's whole shape depends on the endpoint, so rebuild it from
+    // The card's whole shape depends on the endpoint, so rebuild it from
     // a state copy carrying the new selection.
     const step = STATE.find(entry => entry.id === data.step);
     if (step) {
       const preset = ENDPOINTS.find(item => item.id === event.target.value);
-      step.endpoint = event.target.value;
       if (preset) {
+        step.endpoint = preset.id;
         step.provider = preset.adapter;
         if (!preset.models.includes(step.model) && preset.models.length) {
           step.model = preset.models[0];
         }
       } else {
+        // A first-party provider: the role keeps its own model when that
+        // provider serves it, and otherwise takes that provider's first.
         const initial = original[data.step];
-        step.provider = initial.provider;
-        step.model = initial.model;
-        step.thinking = initial.thinking;
+        const catalogue = (step.choices || []).filter(
+          choice => choice.known && choice.provider === event.target.value
+        );
+        step.endpoint = "";
+        step.provider = event.target.value;
+        const same = initial.provider === step.provider && !initial.endpoint;
+        step.model = same
+          ? initial.model
+          : (catalogue.length ? catalogue[0].id : step.model);
+        step.thinking = same
+          ? initial.thinking
+          : (catalogue.length ? catalogue[0].default_thinking || "" : "");
       }
-      renderLegend();
+      replaceCard(data.step);
       applyButton.disabled = true;
-      updateNodeText();
       return;
     }
   }
   if (data.kind === "model") {
-    const custom = event.target.parentNode.querySelector('input[data-kind="custom"]');
-    if (custom) custom.style.display = event.target.value === "__custom__" ? "block" : "none";
-    const provider = event.target.parentNode.querySelector(
-      'select[data-kind="provider"]'
+    const box = event.target.closest(".cardctl");
+    const card = box && CHART.legend.cards.find(
+      entry => entry.target === box.dataset.card
     );
-    if (provider) {
-      provider.style.display =
-        event.target.value === "__custom__" ? "block" : "none";
-    }
+    if (card) layoutRow(box, card, event.target.value === "__custom__");
   }
   if (data.step) {
     syncRole(
@@ -1757,7 +2031,6 @@ document.addEventListener("change", event => {
     );
   }
   applyButton.disabled = true;
-  updateNodeText();
 });
 
 document.getElementById("preview").addEventListener("click", async () => {
@@ -1790,6 +2063,13 @@ applyButton.addEventListener("click", async () => {
   result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
     doctor +
     '<p class="note">Reload to edit further; the kit repository now holds these values, ready to commit.</p>';
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && pinned) {
+    pinned = null;
+    applyHighlight(null);
+  }
 });
 
 document.getElementById("revert").addEventListener("click", () => location.reload());
@@ -1860,7 +2140,7 @@ def render_page(token: str) -> str:
         "__CHART__": script_json(manifest.get("chart", {})),
         "__ENDPOINTS__": script_json(endpoint_presets()),
         "__TOKEN_PATH__": script_json(f"/t/{token}/"),
-        "__CATALOGUE_NOTE__": html.escape(catalogue_note),
+        "__CATALOGUE_NOTE__": script_json(catalogue_note),
         "__STANDING__": standing_html(),
     }
     # One pass, so a substituted value that happens to contain another

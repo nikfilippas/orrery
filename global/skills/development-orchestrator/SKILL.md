@@ -235,6 +235,10 @@ Always check exit status and usable final output.
 
 - Let `orrery` and `orrery-agent` produce the nearest fallback proposal. Do not
   improvise a substitution or invoke the proposed model directly.
+- A provider CLI's own same-provider ladder, projected from the manifest by
+  `orrery-sync`, may substitute automatically within the authorised account
+  and discloses itself; report it honestly when it happens. Crossing a
+  provider, endpoint, or account still requires explicit approval.
 - In an interactive terminal, choose from the wrapper's numbered fallback
   menu: this run only, this login session, until the provider-stated reset
   time when one is offered, or stop. When a tool-driven run prints

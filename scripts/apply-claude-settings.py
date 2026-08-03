@@ -144,6 +144,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model", action="store_true")
     parser.add_argument("--effort", action="store_true")
+    parser.add_argument("--fallback", action="store_true")
     parser.add_argument("--companion", action="store_true")
     parser.add_argument("--hooks", action="store_true")
     parser.add_argument("--permissions", action="store_true")
@@ -164,6 +165,7 @@ def parse_args() -> argparse.Namespace:
     if args.all:
         args.model = True
         args.effort = True
+        args.fallback = True
         args.companion = True
         args.hooks = True
         args.permissions = True
@@ -171,13 +173,14 @@ def parse_args() -> argparse.Namespace:
     if not (
         args.model
         or args.effort
+        or args.fallback
         or args.companion
         or args.hooks
         or args.permissions
     ):
         parser.error(
-            "select --model, --effort, --companion, --hooks, "
-            "--permissions, or --all"
+            "select --model, --effort, --fallback, --companion, "
+            "--hooks, --permissions, or --all"
         )
 
     return args
@@ -395,6 +398,35 @@ def merge_effort(
         current["env"] = live_env
     else:
         current.pop("env", None)
+
+
+def merge_fallback(
+    current: dict[str, Any],
+    canonical: dict[str, Any],
+) -> None:
+    """Install or remove the CLI's own same-provider fallback ladder.
+
+    ``fallbackModel`` is an array of model names in Claude's settings
+    schema, tried in order when the primary is unavailable, and unlike
+    the ``--fallback-model`` flag it applies to interactive sessions.
+    An absent or empty canonical ladder removes the live key, so
+    disabling automatic fallback withdraws a previously written one
+    instead of merely omitting it.
+    """
+    ladder = canonical.get("fallbackModel")
+    if ladder is None:
+        current.pop("fallbackModel", None)
+        return
+    if not isinstance(ladder, list) or any(
+        not isinstance(model, str) or not model.strip() for model in ladder
+    ):
+        raise SystemExit(
+            "Canonical fallbackModel must be a JSON array of model names."
+        )
+    if ladder:
+        current["fallbackModel"] = list(ladder)
+    else:
+        current.pop("fallbackModel", None)
 
 
 def sync_directory(path: Path) -> None:
@@ -654,6 +686,9 @@ def apply_selected_settings(
 
     if args.effort:
         merge_effort(updated, canonical)
+
+    if args.fallback:
+        merge_fallback(updated, canonical)
 
     if args.companion:
         companion = canonical.get("enabledPlugins", {}).get(PLUGIN)

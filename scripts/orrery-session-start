@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,10 @@ from orrery_runtime import (  # noqa: E402
     MODEL_ID,
     PROVIDERS,
     THINKING_LEVEL,
+    Role,
     RuntimeConfigError,
     adopted_root,
+    codex_home,
     load_role,
 )
 import orrery_incidents as incident_log  # noqa: E402
@@ -27,6 +30,50 @@ import orrery_incidents as incident_log  # noqa: E402
 
 MAX_INPUT_BYTES = 1024 * 1024
 PROGRAM = "orrery-session-start"
+PERSISTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+
+
+def surface_default_matches(role: Role, active_provider: str) -> bool:
+    """Whether the surface's configured *default* is the configured role.
+
+    This is deliberately not a claim about what is running. The model
+    in a provider's configuration is only a default: the interface's
+    own picker and an in-session `/model` both override it, and
+    neither is visible to a hook. Treating agreement here as proof of
+    the active model would manufacture a false assertion, which is
+    exactly what the principal check exists to prevent. It answers one
+    narrower question: does the stored default still agree with the
+    manifest, or has it drifted and needs `orrery-sync`?
+    """
+    if active_provider != role.provider:
+        return False
+    try:
+        if active_provider == "anthropic":
+            live = json.loads(
+                (Path.home() / ".claude" / "settings.json").read_text()
+            )
+            if not isinstance(live, dict) or live.get("model") != role.model:
+                return False
+            environment = (
+                live.get("env") if isinstance(live.get("env"), dict) else {}
+            )
+            persisted = live.get("effortLevel")
+            active = environment.get("CLAUDE_CODE_EFFORT_LEVEL")
+            if role.thinking is None:
+                return persisted is None and active is None
+            if role.thinking in PERSISTED_EFFORTS:
+                return persisted == role.thinking and active is None
+            # max is honoured only through the environment key.
+            return active == role.thinking and persisted is None
+        data = tomllib.loads((codex_home() / "config.toml").read_text())
+        if data.get("model") != role.model:
+            return False
+        return (
+            not role.thinking
+            or data.get("model_reasoning_effort") == role.thinking
+        )
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        return False
 
 
 def environment_effort() -> str | None:
@@ -180,6 +227,40 @@ def main() -> int:
         # cannot run at all. That is a property of the surface, not an
         # error in the configuration, and it earns one short line, not
         # an alarm.
+        # The active model is genuinely unknowable here, whatever the
+        # configuration says, so neither branch below may assert one.
+        # The stored default only decides whether this is ordinary
+        # (aligned, so nothing to act on) or drifted (actionable).
+        aligned = surface_default_matches(configured, active_provider)
+        selection_note = (
+            "The model chosen in the interface, or with /model, "
+            "overrides the stored default and is not visible to this "
+            "hook, so it is authoritative over anything Orrery says "
+            "here."
+        )
+        if aligned:
+            print(
+                json.dumps(
+                    hook_output(
+                        f"Orrery: principal configured as {configured_label}; "
+                        "this surface does not report the active model, so "
+                        "what is running is unverified.",
+                        "This surface's SessionStart payload carries no "
+                        "model, so Orrery cannot determine which model is "
+                        f"running. The configured principal is "
+                        f"{configured_label} and this surface's stored "
+                        f"default agrees with it. {selection_note} If you "
+                        "mention this at all, use one short line saying the "
+                        "principal is configured but unverified for this "
+                        "session. Never state that the configured model is "
+                        "the one running, and if the interface shows a "
+                        "different model, report that instead. This is a "
+                        "property of the surface, not an error.",
+                    )
+                )
+            )
+            return 0
+
         effort = (
             environment_effort()
             if active_provider == "anthropic"
@@ -210,29 +291,38 @@ def main() -> int:
         print(
             json.dumps(
                 hook_output(
-                    "Orrery: the principal is interface-asserted on "
-                    "this surface, which exports no model to hooks; "
-                    "expected here, not an error. Configured: "
-                    f"{configured_label}; {thinking_note}.",
+                    f"Orrery: principal configured as {configured_label}; "
+                    "this surface does not report the active model, so "
+                    "what is running is unverified, and its stored "
+                    "default has drifted from the manifest. Run "
+                    f"orrery-sync to align it; {thinking_note}.",
                     "This surface's SessionStart payload carries no "
-                    "model; that is a property of the surface, "
-                    "expected and not a failure. The principal match "
-                    "therefore rests on the interface's model picker "
-                    f"(configured: {configured_label}); "
-                    f"{thinking_note}. Open your first reply with one "
-                    "short line noting the principal is "
-                    "interface-asserted rather than Orrery-verified, "
-                    "without framing it as an error; do not claim a "
-                    "verified principal or fallback, and do not "
-                    "elaborate unless asked.",
+                    "model, so Orrery cannot determine which model is "
+                    "running, and this surface's stored default no "
+                    "longer matches the configured principal "
+                    f"({configured_label}); {thinking_note}. "
+                    f"{selection_note} Say in one short line that the "
+                    "principal is unverified for this session and that "
+                    "orrery-sync would realign the stored default. "
+                    "Never state that the configured model is the one "
+                    "running, and if the interface shows a different "
+                    "model, report that instead.",
                 )
             )
         )
+        # Recorded only for drift, which is actionable: the stored
+        # default disagrees with the manifest and orrery-sync fixes it.
+        # An unreported active model is a permanent property of the
+        # surface and is not an incident, or the log fills with one
+        # entry per session start and buries real failures.
         incident_log.record(
-            "principal-unverified",
+            "principal-drift",
             program=PROGRAM,
             role=configured,
-            detail="the surface reported no model",
+            detail=(
+                "the surface's stored default no longer matches the "
+                "configured principal; run orrery-sync"
+            ),
             active_provider=active_provider,
             session_thinking=effort,
         )

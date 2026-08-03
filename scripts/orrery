@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -145,6 +146,18 @@ def parse_args(argv: list[str]) -> Invocation:
         provider_arguments=tuple(provider_arguments),
         approval_scope=approval_scope,
     )
+
+
+def role_availability(role: Role):
+    """Endpoint roles need only their adapter and endpoint credential."""
+    if role.endpoint is None:
+        return provider_status(role.provider)
+    executable = shutil.which("claude" if role.provider == "anthropic" else "codex")
+    if executable is None:
+        return provider_status(role.provider)
+    endpoint_environment(role.endpoint)
+    from orrery_fallback import ProviderStatus
+    return ProviderStatus(role.provider, Availability.READY, executable, "endpoint adapter ready")
 
 
 def _record_standing(
@@ -439,7 +452,11 @@ def main() -> int:
                 )
 
     while True:
-        availability = provider_status(role.provider)
+        try:
+            availability = role_availability(role)
+        except RuntimeConfigError as exc:
+            print(f"orrery: {exc}", file=sys.stderr)
+            return 2
         if availability.state is Availability.UNAVAILABLE:
             excluded_providers.add(role.provider)
             candidate, status = _proposal_status(
@@ -471,7 +488,7 @@ def main() -> int:
                 role=role,
                 detail=availability.reason,
             )
-        elif availability.state is Availability.READY:
+        elif availability.state is Availability.READY and role.endpoint is None:
             visibility, visibility_reason = model_status(role, availability)
             if visibility is Availability.UNAVAILABLE:
                 excluded_models.add((role.provider, role.model))
@@ -510,7 +527,11 @@ def main() -> int:
                 file=sys.stderr,
             )
         try:
-            command = principal_command(role, extra)
+            command = principal_command(
+                role,
+                extra,
+                suppress_native_fallback=invocation.no_fallback,
+            )
         except RuntimeConfigError as exc:
             excluded_providers.add(role.provider)
             candidate, status = _proposal_status(

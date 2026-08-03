@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Project the configured principal onto the surface that runs it.
+
+The `orrery` launcher pins the principal's model and thinking level for
+sessions it starts, but most work happens in a provider's own IDE
+extension or CLI, which Orrery never launches. Those surfaces read
+their own configuration files, so the manifest is projected onto the
+one belonging to the configured principal's provider: the session then
+starts on the right model at the right thinking level, and Claude's own
+same-provider fallback ladder is armed for it.
+
+The projection is derived state. The manifest remains the single source
+of truth and is never written back to. Only the principal's own surface
+is touched: writing the other one would make a genuine mismatch look
+correct, and the SessionStart hook must keep reporting it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import tomllib
+import stat
+from pathlib import Path
+from typing import Any
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_fallback import same_provider_ladder  # noqa: E402
+from orrery_runtime import (  # noqa: E402
+    KIT_DIR,
+    Role,
+    RuntimeConfigError,
+    codex_home,
+    load_manifest,
+    load_role,
+)
+
+
+SETTINGS_INSTALLER = KIT_DIR / "scripts" / "apply-claude-settings.py"
+CANONICAL_SETTINGS = KIT_DIR / "global" / "claude-settings.json"
+CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL"
+# Claude persists low..xhigh in effortLevel; max is session-only there
+# and must travel in the environment key instead. Exactly one
+# representation may exist, which the installer enforces.
+PERSISTED_EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
+PROGRAM = "orrery-sync"
+AT_FDCWD = -100
+RENAME_EXCHANGE = 1 << 1
+
+
+class SyncError(Exception):
+    """The projection cannot be performed safely."""
+
+
+def _renameat2() -> Any:
+    try:
+        library = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+        entry = library.renameat2
+    except (AttributeError, OSError):
+        return None
+    entry.restype = ctypes.c_int
+    entry.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    return entry
+
+
+RENAMEAT2 = _renameat2()
+
+
+def exchange_paths(first: Path, second: Path) -> None:
+    if RENAMEAT2 is None:
+        raise SyncError("atomic exchange is unavailable; refusing to update Codex configuration")
+    if RENAMEAT2(AT_FDCWD, os.fsencode(str(first)), AT_FDCWD, os.fsencode(str(second)), RENAME_EXCHANGE) == 0:
+        return
+    code = ctypes.get_errno()
+    raise SyncError(f"atomic exchange failed: {os.strerror(code)}")
+
+
+def config_snapshot(path: Path) -> tuple[bytes, tuple[int, int] | None]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return b"", None
+    except OSError as exc:
+        raise SyncError(f"the Codex configuration is unreadable: {exc}") from exc
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise SyncError("the Codex configuration is not a regular file")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks), (info.st_dev, info.st_ino)
+    finally:
+        os.close(descriptor)
+
+
+def state_dir() -> Path:
+    raw = os.environ.get("XDG_STATE_HOME")
+    base = (
+        Path(raw).expanduser() if raw else Path.home() / ".local" / "state"
+    )
+    return base / "orrery"
+
+
+def record_path() -> Path:
+    return state_dir() / "projection.json"
+
+
+def read_record() -> dict[str, Any]:
+    try:
+        data = json.loads(record_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_record(record: dict[str, Any]) -> None:
+    directory = state_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    os.chmod(directory, 0o700)
+    path = record_path()
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=directory, prefix=".projection.", delete=False
+    ) as handle:
+        json.dump(record, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
+
+
+def claude_settings_path() -> Path:
+    return Path.home() / ".claude" / "settings.json"
+
+
+def claude_fragment(role: Role, ladder: list[str]) -> dict[str, Any]:
+    """The canonical fragment describing this principal for Claude."""
+    fragment: dict[str, Any] = {"model": role.model}
+    if role.thinking:
+        if role.thinking in PERSISTED_EFFORTS:
+            fragment["effortLevel"] = role.thinking
+        else:
+            # max, and any future level Claude does not persist.
+            fragment["env"] = {CLAUDE_EFFORT_ENV: role.thinking}
+    fragment["fallbackModel"] = ladder
+    return fragment
+
+
+def guard_canonical(target: Path) -> None:
+    """Refuse to write role state into the kit's canonical settings.
+
+    The installer follows symlinks and updates their referent, so a
+    live settings path linked into the kit would otherwise gain a role
+    model, which the doctor then rejects.
+    """
+    if target.resolve(strict=False) == CANONICAL_SETTINGS.resolve(
+        strict=False
+    ):
+        raise SyncError(
+            "the live settings path resolves to the kit's canonical "
+            "settings file; refusing to write role state into it"
+        )
+
+
+def run_settings_installer(
+    fragment: dict[str, Any],
+    target: Path,
+    *,
+    selectors: tuple[str, ...] = ("--model", "--effort", "--fallback"),
+) -> None:
+    """Write through the existing atomic, locking, backing-up installer.
+
+    The fragment is ephemeral and private: the canonical settings file
+    deliberately carries no role state, and must not gain any here.
+    """
+    guard_canonical(target)
+    directory = Path(tempfile.mkdtemp(prefix="orrery-sync."))
+    try:
+        os.chmod(directory, 0o700)
+        source = directory / "fragment.json"
+        source.write_text(json.dumps(fragment, indent=2) + "\n")
+        source.chmod(0o600)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SETTINGS_INSTALLER),
+                *selectors,
+                "--source",
+                str(source),
+                "--target",
+                str(target),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise SyncError(f"the settings installer failed: {detail}")
+    finally:
+        for entry in directory.glob("*"):
+            entry.unlink(missing_ok=True)
+        directory.rmdir()
+
+
+def withdraw_claude_ladder(target: Path, record: dict[str, Any], role: Role) -> bool:
+    """Remove an Orrery-written fallback ladder from the Claude surface.
+
+    Used when this surface stops being the principal's, and when the
+    principal moves to a custom endpoint: a ladder of first-party model
+    names left behind would be armed against a third-party service.
+    The model and thinking level are deliberately left alone, since the
+    user may still work on this surface deliberately.
+    """
+    if role.provider != "anthropic" or record.get("surface") != "anthropic":
+        return False
+    expected = record.get("fallbackModel")
+    if not isinstance(expected, list):
+        return False
+    try:
+        live = json.loads(target.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if (
+        not isinstance(live, dict)
+        or not live.get("fallbackModel")
+        or live.get("fallbackModel") != expected
+    ):
+        return False
+    # Shares the canonical guard and propagates failure, so a refused
+    # or failed withdrawal is never reported as a successful cleanup.
+    run_settings_installer(
+        {"fallbackModel": []}, target, selectors=("--fallback",)
+    )
+    return True
+
+
+def codex_config_path() -> Path:
+    return codex_home() / "config.toml"
+
+
+def trailing_comment(rest: str) -> str:
+    """The comment following a value, with its spacing, or nothing.
+
+    The scan tracks quoting so a `#` inside a string value is not
+    mistaken for the start of a comment.
+    """
+    quote: str | None = None
+    for index, character in enumerate(rest):
+        if quote is not None:
+            if character == quote:
+                quote = None
+            continue
+        if character in "\"'":
+            quote = character
+        elif character == "#":
+            return rest[index - 1 :].rstrip("\r\n") if index else "#"
+    return ""
+
+
+def rewrite_codex_root(text: str, values: dict[str, str]) -> str:
+    """Replace root assignments in place, or refuse.
+
+    Only assignments before the first table header are root keys. A key
+    that cannot be located unambiguously is not appended blindly: in a
+    file that already contains tables, an appended line would land
+    inside the last table and change a different setting entirely.
+    """
+    lines = text.splitlines(keepends=True)
+    first_table = len(lines)
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            first_table = index
+            break
+
+    remaining = dict(values)
+    for index in range(first_table):
+        stripped = lines[index].lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, _rest = stripped.partition("=")
+        if not separator:
+            continue
+        name = key.strip().strip('"').strip("'")
+        if name not in remaining:
+            continue
+        indent = lines[index][: len(lines[index]) - len(stripped)]
+        ending = "\n" if lines[index].endswith("\n") else ""
+        # Anything the user wrote after the value, such as a trailing
+        # `# managed by dotfiles`, is carried across: a semantic
+        # comparison would not notice its loss.
+        trailing = trailing_comment(_rest)
+        lines[index] = (
+            f"{indent}{name} = {json.dumps(remaining.pop(name))}"
+            f"{trailing}{ending}"
+        )
+
+    if remaining:
+        if first_table < len(lines):
+            raise SyncError(
+                "the Codex configuration has tables but no root "
+                f"assignment for {', '.join(sorted(remaining))}; refusing "
+                "to append a root key that would land inside a table"
+            )
+        addition = "".join(
+            f"{name} = {json.dumps(value)}\n"
+            for name, value in sorted(remaining.items())
+        )
+        return "".join(lines) + addition
+    return "".join(lines)
+
+
+def sync_codex(role: Role, *, dry_run: bool) -> list[str]:
+    # The final component is resolved so a config.toml symlinked into a
+    # dotfiles repository is updated in place rather than replaced by a
+    # regular file, leaving its referent stale.
+    path = codex_config_path()
+    path = path.parent.resolve(strict=False) / path.name
+    if path.is_symlink():
+        path = Path(os.path.realpath(path))
+    values = {"model": role.model}
+    if role.thinking:
+        values["model_reasoning_effort"] = role.thinking
+    original_bytes, identity = config_snapshot(path)
+    try:
+        original = original_bytes.decode()
+    except UnicodeDecodeError as exc:
+        raise SyncError(f"the Codex configuration is unreadable: {exc}") from exc
+
+    try:
+        before = tomllib.loads(original) if original.strip() else {}
+    except tomllib.TOMLDecodeError as exc:
+        raise SyncError(f"the Codex configuration is not valid TOML: {exc}")
+
+    drift = [
+        f"{name}: {before.get(name)!r} -> {value!r}"
+        for name, value in values.items()
+        if before.get(name) != value
+    ]
+    if not drift or dry_run:
+        return drift
+
+    updated = rewrite_codex_root(original, values)
+    try:
+        after = tomllib.loads(updated)
+    except tomllib.TOMLDecodeError as exc:
+        raise SyncError(f"the rewrite produced invalid TOML: {exc}")
+    expected = dict(before)
+    expected.update(values)
+    if after != expected:
+        raise SyncError(
+            "the rewrite would have changed settings other than the "
+            "principal's model and thinking level; nothing was written"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, prefix=".config.toml.", delete=False
+    ) as handle:
+        handle.write(updated)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    os.chmod(temporary, 0o600)
+    if identity is None:
+        try:
+            os.link(temporary, path)
+        except FileExistsError as exc:
+            raise SyncError("the Codex configuration changed while it was being prepared; nothing was written, so rerun orrery-sync") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+        return drift
+    try:
+        exchange_paths(temporary, path)
+        displaced_bytes, displaced_identity = config_snapshot(temporary)
+        if displaced_identity != identity or displaced_bytes != original_bytes:
+            exchange_paths(temporary, path)
+            raise SyncError("the Codex configuration changed while it was being prepared; nothing was written, so rerun orrery-sync")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return drift
+
+
+def claude_drift(role: Role, ladder: list[str]) -> list[str]:
+    path = claude_settings_path()
+    try:
+        live = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        live = {}
+    if not isinstance(live, dict):
+        live = {}
+    differences: list[str] = []
+    if live.get("model") != role.model:
+        differences.append(f"model: {live.get('model')!r} -> {role.model!r}")
+    environment = live.get("env") if isinstance(live.get("env"), dict) else {}
+    persisted = live.get("effortLevel")
+    active = environment.get(CLAUDE_EFFORT_ENV)
+    # The two locations are compared independently, not collapsed into
+    # one effective value: `max` is only honoured in the environment
+    # key, so `effortLevel: max` is drift even though it reads as the
+    # right level.
+    if role.thinking is None:
+        expected_persisted, expected_active = None, None
+    elif role.thinking in PERSISTED_EFFORTS:
+        expected_persisted, expected_active = role.thinking, None
+    else:
+        expected_persisted, expected_active = None, role.thinking
+    if (persisted, active) != (expected_persisted, expected_active):
+        differences.append(
+            f"thinking: effortLevel {persisted!r} / {CLAUDE_EFFORT_ENV} "
+            f"{active!r} -> {expected_persisted!r} / {expected_active!r}"
+        )
+    if live.get("fallbackModel", []) != ladder:
+        differences.append(
+            f"fallbackModel: {live.get('fallbackModel')!r} -> {ladder!r}"
+        )
+    return differences
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Project the configured principal onto its provider's own "
+            "configuration surface."
+        )
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="report drift without writing; exit 1 when drift exists",
+    )
+    parser.add_argument("--quiet", action="store_true")
+    arguments = parser.parse_args()
+
+    try:
+        # Global manifest only: a repository's .orrery.json principal is
+        # correct for that directory, and projecting it would change
+        # every other repository's default.
+        role = load_role("orchestrator", apply_override=False)
+        manifest = load_manifest()
+    except RuntimeConfigError as exc:
+        print(f"{PROGRAM}: {exc}", file=sys.stderr)
+        return 2
+
+    if role.endpoint is not None:
+        # No first-party projection is written, but a ladder left by an
+        # earlier first-party principal must be withdrawn: it would
+        # otherwise stay armed while the session runs against the
+        # endpoint's base URL and credential.
+        print(
+            f"{PROGRAM}: the principal is routed at {role.endpoint.label}; "
+            "its models are served by that endpoint, so no first-party "
+            "projection or fallback ladder is written.",
+            file=sys.stderr,
+        )
+        previous = read_record()
+        stale_ladder = (
+            role.provider == "anthropic"
+            and previous.get("surface") == "anthropic"
+            and isinstance(previous.get("fallbackModel"), list)
+            and previous.get("fallbackModel")
+        )
+        if arguments.check:
+            if stale_ladder:
+                try:
+                    live = json.loads(claude_settings_path().read_text())
+                except (OSError, json.JSONDecodeError):
+                    live = {}
+                if isinstance(live, dict) and live.get("fallbackModel") == previous["fallbackModel"]:
+                    print(f"{PROGRAM}: fallbackModel: stale Orrery ladder remains armed")
+                    return 1
+        else:
+            try:
+                withdraw_claude_ladder(claude_settings_path(), previous, role)
+            except SyncError as exc:
+                print(f"{PROGRAM}: {exc}", file=sys.stderr)
+                return 1
+            write_record(
+                {
+                    "surface": role.provider,
+                    "endpoint": role.endpoint.id,
+                    "model": role.model,
+                    "thinking": role.thinking,
+                    "fallbackModel": [],
+                }
+            )
+        return 0
+
+    automatic = manifest.get("principal_auto_fallback", True)
+    if not isinstance(automatic, bool):
+        print(
+            f"{PROGRAM}: principal_auto_fallback must be true or false",
+            file=sys.stderr,
+        )
+        return 2
+    ladder = same_provider_ladder(role) if automatic else []
+
+    try:
+        if role.provider == "anthropic":
+            differences = claude_drift(role, ladder)
+            if differences and not arguments.check:
+                run_settings_installer(
+                    claude_fragment(role, ladder), claude_settings_path()
+                )
+        else:
+            differences = sync_codex(role, dry_run=arguments.check)
+            previous = read_record()
+            if not arguments.check and previous.get("surface") == "anthropic":
+                withdraw_claude_ladder(claude_settings_path(), previous, role)
+    except SyncError as exc:
+        print(f"{PROGRAM}: {exc}", file=sys.stderr)
+        return 1
+
+    if not arguments.check:
+        write_record(
+            {
+                "surface": role.provider,
+                "model": role.model,
+                "thinking": role.thinking,
+                "fallbackModel": ladder,
+            }
+        )
+
+    if not differences:
+        if not arguments.quiet:
+            print(
+                f"{PROGRAM}: {role.provider} already runs "
+                f"{role.model}"
+                + (f" at thinking {role.thinking}" if role.thinking else "")
+                + (f" with fallback {', '.join(ladder)}" if ladder else "")
+            )
+        return 0
+
+    verb = "would change" if arguments.check else "aligned"
+    if not arguments.quiet:
+        print(f"{PROGRAM}: {verb} the {role.provider} surface:")
+        for difference in differences:
+            print(f"  {difference}")
+    return 1 if arguments.check else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

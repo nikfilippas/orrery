@@ -300,6 +300,18 @@ done
 [ "$FOUND" -eq 1 ] ||
     printf 'No obvious orchestration conflicts detected.\n'
 
+printf '\n=== Principal surface ===\n'
+# Adoption is the one command a user is expected to run, so the
+# configured principal is projected onto its provider's own
+# configuration here too: an extension or CLI session started
+# afterwards begins on the right model at the right thinking level,
+# with the same-provider fallback ladder armed. The projection is
+# global, so doing it once aligns every repository. A failure is
+# reported and never blocks adoption.
+if ! python3 "$KIT_DIR/scripts/orrery-sync"; then
+    printf 'The principal surface could not be aligned; run orrery-sync.\n' >&2
+fi
+
 printf '\n=== Migration result ===\n'
 printf 'Canonical instructions: %s/AGENTS.md\n' "$PROJECT_ROOT"
 printf 'Claude wrapper:         %s/CLAUDE.md\n' "$PROJECT_ROOT"
