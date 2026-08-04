@@ -102,10 +102,16 @@ runner surfaces the delegate's own newest output line every couple of
 minutes so slow progress is visible rather than silent, with
 provider-derived text sanitised so it can never forge Orrery's consent
 markers or inject terminal escapes.
-Read-only roles additionally run inside a service unit whose workspace is
-mounted read-only by the kernel wherever the user manager supports mount
-sandboxing; where an environment cannot enforce it, the runner announces
-that protection is tool-level only rather than assuming the guarantee.
+Read-only roles additionally run inside a service unit that maps the
+workspace read-only, together with the git directory behind it and every
+worktree of the same repository, enforced by the kernel rather than by
+tool rules alone. The mapping is explicit, so it holds even where the
+repository sits inside a directory the composition deliberately grants. A
+probe unit composed of the same properties attempts a write into each of
+those paths before the delegate starts, and a write that succeeds is the
+finding; where the guarantee cannot be established the run is refused
+rather than quietly claimed, and `ORRERY_ALLOW_UNCONFINED=1` is the named
+way to accept a degraded run.
 
 `global/orchestration.json` is the only role-assignment source. Every row may
 be changed to either provider. For example, Sol may be the principal while
@@ -226,9 +232,12 @@ dedicated process group and announce the weaker containment.
 A task contract is a sealed JSON description of one bounded change: its goal,
 acceptance criteria, permitted scope, risk, role, and target branch.
 
-Create a task, run it in an isolated worktree under the same containment,
-then let the runner observe the contract verification. It writes an evidence
-packet before the task can be explicitly merged or closed. A controller that
+Create a task, run it in an isolated worktree under the same delegate
+containment, then let the runner observe the contract verification. The
+verification commands are the repository's own, so they run in a
+time-bounded transient unit rather than under the delegate's filesystem
+allowlist. The runner writes an evidence packet before the task can be
+explicitly merged or closed. A controller that
 is interrupted can be resumed from its receipts; a failed or interrupted task
 can be run again with the required consent flags.
 

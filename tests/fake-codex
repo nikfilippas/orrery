@@ -28,15 +28,32 @@ def effort(level: str) -> dict[str, str]:
 
 
 def probe_writes() -> None:
-    """Record whether confinement permits each requested write."""
+    """Record whether confinement permits each requested write or rename.
+
+    Renames matter separately from writes. A read-only mapping refuses
+    every write inside a directory and makes it a mount point, but says
+    nothing about that directory's ancestors: where one is renameable, a
+    delegate can move the tree aside and recreate the path with content
+    of its own, which anyone reading the path afterwards takes for the
+    original.
+    """
     requested = os.environ.get("CODEX_FAKE_PROBE_WRITES")
+    renames = os.environ.get("CODEX_FAKE_PROBE_RENAMES")
     result_path = os.environ.get("CODEX_FAKE_PROBE_RESULT")
-    if not requested or not result_path:
+    if not (requested or renames) or not result_path:
         return
     results: dict[str, bool] = {}
-    for name, value in json.loads(requested).items():
+    for name, value in json.loads(requested or "{}").items():
         try:
             Path(value).write_text("fake Codex confinement probe\n")
+        except OSError:
+            results[name] = False
+        else:
+            results[name] = True
+    for name, value in json.loads(renames or "{}").items():
+        target = Path(value)
+        try:
+            target.rename(target.with_name(target.name + ".moved"))
         except OSError:
             results[name] = False
         else:

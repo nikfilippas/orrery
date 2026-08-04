@@ -309,11 +309,38 @@ On systemd systems the delegated process runs in a transient service with:
 - a `RuntimeMaxSec` backstop
 - a private umask
 - a fixed working directory
-- `ReadOnlyPaths` on the workspace for read-only roles, enforced by the
-  kernel rather than by tool rules alone. A probe unit checks that the
-  environment can actually enforce it; where unprivileged user
-  namespaces are restricted and systemd would drop the option silently,
-  the runner announces that write protection is tool-level only.
+- `ReadOnlyPaths` for read-only roles on the workspace, on the common git
+  directory behind it, and on every worktree of the same repository,
+  enforced by the kernel rather than by tool rules alone. The mapping is
+  explicit rather than implied by absence from the write allowlist,
+  because `/tmp`, `/var/tmp` and the provider's own directory are granted
+  for the provider CLIs' sake and a repository inside one of them would
+  otherwise be writable: a delegate refused its own workspace could still
+  rewrite refs, or plant a hook that runs on your next git command.
+  Measured, because the deeper mapping wins and the direction is not
+  symmetric: a read-only mapping beats a grant containing it and a grant
+  naming the same path, but a grant nested *inside* it beats the mapping,
+  so `--receipts` pointed inside a reviewed tree is refused rather than
+  composed.
+- Read-only mappings on the ancestors of those paths, up to the first one
+  whose own parent is not writable. A mapping protects a directory's
+  contents and makes it a mount point, which cannot be renamed, but says
+  nothing about its ancestors: with a repository two levels under `/tmp`,
+  a delegate refused every write inside its workspace could otherwise
+  rename the workspace's parent and recreate the path with a tree of its
+  own. A workspace directly under `/tmp` needs no such mapping, because
+  `/tmp` itself cannot be renamed.
+- A probe unit composed of exactly those properties, run before the
+  delegate, which writes inside the run directory and attempts a write
+  into every path being claimed read-only, where a write that succeeds is
+  the finding. Every path is resolved first, so the mappings follow the
+  real directories rather than the names used to reach them: a symlink
+  that merely points at the workspace is not itself protected.
+  Where the allowlist cannot be enforced at all,
+  every role is refused; where only the workspace mapping fails, read-only
+  roles are refused and workers are unaffected. `ORRERY_ALLOW_UNCONFINED=1`
+  accepts a degraded run explicitly, and a read-only run that proceeds
+  without the guarantee is fingerprinted and inspected as a writer is.
 
 The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
 stops the whole control group and removes the private prompt, settings, log,

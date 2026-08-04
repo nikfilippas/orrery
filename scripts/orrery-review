@@ -501,7 +501,10 @@ def parse_args(argv: list[str]) -> Invocation:
     if workspace is not None:
         try:
             workspace = workspace.resolve(strict=True)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
+            # A symlink loop raises RuntimeError rather than OSError up to
+            # Python 3.12, so catching OSError alone turned a bad argument
+            # into a traceback.
             raise PlainUsageError(f"--workspace is not an existing directory: {exc}") from exc
         if not workspace.is_dir() or git_workspace_fingerprint(workspace) is None:
             raise PlainUsageError("--workspace must be an existing git worktree")
@@ -510,7 +513,7 @@ def parse_args(argv: list[str]) -> Invocation:
             raise PlainUsageError("--receipts must not be or contain a symlink")
         try:
             receipts = receipts.resolve(strict=True)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             raise PlainUsageError(f"--receipts is not an existing writable directory: {exc}") from exc
         if not receipts.is_dir() or not os.access(receipts, os.W_OK):
             raise PlainUsageError("--receipts must be an existing writable directory")
@@ -788,10 +791,72 @@ def unit_status(unit: str) -> tuple[bool, str]:
     return True, active_state
 
 
-def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
-    """Whether systemd behaviorally enforces the composed write allowlist."""
+def containment_properties(
+    writable_paths: list[Path],
+    read_only_paths: list[Path] | None = None,
+) -> list[str]:
+    """The filesystem properties every contained unit is composed from.
+
+    A probe that composed anything else would answer a different
+    question from the one the run relies on, so the probes and the real
+    unit are built from this one list.
+    """
+    def listed(path: Path) -> str:
+        # These properties take a space-separated list, so an unquoted
+        # path containing a space is read as two paths and systemd
+        # refuses the unit outright ("Invalid ReadWritePaths"). Quoting
+        # every entry costs nothing and keeps a workspace or provider
+        # home under a directory with a space in its name usable.
+        return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    return [
+        # ProtectSystem=strict makes the whole hierarchy read-only while
+        # leaving /dev, /proc and /sys alone. A bare ReadOnlyPaths=/ also
+        # froze /proc, which broke the provider's own bubblewrap sandbox
+        # ("setting up uid map: Read-only file system") in a live run.
+        "--property=ProtectSystem=strict",
+        "--property=ProtectHome=read-only",
+        *[
+            f"--property=ReadWritePaths={listed(path)}"
+            for path in dict.fromkeys(writable_paths)
+        ],
+        # The deeper mapping wins, measured on systemd 257 and 259: a
+        # read-only mapping beats a grant that contains it and a grant
+        # naming the same path, but a grant nested inside it beats the
+        # mapping. Callers refuse that nesting rather than compose it.
+        *[
+            f"--property=ReadOnlyPaths={listed(path)}"
+            for path in dict.fromkeys(read_only_paths or [])
+        ],
+        "--property=NoNewPrivileges=yes",
+    ]
+
+
+def confinement_enforced(
+    writable_paths: list[Path],
+    probe_root: Path,
+    read_only_paths: list[Path] | None = None,
+) -> bool:
+    """Whether systemd behaviorally enforces the composed write allowlist.
+
+    `read_only_paths` are the paths whose read-only-ness is being
+    claimed. Each is composed into the probe exactly as the run will
+    compose it, and each is written to, so a claim the host cannot
+    honour fails here rather than silently at the delegate.
+    """
     inside = probe_root / ".containment-probe-inside"
-    outside = probe_root.parent / f".containment-probe-outside-{uuid.uuid4().hex}"
+    # Home rather than the run directory's parent. That parent is
+    # $XDG_RUNTIME_DIR/orrery-review, whose unwritability comes from
+    # ProtectHome covering /run/user rather than from the allowlist, so
+    # pointing XDG_RUNTIME_DIR under /tmp put the negative target inside
+    # a deliberate grant and refused every run on a host whose
+    # confinement was intact. ProtectHome covers home on every host, and
+    # nothing grants it.
+    outside = Path.home() / f".containment-probe-outside-{uuid.uuid4().hex}"
+    refused = [
+        path / f".containment-probe-{uuid.uuid4().hex}"
+        for path in dict.fromkeys(read_only_paths or [])
+    ]
     try:
         inside.mkdir(mode=0o700)
         result = subprocess.run(
@@ -802,24 +867,16 @@ def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
                 "--wait",
                 "--collect",
                 "--pipe",
-                # ProtectSystem=strict makes the whole hierarchy
-                # read-only while leaving /dev, /proc and /sys alone.
-                # A bare ReadOnlyPaths=/ also froze /proc, which broke
-                # the provider's own bubblewrap sandbox ("setting up
-                # uid map: Read-only file system") in a live run.
-                "--property=ProtectSystem=strict",
-                "--property=ProtectHome=read-only",
-                *[
-                    f"--property=ReadWritePaths={path}"
-                    for path in dict.fromkeys(writable_paths)
-                ],
-                "--property=NoNewPrivileges=yes",
+                *containment_properties(writable_paths, read_only_paths),
                 "/bin/sh",
                 "-c",
-                'touch "$1/inside" && ! touch "$2/outside"',
+                'directory="$1"; shift; touch "$directory/inside" || exit 1; '
+                'for path in "$@"; do '
+                'if touch "$path" 2>/dev/null; then exit 1; fi; done; exit 0',
                 "probe",
                 str(inside),
                 str(outside),
+                *[str(path) for path in refused],
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -831,12 +888,16 @@ def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
         return False
     finally:
         shutil.rmtree(inside, ignore_errors=True)
-        try:
-            outside.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return False
+        # A probe file that exists is itself the finding, so it is removed
+        # either way rather than left in a path the delegate was supposed
+        # to be unable to touch.
+        for path in (outside, *refused):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
     return result.returncode == 0
 
 
@@ -862,10 +923,7 @@ def read_only_paths_enforced(target: Path) -> bool:
                     "--wait",
                     "--collect",
                     "--pipe",
-                    "--property=ProtectSystem=strict",
-                    "--property=ProtectHome=read-only",
-                    f"--property=ReadWritePaths={writable}",
-                    "--property=NoNewPrivileges=yes",
+                    *containment_properties([writable]),
                     "/bin/sh",
                     "-c",
                     'touch "$1/inside" && ! touch "$2"',
@@ -889,6 +947,126 @@ def read_only_paths_enforced(target: Path) -> bool:
             except OSError:
                 return False
         return result.returncode == 0
+
+
+def repository_read_only_paths(workspace: Path) -> list[Path]:
+    """Every path a read-only role must not be able to write.
+
+    The workspace alone is not the repository. A linked worktree keeps
+    its refs, config and hooks in the common git directory, which lives
+    with the main checkout: a delegate that cannot touch its own
+    workspace could still rewrite HEAD, or plant a hook that runs on the
+    user's next git command, whenever that directory sits inside one of
+    the paths granted above. Measured before this was added, with a
+    repository under /tmp: workspace refused, common git directory
+    written.
+    """
+    paths = [workspace]
+
+    def plumbing(*arguments: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(workspace), *arguments],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    # Plain --git-common-dir rather than --path-format=absolute, which
+    # only git 2.31 and later understands: losing this path to an older
+    # git would silently drop the mapping that matters most, and nothing
+    # downstream would notice because the probe only tests what it is
+    # given. Relative output is relative to the workspace, since that is
+    # where git ran.
+    common = plumbing("rev-parse", "--git-common-dir")
+    if common and common.strip():
+        paths.append(workspace / common.strip())
+    listing = plumbing("worktree", "list", "--porcelain")
+    for line in (listing or "").splitlines():
+        if line.startswith("worktree "):
+            paths.append(Path(line[len("worktree "):]))
+
+    seen: dict[Path, None] = {}
+    for path in paths:
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        # systemd refuses to start a unit naming a path that is not
+        # there, so a stale worktree entry would take the run down.
+        seen.setdefault(resolved, None)
+    return list(seen)
+
+
+def grant_defeating(
+    protected: list[Path], writable_paths: list[Path]
+) -> str | None:
+    """A write grant that defeats a read-only mapping, described, or None.
+
+    Measured, because the direction is not symmetric: the deeper mapping
+    wins. A grant *containing* a protected path leaves it read-only,
+    which is what makes a workspace under /tmp safe. A grant *nested
+    inside* one wins instead, so `--receipts` pointed within a reviewed
+    tree would hand the delegate a writable pocket of it. A grant naming
+    the same path loses to the mapping, which is safe but means the grant
+    silently stops doing what it was added for.
+    """
+    grants = [path.resolve(strict=False) for path in writable_paths]
+    for target in protected:
+        resolved = target.resolve(strict=False)
+        for grant in grants:
+            if grant == resolved:
+                return f"{grant} is granted and mapped read-only at once"
+            if resolved in grant.parents:
+                return f"{grant} is granted inside read-only {resolved}"
+    return None
+
+
+def ancestors_to_pin(
+    protected: list[Path], writable_paths: list[Path]
+) -> tuple[list[Path], str | None]:
+    """Ancestors that must be mapped too, or why they cannot be.
+
+    A read-only mapping protects a directory's contents and makes it a
+    mount point, which cannot be renamed. It says nothing about the
+    directory's ancestors. Measured: with the repository two levels under
+    /tmp, a delegate refused every write inside its workspace could still
+    rename the workspace's parent and recreate the path with a tree of
+    its own, which the runner and the user would then read as the
+    original. Every ancestor whose own parent is writable is therefore
+    mapped as well, which makes it a mount point in turn; the walk stops
+    where the parent is no longer writable, so a workspace directly under
+    /tmp costs nothing.
+    """
+    grants = [path.resolve(strict=False) for path in writable_paths]
+
+    def writable(path: Path) -> bool:
+        return any(grant == path or grant in path.parents for grant in grants)
+
+    resolved_protected = {path.resolve(strict=False) for path in protected}
+    pinned: dict[Path, None] = {}
+    for target in protected:
+        current = target.resolve(strict=False)
+        while current.parent != current and writable(current.parent):
+            # `current` sits in a writable directory, so it can be
+            # renamed and must be a mount point of its own. The target
+            # already is one; its ancestors are not.
+            if current not in resolved_protected:
+                if any(grant == current for grant in grants):
+                    # It would have to be granted and refused at once,
+                    # and the mapping wins, so the grant would stop doing
+                    # what it exists for. The layout cannot give the
+                    # guarantee.
+                    return [], f"{current} is granted but must be pinned read-only"
+                pinned.setdefault(current, None)
+            current = current.parent
+    return list(pinned), None
 
 
 def workspace_overlap(workspace: Path, trusted: dict[str, Path]) -> str | None:
@@ -1146,9 +1324,18 @@ def provider_state_paths(provider: str) -> list[Path]:
 
     Measured, not assumed: a live Codex delegate fails at app-server
     initialisation when its own home is read-only. Only the running
-    provider's own directory is granted, so a delegate still cannot
-    reach the other provider's credentials, the adoption or standing
-    stores, or anything on PATH.
+    provider's own directory is granted, so a delegate cannot write the
+    other provider's configuration, the adoption or standing stores, or
+    anything on PATH.
+
+    The grant is wide, and it is a persistence channel rather than only a
+    credential one: this directory holds the settings that define hooks
+    for the operator's next interactive session, and the configuration
+    that names MCP servers and notify commands. A read-only role can
+    write it. Narrowing that to the individual files is possible, since a
+    read-only mapping nested inside a grant is honoured, but it changes
+    what a live provider CLI may do at startup and has not been measured
+    against one.
     """
     paths: list[Path] = []
     if provider == "openai":
@@ -1158,7 +1345,7 @@ def provider_state_paths(provider: str) -> list[Path]:
         candidate = Path(raw).expanduser() if raw else Path.home() / ".claude"
     try:
         resolved = candidate.resolve(strict=False)
-    except OSError:
+    except (OSError, RuntimeError):
         return paths
     if resolved.is_dir():
         paths.append(resolved)
@@ -2051,8 +2238,34 @@ def main(
         writable_paths.extend(
             path for path in (Path("/tmp"), Path("/var/tmp")) if path.is_dir()
         )
+        # A read-only role's guarantee is that its workspace cannot be
+        # written. Leaving the workspace out of the allowlist does not
+        # give that, because /tmp, /var/tmp and the provider's own
+        # directory are granted just above: a workspace inside any of
+        # them was writable while the wrapper said nothing at all. An
+        # explicit read-only mapping is honoured against those grants, so
+        # the guarantee stops depending on where the workspace sits.
+        protected_paths = (
+            repository_read_only_paths(workspace) if role_config.read_only else []
+        )
+        pinned_paths, pin_conflict = ancestors_to_pin(
+            protected_paths, writable_paths
+        )
+        read_only_paths = protected_paths + pinned_paths
+        conflict = pin_conflict or grant_defeating(protected_paths, writable_paths)
         confinement_ok = use_systemd and confinement_enforced(
             writable_paths, run_dir
+        )
+        # Kept separate from the guarantee above so that a workspace the
+        # host cannot protect stops read-only roles alone, and never a
+        # worker whose workspace is meant to be writable. An empty set of
+        # protected paths does not mean "guaranteed": for a read-only
+        # role it means the workspace could not even be resolved.
+        workspace_guaranteed = not role_config.read_only or (
+            bool(protected_paths)
+            and conflict is None
+            and confinement_ok
+            and confinement_enforced(writable_paths, run_dir, read_only_paths)
         )
         if not confinement_ok:
             detail = (
@@ -2075,6 +2288,34 @@ def main(
                 return 1
             print(
                 f"{PROGRAM_NAME}: confinement is not enforced "
+                "(ORRERY_ALLOW_UNCONFINED=1).",
+                file=sys.stderr,
+            )
+        elif not workspace_guaranteed:
+            # The allowlist holds but this workspace cannot be mapped
+            # read-only, so the one guarantee a read-only role exists to
+            # make is unavailable. Fail closed behind the same named
+            # escape rather than claim it by staying silent.
+            incident_log.record(
+                "containment-degraded",
+                program=PROGRAM_NAME,
+                role=role_config,
+                detail=(
+                    f"workspace read-only mapping unenforceable: {workspace}"
+                    + (f"; {conflict}" if conflict else "")
+                ),
+            )
+            if os.environ.get("ORRERY_ALLOW_UNCONFINED") != "1":
+                print(
+                    f"{PROGRAM_NAME}: the workspace cannot be mapped "
+                    "read-only for a read-only role"
+                    + (f" ({conflict})" if conflict else "")
+                    + "; set ORRERY_ALLOW_UNCONFINED=1 to proceed.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"{PROGRAM_NAME}: the workspace is not read-only "
                 "(ORRERY_ALLOW_UNCONFINED=1).",
                 file=sys.stderr,
             )
@@ -2164,18 +2405,7 @@ def main(
                 # at most to the hard cap, fires first and reports
                 # diagnostics.
                 f"--property=RuntimeMaxSec={hard_timeout_seconds + 60}s",
-                # ProtectSystem=strict makes the whole hierarchy
-                # read-only while leaving /dev, /proc and /sys alone.
-                # A bare ReadOnlyPaths=/ also froze /proc, which broke
-                # the provider's own bubblewrap sandbox ("setting up
-                # uid map: Read-only file system") in a live run.
-                "--property=ProtectSystem=strict",
-                "--property=ProtectHome=read-only",
-                *[
-                    f"--property=ReadWritePaths={path}"
-                    for path in dict.fromkeys(writable_paths)
-                ],
-                "--property=NoNewPrivileges=yes",
+                *containment_properties(writable_paths, read_only_paths),
                 f"--working-directory={workspace}",
                 sys.executable,
                 str(launcher_path),
@@ -2206,14 +2436,19 @@ def main(
         started = time.monotonic()
         deadline = started + timeout_seconds
         hard_deadline = started + hard_timeout_seconds
+        # A read-only role is exempt from inspection because its
+        # workspace cannot have changed. Where that guarantee could not
+        # be established, the exemption would rest on the role's name
+        # rather than on anything enforced, and a tampering delegate
+        # would be retried automatically, so it is fingerprinted exactly
+        # as a writer is.
+        workspace_inspectable = not role_config.read_only or not workspace_guaranteed
         workspace_before = (
-            None
-            if role_config.read_only
-            else git_workspace_fingerprint(workspace)
+            git_workspace_fingerprint(workspace) if workspace_inspectable else None
         )
 
         def workspace_requires_inspection() -> bool:
-            if role_config.read_only:
+            if not workspace_inspectable:
                 return False
             workspace_after = git_workspace_fingerprint(workspace)
             return (

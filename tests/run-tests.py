@@ -9480,23 +9480,11 @@ def test_read_only_unit_workspace_guard() -> None:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            # Gated exactly as the two sibling confinement tests are: a
-            # host that cannot enforce ReadOnlyPaths, which is any runner
-            # restricting unprivileged user namespaces, has nothing to
-            # prove here.
-            #
-            # KNOWN GAP, deliberately not asserted. Where the guarantee
-            # is unenforceable the wrapper still claims confinement by
-            # staying silent, because its own probe only tests a sibling
-            # of the run directory and never the workspace. Making it
-            # probe the workspace was tried and reverted: it pushed
-            # `confinement_ok` false on such hosts, which reaches the
-            # refuse branch and stops every delegated run rather than
-            # degrading. Announce-versus-refuse is a design decision, and
-            # it is item 1b for the security review.
-            if not review_module.read_only_paths_enforced(workspace):
-                print("      (skipped: this host cannot enforce confinement)")
-                return
+            # Not gated on the host. Either the wrapper holds the
+            # guarantee or it says it cannot, and both are asserted
+            # below, so a host that cannot enforce anything still has to
+            # prove it reports that rather than claiming confinement by
+            # staying silent.
             environment = review_environment(
                 "success", standing_state=state_dir
             )
@@ -9517,11 +9505,14 @@ def test_read_only_unit_workspace_guard() -> None:
                 and "fake Claude verdict" in stdout,
                 f"the read-only run failed outright: {stderr[-600:]}",
             )
-            announced_degraded = "confinement is not enforced" in stderr
+            announced_degraded = (
+                "confinement is not enforced" in stderr
+                or "workspace is not read-only" in stderr
+            )
             wrote = (workspace / "blocked.txt").exists()
             if announced_degraded:
-                # It said the guarantee is unavailable. Nothing is owed
-                # beyond having said so before the delegate ran.
+                # It said the guarantee is unavailable, which is all that
+                # is owed on a host that cannot give it.
                 pass
             else:
                 # It claimed confinement by staying silent, so the write
@@ -9670,6 +9661,303 @@ def test_tmp_workspace_confinement() -> None:
         require(
             process.returncode == 0 and "# PASS" in stdout,
             f"a /tmp workspace did not run: {stderr[-600:]}",
+        )
+
+
+@test("a read-only workspace under a granted path is still read-only")
+def test_read_only_workspace_inside_a_grant() -> None:
+    """The guarantee must not depend on where the workspace happens to sit.
+
+    /tmp and /var/tmp are granted a few lines above the composition
+    because the provider CLIs build their bubblewrap mounts there. A
+    workspace inside one of them was therefore writable to a read-only
+    delegate while the wrapper stayed silent, which is the CI incident
+    that opened this. The mapping is explicit now, and systemd honours it
+    against the surrounding grant.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        provider_home = root / "codex-home"
+        workspace.mkdir()
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps(
+            {"workspace": str(workspace / "blocked.txt")}
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=workspace
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"the run failed: {stderr[-600:]}")
+        writes = read_json(result_path)
+        degraded = (
+            "confinement is not enforced" in stderr
+            or "workspace is not read-only" in stderr
+        )
+        if degraded:
+            # A host that cannot give the guarantee owes only the
+            # announcement, which it made.
+            return
+        require(
+            writes == {"workspace": False},
+            "a read-only delegate wrote a workspace under a granted path "
+            f"while the wrapper claimed confinement: {writes}; {stderr[-600:]}",
+        )
+
+
+@test("a workspace whose path contains a space still runs contained")
+def test_workspace_path_with_a_space() -> None:
+    """`ReadWritePaths` and `ReadOnlyPaths` take space-separated lists.
+
+    An unquoted path with a space in it is read as two paths, systemd
+    refuses the unit with "Invalid ReadWritePaths", and the wrapper
+    reports confinement as unavailable. Before quoting, a repository or a
+    provider home under any directory with a space in its name could not
+    be delegated at all.
+    """
+    with confinable_scratch() as directory:
+        root = Path(directory) / "a workspace"
+        provider_home = Path(directory) / "codex home"
+        root.mkdir()
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps(
+            {"workspace": str(root / "blocked.txt")}
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=root
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"a spaced workspace path did not run: {stderr[-600:]}",
+        )
+        if (
+            "confinement is not enforced" in stderr
+            or "workspace is not read-only" in stderr
+        ):
+            return
+        require(
+            read_json(result_path) == {"workspace": False},
+            f"a spaced path lost the read-only guarantee: {stderr[-600:]}",
+        )
+
+
+@test("a read-only delegate cannot write the repository behind its worktree")
+def test_read_only_repository_under_a_grant() -> None:
+    """The workspace is not the repository.
+
+    A linked worktree keeps refs, config and hooks in the common git
+    directory beside the main checkout. With the repository under /tmp,
+    which the composition grants, a delegate refused its own workspace
+    could still plant a hook that runs on the user's next git command.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        main, linked = root / "main", root / "linked"
+        provider_home = root / "codex-home"
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        (main / "tracked").write_text("x\n")
+        for arguments in (
+            ["add", "tracked"],
+            ["-c", "user.name=Kit", "-c", "user.email=kit@test", "commit", "-qm", "initial"],
+            ["worktree", "add", "-q", str(linked)],
+        ):
+            subprocess.run(["git", "-C", str(main), *arguments], check=True)
+        common = str(
+            (linked / subprocess.run(
+                ["git", "-C", str(linked), "rev-parse", "--git-common-dir"],
+                check=True, stdout=subprocess.PIPE, text=True,
+            ).stdout.strip()).resolve()
+        )
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps(
+            {
+                "workspace": str(linked / "blocked.txt"),
+                "common_git_dir": str(Path(common) / "blocked"),
+                "git_hook": str(Path(common) / "hooks" / "post-checkout"),
+                "main_worktree": str(main / "blocked.txt"),
+            }
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment,
+            "--workspace",
+            str(linked),
+            "--timeout",
+            "60",
+            "--",
+            "prompt",
+            cwd=linked,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"the run failed: {stderr[-600:]}")
+        if (
+            "confinement is not enforced" in stderr
+            or "workspace is not read-only" in stderr
+        ):
+            return
+        writes = read_json(result_path)
+        require(
+            writes == {
+                "common_git_dir": False,
+                "git_hook": False,
+                "main_worktree": False,
+                "workspace": False,
+            },
+            f"a read-only delegate reached the repository: {writes}; {stderr[-600:]}",
+        )
+
+
+@test("a read-only workspace cannot be swapped by renaming its parent")
+def test_read_only_workspace_parent_pinning() -> None:
+    """A mapping protects contents; it does not protect the path.
+
+    The workspace becomes a mount point, so it cannot be renamed, but its
+    ancestors are ordinary directories. With the repository two levels
+    under /tmp, which the composition grants, a delegate refused every
+    write inside its workspace could rename the parent and recreate the
+    path with a tree of its own; the runner, the verifier and the user
+    would then read the planted tree as the original.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        outer = Path(directory) / "outer"
+        workspace = outer / "workspace"
+        provider_home = Path(directory) / "codex-home"
+        workspace.mkdir(parents=True)
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        (workspace / "tracked.txt").write_text("genuine\n")
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_RENAMES"] = json.dumps(
+            {"parent": str(outer), "workspace": str(workspace)}
+        )
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=workspace
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"the run failed: {stderr[-600:]}")
+        if (
+            "confinement is not enforced" in stderr
+            or "workspace is not read-only" in stderr
+        ):
+            return
+        require(
+            read_json(result_path) == {"parent": False, "workspace": False},
+            f"a read-only delegate could move its workspace: {stderr[-600:]}",
+        )
+        require(
+            (workspace / "tracked.txt").read_text() == "genuine\n",
+            "the workspace was replaced under the original path",
+        )
+
+
+@test("a looping symlink argument is refused rather than raised")
+def test_symlink_loop_argument() -> None:
+    """`Path.resolve` raises RuntimeError, not OSError, on a loop.
+
+    Up to Python 3.12 a symlink cycle raises `RuntimeError: Symlink loop`,
+    so catching `OSError` alone turned a bad argument into a traceback
+    rather than the usage error the code plainly intended.
+    """
+    with confinable_scratch() as directory:
+        root = Path(directory)
+        (root / "a").symlink_to(root / "b")
+        (root / "b").symlink_to(root / "a")
+        environment = review_environment("success")
+        for option in ("--workspace", "--receipts"):
+            process = start_review(
+                environment, option, str(root / "a"), "--", "prompt"
+            )
+            _stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 2
+                and "Traceback" not in stderr
+                and option in stderr,
+                f"{option} with a symlink loop was not refused cleanly: "
+                f"{process.returncode}; {stderr[-400:]}",
+            )
+
+
+@test("a read-only role refuses a grant nested inside the reviewed tree")
+def test_read_only_refuses_nested_grant() -> None:
+    """The deeper mapping wins, so a nested grant beats the mapping.
+
+    Receipts pointed inside the reviewed tree would hand the delegate a
+    writable pocket of the very tree it must not change, and neither the
+    equality check nor a probe of the workspace root would notice.
+    """
+    with confinable_scratch() as directory:
+        workspace = Path(directory) / "workspace"
+        receipts = workspace / "receipts"
+        receipts.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        environment = review_environment("success")
+        process = start_review(
+            environment,
+            "--receipts",
+            str(receipts),
+            "--timeout",
+            "60",
+            "--",
+            "prompt",
+            cwd=workspace,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 1 and "granted inside read-only" in stderr,
+            f"a writable pocket of the reviewed tree was accepted: "
+            f"{process.returncode}; {stderr[-600:]}",
+        )
+
+
+@test("a read-only role refuses a workspace a grant names outright")
+def test_read_only_workspace_equal_to_a_grant() -> None:
+    """A grant naming the workspace itself is a contradiction, not a case.
+
+    Nesting either way is resolved by the more specific mapping, but one
+    path in both sets means the grant silently stops doing what it was
+    added for. A read-only role refuses; a worker, whose workspace is
+    meant to be writable, is unaffected.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        workspace = Path(directory) / "workspace"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        environment = review_environment("success")
+        # The receipts directory is granted for every role, so pointing it
+        # at the workspace makes a grant name it exactly.
+        process = start_review(
+            environment,
+            "--receipts",
+            str(workspace),
+            "--timeout",
+            "60",
+            "--",
+            "prompt",
+            cwd=workspace,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 1
+            and "cannot be mapped read-only" in stderr,
+            f"a contradictory grant was accepted: {process.returncode}; "
+            f"{stderr[-600:]}",
         )
 
 
@@ -12866,9 +13154,17 @@ def test_read_only_linked_worktree_command_paths() -> None:
                     process.returncode == 0
                     and "--property=ProtectSystem=strict" in arguments
                     and "--property=ProtectHome=read-only" in arguments
-                    and f"--property=ReadWritePaths={provider_home}" in arguments
-                    and f"--property=ReadWritePaths={linked}" not in arguments
-                    and f"--property=ReadWritePaths={common_git}" not in arguments
+                    # Values are quoted because these properties take a
+                    # space-separated list.
+                    and f'--property=ReadWritePaths="{provider_home}"' in arguments
+                    and f'--property=ReadWritePaths="{linked}"' not in arguments
+                    and f'--property=ReadWritePaths="{common_git}"' not in arguments
+                    # Absence from the allowlist is not the guarantee: the
+                    # mapping has to be there, or a repository under a
+                    # granted path is writable and nothing says so.
+                    and f'--property=ReadOnlyPaths="{linked}"' in arguments
+                    and f'--property=ReadOnlyPaths="{common_git}"' in arguments
+                    and f'--property=ReadOnlyPaths="{root}"' in arguments
                     and "--property=NoNewPrivileges=yes" in arguments,
                     stderr,
                 )
