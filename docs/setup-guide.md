@@ -690,6 +690,12 @@ The maintained artefacts are:
   lifecycle helpers.
 - `tests/run-tests.py`, `tests/fake-codex`, and `tests/fake-claude` — offline
   regression suite and provider stand-ins.
+- `tests/run-like-ci.sh` — the suite under the ways a CI runner differs from
+  a developer machine: `TMPDIR` at `/tmp`, no `init.defaultBranch`, and no
+  provider CLI on `PATH`. Every one of those has hidden a real defect behind
+  a green local run. It does not simulate the runner's restricted user
+  namespaces; the script says why, and confinement behaviour has to be judged
+  on a real runner.
 - `.github/workflows/ci.yml` — lint and suite on push and pull request. The
   suite needs a systemd user manager, so the job enables lingering before it
   runs.
