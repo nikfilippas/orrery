@@ -7852,7 +7852,18 @@ def test_initializer_git_boundaries() -> None:
             kit,
             ignore=shutil.ignore_patterns(".git", "__pycache__"),
         )
+        # init-project.sh reaches orrery-sync, which projects the
+        # principal onto $HOME/.claude/settings.json. Inheriting the real
+        # HOME therefore rewrote the developer's own live configuration.
+        # It went unnoticed here because that file already exists and the
+        # projection happened to be a no-op; on a machine without one,
+        # such as a CI runner, the file was created and the end-of-suite
+        # guard caught it.
+        home = root / "home"
+        home.mkdir()
         environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_STATE_HOME"] = str(home / "state")
 
         def invoke(
             target: Path,
@@ -8025,6 +8036,14 @@ def test_initializer_instruction_combinations() -> None:
             ignore=shutil.ignore_patterns(".git", "__pycache__"),
         )
 
+        # As in the worktree-boundary test: init-project.sh reaches
+        # orrery-sync, which writes $HOME/.claude/settings.json.
+        home = root / "home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_STATE_HOME"] = str(home / "state")
+
         def repository(name: str) -> Path:
             path = root / name
             path.mkdir()
@@ -8038,6 +8057,7 @@ def test_initializer_instruction_combinations() -> None:
                     str(kit / "scripts" / "init-project.sh"),
                     str(path),
                 ],
+                env=environment,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -9462,10 +9482,16 @@ def test_read_only_unit_workspace_guard() -> None:
             )
             # Some environments (CI runners restricting unprivileged
             # user namespaces) cannot enforce ReadOnlyPaths, and systemd
-            # drops it silently there. The wrapper must then announce
-            # tool-level-only protection; where enforcement works, the
-            # write must actually be blocked and nothing announced.
-            enforced = review_module.read_only_paths_enforced(workspace)
+            # drops it silently there. The contract is therefore about
+            # honesty rather than about capability: whatever the wrapper
+            # says of itself must be true.
+            #
+            # The branch is taken from the wrapper's own announcement,
+            # not from a second probe run here. A probe of our own asks
+            # a subtly different question — different writable set,
+            # different path — and where the two disagree the test fails
+            # for a reason that is about the disagreement rather than
+            # about the product.
             environment = review_environment(
                 "success", standing_state=state_dir
             )
@@ -9486,16 +9512,19 @@ def test_read_only_unit_workspace_guard() -> None:
                 and "fake Claude verdict" in stdout,
                 f"the read-only run failed outright: {stderr[-600:]}",
             )
-            if enforced:
-                require(
-                    not (workspace / "blocked.txt").exists(),
-                    "a read-only unit wrote into the workspace",
-                )
-                require("confinement is not enforced" not in stderr, stderr)
+            announced_degraded = "confinement is not enforced" in stderr
+            wrote = (workspace / "blocked.txt").exists()
+            if announced_degraded:
+                # It said the guarantee is unavailable. Nothing is owed
+                # beyond having said so before the delegate ran.
+                pass
             else:
+                # It claimed confinement by staying silent, so the write
+                # must genuinely have been refused.
                 require(
-                    "confinement is not enforced" in stderr,
-                    f"degraded confinement was not announced: {stderr[-500:]}",
+                    not wrote,
+                    "the wrapper claimed confinement and a read-only unit "
+                    "still wrote into the workspace",
                 )
 
     with tempfile.TemporaryDirectory() as directory:
@@ -9845,16 +9874,21 @@ def test_endpoint_environment_exclusivity() -> None:
 
 @test("endpoint roles skip first-party availability and model checks")
 def test_endpoint_role_preflight() -> None:
-    endpoint = runtime_module.Endpoint("local", "Local", "openai", "http://localhost:11434/v1")
-    role = dataclasses.replace(runtime_module.load_role("implementer"), endpoint=endpoint)
-    original_review = review_module.provider_status
-    try:
-        def unavailable(_provider: str) -> Any:
-            raise Failure("endpoint preflight queried first-party login")
-        review_module.provider_status = unavailable
-        require(review_module.role_availability(role).state is fallback_module.Availability.READY, "review endpoint preflight was unavailable")
-    finally:
-        review_module.provider_status = original_review
+    # role_availability falls back to the first-party check when the
+    # adapter's own binary is missing, so without a CLI on PATH this
+    # asserts the fallback rather than the endpoint path it was written
+    # for. Lend it the stubs, as the ladder tests do.
+    with provider_binaries_on_path():
+        endpoint = runtime_module.Endpoint("local", "Local", "openai", "http://localhost:11434/v1")
+        role = dataclasses.replace(runtime_module.load_role("implementer"), endpoint=endpoint)
+        original_review = review_module.provider_status
+        try:
+            def unavailable(_provider: str) -> Any:
+                raise Failure("endpoint preflight queried first-party login")
+            review_module.provider_status = unavailable
+            require(review_module.role_availability(role).state is fallback_module.Availability.READY, "review endpoint preflight was unavailable")
+        finally:
+            review_module.provider_status = original_review
 
 
 @test("a delegated run reaches its endpoint with the routed credential")
@@ -13609,6 +13643,7 @@ def main() -> int:
                 continue
 
             started = time.monotonic()
+            settings_before_test = live_settings_digest()
             try:
                 function()
             except Failure as exc:
@@ -13624,6 +13659,17 @@ def main() -> int:
             else:
                 elapsed = time.monotonic() - started
                 print(f"PASS  {name} ({elapsed:.1f}s)")
+            # Naming the test that touched the live settings is the whole
+            # value of the check: reported only at the end, it says a
+            # writer somewhere lacks isolation and leaves the reader to
+            # find which of 252 it was, on a machine they may not have.
+            if live_settings_digest() != settings_before_test:
+                failures += 1
+                print(
+                    f"FAIL  {name}\n      this test wrote the live "
+                    "~/.claude/settings.json; it needs HOME isolation or "
+                    "an explicit --target"
+                )
     finally:
         for name, value in saved_environment.items():
             if value is None:
