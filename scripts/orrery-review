@@ -788,10 +788,27 @@ def unit_status(unit: str) -> tuple[bool, str]:
     return True, active_state
 
 
-def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
-    """Whether systemd behaviorally enforces the composed write allowlist."""
+def confinement_enforced(
+    writable_paths: list[Path],
+    probe_root: Path,
+    refused_paths: list[Path] | None = None,
+) -> bool:
+    """Whether systemd behaviorally enforces the composed write allowlist.
+
+    `refused_paths` are the paths whose read-only-ness is actually being
+    claimed, and each is probed directly. Checking only a sibling of the
+    run directory establishes that the allowlist works *somewhere*, which
+    is not the same guarantee: a host can refuse that sibling and still
+    leave the delegate's workspace writable, and the wrapper would then
+    claim confinement it had never tested. Where the two differ the
+    claim, not the probe, is what a user relies on.
+    """
     inside = probe_root / ".containment-probe-inside"
     outside = probe_root.parent / f".containment-probe-outside-{uuid.uuid4().hex}"
+    refused = [
+        path / f".containment-probe-{uuid.uuid4().hex}"
+        for path in dict.fromkeys(refused_paths or [])
+    ]
     try:
         inside.mkdir(mode=0o700)
         result = subprocess.run(
@@ -816,10 +833,13 @@ def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
                 "--property=NoNewPrivileges=yes",
                 "/bin/sh",
                 "-c",
-                'touch "$1/inside" && ! touch "$2/outside"',
+                'd="$1"; shift; touch "$d/inside" || exit 1; '
+                'for p in "$@"; do '
+                'if touch "$p" 2>/dev/null; then exit 1; fi; done; exit 0',
                 "probe",
                 str(inside),
                 str(outside),
+                *[str(path) for path in refused],
             ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -831,12 +851,16 @@ def confinement_enforced(writable_paths: list[Path], probe_root: Path) -> bool:
         return False
     finally:
         shutil.rmtree(inside, ignore_errors=True)
-        try:
-            outside.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            return False
+        # A probe file that exists is itself the finding: the write was
+        # not refused. Remove it either way rather than leaving litter in
+        # a workspace the delegate was not supposed to be able to touch.
+        for path in (outside, *refused):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return False
     return result.returncode == 0
 
 
@@ -2051,8 +2075,26 @@ def main(
         writable_paths.extend(
             path for path in (Path("/tmp"), Path("/var/tmp")) if path.is_dir()
         )
+        # A read-only role's whole point is that the workspace cannot be
+        # written, so that is the path to probe rather than assume. It is
+        # probed only when it sits outside everything deliberately
+        # granted: a workspace under /tmp is writable by a decision made
+        # above, not by a failure of enforcement, and refusing to run
+        # there would break the ordinary case that decision exists for.
+        resolved_workspace = workspace.resolve(strict=False)
+        granted = any(
+            resolved_workspace == granted_path
+            or granted_path in resolved_workspace.parents
+            for granted_path in (
+                path.resolve(strict=False) for path in writable_paths
+            )
+        )
         confinement_ok = use_systemd and confinement_enforced(
-            writable_paths, run_dir
+            writable_paths,
+            run_dir,
+            refused_paths=(
+                [workspace] if role_config.read_only and not granted else []
+            ),
         )
         if not confinement_ok:
             detail = (
