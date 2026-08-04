@@ -1051,6 +1051,10 @@ window.CHART = CHART;
 window.SETTINGS = SETTINGS;
 const ENDPOINTS = __ENDPOINTS__;
 const TOKEN_PATH = __TOKEN_PATH__;
+// A static export has no server behind it. Every action already routes
+// through post(), and every caller already renders reply.error, so one
+// gate there makes the whole page honest rather than silently broken.
+const DEMO = __DEMO__;
 const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
 const original = Object.fromEntries(
   STATE.map(s => [s.id, {
@@ -1959,6 +1963,11 @@ function changes() {
 }
 
 async function post(endpoint, body) {
+  if (DEMO) {
+    return { error:
+      "This is a static demo, so nothing can be previewed or applied. " +
+      "Run orrery-config locally to change the configuration." };
+  }
   const response = await fetch(TOKEN_PATH + endpoint, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -2112,34 +2121,46 @@ def script_json(value: Any) -> str:
     )
 
 
-def render_page(token: str) -> str:
+def render_page(token: str, demo: bool = False) -> str:
     manifest = load_manifest()
-    live = [
-        provider
-        for provider, source in CATALOGUE_DISCOVERY.sources.items()
-        if source == "installed CLI"
-    ]
-    if len(live) == len(PROVIDERS):
+    if demo:
+        # An export cannot ask anything. Its menus are whatever was
+        # installed when it was written, so saying they were "discovered
+        # from the installed CLIs" would be a claim about the reader's
+        # machine rather than about this file.
         catalogue_note = (
-            "Models and thinking levels were discovered from the installed "
-            "Claude and Codex CLIs."
+            "This is a static export. The model menus are frozen at the "
+            "moment it was written, and nothing can be previewed or "
+            "applied; run orrery-config locally for the real page."
         )
     else:
-        fallback = [
+        live = [
             provider
-            for provider in PROVIDERS
-            if provider not in live
+            for provider, source in CATALOGUE_DISCOVERY.sources.items()
+            if source == "installed CLI"
         ]
-        catalogue_note = (
-            "Live model discovery is using the bundled fallback for "
-            f"{', '.join(fallback)}."
-        )
+        if len(live) == len(PROVIDERS):
+            catalogue_note = (
+                "Models and thinking levels were discovered from the "
+                "installed Claude and Codex CLIs."
+            )
+        else:
+            fallback = [
+                provider
+                for provider in PROVIDERS
+                if provider not in live
+            ]
+            catalogue_note = (
+                "Live model discovery is using the bundled fallback for "
+                f"{', '.join(fallback)}."
+            )
     replacements = {
         "__STATE__": script_json(snapshot(manifest)),
         "__SETTINGS__": script_json(settings_snapshot(manifest)),
         "__CHART__": script_json(manifest.get("chart", {})),
         "__ENDPOINTS__": script_json(endpoint_presets()),
         "__TOKEN_PATH__": script_json(f"/t/{token}/"),
+        "__DEMO__": "true" if demo else "false",
         "__CATALOGUE_NOTE__": script_json(catalogue_note),
         "__STANDING__": standing_html(),
     }
@@ -2382,6 +2403,15 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--export",
+        type=Path,
+        metavar="FILE",
+        help="write the page as a standalone file and exit. It has no "
+             "server behind it, so preview and apply say so instead of "
+             "failing quietly, and the model menus are frozen at whatever "
+             "was discovered when it was written.",
+    )
     arguments = parser.parse_args()
 
     try:
@@ -2390,6 +2420,11 @@ def main() -> int:
             print(f"Model discovery: {warning}", file=sys.stderr, flush=True)
         if arguments.print_state:
             return print_state()
+        if arguments.export:
+            page = render_page("demo", demo=True)
+            arguments.export.write_text(page, encoding="utf-8")
+            print(f"wrote {arguments.export} ({len(page)} bytes)")
+            return 0
         return serve(
             arguments.port,
             arguments.timeout,

@@ -60,6 +60,18 @@ objections survive. The default cap is two rounds, configurable from one to
 four. A repeated blocker or an uncleared blocker at the cap stops before
 implementation and asks the user to choose.
 
+### What is actually sent
+
+You type one line. The session answering it has already been given several
+hundred lines of standing instruction, and a delegated role is given that
+same instruction with a bounded assignment in place of your words. None of
+it is hidden: every file below is in this repository.
+
+<p align="center">
+  <img src="prompt-layers.svg" width="100%"
+       alt="Three columns. You type one line. The principal session also carries the shared policy, the one-line Claude import, the repository rules, the SessionStart injection, and the orchestration skill. A delegated role carries the same standing policy, a silenced SessionStart, an ORRERY ROLE HANDOFF naming its role, its access mode, the reviewer comment contract, and the report style, then the assignment; it never receives the typed prompt and cannot delegate further.">
+</p>
+
 ## Default roles
 
 The shipped configuration:
@@ -241,6 +253,10 @@ default.
 orrery-config
 ```
 
+The page itself is on GitHub Pages, with the model menus frozen and
+preview and apply inert, so it can be tried without installing anything:
+**[the configuration page](https://nikfilippas.github.io/orrery/config-demo.html)**.
+
 The localhost-only page is generated from the canonical manifest. On launch it
 discovers picker-visible models and each model's exact thinking levels from the
 installed Claude and Codex CLIs, without running a model. Discovery is
@@ -256,8 +272,8 @@ The diagram is the workflow, flowing left to right:
 
 - the legend is the single place where roles are configured; the boxes show
   each live assignment as plain text;
-- hovering a node outlines only that node, and steps sharing its role stay
-  lit;
+- hovering a node lights the shortest route to it and dims everything else,
+  including steps that share its role; clicking pins that route;
 - the five classifier outcomes stack top to bottom in the required order;
 - the plan and plan-review pair sit in a framed loop: a straight challenge
   arrow in, a return arc outside the frame, and the round cap between them;

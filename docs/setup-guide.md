@@ -640,7 +640,8 @@ verify that paths and labels do not intersect unrelated nodes.
 
 The maintained artefacts are:
 
-- `README.md`, `LICENSE`, `logo.svg`, `banner.svg`, and `flowchart.svg` —
+- `README.md`, `LICENSE`, `logo.svg`, `banner.svg`, `flowchart.svg`, and
+  `prompt-layers.svg` —
   project overview, licence, logo, the banner the README opens with, and
   the flowchart it shows. All three drawings are vector: the flowchart is
   generated from `global/orchestration.json` rather than drawn by hand, and
@@ -648,6 +649,14 @@ The maintained artefacts are:
   any size and cost 56KB between them. The banner embeds the mark, so the
   two cannot disagree.
 - `docs/setup-guide.md` — this operational reference.
+- `docs/config-demo.html` — the configuration page as a standalone file,
+  written by `orrery-config --export`. It has no server behind it, so the
+  model menus are frozen at the moment it was written and preview and
+  apply say so rather than failing quietly. Regenerate it when the chart
+  or the page changes; GitHub Pages serves it from this directory.
+- `prompt-layers.svg` — what a session and a delegate each actually
+  receive, generated from this kit's own files so the line counts cannot
+  drift from the instructions they describe.
 - `global/AGENTS.md` — canonical shared policy.
 - `global/CLAUDE.md` — the exact `@AGENTS.md` Claude import.
 - `global/claude-settings.json` — Claude-only hooks, permissions, and companion

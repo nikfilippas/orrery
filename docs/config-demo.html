@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Órrery configuration</title>
+<style>
+  :root {
+    --ground: #f3f5f6; --panel: #ffffff; --edge: #d9dfe3;
+    --ink: #1b2226; --soft: #4c5a63; --accent: #38617f; --accent-ink: #ffffff;
+    --mechanic: #737d94; --implementer: #587b50; --plan-reviewer: #8a6a9c; --reviewer: #a97a24;
+    --wire: #8b969d; --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #14181b; --panel: #1c2226; --edge: #2c353b;
+      --ink: #dde3e6; --soft: #a6b2b9; --accent: #7fa8c9; --accent-ink: #10161a;
+      --mechanic: #98a2b8; --implementer: #86a97e; --plan-reviewer: #b294c4; --reviewer: #cfa04a;
+      --wire: #6b7880; --code: #10161a; --code-ink: #cfd9de; --bad: #d98a8a; --good: #7dba8a;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-padding-bottom: 92px; }
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: system-ui, sans-serif; font-size: 15px; line-height: 1.5;
+  }
+  /* The whole surface is meant to sit in one tab: the drawing is scaled to
+     whatever room is left, and only a long preview scrolls, inside itself. */
+  html, body { height: 100%; }
+  body { overflow: hidden; }
+  .wrap {
+    max-width: 1880px; margin: 0 auto; padding: 10px 20px;
+    height: 100%; display: flex; flex-direction: column; gap: 6px;
+  }
+  .layout {
+    flex: 1 1 auto; min-height: 0; display: flex; justify-content: center;
+    align-items: flex-start;
+  }
+  .chartwrap {
+    flex: 1 1 auto; min-width: 0; height: 100%; border-radius: 10px;
+    display: flex; justify-content: center; align-items: center;
+    overflow: hidden;
+  }
+  .canvasfit { position: relative; }
+  .canvas {
+    position: absolute; top: 0; left: 0;
+    transform-origin: 0 0; overflow: hidden;
+  }
+  .canvas svg.art { position: absolute; inset: 0; display: block; }
+  .art g[data-node], .art g[data-card], .art [data-edge], .art [data-part] {
+    transition: opacity .16s;
+  }
+  .art g[data-node].dim, .art g[data-card].dim, .art [data-edge].dim,
+  .art [data-part].dim {
+    opacity: .26;
+  }
+  .cardctl { transition: opacity .16s; }
+  .cardctl.dim { opacity: .3; }
+  /* The step being pointed at is outlined, so it is clear which of the
+     lit ones is the subject. */
+  .art g[data-node].self rect, .art g[data-node].self polygon {
+    stroke: #ffffff; stroke-width: 2.4;
+  }
+  /* Pinning sweeps a light along the route, each part starting a moment
+     after the one before it, so it leaves the entry and arrives at the
+     step just pinned. */
+  @keyframes sweep {
+    0% { filter: none; }
+    30% {
+      filter: brightness(1.7)
+        drop-shadow(0 0 5px rgba(255, 255, 255, .55));
+    }
+    100% { filter: none; }
+  }
+  .art .sweep { animation: sweep 480ms ease-out both; }
+  .hot { cursor: pointer; }
+  @media (prefers-reduced-motion: reduce) {
+    .art .sweep { animation: none; }
+    .art g[data-node], .art g[data-card], .art [data-edge],
+    .art [data-part], .cardctl { transition: none; }
+  }
+  /* Transparent hit areas over the drawn nodes: the artwork stays exactly
+     as exported, and only hovering and tooltips live in the DOM. */
+  .hot { position: absolute; z-index: 5; }
+  .hot.has-tip { z-index: 25; }
+  .hot.has-tip { cursor: help; }
+  .tip {
+    position: absolute; top: 100%; left: 0; margin-top: 7px;
+    width: 250px; z-index: 60; text-align: left; white-space: normal;
+    background: var(--panel); color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 8px; padding: 10px 12px; font-size: 11.5px;
+    line-height: 1.45; box-shadow: 0 10px 28px rgba(0,0,0,.45);
+    font-weight: 400; display: none;
+  }
+  .tip.flip-x { left: auto; right: 0; }
+  .tip.flip-y { top: auto; bottom: 100%; margin: 0 0 7px; }
+  .hot:hover > .tip, .hot:focus-within > .tip { display: block; }
+  .tip b { display: block; margin-bottom: 3px; }
+  /* The card's control layer covers the whole card, so it must let a
+     pointer through everywhere except on the controls themselves. */
+  .cardctl { position: absolute; z-index: 20; pointer-events: none; }
+  .cardctl .ctl { pointer-events: auto; }
+  .cardctl .ctl {
+    position: absolute; box-sizing: border-box; line-height: 1;
+    appearance: none; -webkit-appearance: none;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px; font-weight: 500; letter-spacing: .01em;
+    color: #fff; background-color: rgba(255,255,255,.14);
+    border: 1px solid rgba(255,255,255,.28); border-radius: 8px;
+    padding: 0 9px; cursor: pointer;
+    transition: background .16s ease, border-color .16s ease,
+      box-shadow .16s ease;
+  }
+  .cardctl select.ctl {
+    padding-right: 22px; background-repeat: no-repeat;
+    background-position: right 8px center; background-size: 9px 9px;
+    background-image: url("data:image/svg+xml;utf8,\
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>\
+<path d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%23ffffff' \
+stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  }
+  .cardctl input.ctl { cursor: text; }
+  .cardctl .ctl:hover:not(:disabled) {
+    background-color: rgba(255,255,255,.22);
+    border-color: rgba(255,255,255,.46);
+  }
+  .cardctl .ctl:focus-visible {
+    outline: none; border-color: rgba(255,255,255,.9);
+    box-shadow: 0 0 0 3px rgba(255,255,255,.22);
+  }
+  .cardctl .ctl:disabled { opacity: .5; cursor: default; }
+  .cardctl .ctl::placeholder { color: rgba(255,255,255,.5); }
+  .cardctl select.ctl option { background: #16232d; color: #eaf1f5; }
+  /* A pale card needs the same controls drawn in ink rather than light. */
+  .cardctl.on-light .ctl {
+    color: #10161a; background-color: rgba(0,0,0,.05);
+    border-color: rgba(0,0,0,.22);
+  }
+  .cardctl.on-light select.ctl {
+    background-image: url("data:image/svg+xml;utf8,\
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'>\
+<path d='M1.6 3.4 5 6.8l3.4-3.4' fill='none' stroke='%2310161a' \
+stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+  }
+  .cardctl.on-light .ctl:hover:not(:disabled) {
+    background-color: rgba(0,0,0,.09); border-color: rgba(0,0,0,.38);
+  }
+  .cardctl.on-light .ctl:focus-visible {
+    border-color: rgba(0,0,0,.7); box-shadow: 0 0 0 3px rgba(0,0,0,.16);
+  }
+  .cardctl.on-light .ctl::placeholder { color: rgba(0,0,0,.42); }
+  .cardctl.on-light select.ctl option { background: #ffffff; color: #10161a; }
+  /* The buttons live in the drawing's clear top-right band. */
+  .actions { display: none; }
+  .actionbar {
+    position: absolute; z-index: 30; display: flex; align-items: center;
+    justify-content: flex-end; gap: 8px;
+  }
+  .actionbar .btn {
+    appearance: none; height: 100%; box-sizing: border-box;
+    border: 1px solid rgba(255,255,255,.26); border-radius: 999px;
+    background-color: rgba(255,255,255,.11); color: #eef4f7;
+    padding: 0 18px; font-family: inherit; font-weight: 600;
+    letter-spacing: .012em; line-height: 1; cursor: pointer; white-space: nowrap;
+    transition: background-color .16s ease, border-color .16s ease,
+      box-shadow .16s ease, color .16s ease, transform .07s ease;
+  }
+  .actionbar .btn:hover:not(:disabled) {
+    background-color: rgba(255,255,255,.19); border-color: rgba(255,255,255,.44);
+  }
+  .actionbar .btn:active:not(:disabled) { transform: translateY(1px); }
+  .actionbar .btn:focus-visible {
+    outline: none; box-shadow: 0 0 0 3px rgba(255,255,255,.3);
+  }
+  .actionbar .btn-primary {
+    background-color: #e9f1f5; border-color: transparent; color: #0c1c25;
+    box-shadow: 0 2px 12px rgba(0,0,0,.35);
+  }
+  .actionbar .btn-primary:hover:not(:disabled) {
+    background-color: #ffffff; border-color: transparent;
+  }
+  .actionbar .btn-go {
+    background-color: #2f7d43; border-color: transparent; color: #fff;
+    box-shadow: 0 2px 12px rgba(0,0,0,.35);
+  }
+  .actionbar .btn-go:hover:not(:disabled) {
+    background-color: #379150; border-color: transparent;
+  }
+  .actionbar .btn:disabled {
+    background-color: rgba(255,255,255,.07); color: rgba(255,255,255,.38);
+    border-color: rgba(255,255,255,.13); box-shadow: none; cursor: default;
+  }
+
+  .scopenote {
+    border-left: 3px solid var(--accent); padding: 4px 12px;
+    font-size: 12.5px; color: var(--soft); margin: 0;
+  }
+  /* Whatever a preview turns out to be, it scrolls inside itself so the
+     page as a whole never does. */
+  #result { overflow: auto; max-height: 30vh; }
+  #result pre {
+    white-space: pre-wrap; word-break: break-word; margin: 6px 0;
+    background: var(--code); color: var(--code-ink);
+    border-radius: 8px; padding: 10px 12px; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="layout">
+    <div class="chartwrap" id="chart"></div>
+  </div>
+  
+  <div class="actions">
+    <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
+    <button id="apply" class="btn btn-go" type="button" disabled>Apply</button>
+    <button id="revert" class="btn btn-ghost" type="button">Revert edits</button>
+  </div>
+  <div id="result"></div>
+</div>
+<script>
+const STATE = [{"id": "orchestrator", "title": "Principal orchestrator", "provider": "anthropic", "model": "fable", "thinking": "max", "access": "principal", "file": "global/orchestration.json", "summary": "Classifies every request, plans, delegates bounded work, inspects each diff itself, runs verification, and owns the outcome.", "selects": "The provider, model, and thinking level used when a new principal session is started with orrery.", "endpoint": "", "choices": [{"provider": "anthropic", "id": "fable", "label": "fable", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "opus", "label": "opus", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "sonnet", "label": "sonnet", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 2, "known": true}, {"provider": "anthropic", "id": "haiku", "label": "haiku", "thinking_levels": [], "default_thinking": null, "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-luna", "label": "gpt-5.6-luna", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "medium", "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-terra", "label": "gpt-5.6-terra", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.6-sol", "label": "gpt-5.6-sol", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "ultra", "fallback_tier": 3, "known": true}, {"provider": "openai", "id": "gpt-5.5", "label": "gpt-5.5", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.4", "label": "gpt-5.4", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}, {"provider": "openai", "id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}]}, {"id": "mechanic", "title": "Mechanical worker", "provider": "openai", "model": "gpt-5.6-luna", "thinking": "low", "access": "workspace-write", "file": "global/orchestration.json", "summary": "Handles narrow, repetitive, well-specified edits and boilerplate in a separate process.", "selects": "The provider, model, and thinking level used by orrery-agent --role mechanic.", "endpoint": "", "choices": [{"provider": "anthropic", "id": "fable", "label": "fable", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "opus", "label": "opus", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "sonnet", "label": "sonnet", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 2, "known": true}, {"provider": "anthropic", "id": "haiku", "label": "haiku", "thinking_levels": [], "default_thinking": null, "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-luna", "label": "gpt-5.6-luna", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "medium", "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-terra", "label": "gpt-5.6-terra", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.6-sol", "label": "gpt-5.6-sol", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "ultra", "fallback_tier": 3, "known": true}, {"provider": "openai", "id": "gpt-5.5", "label": "gpt-5.5", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.4", "label": "gpt-5.4", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}, {"provider": "openai", "id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}]}, {"id": "implementer", "title": "Implementation worker", "provider": "openai", "model": "gpt-5.6-terra", "thinking": "medium", "access": "workspace-write", "file": "global/orchestration.json", "summary": "Handles contained features, real bug fixes, and coherent multi-file implementation tasks in a separate process.", "selects": "The provider, model, and thinking level used by orrery-agent --role implementer.", "endpoint": "", "choices": [{"provider": "anthropic", "id": "fable", "label": "fable", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "opus", "label": "opus", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "sonnet", "label": "sonnet", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 2, "known": true}, {"provider": "anthropic", "id": "haiku", "label": "haiku", "thinking_levels": [], "default_thinking": null, "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-luna", "label": "gpt-5.6-luna", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "medium", "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-terra", "label": "gpt-5.6-terra", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.6-sol", "label": "gpt-5.6-sol", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "ultra", "fallback_tier": 3, "known": true}, {"provider": "openai", "id": "gpt-5.5", "label": "gpt-5.5", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.4", "label": "gpt-5.4", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}, {"provider": "openai", "id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}]}, {"id": "plan-reviewer", "title": "Plan reviewer", "provider": "openai", "model": "gpt-5.6-sol", "thinking": "ultra", "access": "read-only", "file": "global/orchestration.json", "summary": "Challenges a complex or high-risk plan in a fresh, read-only process before code is written.", "selects": "The provider, model, and thinking level used by orrery-agent --role plan-reviewer.", "endpoint": "", "choices": [{"provider": "anthropic", "id": "fable", "label": "fable", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "opus", "label": "opus", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "sonnet", "label": "sonnet", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 2, "known": true}, {"provider": "anthropic", "id": "haiku", "label": "haiku", "thinking_levels": [], "default_thinking": null, "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-luna", "label": "gpt-5.6-luna", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "medium", "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-terra", "label": "gpt-5.6-terra", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.6-sol", "label": "gpt-5.6-sol", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "ultra", "fallback_tier": 3, "known": true}, {"provider": "openai", "id": "gpt-5.5", "label": "gpt-5.5", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.4", "label": "gpt-5.4", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}, {"provider": "openai", "id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}]}, {"id": "reviewer", "title": "Final reviewer", "provider": "openai", "model": "gpt-5.6-sol", "thinking": "ultra", "access": "read-only", "file": "global/orchestration.json", "summary": "Reviews finished work or difficult diagnoses in a fresh, read-only process.", "selects": "The provider, model, and thinking level used by orrery-agent --role reviewer.", "endpoint": "", "choices": [{"provider": "anthropic", "id": "fable", "label": "fable", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "opus", "label": "opus", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 3, "known": true}, {"provider": "anthropic", "id": "sonnet", "label": "sonnet", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "max", "fallback_tier": 2, "known": true}, {"provider": "anthropic", "id": "haiku", "label": "haiku", "thinking_levels": [], "default_thinking": null, "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-luna", "label": "gpt-5.6-luna", "thinking_levels": ["low", "medium", "high", "xhigh", "max"], "default_thinking": "medium", "fallback_tier": 1, "known": true}, {"provider": "openai", "id": "gpt-5.6-terra", "label": "gpt-5.6-terra", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.6-sol", "label": "gpt-5.6-sol", "thinking_levels": ["low", "medium", "high", "xhigh", "max", "ultra"], "default_thinking": "ultra", "fallback_tier": 3, "known": true}, {"provider": "openai", "id": "gpt-5.5", "label": "gpt-5.5", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": 2, "known": true}, {"provider": "openai", "id": "gpt-5.4", "label": "gpt-5.4", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}, {"provider": "openai", "id": "gpt-5.4-mini", "label": "gpt-5.4-mini", "thinking_levels": ["low", "medium", "high", "xhigh"], "default_thinking": "medium", "fallback_tier": null, "known": true}]}];
+const SETTINGS = [{"id": "plan_review_rounds", "kind": "integer", "value": 2, "minimum": 1, "maximum": 4, "node": "plan-rounds", "label": "review rounds", "description": "How many plan-review rounds complex work may use. Round one challenges the plan; later rounds only confirm that blocking objections were addressed. A repeated blocking objection, or one still open at the cap, escalates to the user rather than looping.", "choices": [1, 2, 3, 4]}];
+const CHART = {"width": 960.0, "height": 540.0, "scale": 1.9, "iconSize": 15, "iconInset": 7, "background": "#08222e", "wire": "#a6a6a6", "wireSize": 9.96, "font": "Aptos, 'Segoe UI Variable Text', 'Segoe UI', Inter, system-ui, sans-serif", "header": {"x": 20, "y": 15.83, "title": "\u00d3rrery configuration", "titleSize": 14, "subtitle": "Set each role\u2019s model in the legend. Nothing is written until you apply.", "subtitleSize": 9.2, "gap": 10, "noteY": 29.33, "noteSize": 8.6}, "actions": {"x": 946, "y": 5.5, "h": 20}, "loop": {"steps": ["plan", "plan-rounds", "plan-review-step"], "captions": {"plan": ["plan\u003eplan-review-step"], "plan-review-step": ["plan-review-step\u003eplan"]}, "mark": "plan-rounds", "after": ["plan-escalation"]}, "cluster": {"x": 230.02, "y": 423.38, "w": 182.43, "h": 143.25, "r": 23.87, "stroke": "#a6a6a6", "width": 4.5}, "loopMark": {"d": "M292.82 425.98L297.1 421.7L294.72 421.7C295.5 420.18 297.08 419.13 298.91 419.13C300.09 419.13 301.19 419.58 302.01 420.31L306.36 420.31C305.05 417.5 302.19 415.58 298.91 415.58C295.1 415.58 291.88 418.17 290.95 421.7L288.54 421.7L292.82 425.98M309.26 425.98L304.98 421.7L300.7 425.98L303.1 425.98C302.32 427.5 300.74 428.55 298.91 428.55C297.73 428.55 296.64 428.1 295.81 427.37L291.44 427.37C292.78 430.18 295.61 432.1 298.91 432.1C302.73 432.1 305.94 429.51 306.88 425.98L309.26 425.98", "fill": "#ffffff"}, "nodes": [{"id": "request", "label": "prompt", "lines": [{"t": "prompt", "x": 56.58, "y": 185.06, "w": 40.23}], "x": 56.63, "y": 181.18, "w": 69.04, "h": 24.89, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "r": 4.15}, {"id": "classify", "label": "classify", "lines": [{"t": "classify", "x": 56.62, "y": 275.9, "w": 42.49}], "x": 56.63, "y": 272.0, "w": 69.04, "h": 24.88, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 4.15}, {"id": "investigation", "label": "read-only investigation", "lines": [{"t": "read-only investigation", "x": 230.88, "y": 58.85, "w": 124.53}], "x": 230.93, "y": 55.01, "w": 181.19, "h": 24.89, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 4.15}, {"id": "investigation-result", "label": "report facts, inferences,\nand uncertainty", "lines": [{"t": "report facts, inferences,", "x": 461.76, "y": 51.65, "w": 133.49}, {"t": "and uncertainty", "x": 460.67, "y": 66.05, "w": 86.19}], "x": 460.62, "y": 55.01, "w": 172.25, "h": 40.57, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "r": 6.76}, {"id": "trivial", "label": "principal implements directly", "lines": [{"t": "principal implements directly", "x": 230.97, "y": 138.19, "w": 160.94}], "x": 231.04, "y": 134.32, "w": 181.41, "h": 24.89, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 4.15}, {"id": "mechanical", "label": "mechanical worker edits", "lines": [{"t": "mechanical worker edits", "x": 230.49, "y": 212.9, "w": 134.29}], "x": 230.54, "y": 209.01, "w": 182.43, "h": 23.46, "shape": "round", "fill": "#9c9ab2", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["mechanic"], "r": 3.91}, {"id": "standard", "label": "implementation worker edits", "lines": [{"t": "implementation worker edits", "x": 229.75, "y": 287.69, "w": 157.3}], "x": 229.84, "y": 283.78, "w": 181.41, "h": 24.88, "shape": "round", "fill": "#3b7d23", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["implementer"], "r": 4.15}, {"id": "plan", "label": "principal writes the plan\nand acceptance criteria", "lines": [{"t": "principal writes the plan", "x": 232.16, "y": 378.89, "w": 134.32}, {"t": "and acceptance criteria", "x": 230.95, "y": 393.29, "w": 129.74}], "x": 231.05, "y": 382.18, "w": 163.11, "h": 36.31, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 6.05}, {"id": "plan-rounds", "label": "review rounds", "lines": [{"t": "review rounds", "x": 230.43, "y": 428.42, "w": 76.48}], "x": 230.54, "y": 424.49, "w": 108.07, "h": 24.88, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "r": 4.15}, {"id": "plan-review-step", "label": "fresh plan-review session\nblocking versus advisory", "lines": [{"t": "fresh plan-review session", "x": 232.24, "y": 458.42, "w": 141.92}, {"t": "blocking versus advisory", "x": 231.01, "y": 472.82, "w": 134.19}], "x": 231.05, "y": 461.7, "w": 163.11, "h": 39.17, "shape": "round", "fill": "#ae5095", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["plan-reviewer"], "r": 6.53}, {"id": "plan-escalation", "label": "stop before implementation\nand ask the user", "lines": [{"t": "stop before implementation", "x": 461.83, "y": 420.1, "w": 154.49}, {"t": "and ask the user", "x": 460.55, "y": 434.5, "w": 89.54}], "x": 460.62, "y": 423.38, "w": 172.25, "h": 40.57, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "r": 6.76}, {"id": "inspect", "label": "principal inspects the real\ndiff, never the summary", "lines": [{"t": "principal inspects the real", "x": 460.72, "y": 228.62, "w": 144.7}, {"t": "diff, never the summary", "x": 459.57, "y": 243.02, "w": 128.72}], "x": 459.6, "y": 231.93, "w": 172.25, "h": 40.57, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 6.76}, {"id": "verify", "label": "proportionate\nverification: tests,\nlint, types, build", "lines": [{"t": "proportionate", "x": 563.07, "y": 139.97, "w": 77.86}, {"t": "verification: tests,", "x": 563.06, "y": 154.37, "w": 101.35}, {"t": "lint, types, build", "x": 561.87, "y": 168.77, "w": 87.94}], "x": 561.88, "y": 150.5, "w": 118.37, "h": 46.94, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "r": 7.82}, {"id": "review-gate", "label": "independent\nfinal review\nwarranted?", "lines": [{"t": "independent", "x": 668.1, "y": 73.97, "w": 72.07}, {"t": "final review", "x": 668.18, "y": 88.37, "w": 65.28}, {"t": "warranted?", "x": 666.89, "y": 102.77, "w": 61.98}], "x": 666.88, "y": 84.51, "w": 176.11, "h": 67.02, "shape": "diamond", "fill": "#e8e8e8", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "points": [[578.82, 84.51], [666.88, 51.0], [754.93, 84.51], [666.88, 118.02]]}, {"id": "review", "label": "fresh final-review\nsession read-\nonly, ephemeral", "lines": [{"t": "fresh final-review", "x": 727.31, "y": 156.72, "w": 97.46}, {"t": "session read-", "x": 726.16, "y": 171.12, "w": 73.8}, {"t": "only, ephemeral", "x": 726.05, "y": 185.52, "w": 87.51}], "x": 726.07, "y": 167.25, "w": 118.37, "h": 47.47, "shape": "round", "fill": "#cc9b00", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["reviewer"], "r": 7.91}, {"id": "correct", "label": "principal corrects\nand adds regression\ncoverage", "lines": [{"t": "principal corrects", "x": 630.93, "y": 217.82, "w": 99.55}, {"t": "and adds regression", "x": 630.93, "y": 232.22, "w": 112.5}, {"t": "coverage", "x": 629.79, "y": 246.62, "w": 49.26}], "x": 629.75, "y": 228.33, "w": 130.06, "h": 46.93, "shape": "round", "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "size": 12.0, "roles": ["orchestrator"], "r": 7.82}, {"id": "findings", "label": "material finding\nsurvives\nverification", "lines": [{"t": "material finding", "x": 771.1, "y": 263.5, "w": 88.18}, {"t": "survives", "x": 771.06, "y": 277.9, "w": 48.02}, {"t": "verification", "x": 769.83, "y": 292.32, "w": 61.64}], "x": 769.83, "y": 274.02, "w": 203.89, "h": 67.01, "shape": "diamond", "fill": "#e8e8e8", "ink": "#000000", "stroke": "#042433", "size": 12.0, "roles": [], "points": [[667.88, 274.01], [769.82, 240.51], [871.77, 274.01], [769.82, 307.52]]}, {"id": "done", "label": "done: external\nactions still\nrequire approval", "lines": [{"t": "done: external", "x": 890.14, "y": 123.79, "w": 81.08}, {"t": "actions still", "x": 890.08, "y": 138.19, "w": 66.56}, {"t": "require approval", "x": 888.92, "y": 152.59, "w": 89.21}], "x": 888.87, "y": 134.33, "w": 115.62, "h": 45.25, "shape": "round", "fill": "#ffffff", "ink": "#000000", "stroke": "#00b050", "size": 12.0, "roles": [], "r": 7.54}], "edges": [{"from": "request", "to": "classify", "d": "M55.51 193.62L55.51 227.71L56.63 227.71L55.51 226.59L55.51 253.93L57.76 253.93L57.76 225.46L56.63 225.46L57.76 226.59L57.76 193.62L55.51 193.62M53.26 252.81L56.63 259.56L60.01 252.81L53.26 252.81"}, {"from": "classify", "to": "investigation", "label": "investigation", "lines": [{"t": "investigation", "x": 114.97, "y": 91.39, "w": 54.88}], "d": "M91.15 273.13L114.69 273.13L114.69 55L113.57 56.13L134.72 56.13L134.72 53.88L112.44 53.88L112.44 272L113.57 270.88L91.15 270.88L91.15 273.13M133.59 58.38L140.34 55L133.59 51.63L133.59 58.38"}, {"from": "classify", "to": "trivial", "label": "trivial", "lines": [{"t": "trivial", "x": 111.69, "y": 161.59, "w": 23.81}], "d": "M91.15 273.13L115.42 273.13L115.42 134.33L114.29 135.45L134.72 135.45L134.72 133.2L113.17 133.2L113.17 272L114.29 270.88L91.15 270.88L91.15 273.13M133.59 137.7L140.34 134.33L133.59 130.95L133.59 137.7"}, {"from": "classify", "to": "mechanical", "label": "mechanical", "lines": [{"t": "mechanical", "x": 114.9, "y": 239.21, "w": 50.9}], "d": "M91.15 273.13L116.36 273.13L116.36 209.01L115.23 210.14L133.69 210.14L133.69 207.89L114.11 207.89L114.11 272L115.23 270.88L91.15 270.88L91.15 273.13M132.57 212.39L139.32 209.01L132.57 205.64L132.57 212.39"}, {"from": "classify", "to": "standard", "label": "standard", "lines": [{"t": "standard", "x": 110.58, "y": 298.18, "w": 38.66}], "d": "M91.15 270.88L116.27 270.88L116.27 283.78L115.15 282.66L133.52 282.66L133.52 284.91L114.02 284.91L114.02 272L115.15 273.13L91.15 273.13L91.15 270.88M132.39 280.41L139.14 283.78L132.39 287.16L132.39 280.41"}, {"from": "classify", "to": "plan", "label": "complex", "lines": [{"t": "complex", "x": 111.69, "y": 348.98, "w": 37.25}], "d": "M91.15 270.88L115.38 270.88L115.38 423.37L114.25 422.25L133.18 422.25L133.18 424.5L113.13 424.5L113.13 272L114.25 273.13L91.15 273.13L91.15 270.88M132.06 420L138.81 423.37L132.06 426.75L132.06 420"}, {"from": "investigation", "to": "investigation-result", "d": "M321.53 56.13L349.14 56.13L349.14 55L348.01 56.13L368.88 56.13L368.88 53.88L346.89 53.88L346.89 55L348.01 53.88L321.53 53.88L321.53 56.13M367.75 58.38L374.5 55L367.75 51.63L367.75 58.38"}, {"from": "trivial", "to": "verify", "d": "M321.75 133.2L413.34 133.2L413.34 150.5L412.22 149.38L497.06 149.38L497.06 151.63L411.09 151.63L411.09 134.33L412.22 135.45L321.75 135.45L321.75 133.2M495.94 147.13L502.69 150.5L495.94 153.88L495.94 147.13"}, {"from": "mechanical", "to": "inspect", "d": "M321.75 207.89L348.14 207.89L348.14 231.94L347.01 230.81L367.85 230.81L367.85 233.06L345.89 233.06L345.89 209.01L347.01 210.14L321.75 210.14L321.75 207.89M366.73 228.56L373.48 231.94L366.73 235.31L366.73 228.56"}, {"from": "standard", "to": "inspect", "d": "M320.55 284.91L348.14 284.91L348.14 231.94L347.01 233.06L367.85 233.06L367.85 230.81L345.89 230.81L345.89 283.78L347.01 282.66L320.55 282.66L320.55 284.91M366.73 235.31L373.48 231.94L366.73 228.56L366.73 235.31"}, {"from": "plan", "to": "plan-review-step", "label": "fresh challenge", "lines": [{"t": "fresh challenge", "x": 230.11, "y": 404.52, "w": 66.13, "haloX": 231.05, "haloW": 163.11, "haloH": 0.95}]}, {"from": "plan-review-step", "to": "plan", "label": "supported blocking objections", "lines": [{"t": "supported blocking objections", "x": 229.55, "y": 488.57, "w": 130.78, "haloH": 0.95}]}, {"from": "plan-review-step", "to": "standard", "label": "none\nremain", "lines": [{"t": "none", "x": 230.39, "y": 323.64, "w": 23.88}, {"t": "remain", "x": 229.28, "y": 335.66, "w": 30.3}], "d": "M231.15 351.75L231.15 322.86L229.85 322.86L230.97 323.99L230.97 301.85L228.72 301.85L228.72 325.11L230.02 325.11L228.9 323.99L228.9 351.75L231.15 351.75M233.22 302.97L229.85 296.22L226.47 302.97L233.22 302.97"}, {"from": "plan-review-step", "to": "plan-escalation", "label": "repeated\nobjection or\nround cap", "lines": [{"t": "repeated", "x": 350.19, "y": 392.3, "w": 40.96}, {"t": "objection or", "x": 350.19, "y": 404.3, "w": 53.44}, {"t": "round cap", "x": 349.17, "y": 416.3, "w": 43.72}], "back": true, "d": "M321.24 424.5L348.99 424.5L348.99 423.37L347.87 424.5L368.88 424.5L368.88 422.25L346.74 422.25L346.74 423.38L347.87 422.25L321.24 422.25L321.24 424.5M367.75 426.75L374.5 423.37L367.75 420L367.75 426.75"}, {"from": "inspect", "to": "verify", "d": "M458.48 211.65L458.48 149.38L497.06 149.38L497.06 151.63L459.6 151.63L460.73 150.5L460.73 211.65L458.48 211.65M495.94 147.13L502.69 150.5L495.94 153.88L495.94 147.13"}, {"from": "verify", "to": "review-gate", "d": "M560.75 127.02L560.78 125.01L560.85 123L560.97 120.99L561.14 118.99L561.6 115.06L562.23 111.21L563.01 107.5L563.45 105.7L563.92 103.93L564.43 102.22L564.97 100.55L565.53 98.93L566.13 97.38L566.75 95.89L567.39 94.45L568.07 93.1L568.76 91.8L569.48 90.59L570.21 89.46L570.97 88.4L571.83 87.33L573.27 86.33L574.56 88.17L573.24 89.09L573.48 88.86L572.75 89.79L572.78 89.74L572.05 90.75L572.09 90.7L571.38 91.79L571.4 91.76L570.7 92.93L570.73 92.88L570.06 94.14L570.08 94.12L569.42 95.44L569.44 95.4L568.81 96.8L568.82 96.77L568.21 98.23L568.22 98.2L567.64 99.73L567.65 99.69L567.09 101.28L567.1 101.25L566.58 102.89L566.59 102.87L566.08 104.56L566.09 104.53L565.63 106.27L565.63 106.24L565.2 108.02L565.21 107.98L564.43 111.65L564.44 111.6L563.83 115.39L563.83 115.35L563.38 119.23L563.38 119.19L563.22 121.17L563.22 121.14L563.1 123.12L563.1 123.09L563.02 125.08L563.02 125.05L563 127.05L560.75 127.02M571.29 84.85L578.83 84.51L574.58 90.75L571.29 84.85"}, {"from": "review-gate", "to": "review", "label": "yes", "lines": [{"t": "yes", "x": 694.81, "y": 133.94, "w": 14.66}], "d": "M665.76 118.1L665.81 118.78L665.96 119.51L666.21 120.24L666.56 120.94L666.97 121.61L667.47 122.28L668.03 122.91L668.65 123.53L669.34 124.12L670.09 124.71L670.9 125.27L671.75 125.81L672.67 126.35L673.62 126.85L674.62 127.35L675.69 127.82L677.91 128.7L680.27 129.49L682.77 130.19L685.38 130.78L688.08 131.25L690.84 131.6L693.64 131.82L696.44 131.89L699.21 131.97L699.15 131.97L701.91 132.18L701.85 132.17L704.56 132.52L704.5 132.51L707.14 132.97L707.09 132.96L709.64 133.54L709.59 133.53L712.04 134.21L711.99 134.19L714.3 134.96L714.24 134.94L716.41 135.8L716.36 135.78L717.38 136.24L717.34 136.22L718.31 136.7L718.28 136.68L719.2 137.17L719.16 137.15L720.04 137.66L720.01 137.64L720.82 138.16L720.78 138.13L721.54 138.66L721.28 138.41L722.08 139.49L723.89 138.15L722.98 136.92L722.05 136.27L721.19 135.73L720.28 135.19L719.32 134.69L718.32 134.19L717.26 133.72L715.04 132.84L712.67 132.05L710.17 131.35L707.56 130.76L704.87 130.29L702.11 129.94L699.3 129.72L696.5 129.65L693.73 129.57L693.78 129.57L691.04 129.36L691.09 129.37L688.39 129.02L688.44 129.03L685.8 128.57L685.85 128.58L683.3 128L683.35 128.01L680.9 127.33L680.96 127.35L678.65 126.58L678.71 126.6L676.54 125.74L676.59 125.76L675.57 125.3L675.6 125.32L674.64 124.84L674.66 124.86L673.74 124.37L673.78 124.39L672.9 123.88L672.94 123.9L672.12 123.38L672.17 123.41L671.41 122.88L671.45 122.91L670.75 122.37L670.8 122.41L670.16 121.85L670.21 121.9L669.64 121.34L669.69 121.39L669.18 120.82L669.24 120.9L668.81 120.31L668.86 120.39L668.5 119.81L668.55 119.9L668.26 119.31L668.32 119.44L668.11 118.85L668.15 118.98L668.02 118.38L668.04 118.54L668 117.94L665.76 118.1M719.54 139.73L726.07 143.52L725.18 136.03L719.54 139.73"}, {"from": "review", "to": "findings", "d": "M724.94 191.02L724.97 192.22L725.08 193.43L725.23 194.64L725.46 195.85L725.74 197.04L726.07 198.22L726.46 199.37L726.91 200.52L727.4 201.64L727.95 202.75L729.16 204.87L730.54 206.88L732.06 208.76L733.72 210.49L734.6 211.3L735.51 212.06L736.44 212.78L737.4 213.44L738.39 214.06L739.39 214.62L740.41 215.12L741.45 215.58L742.5 215.96L743.57 216.28L744.65 216.54L745.75 216.73L746.84 216.84L747.9 216.88L748.93 216.91L748.86 216.91L749.88 217.01L749.8 217L750.82 217.18L750.75 217.16L751.77 217.4L751.7 217.38L752.7 217.69L752.65 217.67L753.65 218.03L753.58 218.01L754.56 218.43L754.51 218.41L755.48 218.89L755.43 218.87L756.39 219.4L756.34 219.37L757.27 219.95L757.22 219.92L758.14 220.56L758.1 220.53L758.99 221.21L758.95 221.18L759.82 221.91L759.79 221.88L760.63 222.65L760.58 222.6L762.18 224.26L762.12 224.19L763.59 226.01L763.53 225.94L764.86 227.87L764.81 227.79L765.98 229.84L765.95 229.78L766.46 230.83L766.44 230.79L766.92 231.87L766.9 231.83L767.33 232.92L767.31 232.88L767.68 233.99L767.64 233.82L767.87 235.14L770.09 234.76L769.84 233.35L769.43 232.13L768.99 230.99L768.5 229.87L767.95 228.76L766.74 226.64L765.36 224.63L763.83 222.74L762.18 221.01L761.28 220.2L760.38 219.44L759.45 218.73L758.49 218.06L757.51 217.45L756.5 216.89L755.48 216.38L754.44 215.93L753.39 215.55L752.32 215.22L751.24 214.96L750.14 214.78L749.05 214.67L747.99 214.63L746.96 214.59L747.03 214.6L746.01 214.49L746.08 214.5L745.06 214.33L745.14 214.34L744.12 214.1L744.19 214.12L743.19 213.81L743.24 213.83L742.24 213.47L742.31 213.5L741.33 213.07L741.38 213.09L740.41 212.61L740.46 212.64L739.51 212.11L739.56 212.14L738.62 211.55L738.67 211.58L737.75 210.94L737.79 210.97L736.9 210.29L736.94 210.32L736.07 209.59L736.11 209.63L735.27 208.86L735.32 208.91L733.72 207.24L733.78 207.31L732.31 205.5L732.37 205.57L731.04 203.63L731.09 203.71L729.92 201.66L729.95 201.73L729.43 200.67L729.45 200.71L728.98 199.63L729 199.68L728.57 198.58L728.59 198.63L728.21 197.52L728.23 197.57L727.91 196.44L727.92 196.5L727.66 195.36L727.67 195.41L727.45 194.26L727.46 194.32L727.31 193.17L727.32 193.22L727.22 192.06L727.22 192.13L727.19 190.97L724.94 191.02M765.47 234.35L769.83 240.51L772.15 233.33L765.47 234.35"}, {"from": "findings", "to": "correct", "label": "yes", "lines": [{"t": "yes", "x": 639.11, "y": 287.57, "w": 14.66}], "d": "M768.71 307.46L768.68 307.88L768.7 307.73L768.62 308.15L768.64 308.06L768.52 308.49L768.57 308.35L768.39 308.77L768.43 308.69L768.21 309.11L768.26 309.02L767.99 309.44L768.04 309.37L767.73 309.78L767.78 309.72L767.41 310.14L767.47 310.07L766.62 310.9L766.7 310.82L765.67 311.64L765.73 311.59L764.54 312.4L764.61 312.36L763.24 313.16L763.29 313.13L761.78 313.92L761.83 313.9L760.17 314.66L760.21 314.64L758.4 315.4L758.44 315.39L756.5 316.12L756.53 316.11L754.47 316.82L754.5 316.82L752.31 317.51L752.34 317.5L750.04 318.17L750.06 318.17L747.65 318.81L747.67 318.81L745.16 319.43L745.19 319.42L742.58 320.01L742.59 320L739.89 320.57L739.91 320.56L737.13 321.1L737.15 321.09L734.29 321.59L734.31 321.58L731.37 322.05L731.39 322.05L728.4 322.47L728.41 322.47L725.36 322.86L725.38 322.86L722.28 323.2L722.29 323.2L719.14 323.51L719.16 323.51L715.97 323.78L715.99 323.78L712.77 324L712.79 323.99L709.55 324.17L709.56 324.17L706.29 324.29L706.31 324.29L703.03 324.38L703.05 324.37L699.77 324.4L699.8 324.4L698.17 324.37L698.2 324.37L696.56 324.29L696.6 324.3L694.97 324.16L695 324.16L693.36 323.98L693.4 323.99L691.77 323.75L691.8 323.75L690.17 323.47L690.2 323.47L688.57 323.14L688.61 323.15L686.99 322.77L687.02 322.78L685.41 322.35L685.44 322.36L683.83 321.89L683.86 321.9L682.27 321.37L682.29 321.38L680.7 320.82L680.74 320.83L677.6 319.57L677.65 319.6L674.55 318.16L674.6 318.19L671.54 316.6L671.59 316.62L668.6 314.88L668.64 314.9L665.71 313.01L665.75 313.04L662.9 311L662.94 311.03L660.15 308.86L660.19 308.89L657.49 306.59L657.53 306.62L654.92 304.2L654.95 304.23L652.44 301.69L652.47 301.72L650.06 299.08L650.09 299.12L647.79 296.37L647.82 296.41L645.63 293.57L645.66 293.61L643.59 290.68L643.62 290.72L641.69 287.71L641.71 287.75L639.9 284.66L639.93 284.71L638.27 281.56L638.29 281.6L636.78 278.39L636.8 278.44L635.43 275.17L635.45 275.22L634.25 271.91L634.27 271.97L633.24 268.61L633.26 268.66L632.4 265.27L632.4 265.32L632.04 263.61L632.04 263.65L631.73 261.93L631.73 261.96L631.46 260.25L631.47 260.28L631.24 258.55L631.25 258.63L631.17 257.34L628.92 257.48L629.01 258.81L629.24 260.58L629.51 262.32L629.83 264.07L630.21 265.81L631.08 269.24L632.13 272.65L633.35 276.01L634.73 279.33L636.27 282.58L637.95 285.78L639.78 288.9L641.74 291.96L643.83 294.92L646.05 297.8L648.38 300.58L650.82 303.26L653.37 305.83L656.01 308.29L658.75 310.61L661.57 312.82L664.47 314.89L667.44 316.81L670.48 318.58L673.58 320.2L676.74 321.65L679.93 322.93L681.55 323.5L683.18 324.04L684.81 324.52L686.46 324.96L688.11 325.35L689.77 325.68L691.43 325.97L693.1 326.22L694.77 326.4L696.44 326.54L698.12 326.62L699.77 326.65L703.08 326.62L706.37 326.54L709.66 326.41L712.91 326.24L716.15 326.02L719.35 325.75L722.52 325.44L725.64 325.09L728.71 324.7L731.72 324.27L734.67 323.8L737.54 323.31L740.34 322.77L743.06 322.2L745.69 321.62L748.23 320.99L750.65 320.34L752.98 319.66L755.19 318.96L757.28 318.23L759.25 317.48L761.1 316.71L762.8 315.93L764.35 315.12L765.77 314.29L767.03 313.43L768.14 312.56L769.07 311.66L769.49 311.18L769.86 310.7L770.18 310.19L770.44 309.69L770.67 309.17L770.82 308.62L770.93 308.08L770.95 307.58L768.71 307.46M633.48 258.34L629.72 251.8L626.74 258.73L633.48 258.34"}, {"from": "correct", "to": "verify", "label": "rerun affected\nchecks", "lines": [{"t": "rerun affected", "x": 599.12, "y": 189.94, "w": 63.07, "haloH": 0.9, "haloSoft": true}, {"t": "checks", "x": 598.18, "y": 201.94, "w": 30.96, "haloH": 0.9, "haloSoft": true}], "d": "M630.87 204.79L630.82 203.99L630.65 203.13L630.36 202.29L629.99 201.47L629.52 200.67L628.96 199.88L628.33 199.13L627.62 198.4L626.85 197.68L625.99 196.98L625.08 196.3L624.1 195.64L623.06 195.01L621.96 194.38L620.82 193.8L619.61 193.23L618.37 192.68L617.06 192.15L614.36 191.2L611.49 190.36L608.51 189.65L605.43 189.07L602.27 188.65L599.06 188.39L597.44 188.32L595.83 188.3L594.24 188.27L594.27 188.27L592.68 188.21L592.73 188.21L589.58 187.95L589.64 187.96L586.53 187.54L586.59 187.55L583.56 186.99L583.62 187L580.69 186.3L580.74 186.32L577.94 185.49L577.99 185.51L575.34 184.57L575.39 184.59L574.13 184.08L574.15 184.09L572.93 183.56L572.97 183.57L571.8 183.02L571.83 183.03L570.71 182.46L570.76 182.49L569.7 181.89L569.73 181.91L568.73 181.29L568.77 181.32L567.83 180.69L567.87 180.72L567 180.07L567.05 180.11L566.24 179.45L566.45 179.67L565.47 178.27L563.63 179.56L564.7 181.09L565.64 181.86L566.55 182.54L567.53 183.2L568.57 183.83L569.67 184.46L570.82 185.04L572.02 185.61L573.27 186.16L574.57 186.68L577.27 187.64L580.14 188.48L583.12 189.19L586.2 189.77L589.36 190.19L592.57 190.45L594.19 190.52L595.8 190.54L597.39 190.57L597.36 190.57L598.94 190.63L598.9 190.63L602.05 190.89L601.99 190.88L605.1 191.3L605.04 191.29L608.07 191.85L608.02 191.84L610.94 192.54L610.89 192.52L613.69 193.35L613.64 193.33L616.29 194.27L616.25 194.25L617.51 194.76L617.48 194.75L618.7 195.28L618.67 195.27L619.84 195.82L619.8 195.81L620.91 196.38L620.88 196.36L621.94 196.96L621.9 196.93L622.9 197.55L622.86 197.52L623.8 198.15L623.76 198.12L624.63 198.77L624.59 198.74L625.4 199.4L625.34 199.35L626.07 200.02L626.03 199.98L626.69 200.66L626.63 200.6L627.21 201.29L627.16 201.23L627.66 201.93L627.6 201.84L628.01 202.55L627.97 202.46L628.3 203.18L628.25 203.06L628.49 203.78L628.45 203.64L628.6 204.36L628.58 204.22L628.63 204.95L630.87 204.79M568.06 178.3L561.88 173.97L562.12 181.51L568.06 178.3"}, {"from": "review-gate", "to": "done", "label": "no", "lines": [{"t": "no", "x": 821.2, "y": 87.26, "w": 11.02}], "d": "M754.93 83.38L889.99 83.38L889.99 106.08L887.74 106.08L887.74 84.51L888.87 85.63L754.93 85.63L754.93 83.38M892.24 104.95L888.87 111.7L885.49 104.95L892.24 104.95"}, {"from": "findings", "to": "done", "label": "none", "lines": [{"t": "none", "x": 887.92, "y": 216.19, "w": 21.82}], "d": "M871.77 275.14L889.99 275.14L889.99 162.57L887.74 162.57L887.74 274.01L888.87 272.89L871.77 272.89L871.77 275.14M892.24 163.7L888.87 156.95L885.49 163.7L892.24 163.7"}], "legend": {"frame": {"x": 764.08, "y": 433.53, "w": 388.93, "h": 208.58, "r": 11.38, "stroke": "#e8e8e8", "width": 1.0, "dash": "4 3"}, "group": {"x": 665.43, "y": 433.33, "w": 191.62, "h": 201.88, "r": 9.39, "fill": "#1c2b30", "stroke": "#042433", "width": 1.5, "dash": "1.5 1.5"}, "cards": [{"target": "orchestrator", "kind": "role", "icon": {"d": "M749.9 348.89L734.58 343.4L719.26 348.89L722.28 349.95L722.28 356.06C722.28 356.26 722.43 356.41 722.63 356.41C722.82 356.41 722.98 356.26 722.98 356.06L722.98 350.2L725.45 351.06L725.45 356.13C725.45 358.19 729.63 359.93 734.58 359.93C739.52 359.93 743.7 358.19 743.7 356.13L743.7 351.06L749.9 348.89M734.58 344.15L747.79 348.88C747.79 348.88 747.79 348.88 747.79 348.89L734.58 353.52L721.37 348.89C721.36 348.88 721.36 348.88 721.37 348.88L734.58 344.15M743 356.13C743 357.56 739.32 359.23 734.58 359.23C729.83 359.23 726.16 357.56 726.16 356.13L726.16 351.31L734.58 354.27L743 351.31L743 356.13", "fill": "#000000", "box": [719.26, 343.4, 30.64, 16.52]}, "x": 665.43, "y": 368.33, "w": 181.15, "h": 60.01, "r": 10.0, "fill": "#156082", "ink": "#ffffff", "stroke": "#042433", "title": {"t": "Principal orchestrator", "x": 585.07, "y": 353.53, "w": 98.76}, "titleSize": 10.56, "fieldSize": 6.0, "fields": [{"label": "ENDPOINT", "x": 585.07, "y": 362.14, "w": 28.18, "slot": [585.07, 363.83, 160.73, 10.95]}, {"label": "MODEL", "x": 585.07, "y": 380.41, "w": 20.9, "slot": [585.07, 382.1, 104.49, 10.95]}, {"label": "THINKING", "x": 693.56, "y": 380.41, "w": 26.22, "slot": [693.56, 382.1, 52.24, 10.95]}], "margin": 5.29, "pad": 10.21}, {"target": "plan_review_rounds", "kind": "setting", "icon": {"d": "M723.17 417.15L728.3 417.15L728.3 419.55L730.69 417.15L732.74 417.15L734.1 419.55L735.47 417.15L737.52 417.15L739.91 419.55L739.91 417.15L745.38 417.15C746.14 417.15 746.75 416.54 746.75 415.79L746.75 408.61C746.75 407.85 746.14 407.24 745.38 407.24L723.17 407.24C722.41 407.24 721.8 407.85 721.8 408.61L721.8 415.79C721.8 416.54 722.41 417.15 723.17 417.15M722.49 408.61C722.49 408.23 722.79 407.92 723.17 407.92L745.38 407.92C745.76 407.92 746.06 408.23 746.06 408.61L746.06 415.79C746.06 416.16 745.76 416.47 745.38 416.47L739.23 416.47L739.23 417.9L738 416.67L737.8 416.47L735.07 416.47L734.88 416.81L734.1 418.17L733.33 416.81L733.13 416.47L730.4 416.47L730.2 416.67L728.98 417.9L728.98 416.47L723.17 416.47C722.79 416.47 722.49 416.16 722.49 415.79L722.49 408.61M725.22 411L741.28 411L741.28 410.32L725.22 410.32L725.22 411M725.22 412.02H743.33V412.71H725.22ZM725.22 413.73H737.86V414.42H725.22ZM738.98 423.9C738.98 425.36 740.16 426.55 741.62 426.55C743.08 426.55 744.27 425.36 744.27 423.9C744.27 422.44 743.08 421.26 741.62 421.26C740.16 421.26 738.98 422.44 738.98 423.9M743.58 423.9C743.58 424.99 742.7 425.86 741.62 425.86C740.54 425.86 739.66 424.98 739.66 423.9C739.66 422.82 740.54 421.94 741.62 421.94C742.71 421.94 743.58 422.82 743.58 423.9M724.63 423.97C724.63 425.43 725.81 426.62 727.27 426.62C728.73 426.62 729.91 425.43 729.91 423.97C729.91 422.51 728.73 421.33 727.27 421.33C725.81 421.33 724.63 422.51 724.63 423.97M729.23 423.97C729.23 425.06 728.35 425.93 727.27 425.93C726.19 425.93 725.31 425.06 725.31 423.97C725.31 422.89 726.19 422.01 727.27 422.01C728.35 422.01 729.23 422.89 729.23 423.97M746.45 428.65C745.68 428.05 744.78 427.61 743.83 427.37C743.12 427.15 742.37 427.03 741.62 427.03C740.87 427.04 740.13 427.16 739.41 427.37C738.47 427.64 737.59 428.07 736.8 428.65C736.74 428.69 736.69 428.73 736.65 428.78C736.72 428.8 736.78 428.81 736.86 428.83C737.06 428.89 737.26 428.96 737.46 429.03C738.12 428.59 738.84 428.25 739.6 428.03C740.26 427.83 740.94 427.73 741.62 427.72C742.31 427.72 742.99 427.82 743.64 428.03C744.51 428.25 745.32 428.64 746.02 429.18C746.26 429.36 746.4 429.64 746.41 429.94L746.41 432.13L747.09 432.13L747.09 429.94C747.08 429.43 746.85 428.96 746.45 428.65M731.39 429.05C731.61 428.97 731.83 428.89 732.05 428.83C732.1 428.82 732.14 428.81 732.19 428.8C732.16 428.77 732.13 428.74 732.1 428.72C731.32 428.12 730.43 427.68 729.48 427.44C728.77 427.22 728.02 427.11 727.27 427.1C726.52 427.12 725.78 427.23 725.06 427.44C724.12 427.71 723.24 428.14 722.44 428.72C722.05 429.03 721.81 429.5 721.8 430.01L721.8 432.2L722.49 432.2L722.49 430.01C722.49 429.72 722.63 429.44 722.86 429.26C723.58 428.74 724.39 428.35 725.25 428.09C725.9 427.9 726.58 427.8 727.27 427.79C727.96 427.79 728.64 427.89 729.29 428.09C730.04 428.29 730.75 428.62 731.39 429.05M739.28 430.77C738.5 430.17 737.61 429.73 736.66 429.49C735.94 429.27 735.2 429.16 734.45 429.15C733.7 429.17 732.96 429.28 732.24 429.49C731.3 429.76 730.41 430.19 729.62 430.77C729.22 431.08 728.99 431.56 728.98 432.06L728.98 434.25L729.66 434.25L729.66 432.06C729.67 431.77 729.8 431.49 730.03 431.31C730.76 430.79 731.57 430.4 732.42 430.15C733.08 429.95 733.76 429.85 734.45 429.84C735.13 429.84 735.81 429.94 736.47 430.15C737.33 430.37 738.14 430.76 738.85 431.3C739.08 431.48 739.22 431.76 739.23 432.06L739.23 434.25L739.91 434.25L739.91 432.06C739.91 431.56 739.67 431.08 739.28 430.77M731.8 426.02C731.8 427.49 732.99 428.67 734.45 428.67C735.91 428.67 737.09 427.48 737.09 426.02C737.09 424.56 735.91 423.38 734.45 423.38C732.99 423.38 731.8 424.56 731.8 426.02M736.41 426.02C736.41 427.11 735.53 427.99 734.45 427.99C733.36 427.99 732.49 427.11 732.49 426.02C732.49 424.94 733.36 424.06 734.45 424.06C735.53 424.06 736.41 424.94 736.41 426.02", "fill": "#000000", "box": [721.8, 407.24, 25.29, 27.01]}, "x": 666.88, "y": 432.52, "w": 181.15, "h": 60.01, "r": 10.0, "fill": "#ffffff", "ink": "#000000", "stroke": "#042433", "title": {"t": "Workflow", "x": 586.51, "y": 426.86, "w": 43.37}, "titleSize": 10.58, "fieldSize": 6.0, "fields": [{"label": "REVIEW ROUNDS", "x": 586.51, "y": 435.47, "w": 45.73, "slot": [586.51, 437.16, 68.0, 10.95]}], "margin": 14.41, "pad": 10.21}, {"target": "plan-reviewer", "kind": "role", "icon": {"d": "M735.51 479.95H740.78V480.65H735.51ZM735.51 482.06H740.78V482.76H735.51ZM735.51 484.17H739.02V484.87H735.51ZM746.4 477.14L744.29 477.14L744.29 475.59C744.29 475.44 744.2 475.31 744.05 475.26C740.37 474.03 736.39 474.01 732.7 475.22C729 474.01 725.02 474.03 721.34 475.26C721.2 475.31 721.1 475.44 721.1 475.59L721.1 477.14L718.99 477.14C718.8 477.14 718.64 477.29 718.64 477.49L718.64 494.36C718.64 494.56 718.8 494.72 718.99 494.72L730.27 494.72C730.42 495.33 730.97 495.77 731.61 495.77L733.79 495.77C734.42 495.77 734.97 495.33 735.12 494.72L746.4 494.72C746.59 494.72 746.75 494.56 746.75 494.36L746.75 477.49C746.75 477.29 746.59 477.14 746.4 477.14M743.59 475.84L743.59 491.98C740.15 490.94 736.48 490.94 733.05 491.98L733.05 475.84C736.48 474.76 740.16 474.76 743.59 475.84M721.8 475.84C725.23 474.76 728.91 474.76 732.34 475.84L732.34 491.98C728.91 490.94 725.24 490.94 721.8 491.98L721.8 475.84M746.05 494.01L734.8 494.01C734.61 494.01 734.45 494.17 734.45 494.36L734.45 494.4C734.45 494.77 734.15 495.07 733.79 495.07L731.61 495.07C731.24 495.07 730.94 494.77 730.94 494.4L730.94 494.36C730.94 494.17 730.78 494.01 730.59 494.01L719.34 494.01L719.34 477.84L721.1 477.84L721.1 492.47C721.1 492.66 721.26 492.82 721.45 492.82C721.49 492.82 721.53 492.81 721.57 492.8C725.14 491.61 729.01 491.61 732.58 492.8C732.59 492.8 732.59 492.8 732.6 492.8C732.63 492.81 732.65 492.81 732.68 492.81C732.68 492.81 732.69 492.82 732.7 492.82C732.7 492.82 732.7 492.82 732.71 492.82C732.74 492.81 732.76 492.81 732.79 492.8C732.79 492.8 732.8 492.8 732.81 492.8L732.81 492.8C736.39 491.61 740.25 491.61 743.83 492.8C743.86 492.81 743.9 492.82 743.94 492.82C744.13 492.82 744.29 492.66 744.29 492.47L744.29 477.84L746.05 477.84L746.05 494.01", "fill": "#000000", "box": [718.64, 474.01, 28.11, 21.76]}, "x": 666.88, "y": 497.73, "w": 181.15, "h": 62.05, "r": 10.34, "fill": "#ae5095", "ink": "#ffffff", "stroke": "#042433", "title": {"t": "Plan reviewer", "x": 586.61, "y": 482.92, "w": 60.63}, "titleSize": 10.56, "fieldSize": 6.0, "fields": [{"label": "ENDPOINT", "x": 586.61, "y": 491.53, "w": 28.18, "slot": [586.61, 493.22, 160.53, 10.95]}, {"label": "MODEL", "x": 586.61, "y": 509.8, "w": 20.9, "slot": [586.61, 511.49, 104.35, 10.95]}, {"label": "THINKING", "x": 694.96, "y": 509.8, "w": 26.21, "slot": [694.96, 511.49, 52.18, 10.95]}], "margin": 6.3, "pad": 10.31}, {"target": "mechanic", "kind": "role", "icon": {"d": "M939.25 342.55C939.29 342.52 942.06 339.58 944.85 336.6L944.85 335.78C941.93 338.91 938.89 342.13 938.86 342.17L937.81 343.21L938.52 343.91C935.93 346.36 933.88 347.01 933.88 347.01C933.51 349.29 932.61 351.45 931.25 353.32L931.73 353.8L928.87 354.24C928.87 354.24 928.87 354.24 928.87 354.24C928.87 354.24 928.87 354.24 928.87 354.23C929.03 353.81 929.19 353.18 929.02 352.72C928.93 352.49 928.75 352.3 928.51 352.21C927.88 351.96 926.91 352.68 926.15 353.39C926.15 353.39 926.15 353.39 926.15 353.39C926.15 353.39 926.15 353.38 926.15 353.38C926.23 353.07 926.22 352.74 926.11 352.44C925.99 352.16 925.75 351.96 925.46 351.9C924.84 351.74 923.99 352.42 923.07 353.43C923.07 353.43 923.07 353.44 923.07 353.43C923.06 353.43 923.06 353.43 923.06 353.43C923.83 351.83 924.43 349.9 923.47 348.94C922.77 348.25 921.49 348.23 919.55 348.88C919.41 348.92 919.33 349.08 919.37 349.23C919.42 349.37 919.58 349.45 919.73 349.4C921.43 348.84 922.55 348.81 923.07 349.33C924.24 350.5 922.14 354.07 921.45 355.24C921.34 355.45 921.25 355.6 921.21 355.68C921.11 355.81 921.14 355.99 921.27 356.08C921.28 356.09 921.28 356.09 921.29 356.09C921.33 356.13 921.39 356.14 921.44 356.15C921.58 356.15 921.7 355.99 922 355.6C924.14 352.83 924.99 352.35 925.32 352.44C925.45 352.45 925.55 352.54 925.6 352.65C925.78 353.07 925.42 353.98 925.15 354.45C925.07 354.59 925.12 354.76 925.25 354.83C925.37 354.9 925.51 354.87 925.6 354.77C926.56 353.65 927.87 352.56 928.31 352.73C928.4 352.76 928.47 352.83 928.5 352.92C928.64 353.29 928.37 354.07 928.17 354.46C928.1 354.6 928.15 354.77 928.29 354.84C928.34 354.86 928.4 354.87 928.46 354.86L932.15 354.3C932.17 354.29 932.18 354.28 932.2 354.28L932.83 354.9C934.69 353.54 936.86 352.64 939.14 352.27C939.14 352.27 939.77 350.2 942.21 347.61L942.94 348.34L943.14 348.14C943.15 348.13 943.98 347.31 944.85 346.46L944.85 345.68C944.1 346.42 943.3 347.2 942.94 347.56L942.6 347.21L938.92 343.53L938.92 343.53L938.6 343.21L939.25 342.55M938.73 351.78C936.64 352.16 934.65 352.98 932.89 354.18L932.62 353.91L936.22 350.32C936.49 350.44 936.82 350.38 937.03 350.16C937.32 349.87 937.32 349.4 937.03 349.11C936.74 348.82 936.27 348.82 935.98 349.11C935.77 349.32 935.7 349.65 935.82 349.93L932.23 353.52L931.97 353.26C933.17 351.5 933.99 349.51 934.37 347.41C935.08 347.13 936.83 346.28 938.91 344.31L941.82 347.22C939.85 349.3 939.01 351.07 938.73 351.78", "fill": "#000000", "box": [919.33, 335.78, 25.53, 20.37]}, "x": 858.76, "y": 363.88, "w": 189.0, "h": 62.97, "r": 10.49, "fill": "#9c9ab2", "ink": "#ffffff", "stroke": "#042433", "title": {"t": "Mechanical worker", "x": 774.62, "y": 349.07, "w": 85.96}, "titleSize": 10.56, "fieldSize": 6.0, "fields": [{"label": "ENDPOINT", "x": 774.62, "y": 357.68, "w": 28.18, "slot": [774.62, 359.37, 168.28, 10.95]}, {"label": "MODEL", "x": 774.62, "y": 375.95, "w": 20.9, "slot": [774.62, 377.64, 109.52, 10.95]}, {"label": "THINKING", "x": 888.14, "y": 375.95, "w": 26.21, "slot": [888.14, 377.64, 54.76, 10.95]}], "margin": 6.76, "pad": 10.36}, {"target": "implementer", "kind": "role", "icon": {"d": "M939.25 412.71C939.29 412.68 942.06 409.74 944.85 406.76L944.85 405.94C941.93 409.07 938.89 412.29 938.86 412.33L937.81 413.37L938.52 414.07C935.93 416.52 933.88 417.17 933.88 417.17C933.51 419.45 932.61 421.61 931.25 423.48L931.73 423.96L928.87 424.4C928.87 424.4 928.87 424.4 928.87 424.4C928.87 424.4 928.87 424.4 928.87 424.39C929.03 423.97 929.19 423.34 929.02 422.88C928.93 422.65 928.75 422.46 928.51 422.37C927.88 422.12 926.91 422.84 926.15 423.55C926.15 423.55 926.15 423.55 926.15 423.55C926.15 423.55 926.15 423.54 926.15 423.54C926.23 423.23 926.22 422.9 926.11 422.6C925.99 422.32 925.75 422.12 925.46 422.06C924.84 421.9 923.99 422.58 923.07 423.59C923.07 423.59 923.07 423.6 923.07 423.59C923.06 423.59 923.06 423.59 923.06 423.59C923.83 421.99 924.43 420.06 923.47 419.1C922.77 418.41 921.49 418.39 919.55 419.04C919.41 419.08 919.33 419.24 919.37 419.39C919.42 419.53 919.58 419.61 919.73 419.56C921.43 419 922.55 418.97 923.07 419.49C924.24 420.66 922.14 424.23 921.45 425.4C921.34 425.61 921.25 425.76 921.21 425.84C921.11 425.97 921.14 426.15 921.27 426.24C921.28 426.25 921.28 426.25 921.29 426.25C921.33 426.29 921.39 426.3 921.44 426.31C921.58 426.31 921.7 426.15 922 425.76C924.14 422.99 924.99 422.51 925.32 422.6C925.45 422.61 925.55 422.7 925.6 422.81C925.78 423.23 925.42 424.14 925.15 424.61C925.07 424.75 925.12 424.92 925.25 424.99C925.37 425.06 925.51 425.03 925.6 424.93C926.56 423.81 927.87 422.72 928.31 422.89C928.4 422.92 928.47 422.99 928.5 423.08C928.64 423.45 928.37 424.23 928.17 424.62C928.1 424.76 928.15 424.93 928.29 425C928.34 425.02 928.4 425.03 928.46 425.02L932.15 424.46C932.17 424.45 932.18 424.44 932.2 424.44L932.83 425.06C934.69 423.7 936.86 422.8 939.14 422.43C939.14 422.43 939.77 420.36 942.21 417.77L942.94 418.5L943.14 418.3C943.15 418.29 943.98 417.47 944.85 416.62L944.85 415.84C944.1 416.58 943.3 417.36 942.94 417.72L942.6 417.37L938.92 413.69L938.92 413.69L938.6 413.37L939.25 412.71M938.73 421.94C936.64 422.32 934.65 423.14 932.89 424.34L932.62 424.07L936.22 420.48C936.49 420.6 936.82 420.54 937.03 420.32C937.32 420.03 937.32 419.56 937.03 419.27C936.74 418.98 936.27 418.98 935.98 419.27C935.77 419.48 935.7 419.81 935.82 420.09L932.23 423.68L931.97 423.42C933.17 421.66 933.99 419.67 934.37 417.57C935.08 417.29 936.83 416.44 938.91 414.47L941.82 417.38C939.85 419.46 939.01 421.23 938.73 421.94", "fill": "#000000", "box": [919.33, 405.94, 25.53, 20.37]}, "x": 858.76, "y": 431.04, "w": 189.0, "h": 62.97, "r": 10.49, "fill": "#3b7d23", "ink": "#ffffff", "stroke": "#042433", "title": {"t": "Implementation worker", "x": 774.62, "y": 416.24, "w": 105.74}, "titleSize": 10.56, "fieldSize": 6.0, "fields": [{"label": "ENDPOINT", "x": 774.62, "y": 424.85, "w": 28.18, "slot": [774.62, 426.54, 168.28, 10.95]}, {"label": "MODEL", "x": 774.62, "y": 443.12, "w": 20.9, "slot": [774.62, 444.81, 109.52, 10.95]}, {"label": "THINKING", "x": 888.14, "y": 443.12, "w": 26.21, "slot": [888.14, 444.81, 54.76, 10.95]}], "margin": 6.77, "pad": 10.36}, {"target": "reviewer", "kind": "role", "icon": {"d": "M934.93 479.87H940.2V480.57H934.93ZM934.93 481.98H940.2V482.68H934.93ZM934.93 484.09H938.44V484.79H934.93ZM945.82 477.05L943.71 477.05L943.71 475.51C943.71 475.36 943.62 475.22 943.47 475.17C939.79 473.94 935.81 473.93 932.12 475.14C928.42 473.93 924.44 473.94 920.76 475.17C920.61 475.22 920.52 475.36 920.52 475.51L920.52 477.05L918.41 477.05C918.22 477.05 918.06 477.21 918.06 477.41L918.06 494.28C918.06 494.48 918.22 494.63 918.41 494.63L929.69 494.63C929.84 495.25 930.39 495.69 931.03 495.69L933.21 495.69C933.84 495.69 934.39 495.25 934.54 494.63L945.82 494.63C946.01 494.63 946.17 494.48 946.17 494.28L946.17 477.41C946.17 477.21 946.01 477.05 945.82 477.05M943.01 475.76L943.01 491.9C939.57 490.86 935.9 490.86 932.47 491.9L932.47 475.76C935.9 474.67 939.58 474.67 943.01 475.76M921.22 475.76C924.65 474.67 928.33 474.67 931.76 475.76L931.76 491.9C928.33 490.86 924.66 490.86 921.22 491.9L921.22 475.76M945.47 493.93L934.22 493.93C934.03 493.93 933.87 494.09 933.87 494.28L933.87 494.32C933.87 494.69 933.57 494.99 933.21 494.99L931.03 494.99C930.66 494.99 930.36 494.69 930.36 494.32L930.36 494.28C930.36 494.09 930.2 493.93 930.01 493.93L918.76 493.93L918.76 477.76L920.52 477.76L920.52 492.38C920.52 492.58 920.68 492.74 920.87 492.74C920.91 492.74 920.95 492.73 920.99 492.72C924.56 491.52 928.43 491.52 932 492.72C932.01 492.72 932.01 492.72 932.02 492.72C932.05 492.73 932.07 492.73 932.1 492.73C932.1 492.73 932.11 492.74 932.12 492.74C932.12 492.74 932.12 492.73 932.13 492.73C932.16 492.73 932.18 492.73 932.21 492.72C932.21 492.72 932.22 492.72 932.23 492.72L932.23 492.72C935.81 491.52 939.67 491.52 943.25 492.72C943.28 492.73 943.32 492.74 943.36 492.74C943.55 492.74 943.71 492.58 943.71 492.38L943.71 477.76L945.47 477.76L945.47 493.93", "fill": "#000000", "box": [918.06, 473.93, 28.11, 21.76]}, "x": 858.76, "y": 500.23, "w": 189.0, "h": 68.09, "r": 11.34, "fill": "#cc9b00", "ink": "#ffffff", "stroke": "#042433", "title": {"t": "Final reviewer", "x": 774.89, "y": 485.42, "w": 62.67}, "titleSize": 10.56, "fieldSize": 6.0, "fields": [{"label": "ENDPOINT", "x": 774.89, "y": 494.03, "w": 28.18, "slot": [774.89, 495.72, 167.74, 10.95]}, {"label": "MODEL", "x": 774.89, "y": 512.31, "w": 20.9, "slot": [774.89, 514.0, 109.16, 10.95]}, {"label": "THINKING", "x": 888.05, "y": 512.31, "w": 26.22, "slot": [888.05, 514.0, 54.58, 10.95]}], "margin": 9.32, "pad": 10.63}]}};
+const SCOPE = "Saving sets the defaults for new Orrery sessions; running " +
+  "sessions keep theirs, and a repository’s private .orrery.json " +
+  "still wins. " + "This is a static export. The model menus are frozen at the moment it was written, and nothing can be previewed or applied; run orrery-config locally for the real page.";
+// Exposed so the drawing can be measured from a console, and by the
+// checks that verify its geometry against what is painted.
+window.CHART = CHART;
+window.SETTINGS = SETTINGS;
+const ENDPOINTS = [{"id": "kimi", "label": "Kimi (Moonshot AI)", "adapter": "anthropic", "base_url": "https://api.moonshot.ai/anthropic", "key_env": "MOONSHOT_API_KEY", "models": ["kimi-k3[1m]", "kimi-k2.7-code"], "verified": true}, {"id": "deepseek", "label": "DeepSeek", "adapter": "anthropic", "base_url": "https://api.deepseek.com/anthropic", "key_env": "DEEPSEEK_API_KEY", "models": ["deepseek-v4-pro", "deepseek-v4-flash"], "verified": true}, {"id": "glm", "label": "GLM (Z.ai)", "adapter": "anthropic", "base_url": "https://api.z.ai/api/anthropic", "key_env": "ZAI_API_KEY", "models": ["glm-5.2", "glm-4.7"], "verified": true}, {"id": "qwen", "label": "Qwen (Alibaba Model Studio, coding plan)", "adapter": "anthropic", "base_url": "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic", "key_env": "DASHSCOPE_API_KEY", "models": ["qwen3.7-plus", "qwen3-coder-next"], "verified": true}, {"id": "minimax", "label": "MiniMax", "adapter": "anthropic", "base_url": "https://api.minimax.io/anthropic", "key_env": "MINIMAX_API_KEY", "models": ["MiniMax-M3[1m]", "MiniMax-M3"], "verified": true}, {"id": "minimax-codex", "label": "MiniMax through Codex", "adapter": "openai", "base_url": "https://api.minimax.io/v1", "key_env": "MINIMAX_API_KEY", "models": ["MiniMax-M3"], "verified": true}, {"id": "openrouter", "label": "OpenRouter", "adapter": "anthropic", "base_url": "https://openrouter.ai/api", "key_env": "OPENROUTER_API_KEY", "models": ["~anthropic/claude-sonnet-latest", "~openai/gpt-latest"], "verified": true}, {"id": "ollama", "label": "Ollama (local)", "adapter": "anthropic", "base_url": "http://localhost:11434", "key_env": "", "models": ["qwen3-coder", "gpt-oss:20b"], "verified": true}, {"id": "ollama-codex", "label": "Ollama through Codex (local)", "adapter": "openai", "base_url": "http://localhost:11434/v1", "key_env": "", "models": ["gpt-oss:20b", "gpt-oss:120b"], "verified": true}, {"id": "grok", "label": "Grok (xAI)", "adapter": "openai", "base_url": "https://api.x.ai/v1", "key_env": "XAI_API_KEY", "models": ["grok-4.5", "grok-4.3"], "verified": false}];
+const TOKEN_PATH = "/t/demo/";
+// A static export has no server behind it. Every action already routes
+// through post(), and every caller already renders reply.error, so one
+// gate there makes the whole page honest rather than silently broken.
+const DEMO = true;
+const roles = Object.fromEntries(STATE.map(s => [s.id, s]));
+const original = Object.fromEntries(
+  STATE.map(s => [s.id, {
+    provider: s.provider, model: s.model, thinking: s.thinking || "",
+    endpoint: s.endpoint || ""
+  }])
+);
+const originalSettings = Object.fromEntries(SETTINGS.map(s => [s.id, s.value]));
+const host = document.getElementById("chart");
+const result = document.getElementById("result");
+const applyButton = document.getElementById("apply");
+const SVGNS = "http://www.w3.org/2000/svg";
+// The drawing is authored at CHART.width x CHART.height and painted through
+// a viewBox, so every coordinate below is the exported one and the page can
+// take a fresh export unchanged.
+const S = CHART.scale || 1;
+
+function esc(text) {
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function element(name, attributes) {
+  const node = document.createElementNS(SVGNS, name);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  return node;
+}
+
+function stepsUsing(roleId) {
+  return CHART.nodes.filter(n => n.roles.includes(roleId)).length;
+}
+
+function boxLeft(item) { return item.x - item.w / 2; }
+function boxTop(item) { return item.y - item.h / 2; }
+
+function panel(item, extra) {
+  return element("rect", Object.assign({
+    x: boxLeft(item), y: boxTop(item), width: item.w, height: item.h,
+    rx: item.r || 0, ry: item.r || 0,
+    fill: item.fill || "none",
+    stroke: item.stroke, "stroke-width": item.width || 1.5,
+    "stroke-dasharray": item.dash || "none",
+  }, extra || {}));
+}
+
+function textRun(line, size, fill, anchor, bold) {
+  const text = element("text", {
+    x: line.x, y: line.y, "font-size": size, fill,
+    "text-anchor": anchor, "font-weight": bold ? "700" : "400",
+  });
+  // Aptos is a Microsoft font and is usually absent, so every run is
+  // pinned to the width it was drawn at. The layout then holds whatever
+  // the browser substitutes, instead of spilling out of its box.
+  if (line.w) {
+    text.setAttribute("textLength", line.w);
+    text.setAttribute("lengthAdjust", line.fit || "spacingAndGlyphs");
+  }
+  text.textContent = line.t;
+  return text;
+}
+
+// A blurred patch of the background, laid under a caption so the wire it
+// sits on fades away rather than striking through the words.
+function halo(line, size) {
+  // Wide enough that the blur has faded out past the words, and tall
+  // enough that its middle is fully opaque where the letters sit.
+  const width = (line.haloW || line.w) + size * 1.1;
+  const height = size * (line.haloH || 1.9);
+  return element("rect", {
+    x: (line.haloX || line.x) - width / 2,
+    y: line.y - size * 0.32 - height / 2,
+    width, height,
+    fill: CHART.background,
+    filter: line.haloSoft ? "url(#soften-more)" : "url(#soften)",
+  });
+}
+
+function header() {
+  const own = CHART.header;
+  const group = element("g", { class: "header" });
+  const text = element("text", {
+    x: own.x, y: own.y, "text-anchor": "start",
+    "font-size": own.titleSize, "font-weight": "700", fill: "#ffffff",
+  });
+  const name = element("tspan", {});
+  name.textContent = own.title;
+  const stand = element("tspan", {
+    dx: own.gap, "font-size": own.subtitleSize,
+    "font-weight": "400", fill: CHART.wire,
+  });
+  stand.textContent = own.subtitle;
+  text.appendChild(name);
+  text.appendChild(stand);
+  group.appendChild(text);
+  const note = element("text", {
+    x: own.x, y: own.noteY, "text-anchor": "start", class: "scopeline",
+    "font-size": own.noteSize, "font-weight": "400", fill: CHART.wire,
+  });
+  note.textContent = SCOPE;
+  group.appendChild(note);
+  return group;
+}
+
+// The note shares its band with the buttons, so it is held to the room
+// left of them however wide their labels turn out to be.
+function fitHeaderNote(canvas) {
+  const note = canvas.querySelector("text.scopeline");
+  const bar = canvas.querySelector(".actionbar");
+  if (!note || !bar) return;
+  const taken = bar.getBoundingClientRect().width / S;
+  const room = CHART.actions.x - taken - CHART.header.x - 14;
+  note.removeAttribute("textLength");
+  if (note.getComputedTextLength() > room) {
+    note.setAttribute("textLength", room);
+    note.setAttribute("lengthAdjust", "spacingAndGlyphs");
+  }
+}
+
+function nodeShape(node) {
+  if (node.shape === "diamond") {
+    return element("polygon", {
+      points: node.points.map(point => point.join(",")).join(" "),
+      fill: node.fill, stroke: node.stroke, "stroke-width": 1.5,
+    });
+  }
+  return panel(node);
+}
+
+// Every control sits where the drawing left room for it, so the legend
+// keeps the spacing it was designed with.
+function place(host, card, slot, node, className) {
+  node.className = className;
+  node.style.cssText =
+    `left:${(slot[0] - boxLeft(card)) * S}px;top:${(slot[1] - boxTop(card)) * S}px;` +
+    `width:${slot[2] * S}px;height:${slot[3] * S}px`;
+  host.appendChild(node);
+  return node;
+}
+
+// A card whose caption is drawn in black is a pale one, and needs its
+// controls drawn the same way.
+function light(card) {
+  return card.ink === "#000000";
+}
+
+function option(value, label, selected) {
+  const node = document.createElement("option");
+  node.value = value;
+  node.textContent = label;
+  node.selected = Boolean(selected);
+  return node;
+}
+
+function settingControls(card) {
+  const setting = SETTINGS.find(entry => entry.id === card.target);
+  const box = document.createElement("div");
+  box.className = "cardctl" + (light(card) ? " on-light" : "");
+  box.dataset.card = card.target;
+  box.style.cssText =
+    `left:${boxLeft(card) * S}px;top:${boxTop(card) * S}px;` +
+    `width:${card.w * S}px;height:${card.h * S}px`;
+  if (!setting) return box;
+  const select = document.createElement("select");
+  select.dataset.setting = setting.id;
+  for (const value of setting.choices) {
+    select.appendChild(option(
+      value,
+      `${value} round${value === 1 ? "" : "s"}`,
+      value === setting.value,
+    ));
+  }
+  place(box, card, card.fields[0].slot, select, "ctl");
+  return box;
+}
+
+function roleControls(card) {
+  const step = STATE.find(entry => entry.id === card.target);
+  const box = document.createElement("div");
+  box.className = "cardctl" + (light(card) ? " on-light" : "");
+  box.dataset.card = card.target;
+  box.style.cssText =
+    `left:${boxLeft(card) * S}px;top:${boxTop(card) * S}px;` +
+    `width:${card.w * S}px;height:${card.h * S}px`;
+  if (!step) return box;
+
+  const preset = ENDPOINTS.find(item => item.id === step.endpoint);
+  const known = (step.choices || []).filter(choice => choice.known);
+  const chosen = known.find(
+    choice => choice.provider === step.provider && choice.id === step.model
+  );
+  const listed = preset ? preset.models.includes(step.model) : Boolean(chosen);
+
+  const endpoint = document.createElement("select");
+  endpoint.dataset.step = step.id;
+  endpoint.dataset.kind = "endpoint";
+  for (const name of ["anthropic", "openai"]) {
+    endpoint.appendChild(option(
+      name,
+      `first-party (${name === "anthropic" ? "Anthropic" : "OpenAI"})`,
+      !preset && step.provider === name,
+    ));
+  }
+  for (const item of ENDPOINTS) {
+    endpoint.appendChild(option(
+      item.id,
+      item.label + (item.verified ? "" : " (unverified)"),
+      item.id === step.endpoint,
+    ));
+  }
+  if (preset) {
+    endpoint.title = `${preset.base_url} · ` +
+      (preset.key_env ? `key from ${preset.key_env}` : "no credential required");
+  }
+  place(box, card, card.fields[0].slot, endpoint, "ctl");
+
+  const model = document.createElement("select");
+  model.dataset.step = step.id;
+  model.dataset.kind = "model";
+  if (preset) {
+    // A third-party endpoint serves its own models, so the first-party
+    // catalogue and its thinking levels do not apply here.
+    for (const name of preset.models) {
+      model.appendChild(option(name, name, name === step.model));
+    }
+  } else {
+    // Seeded by the endpoint: a first-party endpoint is one provider, so
+    // only that provider's catalogue belongs in the list.
+    for (const choice of known.filter(item => item.provider === step.provider)) {
+      model.appendChild(option(choice.id, choice.label, choice.id === step.model));
+    }
+  }
+  model.appendChild(option("__custom__", "custom…", !listed));
+  place(box, card, card.fields[1].slot, model, "ctl");
+
+  const thinking = document.createElement("select");
+  thinking.dataset.step = step.id;
+  thinking.dataset.kind = "thinking";
+  const levels = preset ? [] : (chosen ? chosen.thinking_levels : []);
+  if (levels.length) {
+    for (const level of levels) {
+      thinking.appendChild(option(level, level, level === step.thinking));
+    }
+  } else {
+    thinking.appendChild(option(
+      "",
+      preset ? "endpoint's" : (chosen ? "unavailable" : "manual setup"),
+    ));
+    thinking.disabled = true;
+  }
+  place(box, card, card.fields[2].slot, thinking, "ctl");
+
+  // Naming a model by hand still needs somewhere to type it. The bottom row
+  // gives up its thinking picker -- which a hand-named model cannot offer
+  // anyway -- and model and identifier share the row.
+
+  const custom = document.createElement("input");
+  custom.type = "text";
+  custom.dataset.step = step.id;
+  custom.dataset.kind = "custom";
+  custom.placeholder = "exact identifier";
+  custom.value = listed ? "" : step.model;
+  place(box, card, card.fields[1].slot, custom, "ctl");
+
+  box.dataset.custom = String(!listed);
+  layoutRow(box, card, !listed);
+  return box;
+}
+
+// The bottom row in its two states: model and thinking as drawn, or model
+// and a typed identifier sharing the row while a model is named by hand.
+function layoutRow(box, card, custom) {
+  const model = box.querySelector('select[data-kind="model"]');
+  const typed = box.querySelector('input[data-kind="custom"]');
+  const thinking = box.querySelector('select[data-kind="thinking"]');
+  const label = document.querySelector(
+    `[data-field-label="${card.target}:THINKING"]`
+  );
+  if (!model) return;
+  const gap = 4;
+  const [x, y, , h] = card.fields[1].slot;
+  const full = card.fields[0].slot[2];
+
+  const put = (node, left, width) => {
+    node.style.left = `${(x + left - boxLeft(card)) * S}px`;
+    node.style.top = `${(y - boxTop(card)) * S}px`;
+    node.style.width = `${width * S}px`;
+    node.style.height = `${h * S}px`;
+    node.style.display = "block";
+  };
+
+  if (custom) {
+    const room = full - gap;
+    put(model, 0, room * 0.42);
+    put(typed, room * 0.42 + gap, room * 0.58);
+    if (thinking) thinking.style.display = "none";
+    if (label) label.style.opacity = "0";
+  } else {
+    put(model, 0, card.fields[1].slot[2]);
+    typed.style.display = "none";
+    if (thinking) thinking.style.display = "block";
+    if (label) label.style.opacity = "";
+  }
+}
+
+// What a card stands for, worded for the legend rather than for a step.
+function cardTip(card) {
+  if (card.kind === "setting") {
+    const setting = SETTINGS.find(entry => entry.id === card.target);
+    if (!setting) return "";
+    return `<b>${esc(setting.label)}</b>${esc(setting.description)}`;
+  }
+  const step = roles[card.target];
+  if (!step) return "";
+  const count = stepsUsing(card.target);
+  const shared = count > 1
+    ? ` The ${count} highlighted steps share this role and change together.`
+    : "";
+  const access = step.access ? ` Access: ${esc(step.access)}.` : "";
+  return `<b>${esc(step.title)}</b>${esc(step.summary)}${shared}${access}`;
+}
+
+// A hover target over the card's mark, so the legend explains each role
+// and lights up the steps that run it.
+function cardMarkHot(card) {
+  const detail = cardTip(card);
+  if (!detail) return null;
+  const [, , iw, ih] = card.icon ? card.icon.box : [0, 0, 1, 1];
+  const factor = CHART.iconSize / Math.sqrt(iw * ih);
+  const inset = CHART.iconInset;
+  const hot = document.createElement("div");
+  hot.className = "hot has-tip";
+  hot.tabIndex = 0;
+  hot.style.cssText =
+    `left:${(card.x + card.w / 2 - inset - iw * factor - 2) * S}px;` +
+    `top:${(card.y - card.h / 2 + inset - 2) * S}px;` +
+    `width:${(iw * factor + 4) * S}px;height:${(ih * factor + 4) * S}px`;
+  const bubble = document.createElement("div");
+  bubble.className = "tip flip-x" +
+    (card.y > CHART.height * 0.5 ? " flip-y" : "");
+  bubble.innerHTML = detail;
+  hot.appendChild(bubble);
+  hot.addEventListener("mouseenter", () => {
+    if (!pinned) hoverCard(card.target);
+  });
+  hot.addEventListener("mouseleave", () => {
+    if (!pinned) applyHighlight(null);
+  });
+  hot.addEventListener("focusin", () => {
+    if (!pinned) hoverCard(card.target);
+  });
+  hot.addEventListener("focusout", event => {
+    if (!pinned && !hot.contains(event.relatedTarget)) applyHighlight(null);
+  });
+  return hot;
+}
+
+function cardControls(card) {
+  return card.kind === "setting" ? settingControls(card) : roleControls(card);
+}
+
+function renderLegend(canvas) {
+  for (const card of CHART.legend.cards) {
+    canvas.appendChild(cardControls(card));
+    const mark = cardMarkHot(card);
+    if (mark) canvas.appendChild(mark);
+  }
+}
+
+// One card's controls depend on its endpoint, so only that card is rebuilt.
+function replaceCard(target) {
+  const card = CHART.legend.cards.find(entry => entry.target === target);
+  const existing = document.querySelector(`.cardctl[data-card="${target}"]`);
+  if (!card || !existing) return;
+  existing.replaceWith(cardControls(card));
+}
+
+function render() {
+  host.style.background = CHART.background;
+  const canvas = document.createElement("div");
+  canvas.className = "canvas";
+  canvas.style.cssText =
+    `width:${CHART.width * S}px;height:${CHART.height * S}px;` +
+    `background:${CHART.background}`;
+
+  const art = element("svg", {
+    class: "art", viewBox: `0 0 ${CHART.width} ${CHART.height}`,
+    width: CHART.width * S, height: CHART.height * S,
+    "font-family": CHART.font,
+  });
+
+  // A wire passing under a caption is faded out behind it rather than
+  // crossing it, exactly as the drawing does.
+  const defs = element("defs", {});
+  // Filters work in linear light by default, so a blurred patch of the
+  // background comes back a different colour and prints as a pale box.
+  // Blurring in sRGB keeps it the same colour it started as.
+  const soften = element("filter", {
+    id: "soften", x: "-50%", y: "-100%", width: "200%", height: "300%",
+    "color-interpolation-filters": "sRGB",
+  });
+  soften.appendChild(element("feGaussianBlur", { stdDeviation: "1.6" }));
+  defs.appendChild(soften);
+  // A gentler version, for a caption too hemmed in to carry the usual fade.
+  const gentler = element("filter", {
+    id: "soften-more", x: "-60%", y: "-160%", width: "220%", height: "420%",
+    "color-interpolation-filters": "sRGB",
+  });
+  gentler.appendChild(element("feGaussianBlur", { stdDeviation: "2.8" }));
+  defs.appendChild(gentler);
+  art.appendChild(defs);
+
+  const caption = link => {
+    for (const line of link.lines || []) {
+      const key = `${link.from}>${link.to}`;
+      const patch = halo(line, CHART.wireSize);
+      patch.setAttribute("data-edge", key);
+      art.appendChild(patch);
+      const words = textRun(line, CHART.wireSize, CHART.wire, "middle", false);
+      words.setAttribute("data-edge", key);
+      art.appendChild(words);
+    }
+  };
+  // A caption marked to sit behind is drawn first, so the loop border and
+  // the box it runs into both cover it; the rest keep their place above.
+  for (const link of CHART.edges) if (link.back) caption(link);
+
+  const loopBorder = panel(CHART.cluster);
+  loopBorder.setAttribute("data-part", "cluster");
+  art.appendChild(loopBorder);
+  for (const link of CHART.edges) {
+    if (!link.d) continue;
+    const wire = element("path", { d: link.d, fill: CHART.wire });
+    wire.setAttribute("data-edge", `${link.from}>${link.to}`);
+    art.appendChild(wire);
+  }
+  const loopMark = element("path", {
+    d: CHART.loopMark.d, fill: CHART.loopMark.fill,
+  });
+  loopMark.setAttribute("data-part", "loop");
+  art.appendChild(loopMark);
+
+  for (const node of CHART.nodes) {
+    const group = element("g", { "data-node": node.id });
+    group.appendChild(nodeShape(node));
+    for (const line of node.lines) {
+      group.appendChild(textRun(line, node.size, node.ink, "middle", true));
+    }
+    art.appendChild(group);
+  }
+
+  for (const link of CHART.edges) if (!link.back) caption(link);
+
+  const legend = CHART.legend;
+  art.appendChild(panel(legend.group));
+  for (const card of legend.cards) {
+    // One group per entry, so hovering a step can fade the entries that
+    // have nothing to do with it.
+    const entry = element("g", { "data-card": card.target });
+    art.appendChild(entry);
+    entry.appendChild(panel(card));
+    entry.appendChild(textRun(card.title, card.titleSize, card.ink, "start", false));
+    for (const field of card.fields) {
+      const drawn = textRun(
+        { t: field.label, x: field.x, y: field.y, w: field.w },
+        card.fieldSize, card.ink, "start", false,
+      );
+      drawn.setAttribute("data-field-label", `${card.target}:${field.label}`);
+      entry.appendChild(drawn);
+    }
+    if (card.icon) {
+      // The marks were drawn at different proportions, so matching one
+      // dimension would leave a wide one looking half the size of a tall
+      // one. Matching the area they cover is what reads as the same size.
+      const [ix, iy, iw, ih] = card.icon.box;
+      const side = CHART.iconSize;
+      const factor = side / Math.sqrt(iw * ih);
+      // One inset for every card, so the marks line up as a set rather
+      // than following each card's own inner rhythm.
+      const inset = CHART.iconInset;
+      const toX = card.x + card.w / 2 - inset - iw * factor;
+      const toY = card.y - card.h / 2 + inset;
+      const mark = element("g", {
+        transform: `translate(${toX - ix * factor} ${toY - iy * factor}) ` +
+          `scale(${factor})`,
+      });
+      mark.appendChild(element("path", { d: card.icon.d, fill: card.icon.fill }));
+      entry.appendChild(mark);
+    }
+  }
+  // The frame is drawn last so its border sits in front of the panel it
+  // encloses instead of disappearing behind it.
+  art.appendChild(panel(legend.frame));
+
+  art.appendChild(header());
+  canvas.appendChild(art);
+
+  // The steps light up their kin on hover; what a role actually does is
+  // explained by its mark in the legend instead.
+  for (const node of CHART.nodes) {
+    const hot = document.createElement("div");
+    hot.className = "hot";
+    hot.dataset.node = node.id;
+    hot.style.cssText =
+      `left:${boxLeft(node) * S}px;top:${boxTop(node) * S}px;` +
+      `width:${node.w * S}px;height:${node.h * S}px`;
+    hot.addEventListener("mouseenter", () => {
+      if (!pinned) hoverNode(node.id);
+    });
+    hot.addEventListener("mouseleave", () => {
+      if (!pinned) applyHighlight(null);
+    });
+    hot.addEventListener("click", event => {
+      event.stopPropagation();
+      pinned = pinned === node.id ? null : node.id;
+      if (pinned) hoverNode(node.id, true);
+      else hoverNode(node.id);
+    });
+    canvas.appendChild(hot);
+  }
+
+  renderLegend(canvas);
+
+  // Clicking the drawing itself releases a pin; the legend does not, so a
+  // pinned step survives while its model is changed.
+  canvas.addEventListener("click", event => {
+    if (event.target.closest(".cardctl") || event.target.closest(".hot")) return;
+    if (!pinned) return;
+    pinned = null;
+    applyHighlight(null);
+  });
+
+  const bar = document.createElement("div");
+  bar.className = "actionbar";
+  const box = CHART.actions;
+  bar.style.cssText =
+    `right:${(CHART.width - box.x) * S}px;top:${box.y * S}px;` +
+    `height:${box.h * S}px;font-size:${box.h * 0.44 * S}px`;
+  for (const button of [...document.querySelectorAll(".actions .btn")]) {
+    bar.appendChild(button);
+  }
+  canvas.appendChild(bar);
+
+  const frame = document.createElement("div");
+  frame.className = "canvasfit";
+  frame.appendChild(canvas);
+  host.appendChild(frame);
+  // Measured only once the canvas is in the document, or the buttons have
+  // no width yet and the note would be left running underneath them.
+  fitHeaderNote(canvas);
+  fitCanvas();
+  let pending = false;
+  window.addEventListener("resize", () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; fitCanvas(); });
+  });
+}
+
+// The drawing takes whatever room the tab has left once the page's own
+// furniture is measured, so nothing ever needs scrolling to be seen.
+function fitCanvas() {
+  const frame = document.querySelector(".canvasfit");
+  const canvas = frame.firstChild;
+  const width = CHART.width * S;
+  const height = CHART.height * S;
+  // The chart's box is whatever the column layout leaves it, so the two
+  // measurements below are already free of the page's own furniture.
+  const scale = Math.max(0.2, Math.min(
+    host.clientWidth / width,
+    host.clientHeight / height,
+  ));
+  canvas.style.transform = `scale(${scale})`;
+  frame.style.width = `${width * scale}px`;
+  frame.style.height = `${height * scale}px`;
+}
+
+// How far each step is from the chart's entry, which is the first one
+// listed, and which wires arrive at each step. Between them these give
+// every shortest way in, not merely one of them.
+const INTO = new Map();
+for (const link of CHART.edges) {
+  if (!INTO.has(link.to)) INTO.set(link.to, []);
+  INTO.get(link.to).push(link);
+}
+const ENTRY = CHART.nodes.length ? CHART.nodes[0].id : null;
+const DEPTH = new Map(ENTRY === null ? [] : [[ENTRY, 0]]);
+for (let frontier = [ENTRY]; frontier.length; ) {
+  const next = [];
+  for (const at of frontier) {
+    for (const link of CHART.edges) {
+      if (link.from !== at || DEPTH.has(link.to)) continue;
+      DEPTH.set(link.to, DEPTH.get(at) + 1);
+      next.push(link.to);
+    }
+  }
+  frontier = next;
+}
+const ROUTES = new Map();
+
+// The steps the loop's border is drawn around, taken from the border
+// itself rather than listed again, so moving a box in the drawing cannot
+// leave the two disagreeing.
+const ENCLOSED = new Set(
+  (CHART.cluster ? CHART.nodes : []).filter(node =>
+    boxLeft(node) >= boxLeft(CHART.cluster) &&
+    node.x + node.w / 2 <= CHART.cluster.x + CHART.cluster.w / 2 &&
+    boxTop(node) >= boxTop(CHART.cluster) &&
+    node.y + node.h / 2 <= CHART.cluster.y + CHART.cluster.h / 2
+  ).map(node => node.id)
+);
+
+// Every shortest way in, as the steps and the wires they use. Where two
+// branches rejoin -- a diff can arrive from either worker -- both are
+// shown, because naming one of them would be a claim the chart does not
+// make. A step with no way in is its own route.
+function routeTo(nodeId) {
+  if (ROUTES.has(nodeId)) return ROUTES.get(nodeId);
+  const found = { nodes: new Set([nodeId]), edges: new Set() };
+  if (DEPTH.has(nodeId)) {
+    const pending = [nodeId];
+    while (pending.length) {
+      const at = pending.pop();
+      for (const link of INTO.get(at) || []) {
+        if (DEPTH.get(link.from) !== DEPTH.get(at) - 1) continue;
+        found.edges.add(`${link.from}>${link.to}`);
+        if (found.nodes.has(link.from)) continue;
+        found.nodes.add(link.from);
+        pending.push(link.from);
+      }
+    }
+  }
+  ROUTES.set(nodeId, found);
+  return found;
+}
+
+// A step can be pinned so the highlight survives the trip to the legend
+// entry that configures it; until then hovering rules.
+let pinned = null;
+
+// One rule for the whole drawing: whatever the gesture names stays lit and
+// everything else recedes, the loop's border and its mark included.
+function applyHighlight(state, sweep) {
+  const engaged = Boolean(state);
+  const fade = (part, keep) => part.classList.toggle("dim", engaged && !keep);
+  document.querySelectorAll(".art .sweep").forEach(part => {
+    part.classList.remove("sweep");
+    part.style.animationDelay = "";
+  });
+
+  document.querySelectorAll(".art g[data-node]").forEach(group => {
+    const id = group.dataset.node;
+    fade(group, engaged && state.nodes.has(id));
+    group.classList.toggle("self", engaged && state.self === id);
+  });
+  document.querySelectorAll(".art [data-edge]").forEach(part => {
+    fade(part, engaged && state.edges.has(part.dataset.edge));
+  });
+  document.querySelectorAll(".art [data-part]").forEach(part => {
+    fade(part, engaged && state.parts.has(part.dataset.part));
+  });
+  document.querySelectorAll("[data-card]").forEach(part => {
+    fade(part, engaged && state.cards.has(part.dataset.card));
+  });
+
+  // Pinning runs a light along the route, leaving the entry and arriving at
+  // the step just pinned, so the way in reads in the order it happens.
+  if (!sweep || !engaged) return;
+  const step = 70;
+  const mark = (part, depth) => {
+    part.style.animationDelay = `${Math.max(0, depth) * step}ms`;
+    part.classList.add("sweep");
+  };
+  document.querySelectorAll(".art g[data-node]").forEach(part => {
+    if (state.nodes.has(part.dataset.node)) {
+      mark(part, depthOf(part.dataset.node));
+    }
+  });
+  document.querySelectorAll(".art [data-edge]").forEach(part => {
+    if (state.edges.has(part.dataset.edge)) {
+      mark(part, depthOf(part.dataset.edge.split(">")[1]) - 0.5);
+    }
+  });
+}
+
+// How far along the route something sits. Steps the chart leaves unwired
+// take their place from the loop's own order instead.
+function depthOf(nodeId) {
+  if (DEPTH.has(nodeId)) return DEPTH.get(nodeId);
+  const loop = CHART.loop;
+  const at = loop ? loop.steps.indexOf(nodeId) : -1;
+  if (at > 0 && DEPTH.has(loop.steps[0])) return DEPTH.get(loop.steps[0]) + at;
+  return 0;
+}
+
+// Pointing at a step lights the shortest way to it. The legend shows only
+// what configures that step itself, not everything met along the way.
+function hoverNode(nodeId, sweep) {
+  const route = routeTo(nodeId);
+  const nodes = new Set(route.nodes);
+  const edges = new Set(route.edges);
+
+  // Inside the plan-review loop the order is a prerequisite, not a path:
+  // reaching a later step means the earlier ones have happened, and the
+  // cycle's own captions belong to them.
+  const loop = CHART.loop;
+  if (loop) {
+    let reached = loop.steps.indexOf(nodeId);
+    if (reached < 0 && loop.after.includes(nodeId)) {
+      reached = loop.steps.length - 1;
+    }
+    if (reached >= 0) {
+      for (const id of routeTo(loop.steps[0]).nodes) nodes.add(id);
+      for (const key of routeTo(loop.steps[0]).edges) edges.add(key);
+      for (const step of loop.steps.slice(0, reached + 1)) {
+        nodes.add(step);
+        for (const key of loop.captions[step] || []) edges.add(key);
+      }
+    }
+  }
+
+  const node = CHART.nodes.find(entry => entry.id === nodeId);
+  const cards = new Set(node ? node.roles : []);
+  for (const setting of SETTINGS) {
+    if (setting.node === nodeId) cards.add(setting.id);
+  }
+  applyHighlight({
+    nodes, edges, cards, parts: loopParts(nodes), self: nodeId,
+  }, sweep);
+}
+
+// The border belongs to the loop as a whole; the mark belongs to the step
+// that counts the rounds.
+function loopParts(nodes) {
+  const parts = new Set();
+  if ([...nodes].some(id => ENCLOSED.has(id))) parts.add("cluster");
+  if (CHART.loop && nodes.has(CHART.loop.mark)) parts.add("loop");
+  return parts;
+}
+
+// Pointing at a legend entry lights the steps it configures. No single
+// route is implied, so the wires stay out of it.
+function hoverCard(target) {
+  const setting = SETTINGS.find(entry => entry.id === target);
+  const nodes = new Set(
+    setting
+      ? [setting.node]
+      : CHART.nodes
+          .filter(node => node.roles.includes(target))
+          .map(node => node.id)
+  );
+  applyHighlight({
+    nodes, edges: new Set(), cards: new Set([target]),
+    parts: loopParts(nodes), self: null,
+  });
+}
+
+// Several steps run one role, so every control for that role moves
+// together; the change is visible rather than hidden.
+function choiceFor(roleId, provider, model) {
+  return (roles[roleId].choices || []).find(
+    choice => choice.known &&
+      choice.provider === provider && choice.id === model
+  );
+}
+
+function selectThinking(select, roleId, provider, model, preferred) {
+  const choice = choiceFor(roleId, provider, model);
+  const levels = choice ? choice.thinking_levels : [];
+  select.replaceChildren();
+  if (!levels.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = choice ? "unavailable" : "manual setup";
+    select.appendChild(option);
+    select.disabled = true;
+    return null;
+  }
+  const remembered = preferred ||
+    (provider === roles[roleId].provider &&
+     model === roles[roleId].model ? roles[roleId].thinking : "");
+  const chosen = levels.includes(remembered)
+    ? remembered
+    : (choice.default_thinking || levels[0]);
+  for (const level of levels) {
+    const option = document.createElement("option");
+    option.value = level;
+    option.textContent = level;
+    option.selected = level === chosen;
+    select.appendChild(option);
+  }
+  select.disabled = false;
+  return chosen;
+}
+
+function syncRole(roleId, provider, model, preferredThinking) {
+  const preset = ENDPOINTS.some(item => item.id === endpointChoice(roleId));
+  const known = preset || Boolean(choiceFor(roleId, provider, model));
+  document.querySelectorAll(
+    `select[data-step="${roleId}"][data-kind="model"]`
+  ).forEach(select => {
+    select.value = known ? model : "__custom__";
+    const box = select.closest(".cardctl");
+    const card = CHART.legend.cards.find(
+      entry => entry.target === box.dataset.card
+    );
+    if (card) layoutRow(box, card, select.value === "__custom__");
+  });
+  document.querySelectorAll(`input[data-step="${roleId}"][data-kind="custom"]`)
+    .forEach(input => {
+      if (!known && input.value !== model) input.value = model;
+    });
+  document.querySelectorAll(
+    `select[data-step="${roleId}"][data-kind="thinking"]`
+  ).forEach(select => selectThinking(
+    select, roleId, provider, model, preferredThinking
+  ));
+}
+
+// The endpoint control carries both meanings: a named third-party endpoint,
+// or which first-party provider the role talks to.
+function endpointChoice(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="endpoint"]`
+  );
+  return select ? select.value : "";
+}
+
+function currentEndpoint(id) {
+  const value = endpointChoice(id);
+  return ENDPOINTS.some(item => item.id === value) ? value : "";
+}
+
+function currentProvider(id) {
+  const value = endpointChoice(id);
+  const preset = ENDPOINTS.find(item => item.id === value);
+  return preset ? preset.adapter : value;
+}
+
+function currentModel(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="model"]`
+  );
+  if (!select) return "";
+  if (select.value !== "__custom__") return select.value;
+  const custom = select.parentNode.querySelector('input[data-kind="custom"]');
+  return custom ? custom.value.trim() : "";
+}
+
+function currentThinking(id) {
+  const select = document.querySelector(
+    `select[data-step="${id}"][data-kind="thinking"]`
+  );
+  return !select || select.disabled ? null : select.value;
+}
+
+function currentSetting(id) {
+  const select = document.querySelector(`select[data-setting="${id}"]`);
+  return select ? Number(select.value) : null;
+}
+
+function changes() {
+  const out = {};
+  for (const id of Object.keys(original)) {
+    const endpoint = currentEndpoint(id);
+    const model = currentModel(id);
+    const thinking = currentThinking(id);
+    if (endpoint) {
+      const preset = ENDPOINTS.find(item => item.id === endpoint);
+      if (!model || !preset) continue;
+      if (
+        endpoint !== original[id].endpoint ||
+        model !== original[id].model ||
+        preset.adapter !== original[id].provider
+      ) {
+        out[id] = {endpoint, model, provider: preset.adapter};
+      }
+      continue;
+    }
+    const provider = currentProvider(id);
+    if (original[id].endpoint) {
+      // Leaving an endpoint always counts as a change, even when the
+      // model text happens to be unchanged.
+      if (provider && model) {
+        out[id] = {endpoint: "", provider, model};
+        if (thinking !== null) out[id].thinking = thinking;
+      }
+      continue;
+    }
+    if (
+      provider && model &&
+      (provider !== original[id].provider ||
+       model !== original[id].model ||
+       (thinking !== null && thinking !== original[id].thinking))
+    ) {
+      out[id] = {provider, model};
+      if (thinking !== null) out[id].thinking = thinking;
+    }
+  }
+  for (const setting of SETTINGS) {
+    const value = currentSetting(setting.id);
+    if (value !== null && value !== originalSettings[setting.id]) {
+      out[setting.id] = { value };
+    }
+  }
+  return out;
+}
+
+async function post(endpoint, body) {
+  if (DEMO) {
+    return { error:
+      "This is a static demo, so nothing can be previewed or applied. " +
+      "Run orrery-config locally to change the configuration." };
+  }
+  const response = await fetch(TOKEN_PATH + endpoint, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return response.json();
+}
+
+document.addEventListener("input", event => {
+  const data = event.target.dataset || {};
+  if (data.step && (data.kind === "custom" || data.kind === "provider")) {
+    syncRole(
+      data.step,
+      currentProvider(data.step),
+      currentModel(data.step),
+      currentThinking(data.step)
+    );
+  }
+  applyButton.disabled = true;
+});
+
+document.addEventListener("change", event => {
+  const data = event.target.dataset || {};
+  if (data.kind === "endpoint" && data.step) {
+    // The card's whole shape depends on the endpoint, so rebuild it from
+    // a state copy carrying the new selection.
+    const step = STATE.find(entry => entry.id === data.step);
+    if (step) {
+      const preset = ENDPOINTS.find(item => item.id === event.target.value);
+      if (preset) {
+        step.endpoint = preset.id;
+        step.provider = preset.adapter;
+        if (!preset.models.includes(step.model) && preset.models.length) {
+          step.model = preset.models[0];
+        }
+      } else {
+        // A first-party provider: the role keeps its own model when that
+        // provider serves it, and otherwise takes that provider's first.
+        const initial = original[data.step];
+        const catalogue = (step.choices || []).filter(
+          choice => choice.known && choice.provider === event.target.value
+        );
+        step.endpoint = "";
+        step.provider = event.target.value;
+        const same = initial.provider === step.provider && !initial.endpoint;
+        step.model = same
+          ? initial.model
+          : (catalogue.length ? catalogue[0].id : step.model);
+        step.thinking = same
+          ? initial.thinking
+          : (catalogue.length ? catalogue[0].default_thinking || "" : "");
+      }
+      replaceCard(data.step);
+      applyButton.disabled = true;
+      return;
+    }
+  }
+  if (data.kind === "model") {
+    const box = event.target.closest(".cardctl");
+    const card = box && CHART.legend.cards.find(
+      entry => entry.target === box.dataset.card
+    );
+    if (card) layoutRow(box, card, event.target.value === "__custom__");
+  }
+  if (data.step) {
+    syncRole(
+      data.step,
+      currentProvider(data.step),
+      currentModel(data.step),
+      currentThinking(data.step)
+    );
+  }
+  applyButton.disabled = true;
+});
+
+document.getElementById("preview").addEventListener("click", async () => {
+  const body = changes();
+  if (!Object.keys(body).length) {
+    result.innerHTML = "<p>No changes to preview.</p>"; return;
+  }
+  const reply = await post("preview", body);
+  if (reply.error) {
+    result.innerHTML = `<p class="err">${esc(reply.error)}</p>`; return;
+  }
+  if (!reply.edits.length) {
+    result.innerHTML = "<p>Everything already matches.</p>"; return;
+  }
+  result.innerHTML = "<h3>Exactly this will change:</h3>" +
+    reply.edits.map(e => `<pre>${esc(e.diff)}</pre>`).join("");
+  applyButton.disabled = false;
+});
+
+applyButton.addEventListener("click", async () => {
+  applyButton.disabled = true;
+  const reply = await post("apply", changes());
+  if (reply.error) {
+    result.innerHTML = `<p class="err">${esc(reply.error)}</p>`; return;
+  }
+  const doctor = reply.doctor_pass === null ? "" :
+    `<h3>Doctor: <span class="${reply.doctor_pass ? "ok" : "err"}">` +
+    `${reply.doctor_pass ? "READY" : "attention needed"}</span></h3>` +
+    `<pre>${esc(reply.doctor_tail)}</pre>`;
+  result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
+    doctor +
+    '<p class="note">Reload to edit further; the kit repository now holds these values, ready to commit.</p>';
+});
+
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && pinned) {
+    pinned = null;
+    applyHighlight(null);
+  }
+});
+
+document.getElementById("revert").addEventListener("click", () => location.reload());
+
+const revokeStanding = document.getElementById("revoke-standing");
+if (revokeStanding) {
+  revokeStanding.addEventListener("click", async () => {
+    revokeStanding.disabled = true;
+    const reply = await post("revoke", {});
+    if (reply.error) {
+      result.innerHTML = `<p class="err">${esc(reply.error)}</p>`;
+      revokeStanding.disabled = false;
+      return;
+    }
+    location.reload();
+  });
+}
+
+render();
+</script>
+</body>
+</html>
