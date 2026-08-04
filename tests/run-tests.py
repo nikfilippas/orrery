@@ -272,6 +272,27 @@ def provider_binaries_on_path() -> Iterator[Path]:
         os.environ["PATH"] = saved
 
 
+_HOST_ENFORCES_CONFINEMENT: bool | None = None
+
+
+def host_enforces_confinement() -> bool:
+    """Whether this host can enforce the delegate confinement at all.
+
+    A runner that restricts unprivileged user namespaces accepts the unit
+    and then silently drops its sandbox. The wrapper measures that and
+    refuses to run rather than claim a guarantee it cannot keep, so a
+    suite on such a host has to opt in exactly as its operator would.
+    Probed once, because each probe is a transient unit.
+    """
+    global _HOST_ENFORCES_CONFINEMENT
+    if _HOST_ENFORCES_CONFINEMENT is None:
+        with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+            _HOST_ENFORCES_CONFINEMENT = review_module.read_only_paths_enforced(
+                Path(directory)
+            )
+    return _HOST_ENFORCES_CONFINEMENT
+
+
 def review_environment(
     mode: str,
     marker: Path | None = None,
@@ -300,6 +321,11 @@ def review_environment(
         standing_state = Path(tempfile.mkdtemp(prefix="kit-standing."))
         STATE_DIRS.append(str(standing_state))
     environment["XDG_STATE_HOME"] = str(standing_state)
+    if not host_enforces_confinement():
+        # Only where the guarantee is unavailable, so a host that can
+        # enforce still proves the wrapper refuses when it cannot. Tests
+        # of the refusal itself remove this again.
+        environment["ORRERY_ALLOW_UNCONFINED"] = "1"
     return environment
 
 
@@ -2233,6 +2259,14 @@ def test_wrapper_keeps_state_when_stop_fails() -> None:
     try:
         os.environ["PATH"] = environment["PATH"]
         os.environ["CODEX_FAKE_MODE"] = "success"
+        # This one runs main() in process rather than as a subprocess, so
+        # it has to carry across the opt-in the prepared environment holds
+        # on a host that cannot enforce confinement. Without it the run is
+        # refused before it ever reaches the stop this test is about.
+        if "ORRERY_ALLOW_UNCONFINED" in environment:
+            os.environ["ORRERY_ALLOW_UNCONFINED"] = environment[
+                "ORRERY_ALLOW_UNCONFINED"
+            ]
         review_module.stop_unit = refuse
         review_module.PROGRAM_NAME = "orrery-review"
         sys.argv = ["orrery-review", "--timeout", "60", "--", "prompt"]
@@ -9908,6 +9942,9 @@ def test_read_only_refuses_nested_grant() -> None:
         receipts.mkdir(parents=True)
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         environment = review_environment("success")
+        # The refusal is what is being tested, so the escape that would
+        # wave it through has to go, whatever the host can enforce.
+        environment.pop("ORRERY_ALLOW_UNCONFINED", None)
         process = start_review(
             environment,
             "--receipts",
@@ -9920,10 +9957,17 @@ def test_read_only_refuses_nested_grant() -> None:
         )
         _stdout, stderr = finish_review(process, environment)
         require(
-            process.returncode == 1 and "granted inside read-only" in stderr,
+            process.returncode == 1 and "ORRERY_ALLOW_UNCONFINED=1" in stderr,
             f"a writable pocket of the reviewed tree was accepted: "
             f"{process.returncode}; {stderr[-600:]}",
         )
+        if host_enforces_confinement():
+            # Where the allowlist itself cannot be enforced the general
+            # refusal fires first, and its reason is the honest one.
+            require(
+                "granted inside read-only" in stderr,
+                f"the refusal did not name the nested grant: {stderr[-400:]}",
+            )
 
 
 @test("a read-only role refuses a workspace a grant names outright")
@@ -9940,6 +9984,7 @@ def test_read_only_workspace_equal_to_a_grant() -> None:
         workspace.mkdir()
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         environment = review_environment("success")
+        environment.pop("ORRERY_ALLOW_UNCONFINED", None)
         # The receipts directory is granted for every role, so pointing it
         # at the workspace makes a grant name it exactly.
         process = start_review(
@@ -9954,11 +9999,15 @@ def test_read_only_workspace_equal_to_a_grant() -> None:
         )
         _stdout, stderr = finish_review(process, environment)
         require(
-            process.returncode == 1
-            and "cannot be mapped read-only" in stderr,
+            process.returncode == 1 and "ORRERY_ALLOW_UNCONFINED=1" in stderr,
             f"a contradictory grant was accepted: {process.returncode}; "
             f"{stderr[-600:]}",
         )
+        if host_enforces_confinement():
+            require(
+                "cannot be mapped read-only" in stderr,
+                f"the refusal did not name the contradiction: {stderr[-400:]}",
+            )
 
 
 @test("delegated environments drop session sockets")

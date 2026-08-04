@@ -738,7 +738,12 @@ The maintained artefacts are:
   on a real runner.
 - `.github/workflows/ci.yml` — lint and suite on push and pull request. The
   suite needs a systemd user manager, so the job enables lingering before it
-  runs.
+  runs. A hosted runner restricts unprivileged user namespaces, so it accepts
+  the sandbox and silently drops it; the wrapper measures that and refuses to
+  run, and the suite therefore opts in with `ORRERY_ALLOW_UNCONFINED=1` on any
+  host that cannot enforce, exactly as an operator there would have to. The
+  confinement assertions skip themselves on such a host rather than pretending,
+  so CI proves everything except the containment itself.
 
 ## Troubleshooting
 
