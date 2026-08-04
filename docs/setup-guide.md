@@ -649,6 +649,10 @@ The maintained artefacts are:
   any size and cost 56KB between them. The banner embeds the mark, so the
   two cannot disagree.
 - `docs/setup-guide.md` — this operational reference.
+- `docs/.nojekyll` — serves this directory verbatim on GitHub Pages.
+  Pages runs Jekyll by default, which would try to render Liquid tags in
+  the exported page; it has none today, but the page is generated and a
+  later edit should not be able to break the published copy silently.
 - `docs/config-demo.html` — the configuration page as a standalone file,
   written by `orrery-config --export`. It has no server behind it, so the
   model menus are frozen at the moment it was written and preview and
