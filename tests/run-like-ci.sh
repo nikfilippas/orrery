@@ -63,4 +63,6 @@ echo "  TMPDIR=$TMPDIR, no init.defaultBranch, no provider CLIs on PATH"
 echo "  (confinement enforcement is not simulated; see the comment above)"
 echo
 
-exec "$kit/tests/run-tests.py" "$@"
+# Not exec: replacing the shell image skips the EXIT trap above, which
+# left the temporary git configuration behind on every run.
+"$kit/tests/run-tests.py" "$@"
