@@ -30,6 +30,11 @@ single-provider session and says so.
   read-only reviewer sessions; objections are classified blocking or
   advisory, the loop is capped, and deadlocks escalate to you instead of
   iterating to agreement.
+- **Findings that outlive the reviewer.** A task review returns a
+  schema-validated document, not a paragraph. Findings need evidence, an
+  implementer may answer one but never close it, and a task cannot merge
+  while a blocking finding is unresolved, including after rework and a
+  later clean review.
 - **Enforced containment, not promised containment.** Read-only roles
   run inside a service unit whose workspace mapping is enforced by the
   kernel and probed before every run; where the guarantee cannot be

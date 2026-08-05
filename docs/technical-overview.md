@@ -291,6 +291,7 @@ orrery-task run T-1
 orrery-task status
 orrery-task show T-1
 orrery-task verify T-1
+orrery-task review T-1
 orrery-task merge T-1
 orrery-task close T-1
 orrery-task cancel T-1 --discard
@@ -299,6 +300,75 @@ orrery-task resume
 
 The ledger under `.orrery/` is authoritative and is excluded from
 tracking by default.
+
+### Structured review
+
+A contract carrying `"review": true` does not walk from verification to
+the merge gate on its own. It stops at a review, and the review is an
+artefact with the same standing as the evidence packet rather than a
+paragraph somebody reads.
+
+The reviewer is asked for a JSON document and the provider is made to
+enforce the shape: `--output-schema` for Codex, `--json-schema` for
+Claude. The runner then validates the reply itself, because a provider
+that ignores the flag must not pass silently, and a document that does
+not validate is retried once with the validator's exact complaint
+appended, so a sound judgement in the wrong shape is not thrown away.
+
+Each finding is `blocking` or `advisory`, the vocabulary the plan-review
+loop already uses. A blocking finding must carry evidence, either a file
+and line range that exists in the reviewed tree or a command that
+reproduces the defect; one that cannot support itself is recorded as
+advisory with the reason, rather than the whole review being discarded.
+A reviewer's own confidence may be recorded and never reaches the gate,
+because a model's estimate of itself is a claim like any other.
+
+**The gate reads findings, not verdicts.** A task may not merge while
+any finding ever recorded blocking lacks a resolution record. That
+distinction is the point of the phase: anchor on the latest verdict and
+one rework round sheds the objection, because a blind second reviewer is
+by construction never told the first one existed, returns clean, and the
+task merges with nothing fixed. Unresolved findings are therefore
+carried into every later review, and a re-review must account for each
+by identifier as `still_present`, `resolved` or `withdrawn`, with
+`resolved` held to the same evidence rule. Silence is not expressible.
+
+An implementer may respond to a finding and cannot close one. `fixed`
+and `withdrawn` require a re-review; `overridden` requires you, and a
+reason, and appears in the completion report.
+
+The reviewer runs in the task worktree with a packet built from the
+contract and the evidence, carrying the diff and the verification logs
+as content. It does not receive the implementer's account of its own
+work, and the dispatch commit no longer names the role that wrote it,
+because a reviewer runs `git log` unprompted. This removes the routes a
+reviewer would take without trying; a read-only mapping stops writes and
+not reads, so a determined delegate could still go looking, which is the
+read residual recorded under Leave No Trace.
+
+Every free-text field renders through the same filter applied to
+delegate stderr. A findings report is a better channel than stderr for a
+forged consent marker or a terminal escape, since you read it and act on
+it. The document is stored and hashed raw, so what the reviewer wrote is
+what the ledger anchors.
+
+Review states sit between verification and the gate:
+
+```text
+VERIFICATION_PASSED -> IN_REVIEW | AWAITING_MERGE
+IN_REVIEW           -> REVIEW_PASSED | REVIEW_BLOCKED | INTERRUPTED | CANCELLED
+REVIEW_BLOCKED      -> READY | REVIEW_PASSED | REVIEW_BLOCKED | CANCELLED
+```
+
+A contract without the key behaves exactly as it did before this
+existed.
+
+What the suite establishes, and what it does not: a real defect in a
+real diff, under a contract whose own verification passes over it,
+reaches the gate as a blocking finding and stops the merge. The findings
+in that corpus are supplied to a stub provider, so it demonstrates that
+the pipeline carries a judgement faithfully. Whether a live reviewer
+finds a defect it was shown is a separate, credit-spending test.
 
 ## Visual configuration
 
