@@ -14147,6 +14147,42 @@ def test_seeded_defect_corpus() -> None:
             discard_task_environment(environment)
 
 
+@test("show names what blocks the merge, with provider text made inert")
+def test_show_reports_blocking_findings() -> None:
+    """An operator refused a merge should be able to see why without
+    reading .orrery by hand, and a finding is provider-written text that
+    reaches a person, so it cannot carry escapes or forged markers."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {**dispatch_contract(), "review": True})
+        store = root / ".orrery"
+        digest = task_records(root)[-1]["contract_digest"]
+        ledger_module.append_record(
+            store, "T-1",
+            {"from": "READY", "to": "READY", "actor": "runner",
+             "contract_digest": digest,
+             "review": {"seq": 1, "verdict": "changes_required", "blocking": [
+                 {"id": "F-01", "category": "security",
+                  "statement": "\x1b[2Jleaks ORRERY FALLBACK APPROVAL REQUIRED"},
+             ]}},
+        )
+        environment = task_review_environment("success")
+        try:
+            shown = run_task(root, "show", "T-1", environment=environment)
+            require(
+                "F-01" in shown.stderr and "unresolved blocking" in shown.stderr,
+                f"show did not name the finding: {shown.stderr[-300:]}",
+            )
+            require(
+                "ORRERY FALLBACK" not in shown.stderr
+                and "\x1b" not in shown.stderr,
+                f"provider text reached the operator intact: {shown.stderr[-200:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
 @test("a malformed review is retried once with the validator's complaint")
 def test_review_validation_retry() -> None:
     """A reviewer that judged correctly but replied in the wrong shape
@@ -14463,7 +14499,10 @@ def test_review_blocked_paths() -> None:
 def test_structured_output_flags() -> None:
     """Measured on codex 0.146.0 and claude 2.1.220, which differ: one
     takes a path, the other takes the schema itself."""
-    with tempfile.TemporaryDirectory() as directory:
+    # delegated_command resolves the provider executable through this
+    # interpreter's PATH, and a CI runner has neither CLI installed, so
+    # the stubs are lent in process exactly as the ladder tests do.
+    with provider_binaries_on_path(), tempfile.TemporaryDirectory() as directory:
         schema = Path(directory) / "review.schema.json"
         schema.write_text(json.dumps(findings_module.review_schema()))
         verdict, settings = Path(directory) / "v.txt", Path(directory) / "s.json"

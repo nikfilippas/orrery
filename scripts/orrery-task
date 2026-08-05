@@ -1200,6 +1200,22 @@ def main(argv: list[str] | None = None) -> int:
                     indent=2,
                 )
             )
+            # Why a merge is refused should be readable here rather than
+            # only in .orrery/reviews. Every field is provider-derived
+            # text reaching a person, so it goes through the same filter
+            # the runner applies to delegate output.
+            outstanding = unresolved_blocking(records)
+            if outstanding:
+                print("\nunresolved blocking findings:", file=sys.stderr)
+                for finding in outstanding:
+                    print(
+                        "  "
+                        + orrery_findings.sanitise_provider_text(
+                            f"{finding['id']} ({finding.get('category', 'unknown')}) "
+                            f"{finding['statement']}"
+                        ),
+                        file=sys.stderr,
+                    )
             return 0
         if command == "status" and arguments in ([], ["--repair"]):
             if not store.exists():
