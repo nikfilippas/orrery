@@ -710,6 +710,13 @@ The maintained artefacts are:
 - `scripts/orrery`, `scripts/orrery_runtime.py`, and
   `scripts/orrery_fallback.py` — supervised principal launch, validated
   provider adapters, availability checks, ranking, and consent.
+- `scripts/orrery_findings.py` — the structured review: the findings
+  schema handed to a provider, the validator that trusts nothing a
+  provider returned, and the filter that renders provider text inert
+  before a person or a principal reads it. A blocking finding without
+  evidence, or citing a path absent from the reviewed tree, is downgraded
+  rather than discarding the review; a re-review must account for every
+  finding carried into it, so a finding cannot be closed by silence.
 - `scripts/orrery_standing.py` — standing fallback approvals: scoped,
   revocable prior consent recorded outside the repository.
 - `scripts/orrery-session-start` — direct Claude/Codex surface comparison and

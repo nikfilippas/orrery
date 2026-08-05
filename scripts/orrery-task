@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orrery_findings  # noqa: E402
 from orrery_fallback import git_workspace_fingerprint  # noqa: E402
 from orrery_ledger import (  # noqa: E402
     LedgerError,
@@ -41,7 +42,7 @@ LATER = frozenset()
 
 def usage() -> int:
     print(
-        "usage: orrery-task create|list|show|status|amend|run|verify|resume|merge|cancel|close", file=sys.stderr
+        "usage: orrery-task create|list|show|status|amend|run|verify|review|resume|merge|cancel|close", file=sys.stderr
     )
     return 2
 
@@ -56,14 +57,30 @@ def read_contract(path: str) -> dict:
     return value
 
 
+# Git here is local plumbing, but it still blocks indefinitely on a held
+# index.lock or a wedged filesystem, and a runner that waits forever is
+# the failure mode the wrapper already refuses to have: it bounds every
+# systemctl call and turns a hang into an error rather than a stall.
+PLUMBING_TIMEOUT_SECONDS = 120
+# A diff or a log that runs away must not become the whole prompt.
+PACKET_TEXT_LIMIT = 200_000
+
+
 def git(root: Path, *arguments: str, text: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(root), *arguments],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=text,
+            check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LedgerError(
+            f"git {' '.join(arguments)} did not finish within "
+            f"{PLUMBING_TIMEOUT_SECONDS}s; the repository may be locked"
+        ) from exc
 
 
 def rel(root: Path, path: Path) -> str:
@@ -201,8 +218,8 @@ def run_verification(command: str, workdir: Path) -> tuple[int, str]:
             return 124, captured
         finally:
             if timed_out:
-                subprocess.run(["systemctl", "--user", "stop", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-                subprocess.run(["systemctl", "--user", "kill", "--kill-who=all", "--signal=KILL", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                subprocess.run(["systemctl", "--user", "stop", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
+                subprocess.run(["systemctl", "--user", "kill", "--kill-who=all", "--signal=KILL", f"{unit}.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=20)
     print("orrery-task: systemd is unavailable; verification uses process-group containment.", file=sys.stderr)
     process: subprocess.Popen[str] | None = None
     timed_out = False
@@ -255,7 +272,7 @@ def dispatch_alive(attempt: Path) -> bool:
     if name:
         return subprocess.run(
             ["systemctl", "--user", "is-active", str(name)], stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, check=False,
+            stderr=subprocess.DEVNULL, check=False, timeout=20,
         ).returncode == 0
     pgid = unit.get("pgid")
     if not isinstance(pgid, int) or pgid <= 0:
@@ -386,12 +403,14 @@ def verify(
                 "evidence_sha256": proof_digest,
             },
         )
+        # A contract that asked for review does not walk to the gate on
+        # its own. Absent the key, Phase 1 behaviour is untouched.
         append_record(
             locked,
             task_id,
             {
                 "from": "VERIFICATION_PASSED",
-                "to": "AWAITING_MERGE",
+                "to": "IN_REVIEW" if contract.get("review") else "AWAITING_MERGE",
                 "actor": "runner",
                 "contract_digest": digest,
                 "evidence": proof,
@@ -428,7 +447,11 @@ def complete_dispatch(
     changed = git(worktree, "status", "--porcelain").stdout != ""
     if changed:
         git(worktree, "add", "-A")
-        message = f"{task_id} {contract['title']} (dispatch {sequence})\n\nOrrery-Role: {role.id} {role.provider}/{role.model}"
+        # No role trailer: a reviewer runs `git log` unprompted, and the
+        # implementer's identity is exactly what a blind review must not
+        # have. The ledger records role_data for the dispatch, which is
+        # where an audit should look.
+        message = f"{task_id} {contract['title']} (dispatch {sequence})"
         committed = git(worktree, "-c", "user.name=Orrery", "-c", "user.email=orrery@localhost", "commit", "-m", message)
         if committed.returncode:
             raise LedgerError(committed.stderr.strip())
@@ -460,6 +483,231 @@ def complete_dispatch(
     return verify(root, store, task_id, contract, sequence, worktree, base, commit, packet, next_state == "NO_CHANGE")
 
 
+
+def blocking_ledger(records: list[dict]) -> tuple[dict[str, dict], set[str]]:
+    """Every finding ever recorded blocking, and those since resolved.
+
+    The gate reads this rather than a review's verdict. Anchoring on the
+    latest verdict would let one rework round shed a finding: a blind
+    second reviewer is never told the first objection existed, returns
+    clean, and the task merges with nothing resolved.
+    """
+    raised: dict[str, dict] = {}
+    resolved: set[str] = set()
+    for record in records:
+        review = record.get("review")
+        if review:
+            for finding in review.get("blocking", []):
+                raised.setdefault(finding["id"], finding)
+        for entry in record.get("resolutions", []):
+            resolved.add(entry["id"])
+    return raised, resolved
+
+
+def unresolved_blocking(records: list[dict]) -> list[dict]:
+    raised, resolved = blocking_ledger(records)
+    return [finding for key, finding in raised.items() if key not in resolved]
+
+
+def review_packet(root: Path, records: list[dict], contract: dict, carried: list[dict]) -> dict:
+    """What the reviewer is given, and nothing else.
+
+    The evidence packet holds `worker_claim`, the delegate's own account
+    of what it did. That is precisely what a blind review must not read,
+    so the packet is rebuilt rather than forwarded, and the reviewer runs
+    in the task worktree where `.orrery` is not present at all.
+    """
+    verified = next(r for r in reversed(records) if r.get("to") == "VERIFICATION_PASSED")
+    # The ledger stores the evidence as a repository-relative path, and
+    # the packet is the file it names, exactly as the merge gate reads it.
+    evidence = json.loads((root / verified["evidence"]).read_text())
+
+    def inlined(relative: str | None) -> str:
+        """Content, not a path.
+
+        The reviewer works in the task worktree, where `.orrery` does not
+        exist, so a packet that referenced these files would point at
+        nothing. Inlining also keeps the reviewer from having to reach
+        outside its workspace to do its job at all.
+        """
+        if not relative:
+            return ""
+        try:
+            text = (root / relative).read_text(errors="replace")
+        except OSError:
+            return ""
+        if len(text) > PACKET_TEXT_LIMIT:
+            return (
+                text[:PACKET_TEXT_LIMIT]
+                + f"\n[truncated at {PACKET_TEXT_LIMIT} characters]\n"
+            )
+        return text
+
+    diff = dict(evidence["diff"])
+    diff["patch"] = inlined(diff.pop("patch", None))
+    verification = [
+        {**entry, "log": inlined(entry.get("log"))}
+        for entry in evidence.get("verification", [])
+    ]
+    return {
+        "v": 1,
+        "task_id": contract["task_id"],
+        "title": contract["title"],
+        "goal": contract["goal"],
+        "acceptance_criteria": contract["acceptance_criteria"],
+        "scope": contract["scope"],
+        "commit": evidence["commit"],
+        "base_head": evidence["base_head"],
+        "diff": diff,
+        "verification": verification,
+        "out_of_scope": evidence.get("out_of_scope", []),
+        "carried_findings": carried,
+    }
+
+
+def review_task(root: Path, task_id: str, flags: list[str]) -> int:
+    """Dispatch one blind review and record what it found.
+
+    The reviewer runs in the task worktree, so `.orrery` is simply not
+    there: it is kept untracked, and an untracked path does not exist in
+    a linked worktree. That is the mechanism, and it works for either
+    provider; the Claude deny list is only defence in depth.
+    """
+    store = root / ".orrery"
+    records, state = current(store, task_id)
+    if state not in {"IN_REVIEW", "REVIEW_BLOCKED"}:
+        raise LedgerError(f"task {task_id} is {state}")
+    contract = load_contract(store, task_id)
+    digest = records[-1]["contract_digest"]
+    worktree = worktree_path(root, task_id)
+    if not worktree.exists():
+        raise LedgerError("task worktree is missing; resume or re-run the task")
+    carried = unresolved_blocking(records)
+    carried_ids = [finding["id"] for finding in carried]
+    role = load_role("reviewer")
+    sequence = 1 + sum(1 for record in records if record.get("review"))
+    # A review whose record never landed would otherwise collide with its
+    # own leftover directory, and the wrapper's O_EXCL receipt turns that
+    # into a confusing "File exists" rather than a fresh attempt.
+    while (store / "reviews" / task_id / str(sequence)).exists():
+        sequence += 1
+
+    reviews = store / "reviews" / task_id
+    reviews.mkdir(parents=True, exist_ok=True)
+    attempt = reviews / f"{sequence}"
+    attempt.mkdir(exist_ok=True)
+    schema_path = attempt / "schema.json"
+    _atomic_write(
+        schema_path,
+        (json.dumps(orrery_findings.review_schema(carried_ids), indent=2) + "\n").encode(),
+        0o600,
+    )
+    packet = review_packet(root, records, contract, carried)
+    packet_path = attempt / "packet.json"
+    _atomic_write(packet_path, (json.dumps(packet, indent=2) + "\n").encode(), 0o600)
+
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("orrery-review")),
+        "--role", role.id,
+        "--workspace", str(worktree),
+        "--receipts", str(attempt),
+        "--schema", str(schema_path),
+    ]
+    prompt = REVIEW_PROMPT.format(
+        task_id=task_id, packet=packet_path.read_text(),
+    )
+    # No timeout here on purpose, matching the implementation dispatch: the
+    # wrapper owns the budget. It applies the reviewer role's manifest
+    # timeouts, extends them only while the delegate is still producing
+    # output, and backs the whole thing with RuntimeMaxSec on the unit, so
+    # a second deadline here would either duplicate that or cut a live
+    # review short.
+    process = subprocess.run(
+        command + flags + ["--", prompt], cwd=worktree, check=False
+    )
+    result = attempt / "result.txt"
+    if process.returncode != 0 or not result.exists() or not result.read_text().strip():
+        with control_lock(root) as locked:
+            append_record(locked, task_id, {
+                "from": current(locked, task_id)[1], "to": "INTERRUPTED",
+                "actor": "runner", "reason": "review-missing-result",
+                "phase": "review", "contract_digest": digest,
+            })
+        raise LedgerError("the reviewer returned no usable document")
+
+    try:
+        document = orrery_findings.parse_review(result.read_text())
+        accepted = orrery_findings.validate_review(
+            document, task_id=task_id, carried_ids=carried_ids,
+            path_exists=lambda candidate: (worktree / candidate).exists(),
+        )
+    except orrery_findings.FindingsError as exc:
+        raise LedgerError(f"the review did not validate: {exc}") from exc
+
+    stored = accepted["document"]
+    _atomic_write(
+        attempt / "review.json",
+        (json.dumps(stored, indent=2, sort_keys=True) + "\n").encode(),
+        0o600,
+    )
+    review_sha = hashlib.sha256(
+        json.dumps(stored, sort_keys=True).encode()
+    ).hexdigest()
+    blocking = [
+        {"id": f["id"], "statement": f["statement"], "category": f["category"]}
+        for f in stored["findings"] if f["severity"] == "blocking"
+    ]
+    resolutions = [
+        {"id": entry["id"],
+         "disposition": "fixed" if entry["disposition"] == "resolved" else "withdrawn"}
+        for entry in stored.get("carried", [])
+        if entry["disposition"] in {"resolved", "withdrawn"}
+    ]
+    # Still-present carried findings count as much as new ones. Reading
+    # only this review's findings would pass a task whose earlier
+    # objection the reviewer had just confirmed was still there.
+    still_present = [
+        entry["id"] for entry in stored.get("carried", [])
+        if entry["disposition"] == "still_present"
+    ]
+    with control_lock(root) as locked:
+        append_record(locked, task_id, {
+            "from": current(locked, task_id)[1],
+            "to": "REVIEW_BLOCKED" if blocking or still_present else "REVIEW_PASSED",
+            "actor": "runner",
+            "contract_digest": digest,
+            "review": {
+                "seq": sequence, "sha256": review_sha,
+                "verdict": stored["verdict"], "blocking": blocking,
+                "advisory": sum(
+                    1 for f in stored["findings"] if f["severity"] == "advisory"
+                ),
+                "downgrades": accepted["downgrades"],
+                "commit": packet["commit"],
+                **role_data(role),
+            },
+            "resolutions": resolutions,
+        })
+    print(orrery_findings.render_review(stored))
+    remaining = unresolved_blocking(current(store, task_id)[0])
+    return 1 if remaining else 0
+
+
+REVIEW_PROMPT = """You are reviewing one bounded change. You have the contract, the diff, and
+the repository at the reviewed commit. You do not have, and must not seek,
+the implementer's account of its own work.
+
+Return only a JSON document conforming to the schema you were given.
+Every blocking finding needs evidence: a file and line range in this
+worktree, or a command that reproduces the defect. A finding you cannot
+evidence is advisory. Record anything you could not check in
+unable_to_verify rather than leaving it unsaid.
+
+Review packet for {task_id}:
+{packet}
+"""
+
 def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     allow_dirty, accept_changed, forwarded = parse_run_flags(flags)
     store = root / ".orrery"
@@ -467,7 +715,21 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     if tracked:
         raise LedgerError("the .orrery ledger must not be tracked")
     records, state = current(store, task_id)
-    if state in {"DISPATCH_FAILED", "INTERRUPTED", "VERIFICATION_FAILED"}:
+    if state == "INTERRUPTED":
+        # Which phase was interrupted decides how it resumes. Without
+        # this the retry below sends an interrupted REVIEW to READY, and
+        # dispatch re-runs contract["assigned_role"], which is
+        # write-capable: a dead reviewer would implement a second time
+        # over already verified work.
+        interrupted = next(
+            (r for r in reversed(records) if r.get("to") == "INTERRUPTED"), None
+        )
+        if interrupted and interrupted.get("phase") == "review":
+            raise LedgerError(
+                f"task {task_id} was interrupted during review; "
+                f"run orrery-task review {task_id}"
+            )
+    if state in {"DISPATCH_FAILED", "INTERRUPTED", "VERIFICATION_FAILED", "REVIEW_BLOCKED"}:
         previous = next((r for r in reversed(records) if r.get("worktree_fingerprint")), None)
         candidate = worktree_path(root, task_id)
         if previous and candidate.exists() and git_workspace_fingerprint(candidate) != previous["worktree_fingerprint"] and not accept_changed:
@@ -504,6 +766,7 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
             if other != task_id and current(locked, other)[1] in {
                 "DISPATCHED",
                 "IN_PROGRESS",
+                "IN_REVIEW",
             }:
                 raise LedgerError(f"task {other} is busy")
         sequence = 1 + sum(r["to"] == "DISPATCHED" for r in records)
@@ -691,7 +954,7 @@ def rerun_verify(root: Path, task_id: str) -> int:
 def resume_task(root: Path, task_id: str) -> int:
     store = root / ".orrery"
     records, state = current(store, task_id)
-    if state not in {"DISPATCHED", "IN_PROGRESS"}:
+    if state not in {"DISPATCHED", "IN_PROGRESS", "IN_REVIEW"}:
         print(f"{task_id} {state}")
         return 0
     dispatch_record = next(record for record in reversed(records) if "dispatch" in record)
@@ -767,6 +1030,14 @@ def merge_task(root: Path, task_id: str, flags: list[str]) -> int:
         raise LedgerError("latest evidence was not verified")
     if verified.get("evidence_sha256") != evidence_digest(root, evidence):
         raise LedgerError("evidence packet digest does not match verification record")
+    # Anchored on the findings, never on a verdict. A finding raised
+    # before a rework round is still unresolved after it, however clean a
+    # later review looks, so this survives exactly the route that would
+    # otherwise drop it.
+    outstanding = unresolved_blocking(records)
+    if outstanding:
+        named = ", ".join(f"{f['id']} ({f['statement'][:60]})" for f in outstanding)
+        raise LedgerError(f"unresolved blocking finding: {named}")
     dispatched = next(record for record in reversed(records) if "dispatch" in record)
     base = dispatched["gate"]["base_head"]
     implemented = next((record for record in reversed(records) if record.get("commit")), None)
@@ -826,7 +1097,7 @@ def cancel_task(root: Path, task_id: str, flags: list[str]) -> int:
     records, state = current(store, task_id)
     if state in {"MERGED", "CLOSED"} or (state == "CANCELLED" and "--discard" not in flags):
         raise LedgerError(f"task {task_id} is {state}")
-    if state in {"DISPATCHED", "IN_PROGRESS"}:
+    if state in {"DISPATCHED", "IN_PROGRESS", "IN_REVIEW"}:
         attempt = Path(next(r["dispatch"]["receipts"] for r in reversed(records) if "dispatch" in r))
         if dispatch_alive(attempt):
             raise LedgerError("task is still running; resume first")
@@ -860,6 +1131,8 @@ def main(argv: list[str] | None = None) -> int:
             return dispatch(root, arguments.pop(0), arguments)
         if command == "verify" and len(arguments) == 1:
             return rerun_verify(root, arguments[0])
+        if command == "review" and arguments:
+            return review_task(root, arguments.pop(0), arguments)
         if command == "resume" and len(arguments) <= 1:
             store = root / ".orrery"
             identifiers = arguments or (task_ids(store) if store.exists() else [])

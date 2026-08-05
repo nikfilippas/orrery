@@ -199,6 +199,7 @@ def _git(directory: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         ["git", "-C", str(directory), *arguments],
         env=_git_environment(),
         text=True,
+        timeout=120,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -730,7 +731,17 @@ def delegated_command(
     role: Role,
     verdict_path: Path,
     settings_path: Path | None,
+    schema_path: Path | None = None,
 ) -> list[str]:
+    """The provider invocation for one delegated role.
+
+    `schema_path` makes the provider enforce a JSON Schema on its final
+    message. The two CLIs want it differently, measured on codex 0.146.0
+    and claude 2.1.220: Codex takes a path with `--output-schema`, Claude
+    takes the schema itself inline with `--json-schema`. Neither is
+    trusted afterwards, because a provider that ignores the flag must not
+    pass silently; the caller validates what comes back regardless.
+    """
     if role.id == "orchestrator":
         raise RuntimeConfigError(
             "use the orrery launcher for the principal orchestrator"
@@ -752,9 +763,11 @@ def delegated_command(
                 "--skip-git-repo-check",
                 "--output-last-message",
                 str(verdict_path),
-                "-",
             ]
         )
+        if schema_path is not None:
+            command.extend(["--output-schema", str(schema_path)])
+        command.append("-")
         return command
 
     if settings_path is None:
@@ -789,6 +802,10 @@ def delegated_command(
     ]
     if role.thinking:
         command.extend(["--effort", role.thinking])
+    if schema_path is not None:
+        # Inline rather than a path, which is what this CLI accepts. The
+        # schema is not a secret, so argv is an acceptable home for it.
+        command.extend(["--json-schema", schema_path.read_text()])
     return command
 
 
@@ -816,6 +833,14 @@ def claude_sandbox_settings(role: Role, cwd: Path) -> dict[str, Any]:
             "NotebookEdit",
             "Bash(git commit *)",
             "Bash(git push *)",
+            # Defence in depth for a blind review: the ledger holds the
+            # implementer's own account of its work. This is Claude-only
+            # and pattern-based, and a read-only mapping does not stop a
+            # read anyway, so nothing may depend on it. What actually
+            # keeps the account out of reach is that the reviewer runs in
+            # the task worktree and its packet carries content rather
+            # than paths.
+            "Read(.orrery/**)",
         ]
     return {
         "sandbox": {"enabled": False},
@@ -879,6 +904,7 @@ def claude_canary_exclude(cwd: Path) -> Path:
         result = subprocess.run(
             ["git", "-C", str(cwd), "rev-parse", "--git-path", "info/exclude"],
             stdin=subprocess.DEVNULL,
+            timeout=120,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,

@@ -194,6 +194,22 @@ def main() -> int:
     if marker:
         Path(marker).write_text(f"{os.getpid()}\n")
 
+    # A review is asked for a document, not prose. The reply is supplied
+    # by the test rather than invented here: a fake provider can show
+    # that the pipeline carries findings, and cannot show that a model
+    # finds a defect. Only the live corpus can do that.
+    if review := os.environ.get("CODEX_FAKE_REVIEW"):
+        destination = output_path(sys.argv[1:])
+        if destination is not None:
+            destination.write_text(review)
+        schema = None
+        for index, argument in enumerate(sys.argv):
+            if argument == "--output-schema" and index + 1 < len(sys.argv):
+                schema = Path(sys.argv[index + 1])
+        if record := os.environ.get("CODEX_FAKE_SCHEMA_SEEN"):
+            Path(record).write_text(schema.read_text() if schema else "")
+        return 0
+
     if arguments_path:
         # One argument per line, so the tests can assert the exact
         # invocation contract the wrapper promises.
@@ -219,8 +235,12 @@ def main() -> int:
 
     if mode in {"edit", "edit-fail"}:
         edit_path = Path(os.environ.get("CODEX_FAKE_EDIT_PATH", "edited.txt"))
+        # The content matters when the diff itself has to carry a real
+        # defect: a corpus that seeds only the reviewer's findings tests
+        # the pipeline, not the code under review.
+        edit_text = os.environ.get("CODEX_FAKE_EDIT_TEXT", "fake Codex edit\n")
         with edit_path.open("a", encoding="utf-8") as handle:
-            handle.write("fake Codex edit\n")
+            handle.write(edit_text)
         if mode == "edit-fail":
             mode = "fail"
 

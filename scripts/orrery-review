@@ -47,6 +47,7 @@ from orrery_fallback import (  # noqa: E402
     provider_status,
     request_fallback_decision,
 )
+from orrery_findings import sanitise_provider_text  # noqa: E402
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
     candidate_role,
@@ -141,7 +142,9 @@ class Invocation:
         stream_mode: str = "lines",
         workspace: Path | None = None,
         receipts: Path | None = None,
+        schema_path: Path | None = None,
     ) -> None:
+        self.schema_path = schema_path
         self.log_path = log_path
         self.stream_mode = stream_mode
         self.timeout_seconds = timeout_seconds
@@ -254,7 +257,7 @@ def usage() -> str:
         "Usage:\n"
         f"  {PROGRAM_NAME} [--timeout SECONDS] [--hard-timeout SECONDS]\n"
         "                 [--output PATH] [--log PATH] [--workspace DIR]\n"
-        "                 [--receipts DIR]\n"
+        "                 [--receipts DIR] [--schema FILE]\n"
         "                 [--stream | --no-stream]\n"
         "                 [--approve-fallback PROVIDER:MODEL]\n"
         "                 [--approval-scope run|session|until:ISO8601]\n"
@@ -310,6 +313,7 @@ def parse_args(argv: list[str]) -> Invocation:
     revoke = False
     workspace: Path | None = None
     receipts: Path | None = None
+    schema_path: Path | None = None
 
     index = 0
     while index < len(argv):
@@ -387,6 +391,16 @@ def parse_args(argv: list[str]) -> Invocation:
             if not value:
                 raise UsageError("--output requires a non-empty path")
             output_path = Path(value)
+        elif argument == "--schema":
+            index += 1
+            if index >= len(argv) or not argv[index]:
+                raise UsageError("--schema requires a path to a JSON Schema")
+            schema_path = Path(argv[index]).expanduser()
+        elif argument.startswith("--schema="):
+            value = argument.split("=", 1)[1]
+            if not value:
+                raise UsageError("--schema requires a path to a JSON Schema")
+            schema_path = Path(value).expanduser()
         elif argument in ("--workspace", "--receipts"):
             if index + 1 >= len(argv):
                 raise UsageError(f"missing value for {argument}")
@@ -540,6 +554,7 @@ def parse_args(argv: list[str]) -> Invocation:
         stream_mode=stream_mode,
         workspace=workspace,
         receipts=receipts,
+        schema_path=schema_path,
     )
 
 
@@ -548,16 +563,9 @@ def parse_args(argv: list[str]) -> Invocation:
 # ORRERY FALLBACK APPROVAL REQUIRED) or smuggle terminal escape
 # sequences into the transcript, so every such path renders through
 # this filter. Stdout is the verdict's data channel and stays raw.
-_PROTOCOL_TOKEN = re.compile(r"ORRERY")
-
-
-def sanitise_provider_text(text: str) -> str:
-    kept = "".join(
-        ch
-        for ch in text
-        if ch in "\n\t" or 0x20 <= ord(ch) < 0x7F or ord(ch) >= 0xA0
-    )
-    return _PROTOCOL_TOKEN.sub("OR·RERY", kept)
+# Defined in orrery_findings so that anything rendering provider text can
+# import it. This file has no .py extension and cannot be imported, which
+# would otherwise have left a second copy of the filter to drift.
 
 
 def next_deadline(
@@ -1583,6 +1591,13 @@ def claude_verdict(log_path: Path) -> str:
             verdict = payload.get("result")
             if isinstance(verdict, str) and verdict.strip():
                 return verdict
+            # Under --json-schema the result is the structured document
+            # itself rather than prose. Accepting only a string here would
+            # classify a perfectly good structured reply as a provider
+            # failure, and the retry would then record missing-result for
+            # a fault no retry can fix.
+            if isinstance(verdict, (dict, list)):
+                return json.dumps(verdict, sort_keys=True)
     raise ValueError("the log holds no JSON result object")
 
 
@@ -2360,6 +2375,7 @@ def main(
                 role_config,
                 verdict_path,
                 settings_path,
+                invocation.schema_path,
             )
         except RuntimeConfigError as exc:
             print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)

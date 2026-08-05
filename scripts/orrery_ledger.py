@@ -23,8 +23,8 @@ STATES = frozenset(
     {
         "NEW", "READY", "DISPATCHED", "IN_PROGRESS", "IMPLEMENTED",
         "NO_CHANGE", "DISPATCH_FAILED", "INTERRUPTED", "VERIFICATION_PASSED",
-        "VERIFICATION_FAILED", "AWAITING_MERGE", "MERGED", "CLOSED",
-        "CANCELLED",
+        "VERIFICATION_FAILED", "IN_REVIEW", "REVIEW_PASSED", "REVIEW_BLOCKED",
+        "AWAITING_MERGE", "MERGED", "CLOSED", "CANCELLED",
     }
 )
 TERMINAL_STATES = frozenset({"MERGED", "CLOSED", "CANCELLED"})
@@ -42,8 +42,26 @@ TRANSITIONS = {
     ),
     "NO_CHANGE": frozenset({"NO_CHANGE", "CLOSED", "READY", "CANCELLED"}),
     "DISPATCH_FAILED": frozenset({"READY", "CANCELLED"}),
-    "INTERRUPTED": frozenset({"READY", "CANCELLED"}),
-    "VERIFICATION_PASSED": frozenset({"AWAITING_MERGE", "CANCELLED"}),
+    # A review can be interrupted too, and must resume as a review: sending
+    # it to READY would re-dispatch contract["assigned_role"], which is a
+    # write-capable role, and implement a second time over verified work.
+    "INTERRUPTED": frozenset({"READY", "IN_REVIEW", "CANCELLED"}),
+    "VERIFICATION_PASSED": frozenset(
+        {"IN_REVIEW", "AWAITING_MERGE", "CANCELLED"}
+    ),
+    "IN_REVIEW": frozenset(
+        {"REVIEW_PASSED", "REVIEW_BLOCKED", "INTERRUPTED", "CANCELLED"}
+    ),
+    "REVIEW_PASSED": frozenset({"AWAITING_MERGE", "CANCELLED"}),
+    # READY for rework, REVIEW_PASSED when every blocking finding has been
+    # resolved, and CANCELLED like every other non-terminal state: without
+    # it, cancelling a reviewed task reports a corrupt ledger.
+    # The self-loop is how a re-review of blocked work records its own
+    # outcome: it starts from REVIEW_BLOCKED and may legitimately leave it
+    # blocked, exactly as NO_CHANGE and AWAITING_MERGE repeat themselves.
+    "REVIEW_BLOCKED": frozenset(
+        {"REVIEW_BLOCKED", "READY", "REVIEW_PASSED", "CANCELLED"}
+    ),
     "VERIFICATION_FAILED": frozenset({"READY", "VERIFICATION_PASSED", "CANCELLED"}),
     "AWAITING_MERGE": frozenset({"AWAITING_MERGE", "MERGED", "CANCELLED"}),
     "MERGED": frozenset({"CLOSED"}),
@@ -54,8 +72,13 @@ DISPATCH_FAILURE_REASONS = frozenset(
     {"timeout", "provider-exit", "missing-result", "spawn-failure", "approval-required"}
 )
 _CONTRACT_KEYS = frozenset(
-    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes"}
+    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review"}
 )
+
+
+# Every local plumbing call is bounded: an unbounded wait turns a held
+# lock into a runner that never returns.
+PLUMBING_TIMEOUT_SECONDS = 120
 
 
 class LedgerError(Exception):
@@ -68,6 +91,7 @@ def repository_root(cwd: Path | None = None) -> Path:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"], cwd=cwd, check=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LedgerError("current directory is not inside a git worktree") from exc
@@ -101,6 +125,7 @@ def _add_exclude(root: Path) -> None:
         result = subprocess.run(
             ["git", "rev-parse", "--git-path", "info/exclude"], cwd=root,
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LedgerError("could not resolve git exclude path") from exc
@@ -228,6 +253,10 @@ def validate_contract(contract: Any, task_id: str | None = None) -> dict[str, An
                 raise _error(f"$.budget.{name}", "must be an integer from 30 to 14400")
     if "notes" in data and not isinstance(data["notes"], str):
         raise _error("$.notes", "must be a string")
+    if "review" in data and not isinstance(data["review"], bool):
+        # Optional and absent means no review, so every contract written
+        # before this key existed keeps its Phase 1 behaviour exactly.
+        raise _error("$.review", "must be true or false")
     return data
 
 
@@ -402,6 +431,7 @@ def create_task(root: Path, contract: dict[str, Any]) -> str:
         subprocess.run(
             ["git", "rev-parse", "--verify", "--quiet", "HEAD"], cwd=root,
             check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise LedgerError(
@@ -416,7 +446,9 @@ def create_task(root: Path, contract: dict[str, Any]) -> str:
         contract["task_id"] = task_id
         if not contract.get("target_ref"):
             try:
-                result = subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                result = subprocess.run(["git", "symbolic-ref", "--quiet", "HEAD"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    timeout=PLUMBING_TIMEOUT_SECONDS,
+                )
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise LedgerError("detached HEAD requires an explicit $.target_ref") from exc
             contract["target_ref"] = result.stdout.strip()
@@ -481,6 +513,7 @@ def ensure_worktree(root: Path, task_id: str, base_commit: str) -> Path:
         result = subprocess.run(
             ["git", "-C", str(path), "symbolic-ref", "--quiet", "--short", "HEAD"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
         if result.returncode == 0 and result.stdout.strip() == branch:
             return path
@@ -490,12 +523,15 @@ def ensure_worktree(root: Path, task_id: str, base_commit: str) -> Path:
     exists = subprocess.run(
         ["git", "-C", str(root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        timeout=PLUMBING_TIMEOUT_SECONDS,
     ).returncode == 0
     command = ["git", "-C", str(root), "worktree", "add"]
     if not exists:
         command.extend(["-b", branch])
     command.extend([str(path), branch if exists else base_commit])
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        timeout=PLUMBING_TIMEOUT_SECONDS,
+    )
     if result.returncode != 0:
         raise LedgerError(result.stderr.strip() or "could not create worktree")
     os.chmod(path, 0o700)
@@ -511,16 +547,19 @@ def merge_branch(root: Path, commit: str) -> tuple[str | None, str]:
             "--no-edit", commit,
         ],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        timeout=PLUMBING_TIMEOUT_SECONDS,
     )
     if result.returncode:
         subprocess.run(
             ["git", "-C", str(root), "merge", "--abort"], stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
         return None, result.stderr
     oid = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"], stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, check=False,
+        timeout=PLUMBING_TIMEOUT_SECONDS,
     )
     return oid.stdout.strip(), ""
 
@@ -533,6 +572,7 @@ def remove_worktree(root: Path, task_id: str) -> list[str]:
         result = subprocess.run(
             ["git", "-C", str(root), "worktree", "remove", "--force", str(path)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
         # Git may unregister a worktree before a failed filesystem removal
         # (for example, when its parent is temporarily unwritable).  A later
@@ -546,16 +586,18 @@ def remove_worktree(root: Path, task_id: str) -> list[str]:
         subprocess.run(
             ["git", "-C", str(root), "worktree", "prune"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
     branch = f"orrery/{task_id}"
     exists = subprocess.run(
         ["git", "-C", str(root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        check=False,
+        check=False, timeout=PLUMBING_TIMEOUT_SECONDS,
     ).returncode == 0
     if exists:
         result = subprocess.run(
             ["git", "-C", str(root), "branch", "-D", branch],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+            timeout=PLUMBING_TIMEOUT_SECONDS,
         )
         if result.returncode:
             remaining.append(f"branch {branch}")
