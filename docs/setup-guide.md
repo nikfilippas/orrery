@@ -676,6 +676,11 @@ The maintained artefacts are:
   any size and cost 56KB between them. The banner embeds the mark, so the
   two cannot disagree.
 - `docs/setup-guide.md` — this operational reference.
+- `docs/technical-overview.md` — the full technical account behind the
+  README: positioning and terminology, roles and budgets, containment,
+  runtime commands, the task control plane, fallback consent, caching,
+  verification, and the benchmark programme. The README stays the short
+  overview; deep sections live here rather than growing it.
 - `docs/.nojekyll` — serves this directory verbatim on GitHub Pages.
   Pages runs Jekyll by default, which would try to render Liquid tags in
   the exported page; it has none today, but the page is generated and a
