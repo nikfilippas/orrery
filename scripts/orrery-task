@@ -606,14 +606,15 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     packet_path = attempt / "packet.json"
     _atomic_write(packet_path, (json.dumps(packet, indent=2) + "\n").encode(), 0o600)
 
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("orrery-review")),
-        "--role", role.id,
-        "--workspace", str(worktree),
-        "--receipts", str(attempt),
-        "--schema", str(schema_path),
-    ]
+    def command_for(attempt_dir: Path) -> list[str]:
+        return [
+            sys.executable,
+            str(Path(__file__).with_name("orrery-review")),
+            "--role", role.id,
+            "--workspace", str(worktree),
+            "--receipts", str(attempt_dir),
+            "--schema", str(schema_path),
+        ]
     prompt = REVIEW_PROMPT.format(
         task_id=task_id, packet=packet_path.read_text(),
     )
@@ -623,27 +624,58 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     # output, and backs the whole thing with RuntimeMaxSec on the unit, so
     # a second deadline here would either duplicate that or cut a live
     # review short.
-    process = subprocess.run(
-        command + flags + ["--", prompt], cwd=worktree, check=False
-    )
-    result = attempt / "result.txt"
-    if process.returncode != 0 or not result.exists() or not result.read_text().strip():
-        with control_lock(root) as locked:
-            append_record(locked, task_id, {
-                "from": current(locked, task_id)[1], "to": "INTERRUPTED",
-                "actor": "runner", "reason": "review-missing-result",
-                "phase": "review", "contract_digest": digest,
-            })
-        raise LedgerError("the reviewer returned no usable document")
-
-    try:
-        document = orrery_findings.parse_review(result.read_text())
-        accepted = orrery_findings.validate_review(
-            document, task_id=task_id, carried_ids=carried_ids,
-            path_exists=lambda candidate: (worktree / candidate).exists(),
+    def dispatch_review(attempt_dir: Path, assignment: str) -> Path | None:
+        """Run one reviewer and return its document, or None if it gave none."""
+        process = subprocess.run(
+            command_for(attempt_dir) + flags + ["--", assignment],
+            cwd=worktree, check=False,
         )
-    except orrery_findings.FindingsError as exc:
-        raise LedgerError(f"the review did not validate: {exc}") from exc
+        produced = attempt_dir / "result.txt"
+        if process.returncode != 0 or not produced.exists():
+            return None
+        return produced if produced.read_text().strip() else None
+
+    accepted = None
+    validation_error = None
+    # One retry, carrying the exact validation error back. A reviewer that
+    # returned a real judgement in a shape the schema refuses should get
+    # the chance to say the same thing correctly, rather than the whole
+    # review being thrown away and the operator left to notice. A second
+    # failure is reported rather than retried again: repeating it costs
+    # another delegated run and the fault is unlikely to be transient.
+    for round_number in (1, 2):
+        this_attempt = attempt if round_number == 1 else attempt.with_name(
+            f"{attempt.name}r"
+        )
+        this_attempt.mkdir(exist_ok=True)
+        assignment = prompt if validation_error is None else (
+            prompt
+            + "\n\nYour previous reply was refused by the schema validator:\n"
+            + validation_error
+            + "\nReturn the same judgement in a document that conforms.\n"
+        )
+        produced = dispatch_review(this_attempt, assignment)
+        if produced is None:
+            with control_lock(root) as locked:
+                append_record(locked, task_id, {
+                    "from": current(locked, task_id)[1], "to": "INTERRUPTED",
+                    "actor": "runner", "reason": "review-missing-result",
+                    "phase": "review", "contract_digest": digest,
+                })
+            raise LedgerError("the reviewer returned no usable document")
+        try:
+            document = orrery_findings.parse_review(produced.read_text())
+            accepted = orrery_findings.validate_review(
+                document, task_id=task_id, carried_ids=carried_ids,
+                path_exists=lambda candidate: (worktree / candidate).exists(),
+            )
+            break
+        except orrery_findings.FindingsError as exc:
+            validation_error = str(exc)
+            if round_number == 2:
+                raise LedgerError(
+                    f"the review did not validate after one retry: {exc}"
+                ) from exc
 
     stored = accepted["document"]
     _atomic_write(

@@ -14147,6 +14147,56 @@ def test_seeded_defect_corpus() -> None:
             discard_task_environment(environment)
 
 
+@test("a malformed review is retried once with the validator's complaint")
+def test_review_validation_retry() -> None:
+    """A reviewer that judged correctly but replied in the wrong shape
+    should get to say the same thing again, rather than the whole review
+    being discarded and the operator left to notice."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {
+            **dispatch_contract(include=["calc.py"], command=SEEDED_VERIFICATION),
+            "review": True,
+        })
+        store = root / ".orrery"
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "calc.py"
+        environment["CODEX_FAKE_EDIT_TEXT"] = SEEDED_SOURCE
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the dispatch did not reach review",
+            )
+            marker = root / "retry-marker"
+            environment["CODEX_FAKE_REVIEW_MARKER"] = str(marker)
+            # A blocking finding with no evidence at all is not merely
+            # downgraded: severity aside, the document omits a required
+            # field, so the validator refuses it outright.
+            environment["CODEX_FAKE_REVIEW_FIRST"] = json.dumps(
+                {"v": 1, "task_id": "T-1", "verdict": "changes_required",
+                 "findings": [{"id": "F-01", "severity": "blocking"}],
+                 "unable_to_verify": []}
+            )
+            environment["CODEX_FAKE_REVIEW"] = seeded_review(SEEDED_DEFECTS)
+            reviewed = run_task(root, "review", "T-1", environment=environment)
+            require(
+                reviewed.returncode == 1
+                and task_module.current(store, "T-1")[1] == "REVIEW_BLOCKED",
+                f"the retry did not recover the review: {reviewed.stderr[-400:]}",
+            )
+            stored = json.loads(
+                (store / "reviews" / "T-1" / "1" / "review.json").read_text()
+            )
+            require(
+                [f["id"] for f in stored["findings"]] == ["F-01", "F-02", "F-03"],
+                f"the recovered review is not the conforming one: {stored}",
+            )
+            require(marker.exists(), "the malformed reply was never produced")
+        finally:
+            discard_task_environment(environment)
+
+
 @test("a live reviewer finds seeded defects when credits are offered")
 def test_seeded_defect_corpus_live() -> None:
     """The only test of substance rather than shape.
