@@ -13009,6 +13009,186 @@ def craft_dead_dispatch(root: Path, *, receipt: bool) -> tuple[str, Path, Path]:
     return base, attempt, worktree
 
 
+@test("different dispatch failures never share a reason string")
+def test_task_reason_strings_distinct() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        conditions: dict[str, tuple[dict, int | None]] = {
+            "timeout": ({}, 124),
+            "preflight-consent": ({}, 75),
+            "approval-with-unit": ({"unit.json": '{"v": 1}'}, 75),
+            "consent-marker-no-receipt": ({"consent-stop.json": '{"v": 1}'}, None),
+            "timeout-with-proposal": ({"consent-stop.json": '{"v": 1}'}, 124),
+            "consent-after-provider-failure": (
+                {
+                    "consent-stop.json": '{"v": 1}',
+                    "receipt.json": '{"v": 1, "exit_status": 7}',
+                },
+                7,
+            ),
+            "spawn": ({}, None),
+            "launcher-died": ({"unit.json": '{"v": 1}'}, None),
+            "receipt-corrupt": ({"receipt.json": "not json"}, None),
+            "receipt-null": ({"receipt.json": "null"}, None),
+            "receipt-bad-bytes": ({"receipt.json": b"\xff\xfe\x00"}, None),
+            "provider-nonzero": (
+                {"receipt.json": '{"v": 1, "exit_status": 7}'}, None,
+            ),
+            "provider-exited-75": (
+                {"receipt.json": '{"v": 1, "exit_status": 75}'}, 75,
+            ),
+            "no-result": (
+                {
+                    "receipt.json": '{"v": 1, "exit_status": 0}',
+                    "stdout.log": "plain text, nothing recoverable\n",
+                },
+                None,
+            ),
+            "success": (
+                {
+                    "receipt.json": '{"v": 1, "exit_status": 0}',
+                    "result.txt": "done\n",
+                },
+                None,
+            ),
+        }
+        observed = {}
+        for name, (files, returncode) in conditions.items():
+            attempt = Path(directory) / name / "attempt-1"
+            attempt.mkdir(parents=True)
+            for filename, content in files.items():
+                # The consent marker lives in the receipts directory's
+                # runner-owned PARENT, exactly where the wrapper writes it.
+                base = attempt.parent if filename == "consent-stop.json" else attempt
+                if isinstance(content, bytes):
+                    (base / filename).write_bytes(content)
+                else:
+                    (base / filename).write_text(content)
+            observed[name] = task_module.receipt_failure(attempt, returncode)
+        expected = {
+            "timeout": "timeout",
+            "preflight-consent": "approval-required",
+            "approval-with-unit": "approval-required",
+            "consent-marker-no-receipt": "approval-required",
+            "timeout-with-proposal": "timeout",
+            "consent-after-provider-failure": "provider-exit",
+            "spawn": "spawn-failure",
+            "launcher-died": "receipt-missing",
+            "receipt-corrupt": "receipt-corrupt",
+            "receipt-null": "receipt-corrupt",
+            "receipt-bad-bytes": "receipt-corrupt",
+            "provider-nonzero": "provider-exit",
+            "provider-exited-75": "provider-exit",
+            "no-result": "missing-result",
+            "success": None,
+        }
+        require(observed == expected, str(observed))
+        names = {reason for reason in expected.values() if reason}
+        require(
+            len(names) == 7,
+            f"the classifier collapsed distinct failure names: {sorted(names)}",
+        )
+        require(
+            names <= ledger_module.DISPATCH_FAILURE_REASONS,
+            f"the ledger refuses classifier reasons: "
+            f"{sorted(names - ledger_module.DISPATCH_FAILURE_REASONS)}",
+        )
+
+
+@test("a launcher that dies before its receipt records receipt-missing")
+def test_task_receipt_missing_records() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, worktree = craft_dead_dispatch(root, receipt=False)
+        records = task_records(root)
+        dispatch_record = next(
+            record for record in reversed(records) if "dispatch" in record
+        )
+        status = task_module.complete_dispatch(
+            root, "T-1", dispatch_contract(), dispatch_record,
+            attempt, worktree, None, 3, None,
+        )
+        failed = task_records(root)[-1]
+        require(status == 3, str(status))
+        require(
+            failed["to"] == "DISPATCH_FAILED"
+            and failed["reason"] == "receipt-missing",
+            str(failed),
+        )
+
+
+@test("a proposal after a provider failure is preserved without renaming it")
+def test_task_consent_after_provider_failure_preserved() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, worktree = craft_dead_dispatch(root, receipt=True)
+        receipt = read_json(attempt / "receipt.json")
+        receipt["exit_status"] = 7
+        write_json(attempt / "receipt.json", receipt)
+        (attempt.parent / "consent-stop.json").write_text('{"v": 1}')
+        records = task_records(root)
+        dispatch_record = next(
+            record for record in reversed(records) if "dispatch" in record
+        )
+        status = task_module.complete_dispatch(
+            root, "T-1", dispatch_contract(), dispatch_record,
+            attempt, worktree, None, 7,
+            ["ORRERY FALLBACK APPROVAL REQUIRED\n", "candidate: openai:sol\n"],
+        )
+        failed = task_records(root)[-1]
+        require(status == 7, str(status))
+        require(
+            failed["to"] == "DISPATCH_FAILED"
+            and failed["reason"] == "provider-exit"
+            and failed.get("consent"),
+            str(failed),
+        )
+        require(
+            "candidate: openai:sol" in (root / failed["consent"]).read_text(),
+            str(failed),
+        )
+
+
+@test("a consent stop is classified approval-required and keeps its proposal")
+def test_task_consent_stop_classification() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, worktree = craft_dead_dispatch(root, receipt=False)
+        records = task_records(root)
+        dispatch_record = next(
+            record for record in reversed(records) if "dispatch" in record
+        )
+        proposal = [
+            "ORRERY FALLBACK APPROVAL REQUIRED\n",
+            "candidate: anthropic:claude-fable-5\n",
+        ]
+        status = task_module.complete_dispatch(
+            root, "T-1", dispatch_contract(), dispatch_record,
+            attempt, worktree, None, 75, proposal,
+        )
+        failed = task_records(root)[-1]
+        require(status == 75, str(status))
+        require(
+            failed["to"] == "DISPATCH_FAILED"
+            and failed["reason"] == "approval-required"
+            and failed.get("worktree_fingerprint"),
+            str(failed),
+        )
+        consent = attempt.parent / "consent.txt"
+        require(consent.exists(), "consent.txt was not preserved")
+        require(
+            "candidate: anthropic:claude-fable-5" in consent.read_text(),
+            consent.read_text(),
+        )
+        require(
+            failed.get("consent")
+            and (root / failed["consent"]).resolve() == consent.resolve(),
+            f"the record does not locate the consent artefact: {failed}",
+        )
+
+
 @test("task resume completes a dispatch that outlived its controller")
 def test_task_resume_completes_dead_dispatch() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -14065,11 +14245,15 @@ def test_seeded_defect_corpus() -> None:
                 f"blocking findings were not reported: {reviewed.stderr[-400:]}",
             )
             schema = store / "reviews" / "T-1" / "1" / "schema.json"
+            # Strict structured output makes every property required, so a
+            # first review's schema still names carried, as nullable; the
+            # validator is what refuses invented carried entries.
+            first_schema = json.loads(schema.read_text())
             require(
                 schema.exists()
-                and "carried" not in json.loads(schema.read_text())["required"],
-                "the reviewer got no schema, or was asked to account for "
-                "findings that do not exist yet",
+                and "null" in first_schema["properties"]["carried"]["type"],
+                "the reviewer got no schema, or its carried array is not "
+                "nullable on a first review",
             )
             require(
                 task_module.current(store, "T-1")[1] == "REVIEW_BLOCKED",
@@ -14233,6 +14417,185 @@ def test_review_validation_retry() -> None:
             discard_task_environment(environment)
 
 
+@test("every review schema node carries an explicit type")
+def test_review_schema_provider_compatible() -> None:
+    """OpenAI's structured-output validator refuses any schema node
+    lacking a 'type' key, which no offline validation can discover.
+    Caught live: {'const': 1} for `v` made the service reject every
+    review with HTTP 400 and the wrapper propose a pointless fallback."""
+    def check(schema: dict, path: str) -> None:
+        # Walk schema positions explicitly, so EVERY node needs a type,
+        # not only nodes that happen to carry enum or const.
+        if "type" not in schema:
+            raise Failure(f"schema node without a type at {path}")
+        if "properties" in schema:
+            if sorted(schema.get("required", [])) != sorted(schema["properties"]):
+                raise Failure(f"schema object not all-required at {path}")
+            for key, value in schema["properties"].items():
+                check(value, f"{path}.{key}")
+        if isinstance(schema.get("items"), dict):
+            check(schema["items"], f"{path}[]")
+    check(findings_module.review_schema(["F-01"]), "$")
+    check(findings_module.review_schema([]), "$")
+
+
+@test("transport nulls validate exactly like absent fields")
+def test_review_null_normalisation() -> None:
+    """Strict structured output sends null where a field is optional by
+    design; the parsed document must be indistinguishable from one that
+    simply omitted the field, and an all-null evidence entry is not an
+    evidence claim."""
+    document = {
+        "v": 1, "task_id": "T-1", "verdict": "changes_required",
+        "findings": [{
+            "id": "F-01", "severity": "blocking", "category": "correctness",
+            "statement": "the sum is a difference",
+            "failure_scenario": "add(2, 1) returns 1",
+            "evidence": [
+                {"file": "edited.txt", "lines": "3", "reproduction": None},
+                {"file": None, "lines": None, "reproduction": None},
+            ],
+            "proposed_resolution": None, "addresses": None, "confidence": None,
+        }],
+        "carried": None,
+        "unable_to_verify": [],
+    }
+    parsed = findings_module.parse_review(json.dumps(document))
+    require("carried" not in parsed, str(parsed))
+    finding = parsed["findings"][0]
+    require(
+        finding["evidence"] == [{"file": "edited.txt", "lines": "3"}]
+        and "confidence" not in finding
+        and "proposed_resolution" not in finding,
+        str(finding),
+    )
+    accepted = findings_module.validate_review(
+        parsed, task_id="T-1", carried_ids=[], path_exists=lambda _: True,
+    )
+    stored = accepted["document"]
+    require(
+        stored["findings"][0]["severity"] == "blocking"
+        and "null" not in json.dumps(stored),
+        str(stored),
+    )
+    # An all-null finding must reach the validator and fail, never be
+    # silently erased: empty-object dropping is for evidence lists only.
+    nulled = dict(document)
+    nulled["findings"] = [{
+        "id": None, "severity": None, "category": None, "statement": None,
+        "failure_scenario": None, "evidence": None,
+        "proposed_resolution": None, "addresses": None, "confidence": None,
+    }]
+    erased = findings_module.parse_review(json.dumps(nulled))
+    require(erased["findings"] == [{}], str(erased))
+    try:
+        findings_module.validate_review(
+            erased, task_id="T-1", carried_ids=[], path_exists=lambda _: True,
+        )
+        raise Failure("an all-null finding was accepted instead of refused")
+    except findings_module.FindingsError:
+        pass
+
+
+@test("weak evidence is dropped, not accepted: blanks, directories, escapes")
+def test_review_evidence_discipline() -> None:
+    """Caught by review: a blank reproduction and {'file': '.'} both
+    satisfied the blocking-evidence rule, because nothing validated the
+    reproduction's content and Path.exists accepted directories,
+    absolute paths and traversals."""
+    with tempfile.TemporaryDirectory() as directory:
+        worktree = Path(directory)
+        (worktree / "real.py").write_text("pass\n")
+        checker = lambda candidate: task_module.reviewable_path(worktree, candidate)  # noqa: E731
+        for candidate, verdict in (
+            ("real.py", True), (".", False), ("..", False),
+            ("/etc/passwd", False), ("../real.py", False), ("missing.py", False),
+        ):
+            require(
+                checker(candidate) is verdict,
+                f"reviewable_path({candidate!r}) is not {verdict}",
+            )
+        base = {
+            "v": 1, "task_id": "T-1", "verdict": "changes_required",
+            "unable_to_verify": [],
+        }
+        blank = findings_module.validate_review(
+            {**base, "findings": [{
+                "id": "F-01", "severity": "blocking", "category": "correctness",
+                "statement": "claim", "failure_scenario": "fails",
+                "evidence": [{"reproduction": "   "}],
+            }]},
+            task_id="T-1", carried_ids=[], path_exists=checker,
+        )
+        downgraded = blank["document"]["findings"][0]
+        require(
+            downgraded["severity"] == "advisory",
+            f"a blank reproduction still supports blocking: {downgraded}",
+        )
+        try:
+            findings_module.validate_review(
+                {**base, "verdict": "clean", "findings": [], "carried": [
+                    {"id": "F-01", "disposition": "resolved",
+                     "evidence": [{"file": "."}]},
+                ]},
+                task_id="T-1", carried_ids=["F-01"], path_exists=checker,
+            )
+            raise Failure("a directory resolved a carried blocking finding")
+        except findings_module.FindingsError:
+            pass
+
+
+@test("the harvest keeps runner artefacts and ignores delegate plants")
+def test_review_harvest_protection() -> None:
+    """The receipts directory is delegate-writable, so the harvest must
+    neither copy unexpected names nor overwrite what the runner wrote:
+    a planted schema.json would otherwise steer the reviewer's own
+    retry and falsify the durable packet."""
+    with tempfile.TemporaryDirectory() as directory:
+        storage = Path(directory) / "storage"
+        receipts = Path(directory) / "receipts"
+        storage.mkdir()
+        receipts.mkdir()
+        (storage / "schema.json").write_text("runner schema\n")
+        (receipts / "schema.json").write_text("planted schema\n")
+        (receipts / "packet.json").write_text("planted packet\n")
+        (receipts / "result.txt").write_text("verdict\n")
+        (receipts / "receipt.json").write_text('{"v": 1, "exit_status": 0}\n')
+        task_module.harvest_receipts(storage, receipts)
+        require(not receipts.exists(), "receipts were not reclaimed")
+        require(
+            (storage / "schema.json").read_text() == "runner schema\n",
+            "a planted schema overwrote the runner's",
+        )
+        require(
+            not (storage / "packet.json").exists(),
+            "an unexpected delegate file was harvested",
+        )
+        require(
+            (storage / "result.txt").read_text() == "verdict\n"
+            and (storage / "receipt.json").exists(),
+            "wrapper artefacts were not harvested",
+        )
+
+
+@test("review receipts live outside the reviewed tree and its worktree")
+def test_review_receipts_outside_mappings() -> None:
+    """A read-only review maps the root and every worktree read-only, and
+    the composition refuses a writable grant nested inside them, so the
+    delegate's receipts must resolve elsewhere. Caught live: receipts
+    under .orrery/reviews made every live review refuse to start."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        receipts = task_module.review_receipts_dir(root, "T-1", "1")
+        worktree = ledger_module.worktree_path(root, "T-1")
+        require(
+            root.resolve() not in receipts.resolve().parents
+            and worktree.resolve() not in receipts.resolve().parents,
+            str(receipts),
+        )
+
+
 @test("a live reviewer finds seeded defects when credits are offered")
 def test_seeded_defect_corpus_live() -> None:
     """The only test of substance rather than shape.
@@ -14247,28 +14610,68 @@ def test_seeded_defect_corpus_live() -> None:
     with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
         root = Path(directory)
         init_task_repository(root)
+        # The defect must arrive IN the reviewed diff, not sit in the
+        # base: the review packet shows the dispatch's patch, and a
+        # reviewer shown a diff that replaces a broken function is right
+        # to call it clean. Caught live twice: first the seeded defect
+        # lived in the baseline commit and the fake edit overwrote it;
+        # then create_dispatch_task turned out to clobber the baseline
+        # with "base\n", so the correct function is committed AFTER task
+        # creation and the reviewed patch is asserted below.
+        create_dispatch_task(root, {
+            **dispatch_contract(), "review": True,
+            "goal": "Keep add returning the sum of its arguments.",
+        })
         (root / "edited.txt").write_text(
-            "def add(a, b):\n    # returns the sum of a and b\n    return a - b\n"
+            "def add(a, b):\n    # returns the sum of a and b\n    return a + b\n"
         )
         subprocess.run(["git", "-C", str(root), "add", "edited.txt"], check=True)
         subprocess.run(
             ["git", "-C", str(root), "-c", "user.email=kit@test",
-             "-c", "user.name=Kit", "commit", "-qm", "seeded"], check=True,
+             "-c", "user.name=Kit", "commit", "-qm", "baseline"], check=True,
         )
-        create_dispatch_task(root, {**dispatch_contract(), "review": True})
-        environment = task_review_environment("edit")
-        dispatched = run_task(root, "run", "T-1", environment=environment)
-        require(dispatched.returncode == 0, dispatched.stderr[-400:])
-        result = run_task(root, "review", "T-1", environment=os.environ.copy())
-        stored_path = root / ".orrery" / "reviews" / "T-1" / "1" / "review.json"
-        require(stored_path.exists(), f"no review was stored: {result.stderr[-600:]}")
-        stored = json.loads(stored_path.read_text())
-        blocking = [f for f in stored["findings"] if f["severity"] == "blocking"]
-        require(
-            blocking
-            and any("edited.txt" in json.dumps(f["evidence"]) for f in blocking),
-            f"a live reviewer missed a defect it was shown: {stored}",
+        # The dispatch runs the fake implementer, the review runs live.
+        # Both halves must resolve one worktree state home, which is what
+        # the stable environment exists for; the isolated variant parks
+        # the worktree where the live half can never find it.
+        environment = stable_task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "edited.txt"
+        environment["CODEX_FAKE_EDIT_TEXT"] = (
+            "def add(a, b):\n    # returns the sum of a and b\n    return a - b\n"
         )
+        try:
+            dispatched = run_task(root, "run", "T-1", environment=environment)
+            require(dispatched.returncode == 0, dispatched.stderr[-400:])
+            result = run_task(root, "review", "T-1", environment=os.environ.copy())
+            stored_path = root / ".orrery" / "reviews" / "T-1" / "1" / "review.json"
+            require(stored_path.exists(), f"no review was stored: {result.stderr[-600:]}")
+            patch = subprocess.run(
+                ["git", "-C", str(root), "log", "-1", "-p", "orrery/T-1"],
+                stdout=subprocess.PIPE, text=True, check=True,
+            ).stdout
+            require(
+                "return a - b" in patch,
+                f"the reviewed patch does not introduce the defect: {patch[-400:]}",
+            )
+            stored = json.loads(stored_path.read_text())
+            arithmetic = re.compile(
+                r"sum|subtract|minus|difference|a\s*-\s*b|wrong|incorrect",
+                re.IGNORECASE,
+            )
+            blocking = [
+                f for f in stored["findings"]
+                if f["severity"] == "blocking"
+                and "edited.txt" in json.dumps(f["evidence"])
+                and arithmetic.search(
+                    f["statement"] + " " + f.get("failure_scenario", "")
+                )
+            ]
+            require(
+                bool(blocking),
+                f"no blocking finding tied to the arithmetic defect: {stored}",
+            )
+        finally:
+            discard_task_environment(environment)
 
 
 @test("an interrupted review is not retried as an implementation")
@@ -14713,19 +15116,39 @@ def test_review_rendering_is_inert() -> None:
     )
 
 
-@test("the schema demands carried findings only when there are any")
+@test("the carried array is nullable in the schema and owed to the validator")
 def test_review_schema_shape() -> None:
+    """Strict structured output demands every property be required, so
+    the schema can no longer express "carried only on a re-review". The
+    property moved: the schema keeps carried always-required but
+    nullable, and the VALIDATOR enforces that its id set matches exactly
+    what the runner carried in, absence included."""
     first = findings_module.review_schema()
     again = findings_module.review_schema(["F-01"])
-    require(
-        "carried" not in first["required"] and "carried" in again["required"],
-        "the carried array is not required exactly when findings were carried",
-    )
+    for schema in (first, again):
+        require(
+            "carried" in schema["required"]
+            and "null" in schema["properties"]["carried"]["type"],
+            "carried must be always-required and nullable",
+        )
     require(
         first["additionalProperties"] is False
         and first["properties"]["findings"]["items"]["additionalProperties"] is False,
         "the schema permits fields it does not define",
     )
+    document = {
+        "v": 1, "task_id": "T-1", "verdict": "approved", "findings": [],
+        "carried": None, "unable_to_verify": [],
+    }
+    parsed = findings_module.parse_review(json.dumps(document))
+    try:
+        findings_module.validate_review(
+            parsed, task_id="T-1", carried_ids=["F-01"],
+            path_exists=lambda _: True,
+        )
+        raise Failure("a re-review silent about carried findings was accepted")
+    except findings_module.FindingsError:
+        pass
     json.dumps(again)
 
 

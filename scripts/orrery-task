@@ -33,6 +33,7 @@ from orrery_ledger import (  # noqa: E402
     repository_root,
     repair_ledger,
     task_ids,
+    repo_identity,
     worktree_path,
 )
 from orrery_runtime import RuntimeConfigError, load_role  # noqa: E402
@@ -289,14 +290,47 @@ def dispatch_alive(attempt: Path) -> bool:
 def receipt_failure(attempt: Path, returncode: int | None = None) -> str | None:
     receipt_path = attempt / "receipt.json"
     if not receipt_path.exists():
+        # A timed-out attempt is a timeout even when the wrapper also
+        # proposed a fallback on the way down: the reason carries the
+        # attempt's terminal fact, and the proposal survives as
+        # consent.txt beside it rather than by renaming the failure.
         if returncode == 124:
             return "timeout"
-        return "spawn-failure" if not (attempt / "unit.json").exists() else "provider-exit"
+        # Written by the wrapper at its consent stop, into the receipts
+        # directory's PARENT: the receipts dir is the delegate's own
+        # writable grant, so a marker inside it could be forged by the
+        # very process being classified. The exit code alone is
+        # ambiguous, a post-attempt stop reuses the failed provider's
+        # status and --no-fallback passes a provider's own 75 through,
+        # so the marker decides, but only while no receipt exists. A
+        # receipt means an attempt actually ran and failed, which is the
+        # fact the reason must carry.
+        if (attempt.parent / "consent-stop.json").exists():
+            return "approval-required"
+        # A marker-less 75 without a receipt is a consent stop whose
+        # marker write failed. A provider's own 75 cannot land here,
+        # because the launcher writes a receipt before propagating any
+        # provider status.
+        if returncode == 75:
+            return "approval-required"
+        if not (attempt / "unit.json").exists():
+            return "spawn-failure"
+        # The unit registered but no receipt landed: the launcher died
+        # between spawn and write. Not the provider's own exit, which a
+        # receipt would report below.
+        return "receipt-missing"
     try:
         receipt = json.loads(receipt_path.read_text())
-    except json.JSONDecodeError:
-        return "provider-exit"
-    if receipt.get("exit_status") != 0:
+    except (OSError, ValueError):
+        # The launcher writes the receipt to a temporary name and renames
+        # it into place, so an unreadable receipt is a disk fault or
+        # tampering, never a torn write.
+        return "receipt-corrupt"
+    if not isinstance(receipt, dict) or not isinstance(
+        receipt.get("exit_status"), int
+    ):
+        return "receipt-corrupt"
+    if receipt["exit_status"] != 0:
         return "provider-exit"
     result = attempt / "result.txt"
     if not result.exists() or not result.read_text().strip():
@@ -438,11 +472,18 @@ def complete_dispatch(
             partial_path = attempt.parent / "partial.patch"
             _atomic_write(partial_path, git(worktree, "diff").stdout.encode(), 0o600)
             partial = rel(root, partial_path)
-        if reason == "approval-required" and stderr_tail is not None:
-            _atomic_write(attempt.parent / "consent.txt", "".join(stderr_tail).encode(), 0o600)
+        consent = None
+        awaiting_approval = (
+            reason == "approval-required"
+            or (attempt.parent / "consent-stop.json").exists()
+        )
+        if awaiting_approval and stderr_tail is not None:
+            consent_path = attempt.parent / "consent.txt"
+            _atomic_write(consent_path, "".join(stderr_tail).encode(), 0o600)
+            consent = rel(root, consent_path)
         with control_lock(root) as locked:
             state = current(locked, task_id)[1]
-            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial})
+            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "consent": consent})
         return returncode or 1
     changed = git(worktree, "status", "--porcelain").stdout != ""
     if changed:
@@ -565,6 +606,70 @@ def review_packet(root: Path, records: list[dict], contract: dict, carried: list
     }
 
 
+def reviewable_path(worktree: Path, candidate: str) -> bool:
+    """Whether evidence names a regular file inside the reviewed tree.
+
+    Path.exists alone accepted directories, absolute paths (an absolute
+    right-hand side wins the join outright) and `..` escapes, so "." or
+    "/etc/passwd" satisfied the blocking-evidence discipline. Anything
+    that is not a regular file under the worktree is a claim about
+    something the reviewer did not read there.
+    """
+    if Path(candidate).is_absolute():
+        return False
+    resolved = (worktree / candidate).resolve()
+    anchor = worktree.resolve()
+    if anchor not in resolved.parents:
+        return False
+    return resolved.is_file()
+
+
+def review_receipts_dir(root: Path, task_id: str, name: str) -> Path:
+    """A delegate-writable receipts home outside every read-only mapping.
+
+    A read-only review maps the workspace, the common git dir and every
+    worktree of the repository read-only, and the composition refuses a
+    writable grant nested inside any of them, so receipts cannot live
+    under `.orrery` in the repository root. They live beside the task
+    worktrees under the state home instead, and the runner copies the
+    durable artefacts into `.orrery/reviews` after the run.
+    """
+    state_home = Path(
+        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))
+    )
+    return (
+        state_home / "orrery" / "review-receipts"
+        / repo_identity(root) / task_id / name
+    )
+
+
+def harvest_receipts(storage: Path, receipts: Path) -> None:
+    """Copy a review run's artefacts into durable storage, then drop the
+    state-home directory. A crash between the run and this copy leaves
+    the receipts at the state home rather than losing them.
+
+    The receipts directory is delegate-writable by design, so the
+    harvest takes only the wrapper's own artefact names and never
+    overwrites a file the runner already wrote: a reviewer that plants
+    schema.json or packet.json in its receipts must not falsify the
+    durable packet or steer its own retry.
+    """
+    if not receipts.exists():
+        return
+    for name in ("receipt.json", "result.txt", "stdout.log", "stderr.log", "unit.json"):
+        entry = receipts / name
+        target = storage / name
+        if not entry.is_file() or entry.is_symlink() or target.exists():
+            continue
+        _atomic_write(target, entry.read_bytes(), 0o600)
+    shutil.rmtree(receipts, ignore_errors=True)
+    if receipts.exists():
+        print(
+            f"orrery-task: review receipts not fully removed: {receipts}",
+            file=sys.stderr,
+        )
+
+
 def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     """Dispatch one blind review and record what it found.
 
@@ -624,16 +729,32 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     # output, and backs the whole thing with RuntimeMaxSec on the unit, so
     # a second deadline here would either duplicate that or cut a live
     # review short.
-    def dispatch_review(attempt_dir: Path, assignment: str) -> Path | None:
+    def dispatch_review(receipts_dir: Path, assignment: str) -> Path | None:
         """Run one reviewer and return its document, or None if it gave none."""
         process = subprocess.run(
-            command_for(attempt_dir) + flags + ["--", assignment],
+            command_for(receipts_dir) + flags + ["--", assignment],
             cwd=worktree, check=False,
         )
-        produced = attempt_dir / "result.txt"
+        produced = receipts_dir / "result.txt"
         if process.returncode != 0 or not produced.exists():
             return None
         return produced if produced.read_text().strip() else None
+
+
+    # A crashed review leaves its receipts at the state home; reclaim
+    # them before dispatching so a paid run's artefacts are not lost and
+    # nothing readable lingers. Reclamation follows the harvest rules;
+    # an orphan with no matching storage directory is removed.
+    orphans_root = review_receipts_dir(root, task_id, "orphan").parent
+    if orphans_root.exists():
+        for orphan in sorted(orphans_root.iterdir()):
+            if not orphan.is_dir():
+                continue
+            storage_dir = reviews / orphan.name
+            if storage_dir.is_dir():
+                harvest_receipts(storage_dir, orphan)
+            else:
+                shutil.rmtree(orphan, ignore_errors=True)
 
     accepted = None
     validation_error = None
@@ -648,13 +769,16 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
             f"{attempt.name}r"
         )
         this_attempt.mkdir(exist_ok=True)
+        this_receipts = review_receipts_dir(root, task_id, this_attempt.name)
+        this_receipts.mkdir(mode=0o700, parents=True, exist_ok=True)
         assignment = prompt if validation_error is None else (
             prompt
             + "\n\nYour previous reply was refused by the schema validator:\n"
             + validation_error
             + "\nReturn the same judgement in a document that conforms.\n"
         )
-        produced = dispatch_review(this_attempt, assignment)
+        produced = dispatch_review(this_receipts, assignment)
+        harvest_receipts(this_attempt, this_receipts)
         if produced is None:
             with control_lock(root) as locked:
                 append_record(locked, task_id, {
@@ -664,10 +788,12 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
                 })
             raise LedgerError("the reviewer returned no usable document")
         try:
-            document = orrery_findings.parse_review(produced.read_text())
+            document = orrery_findings.parse_review(
+                (this_attempt / "result.txt").read_text()
+            )
             accepted = orrery_findings.validate_review(
                 document, task_id=task_id, carried_ids=carried_ids,
-                path_exists=lambda candidate: (worktree / candidate).exists(),
+                path_exists=lambda candidate: reviewable_path(worktree, candidate),
             )
             break
         except orrery_findings.FindingsError as exc:
@@ -936,11 +1062,6 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     dispatch_record = next(record for record in reversed(current(store, task_id)[0]) if "dispatch" in record)
     if returncode == 2:
         return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, 2, stderr_tail)
-    if returncode == 75:
-        # The receipt wrapper intentionally has no receipt for a consent stop.
-        with control_lock(root) as locked:
-            append_record(locked, task_id, {"from": "IN_PROGRESS", "to": "DISPATCH_FAILED", "actor": "runner", "reason": "approval-required", "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": None})
-        return returncode
     return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, returncode, stderr_tail)
 
 

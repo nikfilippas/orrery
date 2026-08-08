@@ -70,63 +70,79 @@ def sanitise_provider_text(text: str) -> str:
 def review_schema(carried_ids: list[str] | None = None) -> dict[str, Any]:
     """The JSON Schema handed to the provider and used to validate.
 
-    `carried_ids` makes the `carried` array required, and only then, so a
-    first review is not asked to account for findings that do not exist.
+    Strict structured output demands every property be required, so
+    `carried` is always present and nullable rather than conditionally
+    required; the VALIDATOR is what demands real carried entries exactly
+    when `carried_ids` were supplied, and refuses them otherwise.
     """
+    # Two provider meta-rules shape this schema, both discovered live and
+    # both pinned by the suite: every node carries an explicit "type",
+    # and every object lists every property in "required", because
+    # OpenAI's structured-output validator refuses anything less. A field
+    # that is optional by design is therefore nullable rather than
+    # omittable, and the runner strips transport nulls at parse so the
+    # validator and the stored document keep absence semantics.
     evidence = {
         "type": "object",
         "additionalProperties": False,
+        "required": ["file", "lines", "reproduction"],
         "properties": {
-            "file": {"type": "string", "maxLength": MAX_PATH},
-            "lines": {"type": "string", "pattern": _LINES.pattern},
-            "reproduction": {"type": "string", "maxLength": MAX_PARAGRAPH},
+            "file": {"type": ["string", "null"], "maxLength": MAX_PATH},
+            "lines": {"type": ["string", "null"], "pattern": _LINES.pattern},
+            "reproduction": {"type": ["string", "null"], "maxLength": MAX_PARAGRAPH},
         },
     }
     finding = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["id", "severity", "category", "statement", "evidence"],
+        "required": [
+            "id", "severity", "category", "statement", "failure_scenario",
+            "evidence", "proposed_resolution", "addresses", "confidence",
+        ],
         "properties": {
             "id": {"type": "string", "pattern": _FINDING_ID.pattern},
-            "severity": {"enum": list(SEVERITIES)},
-            "category": {"enum": list(CATEGORIES)},
+            "severity": {"type": "string", "enum": list(SEVERITIES)},
+            "category": {"type": "string", "enum": list(CATEGORIES)},
             "statement": {"type": "string", "maxLength": MAX_STATEMENT},
-            "failure_scenario": {"type": "string", "maxLength": MAX_PARAGRAPH},
+            "failure_scenario": {"type": ["string", "null"], "maxLength": MAX_PARAGRAPH},
             "evidence": {"type": "array", "items": evidence, "maxItems": MAX_ITEMS},
             "proposed_resolution": {
-                "type": "array",
+                "type": ["array", "null"],
                 "items": {"type": "string", "maxLength": MAX_PARAGRAPH},
                 "maxItems": MAX_ITEMS,
             },
             "addresses": {"type": ["string", "null"], "pattern": _FINDING_ID.pattern},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
         },
     }
     carried = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["id", "disposition"],
+        "required": ["id", "disposition", "evidence"],
         "properties": {
             "id": {"type": "string", "pattern": _FINDING_ID.pattern},
-            "disposition": {"enum": list(DISPOSITIONS)},
-            "evidence": {"type": "array", "items": evidence, "maxItems": MAX_ITEMS},
+            "disposition": {"type": "string", "enum": list(DISPOSITIONS)},
+            "evidence": {"type": ["array", "null"], "items": evidence, "maxItems": MAX_ITEMS},
         },
     }
-    required = ["v", "task_id", "verdict", "findings", "unable_to_verify"]
-    if carried_ids:
-        required.append("carried")
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": required,
+        "required": [
+            "v", "task_id", "verdict", "findings", "carried",
+            "unable_to_verify",
+        ],
         "properties": {
-            "v": {"const": SCHEMA_VERSION},
+            "v": {"type": "integer", "const": SCHEMA_VERSION},
             "task_id": {"type": "string", "maxLength": 64},
-            "verdict": {"enum": list(VERDICTS)},
+            "verdict": {"type": "string", "enum": list(VERDICTS)},
             "findings": {
                 "type": "array", "items": finding, "maxItems": MAX_FINDINGS
             },
-            "carried": {"type": "array", "items": carried, "maxItems": MAX_FINDINGS},
+            "carried": {
+                "type": ["array", "null"], "items": carried,
+                "maxItems": MAX_FINDINGS,
+            },
             "unable_to_verify": {
                 "type": "array",
                 "items": {"type": "string", "maxLength": MAX_PARAGRAPH},
@@ -173,18 +189,35 @@ def _evidence(entries: Any, field: str, exists: Any) -> tuple[list[dict], list[s
     dropped: list[str] = []
     for index, entry in enumerate(entries):
         _keys(entry, {"file", "lines", "reproduction"}, set(), f"{field}[{index}]")
+        # A blank reproduction is a claim with no content, weighed exactly
+        # like a path that is not in the tree: the entry goes and the
+        # finding is weakened rather than the document being thrown away.
+        blank_reproduction = False
+        if "reproduction" in entry:
+            command = entry["reproduction"]
+            if not isinstance(command, str) or len(command) > MAX_PARAGRAPH:
+                raise FindingsError(
+                    f"{field}[{index}].reproduction must be a bounded string"
+                )
+            if not command.strip():
+                dropped.append(f"{field}[{index}]: blank reproduction")
+                blank_reproduction = True
+                entry = {k: v for k, v in entry.items() if k != "reproduction"}
         if "file" in entry:
             path = _text(entry["file"], f"{field}[{index}].file", MAX_PATH)
             if "lines" in entry and not _LINES.match(str(entry["lines"])):
                 raise FindingsError(f"{field}[{index}].lines must be N or N-M")
-            # A path that is not in the reviewed tree means the reviewer
-            # described something it did not read. That is a defect in the
-            # claim, not in the document, so the entry goes and the finding
-            # is weakened rather than the whole review being thrown away.
+            # A path that is not in the reviewed tree, or that is not a
+            # regular file inside it, means the reviewer described
+            # something it did not read. That is a defect in the claim,
+            # not in the document, so the entry goes and the finding is
+            # weakened rather than the whole review being thrown away.
             if exists is not None and not exists(path):
                 dropped.append(f"evidence path not found at commit: {path}")
                 continue
-        elif "reproduction" not in entry:
+        if "file" not in entry and "reproduction" not in entry:
+            if blank_reproduction:
+                continue
             raise FindingsError(f"{field}[{index}] needs a file or a reproduction")
         kept.append(dict(entry))
     return kept, dropped
@@ -394,9 +427,35 @@ def render_review(document: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _strip_nulls(node: Any, key: str | None = None) -> Any:
+    """Collapse transport nulls back into absence.
+
+    The all-required schema makes optional fields nullable, so a
+    provider under strict structured output sends null where a field
+    would simply be absent. Null and absent mean the same thing to the
+    validator and to the stored document. Only an EVIDENCE entry reduced
+    to nothing is dropped, because that is the one place an empty object
+    means "no claim"; anywhere else an emptied element must reach the
+    validator and fail, or a malformed finding would vanish instead of
+    being refused.
+    """
+    if isinstance(node, dict):
+        return {
+            name: _strip_nulls(value, name)
+            for name, value in node.items()
+            if value is not None
+        }
+    if isinstance(node, list):
+        stripped = [_strip_nulls(item, key) for item in node]
+        if key == "evidence":
+            return [item for item in stripped if item != {}]
+        return stripped
+    return node
+
+
 def parse_review(text: str) -> Any:
     """A provider's final message as JSON, however it wrapped it."""
     try:
-        return json.loads(text)
+        return _strip_nulls(json.loads(text))
     except json.JSONDecodeError as exc:
         raise FindingsError(f"the review is not JSON: {exc}") from exc

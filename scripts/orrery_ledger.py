@@ -69,7 +69,15 @@ TRANSITIONS = {
     "CANCELLED": frozenset(),
 }
 DISPATCH_FAILURE_REASONS = frozenset(
-    {"timeout", "provider-exit", "missing-result", "spawn-failure", "approval-required"}
+    {
+        "timeout",
+        "provider-exit",
+        "missing-result",
+        "spawn-failure",
+        "receipt-missing",
+        "receipt-corrupt",
+        "approval-required",
+    }
 )
 _CONTRACT_KEYS = frozenset(
     {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review"}

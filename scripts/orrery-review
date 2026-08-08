@@ -1312,11 +1312,12 @@ def write_service_launcher(
             "os.close(stderr_log)\n"
             "receipt = {'v': 1, 'exit_status': status, 'started': started, 'ended': datetime.now(timezone.utc).isoformat(), 'stdout_bytes': counts[0], 'stderr_bytes': counts[1]}\n"
             "try:\n"
-            "    fd = os.open(receipts / 'receipt.json', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n"
+            "    fd = os.open(receipts / 'receipt.json.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)\n"
             "    with os.fdopen(fd, 'w', encoding='utf-8') as handle:\n"
             "        json.dump(receipt, handle, separators=(',', ':'))\n"
             "        handle.flush()\n"
             "        os.fsync(handle.fileno())\n"
+            "    os.replace(receipts / 'receipt.json.tmp', receipts / 'receipt.json')\n"
             "except OSError as exc:\n"
             "    print(f'orrery-review: could not write receipt: {exc}', file=sys.stderr)\n"
             "    raise SystemExit(1)\n"
@@ -1899,6 +1900,39 @@ def handle_failed_attempt(
             inspection_required=require_rerun_after_inspection,
             status=status,
         )
+        # The exit code cannot carry the consent stop: a pre-attempt stop
+        # exits APPROVAL_REQUIRED, a post-attempt stop reuses the failed
+        # provider's own status, and --no-fallback passes a provider's 75
+        # through untouched. A marker beside the receipts is the only
+        # unambiguous channel to the task runner. Best effort: when the
+        # write fails, the runner's exit-code heuristic still catches the
+        # receiptless case.
+        if invocation.receipts is not None:
+            try:
+                # The receipts directory itself is the delegate's writable
+                # grant, so a marker inside it could be forged by the very
+                # process whose failure is being classified. The parent is
+                # runner-owned in every dispatch layout, so the marker
+                # lives there.
+                fd = os.open(
+                    Path(invocation.receipts).parent / "consent-stop.json",
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "v": 1,
+                            "candidate": proposal.approval_key,
+                            "status": status,
+                        },
+                        handle,
+                        separators=(",", ":"),
+                    )
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError:
+                pass
         return (
             APPROVAL_REQUIRED
             if approval_required_status is None
