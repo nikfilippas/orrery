@@ -7,6 +7,13 @@ rollout file per session under $CODEX_HOME/sessions, with a cumulative
 token count per session. Both are read here, never modified. The numbers
 are what the providers reported at the time and are an accounting of
 usage, not of billing.
+
+`--task` reports a different population entirely. Delegated runs are
+ephemeral by design, so they write no session file and appear in no
+global scan; their accounting comes from the attempt records the wrapper
+writes beside each run. The two views therefore cover disjoint sets of
+runs and must never be added together, which the report says out loud
+rather than leaving to be inferred.
 """
 
 from __future__ import annotations
@@ -18,6 +25,9 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orrery_spend  # noqa: E402
 
 
 COLUMNS = ("fresh_in", "cache_read", "cache_write", "output", "total")
@@ -224,6 +234,235 @@ def read_codex(
     return files
 
 
+def task_attempts(store: Path, task_id: str) -> tuple[list[dict], int]:
+    """Every attempt record for one task, and the runs that left none.
+
+    Dispatches and reviews keep their artefacts in different places, so
+    both trees are walked. A dispatch or review directory with no
+    attempt record at all is counted rather than ignored: it predates
+    this accounting or its artefacts were reclaimed, and either way its
+    cost is not zero, it is absent.
+    """
+    records: list[dict] = []
+    unattributed = 0
+    roots = [
+        directory
+        for parent in (store / "dispatch" / task_id, store / "reviews" / task_id)
+        if parent.is_dir()
+        for directory in sorted(parent.iterdir())
+        if directory.is_dir() and not directory.is_symlink()
+    ]
+    for directory in roots:
+        # A dispatch nests its receipts one level deeper; a review does
+        # not, and its retry lives in a sibling directory of its own.
+        candidates = [directory] + [
+            child
+            for child in sorted(directory.iterdir())
+            if child.is_dir() and child.name.startswith("attempt-")
+        ]
+        found = 0
+        for candidate in candidates:
+            for record in orrery_spend.read_attempts(candidate):
+                records.append(record)
+                found += 1
+        if not found:
+            unattributed += 1
+    return records, unattributed
+
+
+def price_records(records: list[dict]) -> tuple[float | None, str | None]:
+    """Cost for a task's attempts, or why it cannot be given.
+
+    The provider's own billed figure is preferred wherever it exists,
+    because it is the truth and needs no maintenance: Claude reports one
+    per run. The operator's table is consulted only for the attempts
+    that have none, so a Claude-only task can be priced with no table at
+    all, and a table that cannot price those attempts refuses rather
+    than guessing.
+    """
+    total = 0.0
+    table: dict | None = None
+    for record in records:
+        usage = record.get("usage")
+        if not isinstance(usage, dict):
+            # Unknown spend is reported as its own row; it must not be
+            # folded into a money figure as though it were nothing.
+            continue
+        reported = record.get("provider_cost_usd")
+        if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+            total += float(reported)
+            continue
+        if table is None:
+            from orrery_runtime import RuntimeConfigError, load_manifest
+
+            try:
+                table = orrery_spend.price_table(load_manifest())
+            except (RuntimeConfigError, orrery_spend.SpendError) as exc:
+                return None, str(exc)
+            refusal = orrery_spend.price_refusal(table)
+            if refusal:
+                return None, refusal
+        # Tokens the provider says came from another model cannot be
+        # charged at this attempt's rate. The provider's own figure
+        # already accounts for them, so this only bites the table path.
+        named = record.get("reported_models")
+        if named and set(named) != {record.get("model")}:
+            return None, (
+                f"a run on {record.get('model')} reports usage from "
+                f"{sorted(named)}, which this attempt's rate cannot price"
+            )
+        assert table is not None
+        rates = orrery_spend.rate_for(
+            table, record.get("provider"), record.get("model"),
+            record.get("endpoint"),
+        )
+        if rates is None:
+            key = orrery_spend.price_key(
+                record.get("provider"), record.get("model"), record.get("endpoint")
+            )
+            return None, (
+                f"the provider reported no cost for this run and the price "
+                f"table has no rate for {key}"
+            )
+        total += orrery_spend.money_of(usage, rates)
+    return total, None
+
+
+def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
+    store = root / ".orrery"
+    if not (store / "ledger" / f"{task_id}.jsonl").exists():
+        print(f"orrery-usage: no such task: {task_id}", file=sys.stderr)
+        return 2
+    records, unattributed = task_attempts(store, task_id)
+
+    totals: dict[tuple[str, str, str, str], dict[str, int]] = {}
+    unknown = 0
+    reported_cost = 0.0
+    have_reported = False
+    for record in records:
+        usage = record.get("usage")
+        key = (
+            str(record.get("role", "unknown")),
+            str(record.get("provider", "unknown")),
+            str(record.get("model", "unknown")),
+            str(record.get("endpoint") or ""),
+        )
+        bucket = totals.setdefault(key, new_bucket())
+        bucket["events"] += 1
+        if not isinstance(usage, dict):
+            unknown += 1
+            continue
+        for name in orrery_spend.TOKEN_CLASSES:
+            bucket[name] += integer(usage.get(name))
+            bucket["total"] += integer(usage.get(name))
+        cost = record.get("provider_cost_usd")
+        if isinstance(cost, (int, float)):
+            reported_cost += float(cost)
+            have_reported = True
+
+    computed: float | None = None
+    priced_by: set[str] = set()
+    if money:
+        computed, refusal = price_records(records)
+        if refusal is not None:
+            print(f"orrery-usage: cannot report money: {refusal}", file=sys.stderr)
+            return 2
+        priced_by = {
+            "the provider's own figure"
+            if isinstance(record.get("provider_cost_usd"), (int, float))
+            else "the price table"
+            for record in records
+            if isinstance(record.get("usage"), dict)
+        }
+
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "task_id": task_id,
+                    "attempts": len(records),
+                    "unknown_attempts": unknown,
+                    "unattributed_runs": unattributed,
+                    "population": "delegated runs only; disjoint from the global scan",
+                    "usage": [
+                        {
+                            "role": role,
+                            "provider": provider,
+                            "model": model,
+                            "endpoint": endpoint or None,
+                            **bucket,
+                        }
+                        for (role, provider, model, endpoint), bucket in sorted(
+                            totals.items()
+                        )
+                    ],
+                    "provider_cost_usd": reported_cost if have_reported else None,
+                    "computed_cost_usd": computed,
+                    "priced_by": sorted(priced_by),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"Token usage attributed to {task_id}")
+    print(
+        "Delegated runs are ephemeral and write no session file, so these "
+        "figures are disjoint from the global scan and cannot be added to it."
+    )
+    print()
+    print(f"{'ATTRIBUTION':14} {'RUNS':>5}  MEANING")
+    print(f"{'attributed':14} {len(records) - unknown:>5}  usage parsed and counted below")
+    print(
+        f"{'unknown':14} {unknown:>5}  a provider run started and its usage "
+        "was not recovered"
+    )
+    print(
+        f"{'unattributed':14} {unattributed:>5}  a run left no attempt record; "
+        "it predates this accounting or never started a provider"
+    )
+    print()
+    header = (
+        f"{'ROLE':13} {'PROVIDER':10} {'MODEL':22} {'FRESH IN':>10} "
+        f"{'CACHE RD':>10} {'CACHE WR':>10} {'OUTPUT':>9} {'TOTAL':>11} {'RUNS':>5}"
+    )
+    print(header)
+    print("-" * len(header))
+    grand = new_bucket()
+    for (role, provider, model, _endpoint), bucket in sorted(totals.items()):
+        for name in (*COLUMNS, "events"):
+            grand[name] += bucket[name]
+        print(
+            f"{role[:13]:13} {provider[:10]:10} {model[:22]:22} "
+            f"{bucket['fresh_in']:>10,} {bucket['cache_read']:>10,} "
+            f"{bucket['cache_write']:>10,} {bucket['output']:>9,} "
+            f"{bucket['total']:>11,} {bucket['events']:>5,}"
+        )
+    print("-" * len(header))
+    print(
+        f"{'all':13} {'':10} {'':22} {grand['fresh_in']:>10,} "
+        f"{grand['cache_read']:>10,} {grand['cache_write']:>10,} "
+        f"{grand['output']:>9,} {grand['total']:>11,} {grand['events']:>5,}"
+    )
+    if have_reported:
+        print(f"\nProvider-reported cost: {reported_cost:.4f} USD")
+    if computed is not None:
+        print(
+            f"Cost: {computed:.4f} USD, from "
+            + " and ".join(sorted(priced_by or {"no priced runs"}))
+        )
+    if unknown:
+        # Only for runs that actually started a provider. An
+        # unattributed run may have spent nothing at all, and calling
+        # that a floor would invent a cost the ledger says is zero.
+        print(
+            "\nThe totals above are a floor: a run that started and whose "
+            "usage was not recovered spent an unknown amount, which is never "
+            "counted as zero."
+        )
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -235,8 +474,33 @@ def main() -> int:
         default="30",
         help="day count or ISO date to start from (default: 30)",
     )
+    parser.add_argument(
+        "--task",
+        help="report one Orrery task's delegated runs instead of the global scan",
+    )
+    parser.add_argument(
+        "--money",
+        action="store_true",
+        help="also report cost, refusing when the price table cannot answer",
+    )
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
+
+    if args.task:
+        from orrery_ledger import LedgerError, repository_root
+
+        try:
+            root = repository_root()
+        except LedgerError as exc:
+            print(f"orrery-usage: {exc}", file=sys.stderr)
+            return 2
+        return task_report(root, args.task, args.money, args.as_json)
+    if args.money:
+        print(
+            "orrery-usage: --money reports a task's cost and needs --task",
+            file=sys.stderr,
+        )
+        return 2
 
     since = parse_since(args.since)
     totals: dict[tuple[str, str], dict[str, int]] = {}

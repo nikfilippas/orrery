@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orrery_findings  # noqa: E402
+import orrery_spend  # noqa: E402
 from orrery_fallback import git_workspace_fingerprint  # noqa: E402
 from orrery_ledger import (  # noqa: E402
     STATES as LEDGER_STATES,
@@ -33,6 +34,7 @@ from orrery_ledger import (  # noqa: E402
     read_ledger,
     repository_root,
     repair_ledger,
+    risk_review_refusal,
     task_ids,
     repo_identity,
     worktree_path,
@@ -466,6 +468,14 @@ def complete_dispatch(
     digest = dispatch_record["contract_digest"]
     base = dispatch_record["gate"]["base_head"]
     gate = dispatch_record["gate"]
+    # Every provider-started attempt, not just the one that succeeded: a
+    # transient retry and an approved fallback both spend, and counting
+    # one would price the run at a fraction of its cost. Written into the
+    # ledger too, so a ceiling can be enforced under the control lock
+    # without re-reading receipts, and so a dispatch whose artefacts are
+    # later reclaimed still says what it cost.
+    attempt_records = orrery_spend.read_attempts(attempt)
+    spend = orrery_spend.spend_of(attempt_records)
     reason = receipt_failure(attempt, returncode)
     if reason:
         partial = None
@@ -484,7 +494,7 @@ def complete_dispatch(
             consent = rel(root, consent_path)
         with control_lock(root) as locked:
             state = current(locked, task_id)[1]
-            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "consent": consent})
+            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "consent": consent, "spend": spend})
         return returncode or 1
     changed = git(worktree, "status", "--porcelain").stdout != ""
     if changed:
@@ -503,7 +513,7 @@ def complete_dispatch(
         next_state = "IMPLEMENTED" if commit != base else "NO_CHANGE"
     with control_lock(root) as locked:
         state = current(locked, task_id)[1]
-        record = {"from": state, "to": next_state, "actor": "runner", "contract_digest": digest}
+        record = {"from": state, "to": next_state, "actor": "runner", "contract_digest": digest, "spend": spend}
         if next_state == "IMPLEMENTED":
             record["commit"] = commit
         implemented = next((entry for entry in reversed(current(locked, task_id)[0]) if entry.get("commit") == commit), None)
@@ -521,9 +531,129 @@ def complete_dispatch(
         diff = {"files": files, "stat": git(worktree, "diff", "--stat", f"{base}..{commit}").stdout, "patch": rel(root, patch)}
     else:
         out = []
-    packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": [{"attempt": 1, "receipt": receipt}], "diff": diff, "out_of_scope": out, "usage": {"unavailable": "unrecognised attempt artefacts"}, "worker_claim": (attempt / "result.txt").read_text()}
+    packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": attempt_entries(attempt, receipt), "diff": diff, "out_of_scope": out, "usage": spend, "worker_claim": (attempt / "result.txt").read_text()}
     return verify(root, store, task_id, contract, sequence, worktree, base, commit, packet, next_state == "NO_CHANGE")
 
+
+
+class NamedEndpoint:
+    def __init__(self, identifier: str) -> None:
+        self.id = identifier
+
+
+class RanRole:
+    """The provider and model a completed attempt actually used.
+
+    Resumption used to reload the contract's configured role, which is
+    the wrong answer for any run that fell over to another provider: the
+    ledger would name the model that was supposed to run rather than the
+    one that did, and its spend would be priced against the wrong rate.
+    Only the fields `role_data` reads are carried, because that is the
+    only thing a completed dispatch does with a role.
+    """
+
+    def __init__(self, record: dict, role_id: str) -> None:
+        self.id = role_id
+        self.provider = record["provider"]
+        self.model = record["model"]
+        self.thinking = record.get("thinking")
+        endpoint = record.get("endpoint")
+        self.endpoint = NamedEndpoint(endpoint) if endpoint else None
+
+
+def ran_role(attempt: Path, contract: dict, root: Path) -> object:
+    records = orrery_spend.read_attempts(attempt)
+    final = records[-1] if records else None
+    if final and final.get("provider") and final.get("model"):
+        return RanRole(final, final.get("role") or contract["assigned_role"])
+    # A dispatch that predates the accounting has no record to read, so
+    # the configured role remains the only available answer.
+    return load_role(contract["assigned_role"], cwd=root)
+
+
+def attempt_entries(attempt: Path, final_receipt: dict) -> list[dict]:
+    """One packet entry per attempt directory, oldest first.
+
+    The receipt carries the timings and stream sizes, the attempt record
+    carries the identity and the usage, and they live in different files
+    because one is written by the launcher inside the unit and the other
+    by the wrapper outside it. Both are read from the same directory:
+    scanning records and receipts separately and pairing them by
+    position put one attempt's receipt against another attempt's run the
+    moment either scan was short.
+    """
+    entries: list[dict] = []
+    for index, directory in enumerate(orrery_spend.attempt_directories(attempt), 1):
+        entry: dict = {"attempt": index}
+        record = orrery_spend.read_attempt(directory)
+        if record is not None:
+            entry["run"] = record
+        if directory == attempt:
+            entry["receipt"] = final_receipt
+        else:
+            try:
+                entry["receipt"] = json.loads((directory / "receipt.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+        entries.append(entry)
+    return entries
+
+
+def review_rounds_spend(attempt: Path) -> dict:
+    """Both validation rounds of one review.
+
+    An invalid first review is a paid run, and reading only the round
+    that parsed would lose it. A review that produced nothing at all is
+    the same case: it started a provider, so its record exists and its
+    cost is unknown rather than absent.
+    """
+    return orrery_spend.spend_of(
+        [
+            record
+            for directory in (attempt, attempt.with_name(f"{attempt.name}r"))
+            for record in orrery_spend.read_attempts(directory)
+        ]
+    )
+
+
+def take_override(flags: list[str]) -> str | None:
+    """Remove `--override <reason>` from the forwarded flags, if present."""
+    for index, flag in enumerate(list(flags)):
+        if flag == "--override":
+            if index + 1 >= len(flags) or flags[index + 1].startswith("-"):
+                raise LedgerError('--override needs a reason: --override "<why>"')
+            reason = flags[index + 1]
+            del flags[index : index + 2]
+            return reason
+        if flag.startswith("--override="):
+            reason = flag.split("=", 1)[1]
+            if not reason.strip():
+                raise LedgerError('--override needs a reason: --override "<why>"')
+            del flags[index]
+            return reason
+    return None
+
+
+def repeated_review(records: list[dict]) -> dict | None:
+    """Two valid reviews of one commit that changed nothing.
+
+    Keyed on the review records themselves, so a reviewer's reply that
+    the schema refused is not a review and cannot count towards a stop,
+    and advisory findings never do either. Any new commit gives the two
+    reviews different anchors and clears the condition by construction.
+    Reviews recorded before this phase carry no `unresolved` field and so
+    can never trigger it.
+    """
+    reviews = [record["review"] for record in records if record.get("review")]
+    if len(reviews) < 2:
+        return None
+    last, previous = reviews[-1], reviews[-2]
+    unresolved = last.get("unresolved")
+    if not unresolved or previous.get("unresolved") != unresolved:
+        return None
+    if not last.get("commit") or last.get("commit") != previous.get("commit"):
+        return None
+    return {"commit": last["commit"], "unresolved": list(unresolved)}
 
 
 def blocking_ledger(records: list[dict]) -> tuple[dict[str, dict], set[str]]:
@@ -657,12 +787,26 @@ def harvest_receipts(storage: Path, receipts: Path) -> None:
     """
     if not receipts.exists():
         return
-    for name in ("receipt.json", "result.txt", "stdout.log", "stderr.log", "unit.json"):
+    for name in orrery_spend.ATTEMPT_ARTEFACTS:
         entry = receipts / name
         target = storage / name
         if not entry.is_file() or entry.is_symlink() or target.exists():
             continue
         _atomic_write(target, entry.read_bytes(), 0o600)
+    # Superseded attempts travel too, or a retry's cost would be lost at
+    # exactly the moment the run that spent it is being accounted for.
+    prior = receipts / "prior"
+    if prior.is_dir() and not prior.is_symlink():
+        for round_dir in sorted(prior.iterdir()):
+            if not round_dir.is_dir() or round_dir.is_symlink():
+                continue
+            for name in orrery_spend.ATTEMPT_ARTEFACTS:
+                entry = round_dir / name
+                target = storage / "prior" / round_dir.name / name
+                if not entry.is_file() or entry.is_symlink() or target.exists():
+                    continue
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                _atomic_write(target, entry.read_bytes(), 0o600)
     shutil.rmtree(receipts, ignore_errors=True)
     if receipts.exists():
         print(
@@ -814,6 +958,54 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
         raise LedgerError("task worktree is missing; resume or re-run the task")
     carried = unresolved_blocking(records)
     carried_ids = [finding["id"] for finding in carried]
+    # Taken out of the forwarded flags: everything left in `flags` goes
+    # to the wrapper, which knows nothing about this option.
+    override = take_override(flags)
+    stuck = repeated_review(records)
+    if stuck and override is None:
+        detail = (
+            f"two reviews of commit {stuck['commit'][:12]} left the same "
+            "findings open (" + ", ".join(stuck["unresolved"]) + ")"
+        )
+        # Recorded before it is raised, like every other guard: a refusal
+        # that exists only on stderr is invisible to the next reader of
+        # the ledger, which is the only durable account of the task.
+        with control_lock(root) as locked:
+            state_now = current(locked, task_id)[1]
+            append_record(locked, task_id, {
+                "from": state_now, "to": state_now, "actor": "user",
+                "reason": "REFUSED", "contract_digest": digest,
+                "decision": {
+                    "guard": "repeated-review",
+                    "detail": detail,
+                    "counters": {
+                        "commit": stuck["commit"],
+                        "unresolved": stuck["unresolved"],
+                        "reviews": sum(1 for r in records if r.get("review")),
+                    },
+                    "blocked_by": None,
+                },
+            })
+        raise LedgerError(
+            f"task {task_id} is not making progress: {detail}; rework the "
+            'task, or repeat with --override "<reason>"'
+        )
+    if stuck:
+        reason = override
+        with control_lock(root) as locked:
+            append_record(locked, task_id, {
+                "from": current(locked, task_id)[1],
+                "to": current(locked, task_id)[1],
+                "actor": "user",
+                "reason": "LOOP_OVERRIDE",
+                "contract_digest": digest,
+                "override": {
+                    "commit": stuck["commit"],
+                    "unresolved": stuck["unresolved"],
+                    "detail": orrery_findings.sanitise_provider_text(reason),
+                },
+            })
+        records, state = current(store, task_id)
     role = load_role("reviewer")
     sequence = 1 + sum(1 for record in records if record.get("review"))
     # A review whose record never landed would otherwise collide with its
@@ -910,6 +1102,7 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
                     "from": current(locked, task_id)[1], "to": "INTERRUPTED",
                     "actor": "runner", "reason": "review-missing-result",
                     "phase": "review", "contract_digest": digest,
+                    "spend": review_rounds_spend(attempt),
                 })
             raise LedgerError("the reviewer returned no usable document")
         try:
@@ -954,12 +1147,24 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
         entry["id"] for entry in stored.get("carried", [])
         if entry["disposition"] == "still_present"
     ]
+    # What is still open once this review is counted, stored so the
+    # unproductive-loop stop can compare two reviews directly instead of
+    # replaying the ledger prefix that produced each of them.
+    projected = sorted(
+        (
+            {finding["id"] for finding in unresolved_blocking(records)}
+            | {finding["id"] for finding in blocking}
+        )
+        - {entry["id"] for entry in resolutions}
+    )
+    review_spend = review_rounds_spend(attempt)
     with control_lock(root) as locked:
         append_record(locked, task_id, {
             "from": current(locked, task_id)[1],
             "to": "REVIEW_BLOCKED" if blocking or still_present else "REVIEW_PASSED",
             "actor": "runner",
             "contract_digest": digest,
+            "spend": review_spend,
             "review": {
                 "seq": sequence, "sha256": review_sha,
                 "verdict": stored["verdict"], "blocking": blocking,
@@ -968,6 +1173,7 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
                 ),
                 "downgrades": accepted["downgrades"],
                 "commit": packet["commit"],
+                "unresolved": projected,
                 **role_data(role),
             },
             "resolutions": resolutions,
@@ -1074,20 +1280,59 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
         if resolved.returncode != 0 or not base:
             raise LedgerError(f"target ref {target} does not resolve")
 
-        conflict = scope_conflict(locked, task_id, contract["scope"]["include"])
-        if conflict:
-            raise LedgerError(f"task {task_id} cannot start: {conflict}")
-        waiting = dependency_conflict(root, locked, contract, base)
-        if waiting:
-            raise LedgerError(f"task {task_id} cannot start: {waiting}")
+        # Every guard resolves to one refusal so the decision can be
+        # recorded before it is raised. A ledger that keeps only the
+        # dispatches that ran describes a selected sample, and no later
+        # question about whether more agents would have helped can be
+        # asked of it honestly.
         cap = concurrency_cap(root)
         running = active_dispatches(locked, task_id)
-        if len(running) >= cap:
+        spend = spend_so_far(records)
+        counters = {
+            "dispatches": dispatch_count(records),
+            "spend_total": spend["total"],
+            "spend_unknown": bool(spend["unknown"]),
+            "active": [other for other, _state in running],
+            "cap": cap,
+        }
+        refusal: tuple[str, str] | None = None
+        blocked_by: str | None = None
+        conflict = scope_conflict(locked, task_id, contract["scope"]["include"])
+        if conflict:
+            refusal = ("scope", conflict)
+        elif waiting := dependency_conflict(root, locked, contract, base):
+            refusal = ("dependency", waiting)
+        elif len(running) >= cap:
             named = ", ".join(f"{other} ({state})" for other, state in running)
-            raise LedgerError(
-                f"task {task_id} cannot start: {len(running)} of {cap} dispatch "
-                f"slots are in use by {named}"
+            refusal = (
+                "concurrency",
+                f"{len(running)} of {cap} dispatch slots are in use by {named}",
             )
+        else:
+            refusal = budget_conflict(contract, records)
+        if refusal:
+            guard, detail = refusal
+            blocked_by = next(
+                (other for other, _state in running if other in detail), None
+            )
+            append_record(
+                locked,
+                task_id,
+                {
+                    "from": "READY",
+                    "to": "READY",
+                    "actor": "user",
+                    "reason": "REFUSED",
+                    "contract_digest": digest,
+                    "decision": {
+                        "guard": guard,
+                        "detail": detail,
+                        "counters": counters,
+                        "blocked_by": blocked_by,
+                    },
+                },
+            )
+            raise LedgerError(f"task {task_id} cannot start: {detail}")
 
         sequence = 1 + sum(r["to"] == "DISPATCHED" for r in records)
         dispatch_root = root / ".orrery" / "dispatch"
@@ -1140,6 +1385,12 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
                     "receipts": str(attempt),
                     "worktree": str(candidate_worktree),
                     "branch": branch,
+                },
+                "decision": {
+                    "guard": "admitted",
+                    "detail": "every admission guard passed",
+                    "counters": counters,
+                    "blocked_by": None,
                 },
                 "contract_digest": digest,
             },
@@ -1213,9 +1464,12 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     returncode = process.wait()
     reader.join(timeout=10)
     dispatch_record = next(record for record in reversed(current(store, task_id)[0]) if "dispatch" in record)
+    # The role that ran, which is not the configured one when the
+    # wrapper fell over to another provider partway through.
+    ran = ran_role(attempt, contract, root)
     if returncode == 2:
-        return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, 2, stderr_tail)
-    return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, returncode, stderr_tail)
+        return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, ran, 2, stderr_tail)
+    return complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, ran, returncode, stderr_tail)
 
 
 def rerun_verify(root: Path, task_id: str) -> int:
@@ -1276,12 +1530,10 @@ def resume_task(root: Path, task_id: str) -> int:
     contract = load_contract(store, task_id)
     digest = dispatch_record["contract_digest"]
     if (attempt / "receipt.json").exists():
+        role = ran_role(attempt, contract, root)
         if state == "DISPATCHED":
-            role = load_role(contract["assigned_role"], cwd=root)
             with control_lock(root) as locked:
                 append_record(locked, task_id, {"from": "DISPATCHED", "to": "IN_PROGRESS", "actor": "runner", "reason": "attempt", "attempt": 1, **role_data(role), "contract_digest": digest})
-        else:
-            role = load_role(contract["assigned_role"], cwd=root)
         result = complete_dispatch(root, task_id, contract, dispatch_record, attempt, worktree, role, 0)
         print(f"{task_id} {'completed' if result == 0 else 'dispatch failed'}")
         return result
@@ -1291,9 +1543,15 @@ def resume_task(root: Path, task_id: str) -> int:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         _atomic_write(path, git(worktree, "diff").stdout.encode(), 0o600)
         partial = rel(root, path)
+    # An interruption is exactly the case a ceiling must not misread: the
+    # attempt record exists because a provider was started, and the
+    # receipt is missing because the run never finished. Without this the
+    # ledger held no spend for it and the next dispatch passed a token
+    # ceiling it had already crossed.
+    interrupted_spend = orrery_spend.spend_of(orrery_spend.read_attempts(attempt))
     with control_lock(root) as locked:
         latest = current(locked, task_id)[1]
-        append_record(locked, task_id, {"from": latest, "to": "INTERRUPTED", "actor": "runner", "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial})
+        append_record(locked, task_id, {"from": latest, "to": "INTERRUPTED", "actor": "runner", "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "spend": interrupted_spend})
     print(f"{task_id} interrupted")
     return 0
 
@@ -1357,6 +1615,70 @@ def active_dispatches(store: Path, exclude: str | None = None) -> list[tuple[str
     return active
 
 
+def spend_so_far(records: list[dict]) -> dict:
+    """Everything this task is known to have spent, and what is not known.
+
+    Read from the ledger rather than from receipts, because the ceiling
+    is enforced inside the control lock and a scan of the filesystem
+    there would be both slower and racy against a reclaim.
+    """
+    tokens = orrery_spend.empty_tokens()
+    unknown: list[str] = []
+    for record in records:
+        spend = record.get("spend")
+        if not isinstance(spend, dict):
+            continue
+        for name, value in (spend.get("tokens") or {}).items():
+            if name in tokens and isinstance(value, int) and not isinstance(value, bool):
+                tokens[name] += max(0, value)
+        if spend.get("unknown"):
+            unknown.extend(spend.get("gaps") or ["usage was not recorded"])
+    return {"tokens": tokens, "total": sum(tokens.values()), "unknown": unknown}
+
+
+def dispatch_count(records: list[dict]) -> int:
+    return sum(1 for record in records if record.get("to") == "DISPATCHED")
+
+
+def budget_conflict(contract: dict, records: list[dict]) -> tuple[str, str] | None:
+    """Which ceiling refuses this dispatch, and why, or nothing.
+
+    Only the ceilings this contract actually sets are consulted, so a
+    contract written before this phase decides exactly as it did before.
+    The token ceiling bounds new dispatches: a run already in flight
+    cannot be truncated, so one dispatch may cross it, and the refusal
+    says so rather than implying a hard cap.
+    """
+    budget = contract.get("budget") or {}
+    ceiling = budget.get("dispatches")
+    used = dispatch_count(records)
+    if isinstance(ceiling, int) and used >= ceiling:
+        return (
+            "budget-dispatches",
+            f"{used} of {ceiling} dispatches are already spent; "
+            "amend budget.dispatches or close the task",
+        )
+    ceiling = budget.get("tokens")
+    if isinstance(ceiling, int):
+        spend = spend_so_far(records)
+        if spend["unknown"]:
+            return (
+                "spend-unknown",
+                "a previous attempt started a provider run whose usage was "
+                f"not recovered ({spend['unknown'][0]}), so the remaining "
+                "budget is unknown; reconcile the attempt records or amend "
+                "budget.tokens",
+            )
+        if spend["total"] >= ceiling:
+            return (
+                "budget-tokens",
+                f"{spend['total']} of {ceiling} tokens are already spent; "
+                "the ceiling bounds new dispatches rather than truncating "
+                "one in flight, so amend budget.tokens to continue",
+            )
+    return None
+
+
 def waiting_reason(root: Path, store: Path, task_id: str, state: str) -> str:
     """What this task is waiting on, in one clause, or nothing.
 
@@ -1390,6 +1712,12 @@ def waiting_reason(root: Path, store: Path, task_id: str, state: str) -> str:
     running = active_dispatches(store, task_id)
     if len(running) >= concurrency_cap(root):
         return f"(waiting: {len(running)} dispatch slots in use)"
+    try:
+        records = current(store, task_id)[0]
+    except LedgerError:
+        return "(ready to run)"
+    if refusal := budget_conflict(contract, records):
+        return f"(stopped: {refusal[1]})"
     return "(ready to run)"
 
 
@@ -1608,7 +1936,8 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
         None,
     )
     if verified_integration:
-        reconcile_target = load_contract(store, task_id)["target_ref"]
+        reconcile_contract = load_contract(store, task_id)
+        reconcile_target = reconcile_contract["target_ref"]
         current_head = git(
             root, "rev-parse", "--verify", "--quiet", reconcile_target
         ).stdout.strip()
@@ -1620,12 +1949,28 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
         # have omitted this task's checks from its union.
         landed = verified_integration.get("result_commit")
         if current_head and landed and is_ancestor(root, landed, current_head):
+            # The work is already in the target, so refusing here would
+            # not undo it: it would leave a promotion no record accounts
+            # for, which every later union computation then mis-reads.
+            # A contract sealed before the risk rule can reach this, so
+            # the breach is recorded and reported rather than swallowed,
+            # and the reconciliation completes.
+            breach = risk_review_refusal(reconcile_contract)
+            record = {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "contract_digest": records[-1]["contract_digest"], "integration": verified_integration}
+            if breach:
+                record["risk_breach"] = breach
             with control_lock(root) as locked:
                 state_now = current(locked, task_id)[1]
                 if state_now == "AWAITING_MERGE":
-                    append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "contract_digest": records[-1]["contract_digest"], "integration": verified_integration})
+                    append_record(locked, task_id, record)
             print(f"orrery-task: {task_id} was promoted before its record landed; completed it")
-            return 0
+            if breach:
+                print(
+                    f"orrery-task: {task_id} landed without a review decision "
+                    f"and cannot be un-landed: {breach}",
+                    file=sys.stderr,
+                )
+            return 1 if breach else 0
     stale = task_merge_lease(records)
     if stale and not lease_holder_alive(stale):
         with control_lock(root) as locked:
@@ -1657,6 +2002,11 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
     if outstanding:
         named = ", ".join(f"{f['id']} ({f['statement'][:60]})" for f in outstanding)
         raise LedgerError(f"unresolved blocking finding: {named}")
+    # Also at the gate, not only at seal: a contract sealed before this
+    # rule existed would otherwise merge declared high-risk work with no
+    # review and no waiver.
+    if refusal := risk_review_refusal(contract):
+        raise LedgerError(refusal)
     dispatched = next(record for record in reversed(records) if "dispatch" in record)
     base = dispatched["gate"]["base_head"]
     implemented = next((record for record in reversed(records) if record.get("commit")), None)
@@ -2064,6 +2414,23 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{task_id} {state} {waiting_reason(root, store, task_id, state)}".rstrip())
                     if torn:
                         print(f"warning: {task_id} has a torn ledger tail")
+                    # Declining review on declared high-risk work is
+                    # allowed, but never quietly: it is the operator's
+                    # decision and it stays visible for as long as the
+                    # task does.
+                    try:
+                        contract = load_contract(store, task_id)
+                    except LedgerError:
+                        contract = None
+                    if (
+                        contract
+                        and (contract.get("risk") or {}).get("level") == "high"
+                        and contract.get("review") is False
+                    ):
+                        print(
+                            f"  waiver: {task_id} declares high risk and "
+                            "declines independent review"
+                        )
                 active = active_dispatches(store)
                 cap = concurrency_cap(root)
                 print(f"dispatches {len(active)}/{cap}")

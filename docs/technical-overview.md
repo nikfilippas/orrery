@@ -370,6 +370,60 @@ in that corpus are supplied to a stub provider, so it demonstrates that
 the pipeline carries a judgement faithfully. Whether a live reviewer
 finds a defect it was shown is a separate, credit-spending test.
 
+### Ceilings and stops
+
+Attempts nest, and one counter cannot govern them all. A provider
+failure retries once and then asks for consent; a review that does not
+validate is retried once with the validator's complaint; integration
+retries three times against a moving target; plan review has its
+configured round cap. Two things were unbounded, and a contract may now
+bound them: `budget.dispatches` and `budget.tokens`, beside the existing
+time bounds.
+
+Both are checked inside the same held control lock as the scope,
+dependency and concurrency admission, before any lease or worktree
+exists, so two concurrent dispatches cannot both pass one remaining
+budget and a refusal cannot leak a lease. A token ceiling bounds new
+dispatches; a run already in flight cannot be truncated, so one dispatch
+may cross it, and the refusal says so rather than implying a hard cap.
+Where a previous attempt started a provider and its usage was never
+recovered, the remaining budget is not knowable and the next dispatch is
+refused until the records are reconciled or the ceiling is amended.
+
+A task whose reviews stop making progress stops too. Two consecutive
+valid reviews of the same commit, leaving an identical and non-empty set
+of blocking findings open, refuse a third: nothing changed between them,
+so a third paid review has nothing new to look at. A schema-invalid
+reply is not a review and never counts, advisory findings never count,
+and any new commit clears the condition. The refusal is recorded like
+every other guard, and `--override "<reason>"` permits exactly one
+further review and records itself.
+
+A contract declaring `risk.level: high` must say whether it is reviewed.
+Omitting the `review` key is refused at seal and at the gate, the second
+because a contract sealed before this rule would otherwise merge
+declared high-risk work unreviewed. `review: false` still merges, as a
+waiver recorded in the contract and shown by `orrery-task status`: the
+operator may have a reason, but it is a decision on the record rather
+than a gap in one.
+
+Reconciliation is the one place that does not refuse. A promotion whose
+`MERGED` record never landed is already in the target, so refusing would
+not undo it, only leave a landing no record accounts for and every later
+union computation mis-reads. Such a task reconciles, records the breach
+in its `MERGED` record, says so on stderr, and exits non-zero.
+
+Admission and refusal both append a decision record naming the guard
+that decided, the counters as they stood, and the blocking task where
+there is one. A ledger holding only the dispatches that ran is a
+selected sample, and no later question about whether more agents would
+have helped can be asked of it honestly. Amendment retains the contract
+it replaces, keyed by digest, so every decision record resolves to the
+contract that actually applied.
+
+A contract that sets no ceilings and does not declare high risk decides
+exactly as it did before any of this existed.
+
 ## Visual configuration
 
 ```bash
@@ -584,11 +638,54 @@ is Claude-specific.
 ```bash
 orrery-usage --since 7
 orrery-usage --json
+orrery-usage --task T-1
+orrery-usage --task T-1 --money
 ```
 
-This reads local Claude and Codex session logs, deduplicates replayed
-messages, and reports fresh input, cache reads, cache writes, and
-output by provider and model. It does not access the network.
+The first form reads local Claude and Codex session logs, deduplicates
+replayed messages, and reports fresh input, cache reads, cache writes,
+and output by provider and model. It does not access the network.
+
+`--task` reports a different population, and the two must never be
+added together. Delegated runs are ephemeral by design and write no
+session file, so they appear in no global scan; their accounting comes
+from the attempt record the wrapper opens beside each run before it
+starts the provider and completes after it exits. That record names the
+run, the role, and the provider, model and endpoint that actually ran,
+which is not always the configured one: a run that fell over to another
+provider is attributed to the model that answered.
+
+Three numbers are reported rather than one. Attributed tokens come from
+attempts whose usage parsed. Unknown attempts are runs that started and
+whose usage could not be recovered, including one killed between its
+first record and its last. Unattributed runs are dispatches or reviews
+that left no attempt record at all. An unknown attempt is never counted
+as zero: a ceiling that reads a missing measurement as free would wave
+through exactly the runs it cannot see.
+
+`--money` prefers the provider's own billed figure and falls back to a
+table only where there is none. Claude states a cost per run, so a task
+run there prices itself with no configuration at all; Codex states none,
+so those attempts need rates. The report names which sources answered.
+
+The table is `prices` in the manifest or a file named by
+`ORRERY_PRICES`. It declares `as_of`, `currency`, `source`,
+`max_age_days`, and a rate per million tokens in each of the four
+classes, keyed `provider:model`, or `provider@endpoint:model` where a
+custom endpoint bills differently for the same model name. A missing
+rate or a table past its stated maximum age refuses the money question
+and says why; the token report still succeeds. Neither provider offers a
+machine-readable rate endpoint, so rates cannot be fetched: the table is
+the only route for the half that providers do not price themselves.
+
+Tokens are the durable record. Money is derived, and every figure says
+what produced it.
+
+Delegated runs that belong to no task, a plan review or an ad-hoc
+delegation, have no receipts directory and their run directory is
+removed on the way out. Their spend is recorded in the incident log
+instead, so no delegated run is unmeasured whichever entry point started
+it.
 
 ## Incident log
 

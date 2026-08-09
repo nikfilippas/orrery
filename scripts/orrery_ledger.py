@@ -82,6 +82,16 @@ DISPATCH_FAILURE_REASONS = frozenset(
 _CONTRACT_KEYS = frozenset(
     {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review", "depends_on"}
 )
+# The two time bounds are seconds and predate this table; `tokens` and
+# `dispatches` are the ceilings Phase 5 adds. Each key gets its own
+# range because one shared range for seconds and tokens would have made
+# a token ceiling of 30 the smallest expressible bound.
+BUDGET_BOUNDS = {
+    "timeout_seconds": (30, 14400),
+    "hard_timeout_seconds": (30, 14400),
+    "tokens": (1, 1_000_000_000),
+    "dispatches": (1, 100),
+}
 
 
 # Every local plumbing call is bounded: an unbounded wait turns a held
@@ -256,10 +266,11 @@ def validate_contract(contract: Any, task_id: str | None = None) -> dict[str, An
         raise _error("$.assigned_role", "must be mechanic or implementer")
     _string(data.get("target_ref"), "$.target_ref")
     if "budget" in data:
-        budget = _object(data["budget"], "$.budget", frozenset({"timeout_seconds", "hard_timeout_seconds"}))
+        budget = _object(data["budget"], "$.budget", frozenset(BUDGET_BOUNDS))
         for name, value in budget.items():
-            if isinstance(value, bool) or not isinstance(value, int) or not 30 <= value <= 14400:
-                raise _error(f"$.budget.{name}", "must be an integer from 30 to 14400")
+            low, high = BUDGET_BOUNDS[name]
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise _error(f"$.budget.{name}", f"must be an integer from {low} to {high}")
     if "notes" in data and not isinstance(data["notes"], str):
         raise _error("$.notes", "must be a string")
     if "depends_on" in data:
@@ -491,6 +502,29 @@ def dependency_graph_ok(store: Path, task_id: str, depends_on: list[str]) -> Non
             for nxt in declared(node):
                 stack.append((nxt, path + [nxt]))
 
+def risk_review_refusal(contract: dict[str, Any]) -> str | None:
+    """Why declared high-risk work may not proceed unreviewed.
+
+    A contract can declare `risk.level: high` and omit `review`, and it
+    then walks from verification to the merge gate with no independent
+    look at it. The operator has already supplied the fact that decides
+    this, so omission stops counting as consent. An explicit
+    `review: false` is still allowed, because there may be a reason, but
+    it is a decision on the record rather than a gap in one.
+
+    Deliberately not part of `validate_contract`: reading a contract
+    sealed before this rule must keep working, and only sealing and
+    merging enforce it.
+    """
+    level = (contract.get("risk") or {}).get("level")
+    if level == "high" and "review" not in contract:
+        return (
+            "risk.level is high but the contract does not say whether it is "
+            "reviewed; set review to true, or to false to record a waiver"
+        )
+    return None
+
+
 def create_task(root: Path, contract: dict[str, Any]) -> str:
     try:
         subprocess.run(
@@ -518,6 +552,8 @@ def create_task(root: Path, contract: dict[str, Any]) -> str:
                 raise LedgerError("detached HEAD requires an explicit $.target_ref") from exc
             contract["target_ref"] = result.stdout.strip()
         validate_contract(contract, task_id)
+        if refusal := risk_review_refusal(contract):
+            raise LedgerError(refusal)
         dependency_graph_ok(store, task_id, contract.get("depends_on", []))
         data = _stored_bytes(contract)
         path = _contract_path(store, task_id)
@@ -536,12 +572,56 @@ def amend_task(root: Path, task_id: str, contract: dict[str, Any]) -> None:
         if not records or records[-1]["to"] != "READY":
             raise LedgerError("task is not READY")
         validate_contract(contract, task_id)
+        if refusal := risk_review_refusal(contract):
+            raise LedgerError(refusal)
         dependency_graph_ok(store, task_id, contract.get("depends_on", []))
         data = _stored_bytes(contract)
         path = _contract_path(store, task_id)
+        retain_superseded(store, task_id, path)
         _atomic_write(path, data, 0o600)
         os.chmod(path, 0o400)
         append_record(store, task_id, {"from": "READY", "to": "READY", "actor": "user", "reason": "AMENDED", "contract_digest": hashlib.sha256(data).hexdigest()})
+
+
+def retain_superseded(store: Path, task_id: str, path: Path) -> None:
+    """Keep the bytes an amendment is about to replace.
+
+    Every ledger record names its contract by digest, and the amendment
+    used to overwrite the only copy: the risk level, scope, role and
+    ceilings that produced an earlier admission or refusal were then
+    unrecoverable, which makes those decision records unreadable exactly
+    when an audit needs them.
+    """
+    try:
+        previous = path.read_bytes()
+    except OSError:
+        return
+    digest = hashlib.sha256(previous).hexdigest()
+    superseded = _superseded_path(store, task_id, digest)
+    if superseded.exists():
+        return
+    superseded.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _atomic_write(superseded, previous, 0o600)
+    os.chmod(superseded, 0o400)
+
+
+def _superseded_path(store: Path, task_id: str, digest: str) -> Path:
+    return store / "contracts" / "superseded" / f"{task_id}.{digest}.json"
+
+
+def contract_bytes_for(store: Path, task_id: str, digest: str) -> bytes | None:
+    """The exact contract a ledger record was written against."""
+    current_path = _contract_path(store, task_id)
+    try:
+        data = current_path.read_bytes()
+    except OSError:
+        data = None
+    if data is not None and hashlib.sha256(data).hexdigest() == digest:
+        return data
+    try:
+        return _superseded_path(store, task_id, digest).read_bytes()
+    except OSError:
+        return None
 
 
 def task_ids(store: Path) -> list[str]:

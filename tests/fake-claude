@@ -18,6 +18,38 @@ def option_value(name: str) -> str | None:
     return sys.argv[index + 1] if index + 1 < len(sys.argv) else None
 
 
+def usage_fields() -> dict:
+    """The accounting the real CLI puts in its JSON result.
+
+    The per-model breakdown is what the parser prefers, so both it and
+    the flat `usage` field are emitted; a test that wants the flat path
+    removes the breakdown. Suppressible entirely, because an absent
+    record must become a named gap rather than a zero.
+    """
+    if os.environ.get("CLAUDE_FAKE_NO_USAGE"):
+        return {}
+    raw = os.environ.get("CLAUDE_FAKE_USAGE")
+    if raw:
+        return json.loads(raw)
+    return {
+        "usage": {
+            "input_tokens": 1000,
+            "output_tokens": 400,
+            "cache_creation_input_tokens": 250,
+            "cache_read_input_tokens": 700,
+        },
+        "modelUsage": {
+            "claude-fable-5": {
+                "inputTokens": 1000,
+                "outputTokens": 400,
+                "cacheCreationInputTokens": 250,
+                "cacheReadInputTokens": 700,
+            }
+        },
+        "total_cost_usd": 0.0125,
+    }
+
+
 def probe_writes() -> None:
     """Record whether confinement permits each requested write."""
     requested = os.environ.get("CLAUDE_FAKE_PROBE_WRITES")
@@ -207,7 +239,7 @@ def main() -> int:
         print(json.dumps({"result": ""}))
         return 0
 
-    print(json.dumps({"result": "# PASS\nfake Claude verdict\n"}))
+    print(json.dumps({"result": "# PASS\nfake Claude verdict\n", **usage_fields()}))
     return 0
 
 

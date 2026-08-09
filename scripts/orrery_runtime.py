@@ -761,6 +761,13 @@ def delegated_command(
                 "--ephemeral",
                 "--ignore-user-config",
                 "--skip-git-repo-check",
+                # JSONL, so the run's own token usage exists at all.
+                # `--ephemeral` means no rollout file is kept, and the
+                # final-message artefact carries no accounting, so
+                # without this a delegated Codex run is unattributable.
+                # The result still comes from --output-last-message, so
+                # nothing depends on parsing this stream for the verdict.
+                "--json",
                 "--output-last-message",
                 str(verdict_path),
             ]

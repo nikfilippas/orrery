@@ -717,6 +717,13 @@ The maintained artefacts are:
   evidence, or citing a path absent from the reviewed tree, is downgraded
   rather than discarding the review; a re-review must account for every
   finding carried into it, so a finding cannot be closed by silence.
+- `scripts/orrery_spend.py` — per-attempt token accounting: the record a
+  wrapper opens before it starts a provider and completes after it exits,
+  the two providers' usage shapes normalised to four token classes, and
+  the price table's freshness and lookup rules. An unparsed usage record
+  becomes a named gap rather than a zero, because a ceiling that reads a
+  missing measurement as free waves through exactly the runs it cannot
+  see.
 - `scripts/orrery_standing.py` — standing fallback approvals: scoped,
   revocable prior consent recorded outside the repository.
 - `scripts/orrery-session-start` — direct Claude/Codex surface comparison and

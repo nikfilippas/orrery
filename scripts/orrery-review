@@ -48,6 +48,7 @@ from orrery_fallback import (  # noqa: E402
     request_fallback_decision,
 )
 from orrery_findings import sanitise_provider_text  # noqa: E402
+import orrery_spend  # noqa: E402
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
     candidate_role,
@@ -2375,13 +2376,21 @@ def main(
         verdict_path = (
             receipts / "result.txt" if receipts is not None else run_dir / "verdict.txt"
         )
+        run_id = uuid.uuid4().hex
         if receipts is not None:
             try:
+                # A retry and an approved fallback both re-enter here with
+                # the same receipts directory, so the previous attempt is
+                # moved aside rather than overwritten. Until it was, the
+                # O_EXCL below found the earlier attempt's result.txt and
+                # every retry under --receipts died with EEXIST instead of
+                # running again.
+                orrery_spend.rotate_attempt(receipts)
                 descriptor = receipt_open(
                     verdict_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 )
                 os.close(descriptor)
-            except OSError as exc:
+            except (OSError, orrery_spend.SpendError) as exc:
                 print(f"{PROGRAM_NAME}: could not write receipt: {exc}", file=sys.stderr)
                 return 1
         log_path = run_dir / "agent.log"
@@ -2389,6 +2398,51 @@ def main(
         prompt_path = run_dir / "assignment.txt"
         prompt_path.write_text(role_handoff(role_config, prompt, verbosity))
         prompt_path.chmod(0o600)
+
+        def close_run(outcome: str, status: int | None) -> None:
+            """Complete the attempt record on the way out.
+
+            Deliberately not called from the `finally` block. A run
+            killed mid-flight should leave its record open, because an
+            opening half with no completion is precisely the durable
+            statement that a paid run began and its cost is unknown.
+            """
+            if receipts is None:
+                # A run with no receipts directory belongs to no task:
+                # a plan review, a final review, an ad-hoc delegation.
+                # It still spends, and its run directory is removed on
+                # the way out, so the count goes to the incident log
+                # rather than being lost with the directory.
+                usage = None
+                try:
+                    usage = orrery_spend.parse_usage(
+                        role_config.provider, log_path.read_text(errors="replace")
+                    )
+                except OSError:
+                    pass
+                incident_log.record(
+                    "spend",
+                    program=PROGRAM_NAME,
+                    role=role_config,
+                    outcome=outcome,
+                    status=status,
+                    unknown=usage is None,
+                    **(usage["tokens"] if usage else {}),
+                )
+                return
+            try:
+                orrery_spend.close_attempt(
+                    receipts,
+                    exit_status=status,
+                    outcome=outcome,
+                    log_path=log_path,
+                )
+            except OSError as exc:
+                print(
+                    f"{PROGRAM_NAME}: could not complete the attempt record: {exc}",
+                    file=sys.stderr,
+                )
+
         settings_path: Path | None = None
         if role_config.provider == "anthropic":
             settings_path = run_dir / "claude-settings.json"
@@ -2506,6 +2560,43 @@ def main(
                 or workspace_after is None
                 or workspace_before != workspace_after
             )
+
+        if receipts is not None:
+            # Immediately before the spawn, and no earlier. The provider
+            # starts before its unit registers and unit.json names no
+            # model, so a wrapper that dies in that window would leave no
+            # evidence a paid run had begun; but a preflight that refuses
+            # before this point spent nothing, and an open record there
+            # would be read as spend of an unknown size.
+            try:
+                orrery_spend.open_attempt(
+                    receipts,
+                    run_id=run_id,
+                    role=role_config.id,
+                    provider=role_config.provider,
+                    model=role_config.model,
+                    endpoint=(
+                        role_config.endpoint.id
+                        if role_config.endpoint is not None
+                        else None
+                    ),
+                    thinking=role_config.thinking,
+                    access=role_config.access,
+                    fallback_from=(
+                        {
+                            "provider": state.configured.provider,
+                            "model": state.configured.model,
+                        }
+                        if state.is_fallback
+                        else None
+                    ),
+                )
+            except OSError as exc:
+                print(
+                    f"{PROGRAM_NAME}: could not write the attempt record: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
 
         with (
             log_path.open("wb") as log_handle,
@@ -2666,12 +2757,21 @@ def main(
                 # timeout status into a generic failure: the `finally`
                 # block retries the stop and reports a genuine cleanup
                 # failure, so a transient one still exits 124.
+                stopped = True
                 if use_systemd:
                     try:
                         stop_unit(unit)
                     except RuntimeError as exc:
+                        stopped = False
                         print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
                 terminate_client(process)
+                # Only once the run is known to be over. A unit that
+                # would not stop may still be spending, and completing
+                # the record would state a final cost for a run that has
+                # not finished; leaving it open says unknown, which is
+                # the truth until the sweep confirms otherwise.
+                if stopped:
+                    close_run("timeout", 124)
                 return handle_failed_attempt(
                     invocation,
                     state,
@@ -2711,6 +2811,7 @@ def main(
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
+            close_run("provider-exit", return_code)
             return handle_failed_attempt(
                 invocation,
                 state,
@@ -2746,6 +2847,7 @@ def main(
                         file=sys.stderr,
                     )
                     print(diagnostics, file=sys.stderr)
+                close_run("no-result", return_code)
                 return handle_failed_attempt(
                     invocation,
                     state,
@@ -2779,6 +2881,7 @@ def main(
                     file=sys.stderr,
                 )
                 print(diagnostics, file=sys.stderr)
+            close_run("no-result", return_code)
             return handle_failed_attempt(
                 invocation,
                 state,
@@ -2797,6 +2900,7 @@ def main(
                 kind="no-result",
             )
 
+        close_run("completed", return_code)
         verdict = verdict_path.read_text(errors="replace")
 
         # A completed review is expensive and unrepeatable, so every

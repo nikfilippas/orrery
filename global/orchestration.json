@@ -1,6 +1,13 @@
 {
   "verbosity": 1,
   "max_concurrent_tasks": 2,
+  "prices": {
+    "as_of": null,
+    "currency": "USD",
+    "source": "",
+    "max_age_days": 90,
+    "models": {}
+  },
   "steps": [
     {
       "id": "orchestrator",

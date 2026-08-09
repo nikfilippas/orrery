@@ -27,6 +27,28 @@ def effort(level: str) -> dict[str, str]:
     return {"reasoningEffort": level, "description": level}
 
 
+def emit_usage() -> None:
+    """Speak the `turn.completed` event the real CLI emits under --json.
+
+    Suppressible, because a provider that reports nothing must leave a
+    named gap rather than a zero, and that path needs a test too.
+    """
+    if "--json" not in sys.argv or os.environ.get("CODEX_FAKE_NO_USAGE"):
+        return
+    raw = os.environ.get("CODEX_FAKE_USAGE")
+    usage = (
+        json.loads(raw)
+        if raw
+        else {
+            "input_tokens": 1200,
+            "cached_input_tokens": 200,
+            "output_tokens": 300,
+            "reasoning_output_tokens": 50,
+        }
+    )
+    print(json.dumps({"type": "turn.completed", "usage": usage}), flush=True)
+
+
 def probe_writes() -> None:
     """Record whether confinement permits each requested write or rename.
 
@@ -228,6 +250,12 @@ def main() -> int:
             "\n".join(sys.argv[1:]) + "\n"
         )
 
+    if "--json" in sys.argv and os.environ.get("CODEX_FAKE_EVENT_NOISE"):
+        # Real JSONL carries many event types the accounting must ignore,
+        # and diagnostics that are not JSON at all.
+        print("codex: connecting", flush=True)
+        print(json.dumps({"type": "item.started", "item": {"type": "reasoning"}}), flush=True)
+
     assignment = sys.stdin.read()
     if stdin_path:
         Path(stdin_path).write_text(assignment)
@@ -339,6 +367,7 @@ def main() -> int:
             print("service unavailable: 503", file=sys.stderr)
             return 7
 
+    emit_usage()
     destination = output_path(sys.argv[1:])
     if destination is not None:
         destination.write_text("# PASS\nfake verdict\n")

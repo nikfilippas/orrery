@@ -14984,7 +14984,9 @@ def test_seeded_defect_corpus() -> None:
                 f"a review confirming the findings unblocked the task: "
                 f"{again.stderr[-300:]}",
             )
-            # And one that resolves them, with evidence, does clear them.
+            # Two reviews of one commit have now left the same findings
+            # open, and nothing was reworked between them, so a third is
+            # refused before it is paid for.
             environment["CODEX_FAKE_REVIEW"] = seeded_review(
                 [],
                 carried=[
@@ -14993,12 +14995,41 @@ def test_seeded_defect_corpus() -> None:
                     {"id": "F-02", "disposition": "withdrawn"},
                 ],
             )
-            cleared = run_task(root, "review", "T-1", environment=environment)
+            looping = run_task(root, "review", "T-1", environment=environment)
+            require(
+                looping.returncode != 0
+                and "not making progress" in looping.stderr
+                and "F-01" in looping.stderr,
+                f"a third review of an unchanged commit was not refused: "
+                f"{looping.stderr[-300:]}",
+            )
+            refusal = task_records(root)[-1]
+            require(
+                refusal.get("reason") == "REFUSED"
+                and refusal["decision"]["guard"] == "repeated-review"
+                and refusal["decision"]["counters"]["unresolved"] == ["F-01", "F-02"],
+                f"the loop refusal was not recorded in the ledger: {refusal}",
+            )
+            # The override is the operator's, and it is recorded.
+            cleared = run_task(
+                root, "review", "T-1", "--override",
+                "reviewer one was mistaken about the sign",
+                environment=environment,
+            )
             require(
                 cleared.returncode == 0
                 and not task_module.unresolved_blocking(task_records(root)),
                 f"evidenced resolutions did not clear the findings: "
                 f"{cleared.stderr[-300:]}",
+            )
+            override = next(
+                record for record in task_records(root)
+                if record.get("reason") == "LOOP_OVERRIDE"
+            )
+            require(
+                override["override"]["unresolved"] == ["F-01", "F-02"]
+                and "mistaken about the sign" in override["override"]["detail"],
+                f"the override was not recorded with its reason: {override}",
             )
         finally:
             discard_task_environment(environment)
@@ -15836,6 +15867,1013 @@ def test_unknown_principal_endpoint_is_refused() -> None:
             require("does not define endpoint" in str(exc), f"wrong endpoint refusal: {exc}")
         else:
             raise Failure("unknown endpoint was accepted")
+
+
+spend_module = load_script(KIT_DIR / "scripts" / "orrery_spend.py", "kit_orrery_spend")
+USAGE_SCRIPT = KIT_DIR / "scripts" / "orrery-usage"
+
+
+def run_usage(
+    directory: Path, *arguments: str, environment: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(USAGE_SCRIPT), *arguments],
+        cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment, timeout=90, check=False,
+    )
+
+
+def dispatch_attempt(root: Path, sequence: int = 1) -> Path:
+    return root / ".orrery" / "dispatch" / "T-1" / str(sequence) / "attempt-1"
+
+
+def cycle_dispatch(root: Path, spend: dict[str, Any] | None = None) -> None:
+    """Record one complete, failed dispatch without running a provider.
+
+    The ceilings count history, and a real second dispatch would need a
+    second provider run; this writes exactly the history a ceiling reads
+    and nothing else, so the guard is tested rather than the runner.
+    """
+    store = root / ".orrery"
+    digest = task_records(root)[-1]["contract_digest"]
+    ledger_module.append_record(store, "T-1", {
+        "from": "READY", "to": "DISPATCHED", "actor": "user",
+        "contract_digest": digest,
+    })
+    failure = {
+        "from": "DISPATCHED", "to": "DISPATCH_FAILED", "actor": "runner",
+        "reason": "provider-exit", "contract_digest": digest,
+    }
+    if spend is not None:
+        failure["spend"] = spend
+    ledger_module.append_record(store, "T-1", failure)
+    ledger_module.append_record(store, "T-1", {
+        "from": "DISPATCH_FAILED", "to": "READY", "actor": "user",
+        "contract_digest": digest,
+    })
+
+
+@test("a dispatch records what each provider attempt spent")
+def test_attempt_record_carries_usage() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(result.returncode == 0, result.stderr[-400:])
+
+        record = json.loads((dispatch_attempt(root) / "attempt.json").read_text())
+        require(
+            record["provider"] == "openai"
+            and record["model"]
+            and len(record["run_id"]) == 32
+            and record["outcome"] == "completed"
+            and record["started"] < record["ended"]
+            and record["usage_gap"] is None,
+            f"the attempt record is incomplete: {record}",
+        )
+        require(
+            record["usage"] == {
+                "fresh_in": 1000, "cache_read": 200, "cache_write": 0,
+                "output": 350,
+            },
+            f"the provider's own usage was not recorded: {record['usage']}",
+        )
+        packet = json.loads((root / ".orrery" / "evidence" / "T-1" / "1.json").read_text())
+        require(
+            packet["usage"]["total"] == 1550
+            and packet["usage"]["unknown"] is False
+            and packet["usage"]["attempts"] == 1,
+            f"the evidence packet did not carry the spend: {packet['usage']}",
+        )
+        require(
+            "unavailable" not in json.dumps(packet["usage"]),
+            "the packet still carries the usage placeholder",
+        )
+        spend = next(
+            record["spend"] for record in task_records(root) if "spend" in record
+        )
+        require(
+            spend["total"] == 1550,
+            f"the ledger did not record the dispatch spend: {spend}",
+        )
+
+
+@test("a provider that reports no usage leaves a named gap, never a zero")
+def test_attempt_record_names_its_gap() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_NO_USAGE"] = "1"
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(result.returncode == 0, result.stderr[-400:])
+        record = json.loads((dispatch_attempt(root) / "attempt.json").read_text())
+        require(
+            record["usage"] is None
+            and "no usage record" in (record["usage_gap"] or ""),
+            f"a missing usage record was not named: {record}",
+        )
+        packet = json.loads((root / ".orrery" / "evidence" / "T-1" / "1.json").read_text())
+        require(
+            packet["usage"]["unknown"] is True
+            and packet["usage"]["total"] == 0
+            and packet["usage"]["gaps"],
+            f"an unparsed run was counted as free: {packet['usage']}",
+        )
+
+
+@test("a retried attempt keeps both records rather than overwriting one")
+def test_retry_preserves_prior_attempt() -> None:
+    """The retry path was dead under --receipts before this.
+
+    `result.txt` is created O_EXCL before launch, so the second attempt
+    found the first one's file and exited 1 instead of running, which no
+    test caught because the retry test passes no receipts directory.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("transient-once")
+        # Outside the repository: an untracked counter would make the
+        # baseline dirty and the dispatch would refuse before it began.
+        counter = Path(tempfile.mkdtemp(prefix="kit-attempts.")) / "attempts"
+        counter.write_text("0")
+        environment["CODEX_FAKE_ATTEMPTS"] = str(counter)
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(result.returncode == 0, result.stderr[-500:])
+        require(
+            counter.read_text() == "2",
+            "the transient retry never reached the provider a second time",
+        )
+        shutil.rmtree(counter.parent, ignore_errors=True)
+        attempt = dispatch_attempt(root)
+        first = json.loads((attempt / "prior" / "1" / "attempt.json").read_text())
+        second = json.loads((attempt / "attempt.json").read_text())
+        require(
+            first["run_id"] != second["run_id"]
+            and first["outcome"] == "provider-exit"
+            and second["outcome"] == "completed",
+            f"the attempts were not kept apart: {first} {second}",
+        )
+        require(
+            (attempt / "prior" / "1" / "stderr.log").exists()
+            and "503" in (attempt / "prior" / "1" / "stderr.log").read_text(),
+            "the failed attempt's log was lost",
+        )
+        packet = json.loads((root / ".orrery" / "evidence" / "T-1" / "1.json").read_text())
+        require(
+            len(packet["attempts"]) == 2 and packet["usage"]["attempts"] == 2,
+            f"the packet reported one attempt for two runs: {packet['attempts']}",
+        )
+
+
+@test("a wrapper killed mid-run leaves an attempt record with no completion")
+def test_attempt_record_survives_a_killed_wrapper() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        receipts = Path(directory) / "receipts"
+        receipts.mkdir()
+        # An isolated runtime home, because killing the wrapper is the
+        # point of the test and its run directory therefore outlives it.
+        environment = task_review_environment("sleep")
+        process = subprocess.Popen(
+            [
+                sys.executable, str(REVIEW_SCRIPT), "--role", "reviewer",
+                "--timeout", "600", "--receipts", str(receipts), "--", "prompt",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=environment,
+        )
+        try:
+            # Waiting for unit.json, not just the record: the wrapper
+            # writes it only after the provider's unit has registered, so
+            # this asserts an open record while a provider genuinely runs
+            # rather than merely before one was attempted.
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if (receipts / "unit.json").exists():
+                    break
+                time.sleep(0.1)
+            record_path = receipts / "attempt.json"
+            require(
+                (receipts / "unit.json").exists() and record_path.exists(),
+                "no attempt record existed while the provider was running",
+            )
+            record = json.loads(record_path.read_text())
+            require(
+                record["provider"] == "openai"
+                and record["ended"] is None
+                and record["usage"] is None
+                and record["usage_gap"] == "attempt did not complete",
+                f"a live attempt did not describe itself: {record}",
+            )
+        finally:
+            process.kill()
+            process.communicate(timeout=30)
+            # A run with receipts registers as orrery-task-<pid>-, not
+            # orrery-review-, so the unit name is read from the receipt
+            # the wrapper wrote rather than guessed from a prefix. The
+            # wrapper's own cleanup cannot run: it was killed on purpose.
+            try:
+                owner = json.loads((receipts / "unit.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                owner = {}
+            if owner.get("unit"):
+                subprocess.run(
+                    ["systemctl", "--user", "stop", owner["unit"]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30, check=False,
+                )
+            elif isinstance(owner.get("pgid"), int):
+                # Without systemd the wrapper owns a process group
+                # instead, and killing the client leaves the group.
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(owner["pgid"], signal.SIGKILL)
+            for leftover in Path("/run/user").glob(
+                f"*/orrery-review/run.{process.pid}.*"
+            ):
+                shutil.rmtree(leftover, ignore_errors=True)
+            discard_task_environment(environment)
+        require(
+            spend_module.spend_of(spend_module.read_attempts(receipts))["unknown"],
+            "an interrupted paid run was accounted as costing nothing",
+        )
+
+
+@test("an interrupted dispatch records the spend a ceiling must see")
+def test_interrupted_dispatch_records_spend() -> None:
+    """The gap a ceiling most needs closed.
+
+    A controller that dies leaves an opened attempt record and no
+    receipt. Until the INTERRUPTED record carried spend, the ledger held
+    nothing for that run and the next dispatch passed a token ceiling it
+    had already crossed.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {
+            **dispatch_contract(), "budget": {"tokens": 5000},
+        })
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the fixture dispatch did not complete",
+            )
+            attempt = dispatch_attempt(root)
+            # Exactly what a controller killed mid-run leaves: the record
+            # is open and the receipt never landed.
+            record = json.loads((attempt / "attempt.json").read_text())
+            record.update({
+                "ended": None, "exit_status": None, "outcome": None,
+                "usage": None, "usage_gap": "attempt did not complete",
+            })
+            (attempt / "attempt.json").write_text(json.dumps(record))
+            (attempt / "receipt.json").unlink()
+            ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+            kept: list[str] = []
+            for line in ledger.read_text().splitlines():
+                kept.append(line)
+                if json.loads(line)["to"] == "DISPATCHED":
+                    break
+            ledger.write_text("\n".join(kept) + "\n")
+
+            resumed = run_task(root, "resume", "T-1", environment=environment)
+            require(resumed.returncode == 0, f"resume failed: {resumed.stderr[-300:]}")
+        finally:
+            discard_task_environment(environment)
+        final = task_records(root)[-1]
+        require(
+            final["to"] == "INTERRUPTED" and final["spend"]["unknown"] is True,
+            f"an interrupted paid run recorded no spend: {final}",
+        )
+        require(
+            task_module.budget_conflict(
+                {"budget": {"tokens": 5000}}, task_records(root)
+            )[0] == "spend-unknown",
+            "a ceiling read the interrupted run as costing nothing",
+        )
+
+
+@test("an unreadable or half-written attempt record reads as unknown, not zero")
+def test_attempt_record_corruption_is_unknown() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        receipts = Path(directory)
+        require(
+            spend_module.spend_of(spend_module.read_attempts(receipts))["unknown"]
+            is False,
+            "an empty receipts directory was treated as unknown spend",
+        )
+        (receipts / "attempt.json").write_text('{"v": 1, "run_id": "a", tru')
+        found = spend_module.read_attempts(receipts)
+        require(
+            len(found) == 1 and found[0]["usage"] is None,
+            f"a truncated record was discarded rather than kept: {found}",
+        )
+        require(
+            spend_module.spend_of(found)["unknown"] is True,
+            "a truncated record was accounted as costing nothing",
+        )
+        # The completion is atomic, so a crash cannot leave the file
+        # empty between truncate and write.
+        spend_module.open_attempt(
+            receipts, run_id="b", role="reviewer", provider="openai",
+            model="m", endpoint=None, thinking=None, access="read-only",
+            fallback_from=None,
+        )
+        require(
+            not list(receipts.glob(".attempt.json.tmp")),
+            "the temporary record was left behind",
+        )
+
+
+@test("a usage shape the parser does not understand becomes a gap")
+def test_usage_parsers_refuse_unknown_shapes() -> None:
+    codex_unknown = json.dumps(
+        {"type": "turn.completed", "usage": {"new_input_field": 123}}
+    )
+    require(
+        spend_module.parse_codex_usage(codex_unknown) is None,
+        "a renamed Codex usage field was counted as zero tokens",
+    )
+    codex_bad_type = json.dumps(
+        {"type": "turn.completed", "usage": {"input_tokens": "many"}}
+    )
+    require(
+        spend_module.parse_codex_usage(codex_bad_type) is None,
+        "a non-numeric Codex count was accepted",
+    )
+    claude_unknown = json.dumps({"result": "x", "usage": {"prompt_tokens": 5}})
+    require(
+        spend_module.parse_claude_usage(claude_unknown) is None,
+        "a renamed Claude usage field was counted as zero tokens",
+    )
+    claude_bad_model = json.dumps(
+        {"result": "x", "modelUsage": {"m": {"inputTokens": -1}}}
+    )
+    require(
+        spend_module.parse_claude_usage(claude_bad_model) is None,
+        "a negative Claude count was accepted",
+    )
+    still_works = json.dumps(
+        {"type": "turn.completed", "usage": {"output_tokens": 7}}
+    )
+    require(
+        spend_module.parse_codex_usage(still_works)["tokens"]["output"] == 7,
+        "a partial but recognised usage object was refused",
+    )
+
+
+@test("a rotation killed partway is finished, not restarted")
+def test_rotation_resumes() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        receipts = Path(directory)
+        spend_module.open_attempt(
+            receipts, run_id="one", role="reviewer", provider="openai",
+            model="m", endpoint=None, thinking=None, access="read-only",
+            fallback_from=None,
+        )
+        (receipts / "stderr.log").write_text("first attempt output\n")
+        # A rotation that moved the logs and died before the record.
+        partial = receipts / "prior" / "1"
+        partial.mkdir(parents=True)
+        os.replace(receipts / "stderr.log", partial / "stderr.log")
+
+        spend_module.rotate_attempt(receipts)
+        require(
+            not (receipts / "prior" / "2").exists(),
+            "an unfinished rotation was restarted, splitting one attempt",
+        )
+        require(
+            json.loads((partial / "attempt.json").read_text())["run_id"] == "one"
+            and (partial / "stderr.log").read_text() == "first attempt output\n",
+            "the resumed rotation did not reunite the record with its logs",
+        )
+        require(
+            not (receipts / "attempt.json").exists(),
+            "the rotated record was left at the root",
+        )
+
+
+@test("a packet entry pairs a receipt with its own attempt, never another's")
+def test_attempt_entries_stay_aligned() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        attempt = Path(directory)
+        first = attempt / "prior" / "1"
+        first.mkdir(parents=True)
+        # A prior attempt whose record is gone but whose receipt survives:
+        # pairing two independent scans by position put this receipt
+        # against the second attempt's run.
+        (first / "receipt.json").write_text(json.dumps({"exit_status": 7}))
+        spend_module.open_attempt(
+            attempt, run_id="second", role="reviewer", provider="openai",
+            model="m", endpoint=None, thinking=None, access="read-only",
+            fallback_from=None,
+        )
+        entries = task_module.attempt_entries(attempt, {"exit_status": 0})
+        require(
+            len(entries) == 2
+            and entries[0].get("run") is None
+            and entries[0]["receipt"]["exit_status"] == 7
+            and entries[1]["run"]["run_id"] == "second"
+            and entries[1]["receipt"]["exit_status"] == 0,
+            f"the receipts were paired with the wrong attempts: {entries}",
+        )
+
+
+@test("a refusal before the provider starts leaves no attempt record")
+def test_no_record_before_the_spawn() -> None:
+    """Zero and unknown are different answers and must not be confused.
+
+    An open record means a provider run began and its cost cannot be
+    recovered. A preflight that refuses before any child exists spent
+    nothing, so it must leave nothing behind to say otherwise.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        receipts = Path(directory) / "receipts"
+        receipts.mkdir()
+        environment = task_review_environment("success")
+        environment["CODEX_FAKE_AUTH"] = "logged-out"
+        try:
+            refused = subprocess.run(
+                [
+                    sys.executable, str(REVIEW_SCRIPT), "--role", "reviewer",
+                    "--timeout", "60", "--receipts", str(receipts),
+                    "--no-fallback", "--", "prompt",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=environment, timeout=120, check=False,
+            )
+        finally:
+            discard_task_environment(environment)
+        require(
+            refused.returncode != 0,
+            f"a logged-out provider was dispatched anyway: {refused.stderr[-300:]}",
+        )
+        require(
+            not (receipts / "attempt.json").exists(),
+            "a refusal that started no provider was recorded as spend",
+        )
+        require(
+            spend_module.spend_of(spend_module.read_attempts(receipts))["unknown"]
+            is False,
+            "a run that never started was accounted as unknown spend",
+        )
+
+
+@test("resume attributes a dispatch to the provider that actually ran")
+def test_resume_reads_identity_from_the_attempt_record() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the first dispatch did not complete",
+            )
+            attempt = dispatch_attempt(root)
+            record = json.loads((attempt / "attempt.json").read_text())
+            # What an approved cross-provider fallback leaves behind.
+            record.update({
+                "provider": "anthropic", "model": "claude-fable-5",
+                "fallback_from": {"provider": "openai", "model": record["model"]},
+            })
+            (attempt / "attempt.json").write_text(json.dumps(record))
+            ran = task_module.ran_role(
+                attempt, task_module.load_contract(root / ".orrery", "T-1"), root
+            )
+            require(
+                task_module.role_data(ran)["provider"] == "anthropic"
+                and task_module.role_data(ran)["model"] == "claude-fable-5",
+                f"the configured role overrode the one that ran: "
+                f"{task_module.role_data(ran)}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("orrery-usage reports one task and refuses money it cannot price")
+def test_usage_per_task() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the dispatch did not complete",
+            )
+            report = run_usage(root, "--task", "T-1", environment=environment)
+            require(
+                report.returncode == 0
+                and "1,000" in report.stdout
+                and "disjoint from the global scan" in report.stdout,
+                f"the per-task report is wrong: {report.stdout[-400:]} "
+                f"{report.stderr[-200:]}",
+            )
+            require(
+                "attributed         1" in report.stdout
+                and "unknown            0" in report.stdout
+                and "unattributed       0" in report.stdout,
+                f"the three attribution rows are missing: {report.stdout}",
+            )
+            require(
+                "floor" not in report.stdout,
+                "a fully attributed task was reported as a floor",
+            )
+            model = json.loads(
+                (dispatch_attempt(root) / "attempt.json").read_text()
+            )["model"]
+
+            empty = run_usage(root, "--task", "T-1", "--money", environment=environment)
+            require(
+                empty.returncode == 2 and "cannot report money" in empty.stderr,
+                f"an empty price table answered a money question: {empty.stderr}",
+            )
+
+            stale = Path(directory) / "stale.json"
+            write_json(stale, {
+                "as_of": "2020-01-01", "currency": "USD", "source": "test",
+                "max_age_days": 30,
+                "models": {f"openai:{model}": {
+                    "fresh_in": 1.0, "cache_read": 0.1,
+                    "cache_write": 1.0, "output": 4.0,
+                }},
+            })
+            environment["ORRERY_PRICES"] = str(stale)
+            old = run_usage(root, "--task", "T-1", "--money", environment=environment)
+            require(
+                old.returncode == 2 and "past its stated maximum" in old.stderr,
+                f"a stale table priced a task anyway: {old.stderr}",
+            )
+            require(
+                run_usage(root, "--task", "T-1", environment=environment).returncode == 0,
+                "a stale price table broke token reporting",
+            )
+
+            fresh = Path(directory) / "fresh.json"
+            table = json.loads(stale.read_text())
+            table["as_of"] = datetime.now(timezone.utc).date().isoformat()
+            write_json(fresh, table)
+            environment["ORRERY_PRICES"] = str(fresh)
+            priced = run_usage(
+                root, "--task", "T-1", "--money", "--json", environment=environment
+            )
+            require(priced.returncode == 0, f"pricing failed: {priced.stderr}")
+            payload = json.loads(priced.stdout)
+            # 1000 fresh at 1.0, 200 cache reads at 0.1, 350 output at 4.0.
+            require(
+                abs(payload["computed_cost_usd"] - (1000 + 20 + 1400) / 1e6) < 1e-12,
+                f"the computed cost is wrong: {payload['computed_cost_usd']}",
+            )
+
+            # Tokens the provider says came from another model cannot be
+            # charged at this attempt's rate.
+            record = json.loads(
+                (dispatch_attempt(root) / "attempt.json").read_text()
+            )
+            record["reported_models"] = [model, "some-other-model"]
+            (dispatch_attempt(root) / "attempt.json").write_text(json.dumps(record))
+            mixed = run_usage(
+                root, "--task", "T-1", "--money", environment=environment
+            )
+            require(
+                mixed.returncode == 2
+                and "this attempt's rate cannot price" in mixed.stderr,
+                f"mixed-model usage was priced at one model's rate: "
+                f"{mixed.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a provider that reports its own cost needs no price table")
+def test_provider_reported_cost_needs_no_table() -> None:
+    """The operator maintains rates only where a provider gives none.
+
+    Claude states a billed figure per run, so a task run there can be
+    priced with no table at all; Codex states none, so those attempts
+    still need one. Mixing the two must not silently drop either side.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the dispatch did not complete",
+            )
+            attempt = dispatch_attempt(root)
+            record = json.loads((attempt / "attempt.json").read_text())
+            record["provider_cost_usd"] = 0.0125
+            (attempt / "attempt.json").write_text(json.dumps(record))
+            # No ORRERY_PRICES, and the shipped table has no rates.
+            priced = run_usage(
+                root, "--task", "T-1", "--money", "--json", environment=environment
+            )
+            require(priced.returncode == 0, f"pricing refused: {priced.stderr[-300:]}")
+            payload = json.loads(priced.stdout)
+            require(
+                abs(payload["computed_cost_usd"] - 0.0125) < 1e-12
+                and payload["priced_by"] == ["the provider's own figure"],
+                f"the provider's own cost was not used: {payload}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a delegated run outside a task still records what it spent")
+def test_standalone_run_records_spend() -> None:
+    """Plan review, final review and ad-hoc delegation spend too.
+
+    Those runs pass no receipts directory and their run directory is
+    removed on the way out, so without this their tokens were measured
+    nowhere at all: ephemeral runs write no session file either.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "state"
+        state.mkdir()
+        environment = review_environment("success", standing_state=state)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, str(REVIEW_SCRIPT), "--role", "reviewer",
+                    "--timeout", "60", "--", "prompt",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=environment, timeout=120, check=False,
+            )
+            require(result.returncode == 0, f"the run failed: {result.stderr[-300:]}")
+            events = [
+                json.loads(line)
+                for path in state.rglob("*.jsonl")
+                for line in path.read_text().splitlines()
+                if line.strip()
+            ]
+        finally:
+            remove_helper_state(environment)
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        spend = [event for event in events if event.get("kind") == "spend"]
+        require(
+            len(spend) == 1
+            and spend[0]["unknown"] is False
+            and spend[0]["fresh_in"] == 1000
+            and spend[0]["output"] == 350,
+            f"a standalone delegated run recorded no usable spend: {spend}",
+        )
+
+
+@test("a dispatch ceiling refuses the next run and records the refusal")
+def test_dispatch_ceiling() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {
+            **dispatch_contract(), "budget": {"dispatches": 1},
+        })
+        environment = task_review_environment("fail")
+        try:
+            # A real first dispatch that fails, so the refusal is measured
+            # against a task that already owns a worktree and a branch
+            # rather than against an empty repository where nothing could
+            # be lost, and so the retry is the ordinary route back.
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode != 0,
+                "the fixture dispatch was supposed to fail",
+            )
+            ledger_module.append_record(root / ".orrery", "T-1", {
+                "from": "DISPATCH_FAILED", "to": "READY", "actor": "user",
+                "contract_digest": task_records(root)[-1]["contract_digest"],
+            })
+            worktrees_before = git_output(root, "worktree", "list")
+            leases_before = [
+                record for record in task_records(root)
+                if record.get("reason") == "lease-released"
+            ]
+            refused = run_task(root, "run", "T-1", environment=environment)
+            # Snapshotted before teardown: the environment's state home
+            # holds the worktree, so comparing after cleanup would only
+            # measure the cleanup.
+            worktrees_after = git_output(root, "worktree", "list")
+        finally:
+            discard_task_environment(environment)
+        require(
+            refused.returncode == 1
+            and "1 of 1 dispatches" in refused.stderr
+            and "budget.dispatches" in refused.stderr,
+            f"the dispatch ceiling did not refuse: {refused.stderr[-300:]}",
+        )
+        decision = task_records(root)[-1]
+        require(
+            decision["reason"] == "REFUSED"
+            and decision["decision"]["guard"] == "budget-dispatches"
+            and decision["decision"]["counters"]["dispatches"] == 1,
+            f"the refusal was not recorded: {decision}",
+        )
+        require(
+            not (root / ".orrery" / "dispatch" / "T-1" / "2").exists(),
+            "a refused dispatch created an attempt directory",
+        )
+        require(
+            worktrees_after == worktrees_before,
+            "a refused dispatch disturbed an existing worktree",
+        )
+        require(
+            [
+                record for record in task_records(root)
+                if record.get("reason") == "lease-released"
+            ] == leases_before,
+            "a refused dispatch touched the merge leases",
+        )
+
+
+@test("a token ceiling refuses on spend, and refuses harder on unknown spend")
+def test_token_ceiling() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {
+            **dispatch_contract(), "budget": {"tokens": 1000},
+        })
+        cycle_dispatch(root, spend={
+            "tokens": {"fresh_in": 900, "cache_read": 100, "cache_write": 0,
+                       "output": 0},
+            "total": 1000, "attempts": 1, "unknown": False, "gaps": [],
+        })
+        environment = task_review_environment("edit")
+        try:
+            refused = run_task(root, "run", "T-1", environment=environment)
+            require(
+                refused.returncode == 1
+                and "1000 of 1000 tokens" in refused.stderr
+                and "rather than truncating one in flight" in refused.stderr,
+                f"the token ceiling did not refuse: {refused.stderr[-300:]}",
+            )
+            require(
+                task_records(root)[-1]["decision"]["guard"] == "budget-tokens",
+                "the token refusal was not recorded",
+            )
+
+            # An attempt whose cost was never recovered makes the
+            # remaining budget unknowable, which is not the same as zero.
+            cycle_dispatch(root, spend={
+                "tokens": spend_module.empty_tokens(), "total": 0,
+                "attempts": 1, "unknown": True,
+                "gaps": ["abc: attempt did not complete"],
+            })
+            unknown = run_task(root, "run", "T-1", environment=environment)
+            require(
+                unknown.returncode == 1
+                and "remaining budget is unknown" in unknown.stderr,
+                f"unknown spend was treated as free: {unknown.stderr[-300:]}",
+            )
+            require(
+                task_records(root)[-1]["decision"]["guard"] == "spend-unknown",
+                "the unknown-spend refusal was not recorded",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("no ceiling means no new decision, whatever the ledger holds")
+def test_ceilings_absent_change_nothing() -> None:
+    contract = {"budget": {"timeout_seconds": 600}}
+    spent = [{"spend": {"tokens": {"fresh_in": 10 ** 9}, "unknown": True,
+                        "gaps": ["lost"]}}, {"to": "DISPATCHED"}] * 50
+    require(
+        task_module.budget_conflict(contract, spent) is None
+        and task_module.budget_conflict({}, spent) is None,
+        "a contract with no ceilings was refused",
+    )
+    require(
+        task_module.spend_so_far([{"to": "DISPATCHED"}])["unknown"] == []
+        and task_module.spend_so_far([])["total"] == 0,
+        "records written before this phase were read as unknown spend",
+    )
+
+
+@test("the unproductive-loop stop fires only on a repeat of one commit")
+def test_repeated_review_predicate() -> None:
+    def review(commit: str, unresolved: list[str] | None) -> dict:
+        entry = {"seq": 1, "commit": commit}
+        if unresolved is not None:
+            entry["unresolved"] = unresolved
+        return {"review": entry}
+
+    stuck = [review("aaa", ["F-01"]), review("aaa", ["F-01"])]
+    require(
+        task_module.repeated_review(stuck)["unresolved"] == ["F-01"],
+        "two identical reviews of one commit did not stop the task",
+    )
+    require(
+        task_module.repeated_review([review("aaa", ["F-01"])]) is None,
+        "one review was enough to stop the task",
+    )
+    require(
+        task_module.repeated_review(
+            [review("aaa", ["F-01"]), review("bbb", ["F-01"])]
+        ) is None,
+        "a new commit did not clear the stop",
+    )
+    require(
+        task_module.repeated_review(
+            [review("aaa", ["F-01"]), review("aaa", ["F-01", "F-02"])]
+        ) is None,
+        "a different finding set was treated as a repeat",
+    )
+    require(
+        task_module.repeated_review(
+            [review("aaa", []), review("aaa", [])]
+        ) is None,
+        "a task with nothing open was stopped",
+    )
+    require(
+        task_module.repeated_review([review("aaa", None), review("aaa", None)])
+        is None,
+        "reviews recorded before this phase triggered the stop",
+    )
+
+
+@test("declared high risk cannot be left unreviewed by omission")
+def test_high_risk_requires_review() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        risky = dispatch_contract("T-2")
+        risky["risk"] = {"level": "high", "reasons": ["touches the gate"]}
+        risky.pop("review", None)
+        write_json(root / "risky.json", risky)
+        refused = run_task(root, "create", "risky.json")
+        require(
+            refused.returncode != 0
+            and "does not say whether it is reviewed" in refused.stderr,
+            f"high-risk work sealed without a review decision: "
+            f"{refused.stderr[-300:]}",
+        )
+        require(
+            ledger_module.task_ids(root / ".orrery") == ["T-1"],
+            "a refused contract was sealed anyway",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        waived = dispatch_contract()
+        waived["risk"] = {"level": "high", "reasons": ["touches the gate"]}
+        waived["review"] = False
+        create_dispatch_task(root, waived)
+        environment = task_review_environment("edit")
+        try:
+            shown = run_task(root, "status", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            shown.returncode == 0
+            and "waiver: T-1 declares high risk" in shown.stdout,
+            f"the waiver was not shown: {shown.stdout}",
+        )
+
+
+@test("a contract sealed before the risk rule is refused at the gate")
+def test_high_risk_refused_at_the_gate() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        contract = dispatch_contract()
+        contract["risk"] = {"level": "high", "reasons": ["touches the gate"]}
+        contract["review"] = False
+        create_dispatch_task(root, contract)
+        store = root / ".orrery"
+        # Exactly what a contract sealed before this rule looks like: the
+        # review key was never written, and the ledger names its digest.
+        contract.pop("review")
+        contract["task_id"] = "T-1"
+        data = (json.dumps(contract, ensure_ascii=False, indent=2) + "\n").encode()
+        path = store / "contracts" / "T-1.json"
+        path.chmod(0o600)
+        ledger_module._atomic_write(path, data, 0o600)
+        path.chmod(0o400)
+        ledger_module.append_record(store, "T-1", {
+            "from": "READY", "to": "READY", "actor": "user", "reason": "AMENDED",
+            "contract_digest": hashlib.sha256(data).hexdigest(),
+        })
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the fixture dispatch did not complete",
+            )
+            merged = run_task(root, "merge", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            merged.returncode != 0
+            and "does not say whether it is reviewed" in merged.stderr,
+            f"the gate merged unreviewed high-risk work: {merged.stderr[-300:]}",
+        )
+
+
+@test("reconciling an already-landed high-risk promotion reports the breach")
+def test_reconciliation_reports_a_risk_breach() -> None:
+    """Refusing here would not undo the merge, only hide it.
+
+    The work is in the target already, so the honest move is to complete
+    the record, name the breach in it, and exit non-zero. Reconciliation
+    reads the contract before any digest comparison, so rewriting the
+    file reproduces exactly the input that path receives from a store
+    sealed before the risk rule.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        contract = dispatch_contract(include=["one.txt"])
+        contract["risk"] = {"level": "high", "reasons": ["touches the gate"]}
+        contract["review"] = False
+        create_dispatch_task(root, contract)
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            require(
+                run_task(root, "merge", "T-1", environment=environment).returncode == 0,
+                "T-1 did not merge",
+            )
+            ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+            ledger.write_text("\n".join(
+                line for line in ledger.read_text().splitlines()
+                if json.loads(line)["to"] != "MERGED"
+            ) + "\n")
+            contract.pop("review")
+            path = root / ".orrery" / "contracts" / "T-1.json"
+            path.chmod(0o600)
+            write_json(path, contract)
+            path.chmod(0o400)
+            again = run_task(root, "merge", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            again.returncode != 0
+            and "cannot be un-landed" in again.stderr,
+            f"an unreviewed landing was reconciled silently: {again.stderr[-300:]}",
+        )
+        final = task_records(root)[-1]
+        require(
+            final["to"] == "MERGED" and final.get("risk_breach"),
+            f"the breach was not recorded with the reconciliation: {final}",
+        )
+
+
+@test("an amendment keeps the contract its earlier records were written against")
+def test_amendment_retains_the_superseded_contract() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        store = root / ".orrery"
+        original = task_records(root)[-1]["contract_digest"]
+        amended = dispatch_contract()
+        amended["title"] = "a different title"
+        ledger_module.amend_task(root, "T-1", amended)
+        require(
+            task_records(root)[-1]["contract_digest"] != original,
+            "the amendment did not change the digest",
+        )
+        kept = ledger_module.contract_bytes_for(store, "T-1", original)
+        require(
+            kept is not None
+            and hashlib.sha256(kept).hexdigest() == original,
+            "the contract an earlier record names is unrecoverable",
+        )
+        require(
+            json.loads(kept)["title"] != "a different title",
+            "the retained contract is the new one, not the superseded one",
+        )
+        require(
+            ledger_module.task_ids(store) == ["T-1"],
+            "the retained contract was mistaken for another task",
+        )
 
 
 def main() -> int:
