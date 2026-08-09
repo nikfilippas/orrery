@@ -12816,8 +12816,548 @@ def test_task_verify_rerun_preserves_evidence() -> None:
         )
 
 
-@test("task admission refuses a busy repository")
-def test_task_admission_refuses_busy_repository() -> None:
+@test("an ancestry test that cannot answer refuses rather than assuming no")
+def test_ancestry_fails_closed() -> None:
+    """git answers 0 for yes and 1 for no; anything else is a failure to
+    answer. Reading every nonzero exit as "no" failed open in both places
+    it gates: a merge over unrecorded work, and a cancellation over a
+    promoted target."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        head = git_output(root, "rev-parse", "HEAD")
+        require(
+            task_module.is_ancestor(root, head, head) is True,
+            "a commit was not its own ancestor",
+        )
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "user.email=kit@test", "-c",
+             "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "later"],
+            check=True,
+        )
+        later = git_output(root, "rev-parse", "HEAD")
+        require(
+            task_module.is_ancestor(root, head, later) is True
+            and task_module.is_ancestor(root, later, head) is False,
+            "ancestry was answered incorrectly in one direction",
+        )
+        try:
+            task_module.is_ancestor(root, "deadbeef" * 5, later)
+            raise Failure("an unknown object was reported as 'not an ancestor'")
+        # The task module's own LedgerError: the suite also loads the
+        # ledger under a second name, so ledger_module.LedgerError is a
+        # different class object and would not catch this.
+        except task_module.LedgerError as exc:
+            require(
+                "could not determine" in str(exc),
+                f"the refusal did not say it could not tell: {exc}",
+            )
+
+
+@test("a task whose merge lease has a live holder cannot be cancelled")
+def test_cancel_refuses_live_lease() -> None:
+    """R12. Revoking a lease from under a running integration would leave
+    a promoted target with no legal transition left to record."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            digest = task_records(root)[-1]["contract_digest"]
+            # A lease held by this very process, which is alive by
+            # construction, is the case cancellation must refuse.
+            with ledger_module.control_lock(root) as store:
+                ledger_module.append_record(
+                    store, "T-1",
+                    {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE",
+                     "actor": "user", "reason": "merge-started",
+                     "lease": {"pid": os.getpid(),
+                               "start": task_module.process_start_time(os.getpid()),
+                               "head": "unused"},
+                     "contract_digest": digest},
+                )
+            refused = run_task(root, "cancel", "T-1", environment=environment)
+            require(
+                refused.returncode == 1 and "live merge lease" in refused.stderr,
+                f"cancel revoked a live lease: {refused.stderr[-300:]}",
+            )
+            require(
+                task_module.current(root / ".orrery", "T-1")[1] == "AWAITING_MERGE",
+                "the refused cancel still moved the task",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a dependency must be in the code, not merely merged")
+def test_dependency_admission() -> None:
+    """AC2 and AC3. A status is not a code dependency: the dependency's
+    merge commit has to be an ancestor of the base this task branches
+    from, on the same target."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        contract = dispatch_contract("T-2", include=["two.txt"])
+        contract["depends_on"] = ["T-1"]
+        write_json(source, contract)
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        # A dependency naming a task that does not exist, and a cycle, are
+        # refused when the contract is sealed rather than when it runs.
+        bad = root / "bad.json"
+        spoiled = dispatch_contract(include=["three.txt"])
+        spoiled.pop("task_id", None)
+        spoiled["depends_on"] = ["T-99"]
+        write_json(bad, spoiled)
+        refused = run_task(root, "create", str(bad))
+        require(
+            refused.returncode == 1 and "does not exist" in refused.stderr,
+            f"a dependency on a missing task was sealed: {refused.stderr[-200:]}",
+        )
+        bad.unlink()
+        environment = task_review_environment("edit")
+        try:
+            waiting = run_task(root, "run", "T-2", environment=environment)
+            require(
+                waiting.returncode == 1 and "T-1" in waiting.stderr
+                and "not merged" in waiting.stderr,
+                f"an unmet dependency did not block admission: "
+                f"{waiting.stderr[-300:]}",
+            )
+            environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            require(
+                run_task(root, "merge", "T-1", environment=environment).returncode == 0,
+                "T-1 did not merge",
+            )
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            admitted = run_task(root, "run", "T-2", environment=environment)
+            require(
+                admitted.returncode == 0,
+                f"a satisfied dependency still blocked: {admitted.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("an out-of-scope override cannot be given over another task's files")
+def test_out_of_scope_override_respects_holders() -> None:
+    """R10. The override weakens disjointness by design, and under
+    parallelism that bypass crosses task boundaries."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        # T-1 declares one.txt but its worker also touches two.txt, which
+        # T-2 holds.
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["two.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        try:
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            require(
+                run_task(root, "run", "T-2", environment=environment).returncode == 0,
+                "T-2 did not reach the gate",
+            )
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            refused = run_task(
+                root, "merge", "T-1", "--accept-out-of-scope", environment=environment
+            )
+            require(
+                refused.returncode == 1
+                and "cannot be given over another task's files" in refused.stderr
+                and "T-2" in refused.stderr,
+                f"the override crossed a task boundary: {refused.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("an integration verifier that mutates the tree is refused")
+def test_integration_verifier_may_not_mutate() -> None:
+    """A borrowed command that repairs what it is judging would otherwise
+    report success while the already-captured result commit stays broken."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        # Passes on its own branch, where two.txt does not exist, and
+        # mutates once T-2's file is merged in. Only integration can see
+        # it, so the branch verifier cannot have caught it first.
+        create_dispatch_task(root, dispatch_contract(
+            include=["one.txt"],
+            command="if [ -f two.txt ]; then printf x > repaired.txt; fi",
+        ))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["two.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        try:
+            environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            require(
+                run_task(root, "run", "T-2", environment=environment).returncode == 0,
+                "T-2 did not reach the gate",
+            )
+            require(
+                run_task(root, "merge", "T-2", environment=environment).returncode == 0,
+                "T-2 did not merge",
+            )
+            refused = run_task(root, "merge", "T-1", environment=environment)
+            require(
+                refused.returncode == 1
+                and "integration verification failed" in refused.stderr,
+                f"a verifier that mutated the merged tree was accepted: "
+                f"{refused.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a promotion whose record never landed is reconciled to MERGED")
+def test_integration_promotion_reconciles() -> None:
+    """AC10. The durable order is packet, INTEGRATION_VERIFIED naming the
+    result commit, promote, MERGED. A crash in the last gap leaves the
+    target already carrying the verified commit, so the only correct move
+    is to complete the record rather than integrate again."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            require(
+                run_task(root, "merge", "T-1", environment=environment).returncode == 0,
+                "T-1 did not merge",
+            )
+            records = task_records(root)
+            integration = next(
+                r["integration"] for r in reversed(records) if r.get("integration")
+            )
+            # Rewind the ledger to the instant before MERGED landed, which
+            # is the crash this reconciles.
+            ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+            kept = [
+                line for line in ledger.read_text().splitlines()
+                if json.loads(line)["to"] != "MERGED"
+            ]
+            ledger.write_text("\n".join(kept) + "\n")
+            require(
+                task_module.current(root / ".orrery", "T-1")[1] == "AWAITING_MERGE",
+                "the rewind did not reproduce the crash window",
+            )
+            again = run_task(root, "merge", "T-1", environment=environment)
+            require(again.returncode == 0, f"reconciliation failed: {again.stderr[-300:]}")
+            final = task_records(root)[-1]
+            require(
+                final["to"] == "MERGED"
+                and final["merge_commit"] == integration["result_commit"]
+                and final.get("reason") == "reconciled",
+                f"the crash was not reconciled to the verified result: {final}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("two concurrent overlapping admissions cannot both succeed")
+def test_concurrent_admission_race() -> None:
+    """AC6. The failure this tests is a check split from its reservation:
+    two candidates both passing an unlocked scan and then appending
+    serially. Only a genuine race can show the transaction holds."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["shared.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["shared.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "shared.txt"
+        results: dict[str, Any] = {}
+        barrier = threading.Barrier(2)
+
+        def attempt(identifier: str) -> None:
+            barrier.wait()
+            results[identifier] = run_task(
+                root, "run", identifier, environment=environment
+            )
+
+        try:
+            threads = [
+                threading.Thread(target=attempt, args=(name,))
+                for name in ("T-1", "T-2")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=120)
+            admitted = [
+                name for name in ("T-1", "T-2")
+                if any(r["to"] == "DISPATCHED" for r in task_records(root, name))
+            ]
+            require(
+                len(admitted) == 1,
+                f"both overlapping tasks were admitted: {admitted}",
+            )
+            loser = "T-2" if admitted == ["T-1"] else "T-1"
+            require(
+                results[loser].returncode == 1 and "overlaps" in results[loser].stderr,
+                f"the loser was not refused for overlap: "
+                f"{results[loser].stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("two concurrent merges cannot both promote against one target head")
+def test_concurrent_merge_race() -> None:
+    """AC9. Promotion is a lease plus a compare-and-swap on the ref, so
+    the loser must either be turned away or re-integrate, never promote a
+    result verified against a head that has since moved."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["two.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        results: dict[str, Any] = {}
+        barrier = threading.Barrier(2)
+
+        def promote(identifier: str) -> None:
+            barrier.wait()
+            results[identifier] = run_task(
+                root, "merge", identifier, environment=environment
+            )
+
+        try:
+            for identifier, path in (("T-1", "one.txt"), ("T-2", "two.txt")):
+                environment["CODEX_FAKE_EDIT_PATH"] = path
+                require(
+                    run_task(root, "run", identifier, environment=environment).returncode == 0,
+                    f"{identifier} did not reach the gate",
+                )
+            threads = [
+                threading.Thread(target=promote, args=(name,))
+                for name in ("T-1", "T-2")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=180)
+            # Both merging is the goal, not the hazard. What must never
+            # happen is two promotions against the SAME head, which would
+            # mean one of them promoted a result verified against a head
+            # that no longer existed.
+            merged = [
+                name for name in ("T-1", "T-2")
+                if task_module.current(root / ".orrery", name)[1] == "MERGED"
+            ]
+            heads = {}
+            for name in merged:
+                integration = next(
+                    r["integration"] for r in reversed(task_records(root, name))
+                    if r.get("integration")
+                )
+                heads[name] = integration
+            require(
+                len({entry["head"] for entry in heads.values()}) == len(merged),
+                f"two merges verified against the same target head: "
+                f"{[(n, e['head'][:8]) for n, e in heads.items()]}",
+            )
+            promoted = git_output(root, "rev-parse", "HEAD")
+            require(
+                promoted in {entry["result_commit"] for entry in heads.values()},
+                "the target head is not any verified result commit",
+            )
+            for name in merged:
+                require(
+                    task_records(root, name)[-1]["merge_commit"]
+                    == heads[name]["result_commit"],
+                    f"{name} recorded a merge commit it never verified",
+                )
+            for name in ("T-1", "T-2"):
+                if name not in merged:
+                    stderr = results[name].stderr
+                    require(
+                        results[name].returncode != 0
+                        and ("merge lease" in stderr or "target moved" in stderr),
+                        f"{name} failed for an unexpected reason: {stderr[-300:]}",
+                    )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("the concurrency cap is read, bounded, enforced and explained")
+def test_concurrency_cap_and_status() -> None:
+    """AC8. Revision 1 specified this behaviour and tested none of it."""
+    require(
+        task_module.concurrency_cap(KIT_DIR) >= 1,
+        "the manifest cap did not load",
+    )
+    manifest = json.loads((KIT_DIR / "global" / "orchestration.json").read_text())
+    value = manifest["max_concurrent_tasks"]
+    require(
+        isinstance(value, int) and 1 <= value <= 8,
+        f"the shipped cap is outside its bounds: {value!r}",
+    )
+    # It lives beside verbosity rather than in settings, because the
+    # config page requires every setting to bind to a chart node and the
+    # chart is generated from the drawing, not edited here.
+    require(
+        "max_concurrent_tasks" not in manifest.get("settings", {}),
+        "the cap was put on the chart-bound settings surface",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["one.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not run",
+            )
+            shown = run_task(root, "status", environment=environment)
+            require(
+                "dispatches 0/" in shown.stdout,
+                f"status did not report the dispatch slots: {shown.stdout}",
+            )
+            require(
+                "T-2 READY (waiting:" in shown.stdout and "held by T-1" in shown.stdout,
+                f"status did not say what T-2 waits on: {shown.stdout}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+    # The cap itself, which the assertions above do not touch: they run
+    # with zero active dispatches, so what refuses T-2 there is the scope
+    # overlap. This forces a live dispatch and disjoint scopes, so only
+    # the cap can refuse.
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["two.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        digest = task_records(root)[-1]["contract_digest"]
+        with ledger_module.control_lock(root) as store:
+            for origin, target in (("READY", "DISPATCHED"), ("DISPATCHED", "IN_PROGRESS")):
+                ledger_module.append_record(
+                    store, "T-1",
+                    {"from": origin, "to": target, "actor": "runner",
+                     "contract_digest": digest},
+                )
+        environment = task_review_environment("edit")
+        environment["ORRERY_MAX_CONCURRENT_TASKS"] = "1"
+        try:
+            refused = run_task(root, "run", "T-2", environment=environment)
+            require(
+                refused.returncode == 1 and "dispatch slot" in refused.stderr,
+                f"the cap did not refuse a disjoint task: {refused.stderr[-300:]}",
+            )
+            environment["ORRERY_MAX_CONCURRENT_TASKS"] = "2"
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            allowed = run_task(root, "run", "T-2", environment=environment)
+            require(
+                allowed.returncode == 0,
+                f"raising the cap did not admit the task: {allowed.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("two tasks with disjoint scopes both run, and a holder keeps its scope")
+def test_disjoint_scopes_run_concurrently() -> None:
+    """AC1. The point of the phase, and the leak the review caught.
+
+    Successful work leaves DISPATCHED/IN_PROGRESS/IN_REVIEW at once while
+    its branch still touches every path in its scope, so scope ownership
+    runs from admission to a terminal state. A task sitting in
+    AWAITING_MERGE still holds its files.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        for identifier, path in (("T-2", "two.txt"), ("T-3", "one.txt")):
+            source = root / f"{identifier}.json"
+            write_json(source, dispatch_contract(identifier, include=[path]))
+            require(
+                run_task(root, "create", str(source)).returncode == 0,
+                f"{identifier} was not created",
+            )
+            source.unlink()
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "one.txt"
+        try:
+            first = run_task(root, "run", "T-1", environment=environment)
+            require(first.returncode == 0, f"T-1 did not run: {first.stderr[-300:]}")
+            require(
+                task_module.current(root / ".orrery", "T-1")[1] == "AWAITING_MERGE",
+                "T-1 did not reach the gate",
+            )
+            # Disjoint: admitted while T-1 holds one.txt awaiting merge.
+            environment["CODEX_FAKE_EDIT_PATH"] = "two.txt"
+            second = run_task(root, "run", "T-2", environment=environment)
+            require(
+                second.returncode == 0,
+                f"a disjoint task was refused: {second.stderr[-300:]}",
+            )
+            # Overlapping with a holder that is merely AWAITING_MERGE.
+            third = run_task(root, "run", "T-3", environment=environment)
+            require(
+                third.returncode == 1
+                and "held by T-1" in third.stderr
+                and "AWAITING_MERGE" in third.stderr,
+                f"a holder in AWAITING_MERGE released its scope: "
+                f"{third.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("task admission refuses an overlapping scope, not a busy repository")
+def test_task_admission_refuses_overlapping_scope() -> None:
+    """Phase 4 replaces the repository mutex. What refuses a dispatch is
+    an overlap with a task that still holds its scope, named with the
+    holder and its state, not the mere existence of other work."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         init_task_repository(root)
@@ -12840,7 +13380,13 @@ def test_task_admission_refuses_busy_repository() -> None:
             refused = run_task(root, "run", "T-2", environment=environment)
         finally:
             discard_task_environment(environment)
-        require(refused.returncode == 1 and "T-1 is busy" in refused.stderr, refused.stderr)
+        require(
+            refused.returncode == 1
+            and "overlaps" in refused.stderr
+            and "held by T-1" in refused.stderr
+            and "IN_PROGRESS" in refused.stderr,
+            f"the refusal did not name the overlap and holder: {refused.stderr[-300:]}",
+        )
         require(
             all(record["to"] != "DISPATCHED" for record in task_records(root, "T-2")),
             str(task_records(root, "T-2")),
@@ -13497,6 +14043,122 @@ def test_task_resume_exit_and_discard_residue() -> None:
         require(discarded.returncode == 1 and "remains" in discarded.stderr and task_records(root)[-1]["to"] == "CANCELLED" and again.returncode == 0 and not worktree.exists(), f"discard={discarded.returncode}:{discarded.stderr!r}; again={again.returncode}:{again.stderr!r}; records={task_records(root)}")
 
 
+@test("an invariant only the merged task tests still refuses the incoming merge")
+def test_integration_union_catches_asymmetric_break() -> None:
+    """AC5, asymmetric. T-1 ships an invariant and the only test of it.
+    T-2 breaks it in a file T-1 never touched, and T-2's own commands say
+    nothing about it. Running only the incoming contract's checks would
+    merge this; the union is what refuses it.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        (root / "settings.py").write_text("LIMIT = 10\n")
+        subprocess.run(["git", "-C", str(root), "add", "settings.py"], check=True)
+        subprocess.run(
+            ["git", "-C", str(root), "-c", "user.email=kit@test", "-c",
+             "user.name=Kit", "commit", "-qm", "settings"], check=True,
+        )
+        # T-1's check is the only one that asserts the invariant.
+        create_dispatch_task(root, dispatch_contract(
+            include=["guard.py"],
+            command='python3 -B -c "import settings; assert settings.LIMIT == 10"',
+        ))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["settings.py"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        try:
+            # Both branch from the same base, which is what makes this
+            # the concurrent case: T-1's merge lands after T-2 branched,
+            # so its checks are unseen work T-2 must still satisfy.
+            environment["CODEX_FAKE_EDIT_PATH"] = "guard.py"
+            environment["CODEX_FAKE_EDIT_TEXT"] = "# guards the limit\n"
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "T-1 did not reach the gate",
+            )
+            # T-2 breaks the invariant, and its own command does not test it.
+            environment["CODEX_FAKE_EDIT_PATH"] = "settings.py"
+            environment["CODEX_FAKE_EDIT_TEXT"] = "LIMIT = 99\n"
+            require(
+                run_task(root, "run", "T-2", environment=environment).returncode == 0,
+                "T-2 did not reach the gate despite its own checks passing",
+            )
+            require(
+                run_task(root, "merge", "T-1", environment=environment).returncode == 0,
+                "T-1 did not merge",
+            )
+            refused = run_task(root, "merge", "T-2", environment=environment)
+            require(
+                refused.returncode == 1
+                and "integration verification failed" in refused.stderr
+                and "T-1" in refused.stderr,
+                f"the union did not catch the borrowed invariant: "
+                f"{refused.stderr[-400:]}",
+            )
+            require(
+                task_module.current(root / ".orrery", "T-2")[1] == "AWAITING_MERGE",
+                "a failed integration moved the task out of AWAITING_MERGE",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("both tasks merge without a re-run, the second against the moved target")
+def test_parallel_merges_integrate() -> None:
+    """AC4. Under Phase 1 the second merge was refused with "target
+    moved" and the work had to be re-run. It now integrates."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract(include=["one.txt"]))
+        source = root / "T-2.json"
+        write_json(source, dispatch_contract("T-2", include=["two.txt"]))
+        require(run_task(root, "create", str(source)).returncode == 0, "T-2 not created")
+        source.unlink()
+        environment = task_review_environment("edit")
+        try:
+            for identifier, path in (("T-1", "one.txt"), ("T-2", "two.txt")):
+                environment["CODEX_FAKE_EDIT_PATH"] = path
+                require(
+                    run_task(root, "run", identifier, environment=environment).returncode == 0,
+                    f"{identifier} did not reach the gate",
+                )
+            first = run_task(root, "merge", "T-1", environment=environment)
+            require(first.returncode == 0, f"first merge failed: {first.stderr[-300:]}")
+            moved = git_output(root, "rev-parse", "HEAD")
+            second = run_task(root, "merge", "T-2", environment=environment)
+            require(
+                second.returncode == 0,
+                f"the second merge was refused rather than integrated: "
+                f"{second.stderr[-400:]}",
+            )
+            records = task_records(root, "T-2")
+            integration = next(
+                (r["integration"] for r in reversed(records) if r.get("integration")), None
+            )
+            require(
+                integration is not None
+                and integration["head"] == moved
+                and integration["outcome"] == "verified",
+                f"integration did not record the moved target: {integration}",
+            )
+            promoted = git_output(root, "rev-parse", "HEAD")
+            require(
+                promoted == integration["result_commit"],
+                "the promoted head is not the commit that was verified",
+            )
+            require(
+                records[-1]["to"] == "MERGED"
+                and records[-1]["merge_commit"] == integration["result_commit"],
+                f"the merge record does not name the verified result: {records[-1]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
 @test("task merge refuses every gate violation")
 def test_task_merge_gate_matrix() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -13524,8 +14186,19 @@ def test_task_merge_gate_matrix() -> None:
         (root / "untracked").write_text("x\n")
         refused("dirty")
         (root / "untracked").unlink()
-        subprocess.run(["git", "-C", str(root), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "target moved"], check=True)
-        refused("target moved")
+        # A moved target is no longer a refusal: Phase 4 integrates
+        # against it. A target that no longer descends from the base is,
+        # because a rewind is an operator event, not something to merge
+        # across silently.
+        # Amending rewrites the base commit itself, so the old base is no
+        # longer reachable: exactly the force-rewritten target the rule is
+        # for. Committing and resetting back would leave base an ancestor.
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten history"], check=True)
+        rewound = run_task(root, "merge", "T-1")
+        require(
+            rewound.returncode == 1 and "no longer descends" in rewound.stderr,
+            f"a divergent target was not refused: {rewound.stderr[-300:]}",
+        )
         subprocess.run(["git", "-C", str(root), "reset", "--hard", "-q", base], check=True)
         subprocess.run(["git", "-C", str(ledger_module.worktree_path(root, "T-1")), "-c", "user.email=kit@test", "-c", "user.name=Kit", "commit", "-q", "--allow-empty", "-m", "task moved"], check=True)
         refused("task branch")

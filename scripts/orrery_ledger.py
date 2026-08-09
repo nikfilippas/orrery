@@ -80,13 +80,14 @@ DISPATCH_FAILURE_REASONS = frozenset(
     }
 )
 _CONTRACT_KEYS = frozenset(
-    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review"}
+    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review", "depends_on"}
 )
 
 
 # Every local plumbing call is bounded: an unbounded wait turns a held
 # lock into a runner that never returns.
 PLUMBING_TIMEOUT_SECONDS = 120
+_TASK_ID = re.compile(r"^T-[0-9]+$")
 
 
 class LedgerError(Exception):
@@ -261,6 +262,24 @@ def validate_contract(contract: Any, task_id: str | None = None) -> dict[str, An
                 raise _error(f"$.budget.{name}", "must be an integer from 30 to 14400")
     if "notes" in data and not isinstance(data["notes"], str):
         raise _error("$.notes", "must be a string")
+    if "depends_on" in data:
+        # Shape only. Whether the named tasks exist, and whether the graph
+        # is acyclic, needs the store and is checked when the contract is
+        # sealed: a cycle refused at creation is a cycle that cannot be
+        # discovered at runtime with two agents already waiting.
+        depends = data["depends_on"]
+        if not isinstance(depends, list):
+            raise _error("$.depends_on", "must be a list")
+        seen: set[str] = set()
+        for index, entry in enumerate(depends):
+            _string(entry, f"$.depends_on[{index}]")
+            if not _TASK_ID.match(entry):
+                raise _error(f"$.depends_on[{index}]", "must be a task identifier")
+            if task_id is not None and entry == task_id:
+                raise _error(f"$.depends_on[{index}]", "a task cannot depend on itself")
+            if entry in seen:
+                raise _error(f"$.depends_on[{index}]", f"names {entry} twice")
+            seen.add(entry)
     if "review" in data and not isinstance(data["review"], bool):
         # Optional and absent means no review, so every contract written
         # before this key existed keeps its Phase 1 behaviour exactly.
@@ -434,6 +453,44 @@ def repair_ledger(store: Path, task_id: str) -> bool:
     return True
 
 
+
+def dependency_graph_ok(store: Path, task_id: str, depends_on: list[str]) -> None:
+    """Refuse a dependency that does not exist, or any cycle it would close.
+
+    Walked when the contract is sealed rather than when it runs. A cycle
+    discovered at dispatch is a cycle discovered with agents already
+    waiting on each other, which is the failure this design exists to
+    make impossible rather than to detect.
+    """
+    def declared(identifier: str) -> list[str]:
+        path = store / "contracts" / f"{identifier}.json"
+        try:
+            data = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError):
+            return []
+        listed = data.get("depends_on")
+        return [entry for entry in listed if isinstance(entry, str)] if isinstance(listed, list) else []
+
+    for entry in depends_on:
+        if not (store / "contracts" / f"{entry}.json").exists():
+            raise _error("$.depends_on", f"names a task that does not exist: {entry}")
+
+    # Depth-first from each declared dependency, looking for a path back.
+    # The new task is not yet on disk, so its own edges are the ones
+    # supplied here.
+    for start in depends_on:
+        seen: set[str] = set()
+        stack = [(start, [task_id, start])]
+        while stack:
+            node, path = stack.pop()
+            if node == task_id:
+                raise _error("$.depends_on", "would close a cycle: " + " -> ".join(path))
+            if node in seen:
+                continue
+            seen.add(node)
+            for nxt in declared(node):
+                stack.append((nxt, path + [nxt]))
+
 def create_task(root: Path, contract: dict[str, Any]) -> str:
     try:
         subprocess.run(
@@ -461,6 +518,7 @@ def create_task(root: Path, contract: dict[str, Any]) -> str:
                 raise LedgerError("detached HEAD requires an explicit $.target_ref") from exc
             contract["target_ref"] = result.stdout.strip()
         validate_contract(contract, task_id)
+        dependency_graph_ok(store, task_id, contract.get("depends_on", []))
         data = _stored_bytes(contract)
         path = _contract_path(store, task_id)
         _atomic_write(path, data, 0o600)
@@ -478,6 +536,7 @@ def amend_task(root: Path, task_id: str, contract: dict[str, Any]) -> None:
         if not records or records[-1]["to"] != "READY":
             raise LedgerError("task is not READY")
         validate_contract(contract, task_id)
+        dependency_graph_ok(store, task_id, contract.get("depends_on", []))
         data = _stored_bytes(contract)
         path = _contract_path(store, task_id)
         _atomic_write(path, data, 0o600)
@@ -486,10 +545,16 @@ def amend_task(root: Path, task_id: str, contract: dict[str, Any]) -> None:
 
 
 def task_ids(store: Path) -> list[str]:
-    return sorted(
-        (path.stem for path in (store / "contracts").glob("T-*.json")),
-        key=lambda task_id: int(task_id[2:]),
-    )
+    """Every task the ledger knows, whatever became of its contract.
+
+    Enumerating contracts instead made a task with a missing contract
+    invisible rather than an error, which is precisely backwards: an
+    active holder that cannot be read must stop the work that would
+    collide with it, not disappear from the scan.
+    """
+    seen = {path.stem for path in (store / "ledger").glob("T-*.jsonl")}
+    seen.update(path.stem for path in (store / "contracts").glob("T-*.json"))
+    return sorted(seen, key=lambda task_id: int(task_id[2:]))
 
 
 def load_contract(store: Path, task_id: str) -> dict[str, Any]:

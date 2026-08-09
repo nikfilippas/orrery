@@ -1,5 +1,6 @@
 {
   "verbosity": 1,
+  "max_concurrent_tasks": 2,
   "steps": [
     {
       "id": "orchestrator",
@@ -73,9 +74,9 @@
     "header": {
       "x": 20,
       "y": 15.83,
-      "title": "\u00d3rrery configuration",
+      "title": "Órrery configuration",
       "titleSize": 14,
-      "subtitle": "Set each role\u2019s model in the legend. Nothing is written until you apply.",
+      "subtitle": "Set each role’s model in the legend. Nothing is written until you apply.",
       "subtitleSize": 9.2,
       "gap": 10,
       "noteY": 29.33,

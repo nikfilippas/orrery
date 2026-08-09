@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orrery_findings  # noqa: E402
 from orrery_fallback import git_workspace_fingerprint  # noqa: E402
 from orrery_ledger import (  # noqa: E402
+    STATES as LEDGER_STATES,
     LedgerError,
     _atomic_write,
     amend_task,
@@ -670,6 +671,130 @@ def harvest_receipts(storage: Path, receipts: Path) -> None:
         )
 
 
+
+# A task owns its declared scope from admission until it reaches a
+# terminal state. Reusing the old busy set would leak it: successful work
+# leaves DISPATCHED/IN_PROGRESS/IN_REVIEW immediately, while an unmerged
+# branch still touches every path in its scope, so an overlapping task
+# admitted then is forced into exactly the conflict admission exists to
+# prevent, discovered only at its merge.
+TERMINAL = frozenset({"MERGED", "CLOSED", "CANCELLED"})
+
+
+def holds_scope(records: list[dict], state: str) -> bool:
+    """Whether this task still claims its files.
+
+    Read from history rather than from the current state: a retry moves an
+    already-dispatched task back to READY, and a state-based rule would
+    drop its reservation there while its branch still touches every path
+    it declared.
+    """
+    if state in TERMINAL:
+        return False
+    return any(record.get("to") == "DISPATCHED" for record in records)
+
+
+def normalise_scope(path: str) -> str:
+    """A scope entry reduced to the form the overlap test compares."""
+    cleaned = os.path.normpath(path.strip())
+    return "" if cleaned in {".", "/", ""} else cleaned.lstrip("./")
+
+
+def paths_overlap(one: str, other: str) -> bool:
+    """Whether two repository-relative paths claim any file in common.
+
+    The empty string is the repository root, which normalisation produces
+    from "." and which overlaps everything: a scope declared over the
+    whole tree must not silently overlap nothing.
+    """
+    first, second = normalise_scope(one), normalise_scope(other)
+    if first == "" or second == "":
+        return True
+    return (
+        first == second
+        or first.startswith(second + "/")
+        or second.startswith(first + "/")
+    )
+
+
+def scope_holders(store: Path, task_id: str) -> list[tuple[str, str, list[str]]]:
+    """Every other task holding scope, with its state and include set."""
+    holders: list[tuple[str, str, list[str]]] = []
+    for other in task_ids(store):
+        if other == task_id:
+            continue
+        try:
+            records, state = current(store, other)
+        except LedgerError as exc:
+            raise LedgerError(
+                f"cannot tell whether {other} holds scope: {exc}"
+            ) from exc
+        if not holds_scope(records, state):
+            continue
+        try:
+            contract = load_contract(store, other)
+        except LedgerError as exc:
+            raise LedgerError(
+                f"cannot read {other}'s scope while it still holds one: {exc}"
+            ) from exc
+        holders.append((other, state, list(contract["scope"]["include"])))
+    return holders
+
+
+def scope_conflict(store: Path, task_id: str, include: list[str]) -> str | None:
+    """The first overlap with a scope-holding task, described, or None."""
+    for other, state, held in scope_holders(store, task_id):
+        for mine in include:
+            for theirs in held:
+                if paths_overlap(mine, theirs):
+                    return (
+                        f"scope {mine} overlaps {theirs}, held by {other} "
+                        f"which is {state}"
+                    )
+    return None
+
+
+def dependency_conflict(
+    root: Path, store: Path, contract: dict, base: str
+) -> str | None:
+    """Why a declared dependency is not yet satisfied, or None.
+
+    A dependency is a code dependency, not a status. Its merge commit must
+    already be an ancestor of the base this task will branch from, on the
+    same target: a dependency MERGED onto another ref proves nothing about
+    this task's code.
+    """
+    for dependency in contract.get("depends_on", []):
+        try:
+            records, state = current(store, dependency)
+        except LedgerError:
+            return f"dependency {dependency} has no readable ledger"
+        if state == "CANCELLED":
+            return f"dependency {dependency} was cancelled"
+        if state not in {"MERGED", "CLOSED"}:
+            return f"dependency {dependency} is {state}, not merged"
+        try:
+            theirs = load_contract(store, dependency)
+        except LedgerError:
+            return f"dependency {dependency} has no readable contract"
+        if theirs.get("target_ref") != contract.get("target_ref"):
+            return (
+                f"dependency {dependency} targets {theirs.get('target_ref')}, "
+                f"not {contract.get('target_ref')}"
+            )
+        merged = next(
+            (r.get("merge_commit") for r in reversed(records) if r.get("to") == "MERGED"),
+            None,
+        )
+        if not merged:
+            return f"dependency {dependency} records no merge commit"
+        if not is_ancestor(root, merged, base):
+            return (
+                f"dependency {dependency} merged as {merged[:12]}, which is not "
+                f"an ancestor of the base {base[:12]}"
+            )
+    return None
+
 def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     """Dispatch one blind review and record what it found.
 
@@ -913,20 +1038,57 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     dirty = git(root, "status", "--porcelain").stdout
     if dirty and not allow_dirty:
         raise LedgerError("baseline worktree is dirty; use --allow-dirty-baseline")
-    base = git(root, "rev-parse", "HEAD").stdout.strip()
-    symbolic = git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip() or "detached"
     fingerprint = git_workspace_fingerprint(root)
+    # Read, check, reserve, append: one control transaction. Splitting it
+    # would let two overlapping candidates both pass an unlocked scan and
+    # then append serially, admitting both.
     with control_lock(root) as locked:
         records, state = current(locked, task_id)
         if state != "READY":
             raise LedgerError(f"task {task_id} is {state}")
-        for other in task_ids(locked):
-            if other != task_id and current(locked, other)[1] in {
-                "DISPATCHED",
-                "IN_PROGRESS",
-                "IN_REVIEW",
-            }:
-                raise LedgerError(f"task {other} is busy")
+        digest = records[-1]["contract_digest"]
+        contract_path = locked / "contracts" / f"{task_id}.json"
+        try:
+            contract_bytes = contract_path.read_bytes()
+            contract = json.loads(contract_bytes)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LedgerError("task contract is unreadable") from exc
+        if hashlib.sha256(contract_bytes).hexdigest() != digest:
+            raise LedgerError("task contract digest differs from READY record; amend the task")
+        from orrery_ledger import validate_contract  # noqa: E402
+        contract = validate_contract(contract, task_id)
+
+        # The base comes from the contract's own target, never from an
+        # unqualified HEAD: a topic branch carrying a dependency plus
+        # unrelated commits would otherwise satisfy both the same-target
+        # and ancestry checks, and speculative integration would import
+        # the unrelated commits with it.
+        target = contract["target_ref"]
+        symbolic = git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip() or "detached"
+        if symbolic != target:
+            raise LedgerError(
+                f"checked-out ref is {symbolic}, not the contract's target {target}"
+            )
+        resolved = git(root, "rev-parse", "--verify", "--quiet", target)
+        base = resolved.stdout.strip()
+        if resolved.returncode != 0 or not base:
+            raise LedgerError(f"target ref {target} does not resolve")
+
+        conflict = scope_conflict(locked, task_id, contract["scope"]["include"])
+        if conflict:
+            raise LedgerError(f"task {task_id} cannot start: {conflict}")
+        waiting = dependency_conflict(root, locked, contract, base)
+        if waiting:
+            raise LedgerError(f"task {task_id} cannot start: {waiting}")
+        cap = concurrency_cap(root)
+        running = active_dispatches(locked, task_id)
+        if len(running) >= cap:
+            named = ", ".join(f"{other} ({state})" for other, state in running)
+            raise LedgerError(
+                f"task {task_id} cannot start: {len(running)} of {cap} dispatch "
+                f"slots are in use by {named}"
+            )
+
         sequence = 1 + sum(r["to"] == "DISPATCHED" for r in records)
         dispatch_root = root / ".orrery" / "dispatch"
         sequence_dir = dispatch_root / task_id / str(sequence)
@@ -941,17 +1103,6 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
             attempt.mkdir(mode=0o700)
         except FileExistsError as exc:
             raise LedgerError(f"dispatch attempt already exists: {attempt}") from exc
-        digest = records[-1]["contract_digest"]
-        contract_path = locked / "contracts" / f"{task_id}.json"
-        try:
-            contract_bytes = contract_path.read_bytes()
-            contract = json.loads(contract_bytes)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise LedgerError("task contract is unreadable") from exc
-        if hashlib.sha256(contract_bytes).hexdigest() != digest:
-            raise LedgerError("task contract digest differs from READY record; amend the task")
-        from orrery_ledger import validate_contract  # noqa: E402
-        contract = validate_contract(contract, task_id)
         role = load_role(contract["assigned_role"], cwd=root)
         prompt = attempt.parent / "prompt.txt"
         _atomic_write(prompt, handoff(contract).encode(), 0o600)
@@ -1041,9 +1192,11 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
     stderr_tail: list[str] = []
 
     def tee_stderr() -> None:
+        # Prefixed with the task, because two dispatches may now interleave
+        # on one terminal and an unattributed line is worse than no line.
         assert process.stderr is not None
         for line in process.stderr:
-            sys.stderr.write(line)
+            sys.stderr.write(f"[{task_id}] {line}" if line.strip() else line)
             sys.stderr.flush()
             stderr_tail.append(line)
             if len(stderr_tail) > 80:
@@ -1145,7 +1298,288 @@ def resume_task(root: Path, task_id: str) -> int:
     return 0
 
 
-def merge_task(root: Path, task_id: str, flags: list[str]) -> int:
+
+
+DISPATCH_ACTIVE_STATES = frozenset({"DISPATCHED", "IN_PROGRESS", "IN_REVIEW"})
+
+
+def concurrency_cap(root: Path) -> int:
+    """How many dispatches may run at once, from the manifest.
+
+    A ceiling rather than a target: scopes must still be disjoint, and the
+    binding constraint is usually the provider's rate limit rather than
+    this machine. One restores the single-task behaviour of Phase 1.
+    """
+    default = 2
+    # An override, as the verification budget has: without it the cap can
+    # only be exercised by editing the shipped manifest, so the test that
+    # was meant to prove it enforced proved nothing instead.
+    override = os.environ.get("ORRERY_MAX_CONCURRENT_TASKS")
+    if override:
+        try:
+            value = int(override)
+        except ValueError as exc:
+            raise LedgerError(
+                "ORRERY_MAX_CONCURRENT_TASKS must be an integer"
+            ) from exc
+        if not 1 <= value <= 8:
+            raise LedgerError(
+                f"ORRERY_MAX_CONCURRENT_TASKS {value} is outside 1..8"
+            )
+        return value
+    try:
+        from orrery_runtime import MANIFEST_PATH  # noqa: E402
+        manifest = json.loads(MANIFEST_PATH.read_text())
+        value = manifest["max_concurrent_tasks"]
+        low, high = 1, 8
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise LedgerError("max_concurrent_tasks must be an integer")
+    if not isinstance(low, int) or not isinstance(high, int) or not low <= value <= high:
+        raise LedgerError(
+            f"max_concurrent_tasks {value} is outside its bounds {low}..{high}"
+        )
+    return value
+
+
+def active_dispatches(store: Path, exclude: str | None = None) -> list[tuple[str, str]]:
+    active: list[tuple[str, str]] = []
+    for other in task_ids(store):
+        if other == exclude:
+            continue
+        try:
+            state = current(store, other)[1]
+        except LedgerError:
+            continue
+        if state in DISPATCH_ACTIVE_STATES:
+            active.append((other, state))
+    return active
+
+
+def waiting_reason(root: Path, store: Path, task_id: str, state: str) -> str:
+    """What this task is waiting on, in one clause, or nothing.
+
+    A stalled graph should be legible from `status` rather than by
+    reading the ledger, which is the whole reason a graph is allowed to
+    exist in this phase.
+    """
+    if state != "READY":
+        lease = None
+        try:
+            lease = task_merge_lease(current(store, task_id)[0])
+        except LedgerError:
+            pass
+        if lease and lease_holder_alive(lease):
+            return "(merging)"
+        if lease:
+            return "(merge lease held by a dead process; it clears on the next merge)"
+        return ""
+    try:
+        contract = load_contract(store, task_id)
+    except LedgerError:
+        return ""
+    conflict = scope_conflict(store, task_id, contract["scope"]["include"])
+    if conflict:
+        return f"(waiting: {conflict})"
+    head = git(root, "rev-parse", "--verify", "--quiet", contract["target_ref"]).stdout.strip()
+    if head:
+        waiting = dependency_conflict(root, store, contract, head)
+        if waiting:
+            return f"(waiting: {waiting})"
+    running = active_dispatches(store, task_id)
+    if len(running) >= concurrency_cap(root):
+        return f"(waiting: {len(running)} dispatch slots in use)"
+    return "(ready to run)"
+
+
+def unreconciled_promotions(root: Path, store: Path, exclude: str, head: str) -> list[str]:
+    """Tasks whose verified result is already in the target but unrecorded.
+
+    A process that died between moving the ref and recording MERGED leaves
+    work in the target with no durable record of it. Another task must not
+    integrate over that: the union is computed from MERGED records, so the
+    landed task's checks would simply be skipped.
+    """
+    pending: list[str] = []
+    for other in task_ids(store):
+        if other == exclude:
+            continue
+        try:
+            records, state = current(store, other)
+        except LedgerError as exc:
+            raise LedgerError(f"cannot inspect {other} before merging: {exc}") from exc
+        if state in TERMINAL:
+            continue
+        promotion = next(
+            (
+                record["integration"]
+                for record in reversed(records)
+                if record.get("integration", {}).get("outcome") == "verified"
+            ),
+            None,
+        )
+        landed = promotion.get("result_commit") if promotion else None
+        if not landed:
+            continue
+        if is_ancestor(root, landed, head):
+            pending.append(other)
+    return pending
+
+
+def is_ancestor(root: Path, ancestor: str, descendant: str) -> bool:
+    """Whether one commit is an ancestor of another, or an error.
+
+    git answers 0 for yes and 1 for no, and anything else is a failure to
+    answer: 128 for an unknown object, for instance. Reading every nonzero
+    exit as "no" fails open in both places this gates, permitting a merge
+    or a cancellation precisely when ancestry could not be established.
+    """
+    result = git(root, "merge-base", "--is-ancestor", ancestor, descendant)
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise LedgerError(
+        f"could not determine whether {ancestor[:12]} is an ancestor of "
+        f"{descendant[:12]}: git exited {result.returncode} "
+        f"({result.stderr.strip() or 'no detail'})"
+    )
+
+def task_merge_lease(records: list[dict]) -> dict | None:
+    """The merge lease this task holds, live or stale, or None."""
+    for record in reversed(records):
+        if record.get("to") in {"MERGED", "CLOSED", "CANCELLED"}:
+            return None
+        if record.get("reason") == "lease-released":
+            return None
+        lease = record.get("lease")
+        if lease:
+            return lease
+    return None
+
+
+def lease_holder_alive(lease: dict) -> bool:
+    return process_start_time(lease.get("pid", -1)) == lease.get("start")
+
+
+def live_merge_leases(store: Path, exclude: str) -> list[tuple[str, dict]]:
+    """Every other task holding a merge lease whose holder still lives."""
+    live: list[tuple[str, dict]] = []
+    for other in task_ids(store):
+        if other == exclude:
+            continue
+        try:
+            records, _state = current(store, other)
+        except LedgerError:
+            continue
+        lease = task_merge_lease(records)
+        if lease and lease_holder_alive(lease):
+            live.append((other, lease))
+    return live
+
+
+def integration_commands(
+    root: Path, store: Path, task_id: str, contract: dict, base: str, head: str
+) -> list[tuple[str, str, str]]:
+    """The union of verification commands the merged result must satisfy.
+
+    Running only the incoming contract's commands would let a task that
+    breaks an invariant covered solely by an already-merged task's checks
+    merge anyway. The union is exactly the incoming commands plus those of
+    every task whose merge landed on this target after this task's base:
+    already recorded, already sealed, and bounded by what actually
+    changed.
+    """
+    commands = [
+        (task_id, entry["id"], entry["verification"])
+        for entry in contract["acceptance_criteria"]
+    ]
+    for other in task_ids(store):
+        if other == task_id:
+            continue
+        try:
+            records, _state = current(store, other)
+        except LedgerError as exc:
+            raise LedgerError(
+                f"cannot tell whether {other} merged into this target: {exc}"
+            ) from exc
+        merged = next(
+            (r.get("merge_commit") for r in reversed(records) if r.get("to") == "MERGED"),
+            None,
+        )
+        if not merged:
+            continue
+        # Landed on this target, and after our base.
+        if not is_ancestor(root, merged, head):
+            continue
+        if is_ancestor(root, merged, base):
+            continue
+        try:
+            theirs = load_contract(store, other)
+        except LedgerError as exc:
+            raise LedgerError(
+                f"{other} merged into this target but its contract cannot be "
+                f"read, so its checks cannot be honoured: {exc}"
+            ) from exc
+        commands.extend(
+            (other, entry["id"], entry["verification"])
+            for entry in theirs["acceptance_criteria"]
+        )
+    return commands
+
+
+def integration_worktree(root: Path, task_id: str, head: str, attempt: int) -> Path:
+    """A throwaway checkout of the target head to merge into.
+
+    Named per attempt: a shared path let a second run of the same task
+    remove the first's tree from under it.
+    """
+    path = worktree_path(root, task_id).with_name(f"{task_id}-integration-{attempt}")
+    if path.exists():
+        git(root, "worktree", "remove", "--force", str(path))
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    result = git(root, "worktree", "add", "--detach", "--quiet", str(path), head)
+    if result.returncode != 0:
+        raise LedgerError(f"could not prepare an integration worktree: {result.stderr.strip()}")
+    return path
+
+
+def conflicting_paths(scratch: Path) -> list[str]:
+    status = git(scratch, "status", "--porcelain").stdout.splitlines()
+    return sorted(
+        line[3:].strip()
+        for line in status
+        if line[:2] in {"UU", "AA", "DU", "UD", "AU", "UA", "DD"}
+    )
+
+def sequence_of(records: list[dict]) -> int:
+    return sum(1 for r in records if r.get("to") == "DISPATCHED") or 1
+
+
+def merge_task(root: Path, task_id: str, flags: list[str], attempts: int = 3) -> int:
+    """Merge, re-integrating against a moved target rather than giving up.
+
+    A target that moves during integration is the ordinary case under
+    parallelism, so the loser retries against the new head. Bounded,
+    because an unbounded retry against a busy target is a spin.
+    """
+    for remaining in range(attempts - 1, -1, -1):
+        try:
+            return _merge_once(root, task_id, flags)
+        except LedgerError as exc:
+            retryable = "target moved during integration" in str(exc)
+            if not retryable or remaining == 0:
+                raise
+            print(
+                f"orrery-task: {task_id} lost the target head; re-integrating "
+                f"against the new one ({remaining} attempt(s) left)",
+                file=sys.stderr,
+            )
+    raise LedgerError("unreachable")
+
+
+def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
     store = root / ".orrery"
     records, state = current(store, task_id)
     if state != "AWAITING_MERGE":
@@ -1158,13 +1592,45 @@ def merge_task(root: Path, task_id: str, flags: list[str]) -> int:
         ),
         None,
     )
-    if substantive is not None and substantive.get("reason") == "merge-started":
-        expected = substantive.get("expected", {})
-        parents = git(root, "show", "-s", "--format=%P", "HEAD").stdout.split()
-        if parents == [expected.get("base"), expected.get("commit")]:
+    # Reconciliation reads the durable order backwards. The order is:
+    # write the integration packet, record INTEGRATION_VERIFIED naming the
+    # result commit, promote the ref, record MERGED. So a target head that
+    # equals a recorded result commit is a promotion whose record never
+    # landed, and completing it is the only correct move. An
+    # INTEGRATION_VERIFIED whose result never became the head, with a dead
+    # lease, is a failed promotion: that task re-integrates.
+    verified_integration = next(
+        (
+            record["integration"]
+            for record in reversed(records)
+            if record.get("integration", {}).get("outcome") == "verified"
+        ),
+        None,
+    )
+    if verified_integration:
+        reconcile_target = load_contract(store, task_id)["target_ref"]
+        current_head = git(
+            root, "rev-parse", "--verify", "--quiet", reconcile_target
+        ).stdout.strip()
+        # By ancestry, and recording the commit that was actually
+        # promoted. Requiring equality with the current head meant that a
+        # merge landing on top turned a completed promotion back into a
+        # re-integration, which then recorded a newer head: a later target
+        # containing the original result but not that newer commit would
+        # have omitted this task's checks from its union.
+        landed = verified_integration.get("result_commit")
+        if current_head and landed and is_ancestor(root, landed, current_head):
             with control_lock(root) as locked:
-                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": git(root, "rev-parse", "HEAD").stdout.strip(), "contract_digest": substantive["contract_digest"]})
+                state_now = current(locked, task_id)[1]
+                if state_now == "AWAITING_MERGE":
+                    append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "contract_digest": records[-1]["contract_digest"], "integration": verified_integration})
+            print(f"orrery-task: {task_id} was promoted before its record landed; completed it")
             return 0
+    stale = task_merge_lease(records)
+    if stale and not lease_holder_alive(stale):
+        with control_lock(root) as locked:
+            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "detail": "holder is gone", "contract_digest": records[-1]["contract_digest"]})
+        records, _state = current(store, task_id)
     evidence = next((r.get("evidence") for r in reversed(records) if r.get("evidence")), None)
     if not evidence:
         raise LedgerError("latest evidence packet is missing")
@@ -1197,35 +1663,237 @@ def merge_task(root: Path, task_id: str, flags: list[str]) -> int:
     if not implemented:
         raise LedgerError("implemented commit is missing")
     commit = implemented["commit"]
-    lines = git(root, "diff", "--name-status", f"{base}..{commit}").stdout.splitlines()
+    # -z, because a rename carries both its source and destination and the
+    # tab-splitting form kept only one of them: a rename out of a held path
+    # would have gone unnoticed.
+    raw = git(root, "diff", "--name-status", "-z", f"{base}..{commit}").stdout
+    fields = [field for field in raw.split("\0") if field]
+    changed: list[str] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        following = 2 if status[:1] in {"R", "C"} else 1
+        changed.extend(fields[index + 1: index + 1 + following])
+        index += 1 + following
     include, exclude = contract["scope"]["include"], contract["scope"]["exclude"]
-    out = [line.split("\t", 1)[-1] for line in lines if not any(line.split("\t", 1)[-1] == path or line.split("\t", 1)[-1].startswith(path + "/") for path in include) or any(line.split("\t", 1)[-1] == path or line.split("\t", 1)[-1].startswith(path + "/") for path in exclude)]
+    out = [
+        path for path in changed
+        if not any(paths_overlap(path, entry) for entry in include)
+        or any(paths_overlap(path, entry) for entry in exclude)
+    ]
     if out and "--accept-out-of-scope" not in flags:
         raise LedgerError("evidence has out-of-scope changes; use --accept-out-of-scope")
+    if out:
+        # The override is the operator's to give, but it cannot be given
+        # over another live task's files: that would force a holder into
+        # the conflict admission exists to prevent, discovered only at
+        # its own merge.
+        trespass = [
+            (path, other, state)
+            for path in out
+            for other, state, held in scope_holders(store, task_id)
+            for claimed in held
+            if paths_overlap(path, claimed)
+        ]
+        if trespass:
+            named = "; ".join(
+                f"{path} is held by {other} ({state})"
+                for path, other, state in trespass
+            )
+            raise LedgerError(
+                f"--accept-out-of-scope cannot be given over another task's "
+                f"files: {named}"
+            )
     target = contract["target_ref"]
     if git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip() != target:
         raise LedgerError("target branch is not checked out")
     if git(root, "status", "--porcelain").stdout:
         raise LedgerError("target worktree is dirty")
-    if git(root, "rev-parse", "HEAD").stdout.strip() != base:
-        raise LedgerError("target moved; task must be re-run on the new base")
     branch = f"orrery/{task_id}"
     if git(root, "rev-parse", branch).stdout.strip() != commit:
         raise LedgerError("task branch no longer matches evidence")
+
+    # Take the lease. The target may have moved since this task branched,
+    # which is the ordinary case under parallelism and no longer a reason
+    # to refuse; what is refused is another live merge, and a target that
+    # no longer descends from this task's base.
     with control_lock(root) as locked:
-        append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-started", "expected": {"base": base, "commit": commit}, "contract_digest": digest})
-    premerge = git_workspace_fingerprint(root)
-    merge_commit, stderr = merge_branch(root, commit)
-    if merge_commit is None:
-        if git_workspace_fingerprint(root) != premerge:
-            print("orrery-task: merge abort did not restore the target worktree", file=sys.stderr)
-        detail = stderr.splitlines()[0] if stderr.splitlines() else "merge failed"
+        state = current(locked, task_id)[1]
+        if state != "AWAITING_MERGE":
+            raise LedgerError(f"task {task_id} is {state}; merge requires AWAITING_MERGE")
+        mine = task_merge_lease(current(locked, task_id)[0])
+        if mine and lease_holder_alive(mine):
+            raise LedgerError(
+                f"task {task_id} is already being merged by pid {mine['pid']}"
+            )
+        others = live_merge_leases(locked, task_id)
+        if others:
+            held, _lease = others[0]
+            raise LedgerError(f"task {held} holds a live merge lease; retry when it finishes")
+        head = git(root, "rev-parse", "--verify", "--quiet", target).stdout.strip()
+        if not head:
+            raise LedgerError(f"target ref {target} does not resolve")
+        # A rewound or rewritten target is an operator event, never
+        # something to merge across silently.
+        unrecorded = unreconciled_promotions(root, locked, task_id, head)
+        if unrecorded:
+            named = ", ".join(unrecorded)
+            raise LedgerError(
+                f"the target carries work from {named} whose merge was never "
+                f"recorded; run orrery-task merge on {unrecorded[0]} to reconcile "
+                "it first, or its checks will be missing from this integration"
+            )
+        if not is_ancestor(root, base, head):
+            raise LedgerError(
+                f"target {target} no longer descends from this task's base "
+                f"{base[:12]}; it was rewound or rewritten, so rework is your call"
+            )
+        lease = {"pid": os.getpid(), "start": process_start_time(os.getpid()), "head": head}
+        attempt = 1 + sum(
+            1 for r in current(locked, task_id)[0] if r.get("integration")
+        )
+        append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-started", "expected": {"base": base, "commit": commit, "head": head}, "lease": lease, "attempt": attempt, "contract_digest": digest})
+
+    scratch = None
+    try:
+        scratch = integration_worktree(root, task_id, head, attempt)
+        merged = git(
+            scratch,
+            "-c", "user.email=orrery@invalid", "-c", "user.name=Orrery",
+            "merge", "--no-ff", "--no-edit", commit,
+        )
+        if merged.returncode != 0:
+            paths = conflicting_paths(scratch)
+            holders = {
+                other: [p for p in paths if any(paths_overlap(p, inc) for inc in held)]
+                for other, _state, held in scope_holders(root / ".orrery", task_id)
+            }
+            # A task merged since our base is terminal and holds no scope,
+            # yet it is the likeliest author of a conflict on the target
+            # side, so it is named from its sealed contract instead.
+            for owner in {o for o, _c, _v in integration_commands(root, root / ".orrery", task_id, contract, base, head) if o != task_id}:
+                try:
+                    theirs = load_contract(root / ".orrery", owner)
+                except LedgerError:
+                    continue
+                claimed = [
+                    path for path in paths
+                    if any(paths_overlap(path, inc) for inc in theirs["scope"]["include"])
+                ]
+                if claimed:
+                    holders.setdefault(owner, []).extend(claimed)
+            named = ", ".join(paths) or "unknown paths"
+            claims = "; ".join(
+                f"{other} holds {', '.join(claimed)}"
+                for other, claimed in holders.items() if claimed
+            )
+            detail = f"integration conflict on {named}" + (f" ({claims})" if claims else "")
+            with control_lock(root) as locked:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {"attempt": attempt, "outcome": "conflict", "head": head, "paths": paths, "detail": detail}, "contract_digest": digest})
+            raise LedgerError(detail)
+
+        result_commit = git(scratch, "rev-parse", "HEAD").stdout.strip()
+        union = integration_commands(root, root / ".orrery", task_id, contract, base, head)
+        outcomes = []
+        failed = None
+        for owner, criterion, verification in union:
+            command = verification["command"]
+            workdir = scratch / verification.get("workdir", ".")
+            before = git_workspace_fingerprint(scratch)
+            status, log = run_verification(command, workdir)
+            after = git_workspace_fingerprint(scratch)
+            if before is None or after is None or after != before:
+                status, log = 1, (
+                    log + f"\n[{criterion} from {owner} modified the tree it "
+                    "was verifying, or that could not be established; "
+                    "refused]\n"
+                )
+            log_path = evidence_path(root, task_id, f"{sequence_of(records)}-integration-{attempt}-{owner}-{criterion}").with_suffix(".log")
+            log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _atomic_write(log_path, log.encode(), 0o600)
+            outcomes.append({"owner": owner, "criterion": criterion, "command": command, "workdir": verification.get("workdir", "."), "exit_status": status, "log": rel(root, log_path)})
+            if status != 0 and failed is None:
+                failed = f"{criterion} from {owner}"
+
+        packet = {"v": 1, "task_id": task_id, "attempt": attempt, "target_ref": target, "target_head": head, "base": base, "branch_commit": commit, "result_commit": result_commit, "contract_digest": digest, "verification": outcomes}
+        packet_path = evidence_path(root, task_id, f"{sequence_of(records)}-integration-{attempt}")
+        packet_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _atomic_write(packet_path, (json.dumps(packet, indent=2, sort_keys=True) + "\n").encode(), 0o600)
+        packet_relative = rel(root, packet_path)
+        integration = {"attempt": attempt, "head": head, "result_commit": result_commit, "evidence": packet_relative, "evidence_sha256": evidence_digest(root, packet_relative), "commands": sorted({owner for owner, _criterion, _v in union})}
+
+        if failed is not None:
+            with control_lock(root) as locked:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {**integration, "outcome": "failed", "failed": failed}, "contract_digest": digest})
+            raise LedgerError(f"integration verification failed: {failed} (evidence {packet_relative})")
+
         with control_lock(root) as locked:
-            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "merge-failed", "detail": detail, "contract_digest": digest})
-        return 1
-    with control_lock(root) as locked:
-        append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": merge_commit, "accepted_out_of_scope": "--accept-out-of-scope" in flags, "contract_digest": digest, "evidence": evidence})
-    return 0
+            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "integration-verified", "integration": {**integration, "outcome": "verified"}, "contract_digest": digest})
+            # Promotion rechecks all three facts together: the task is
+            # still awaiting merge, the lease is ours, and the target has
+            # not moved under us. git's own compare-and-swap enforces the
+            # last one even against a writer outside Orrery.
+            fresh_records, fresh_state = current(locked, task_id)
+            if fresh_state != "AWAITING_MERGE":
+                raise LedgerError(f"task became {fresh_state} during integration; promotion abandoned")
+            held = task_merge_lease(fresh_records)
+            if not held or held.get("pid") != os.getpid():
+                raise LedgerError("merge lease was lost during integration; promotion abandoned")
+            # The root is rechecked here, not only before integration.
+            # Integration can take minutes, and in that window the
+            # operator may have checked out another branch or edited the
+            # tree: promoting regardless would move their branch, and the
+            # synchronising reset below would discard their work.
+            checkout = git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip()
+            if checkout != target:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {**integration, "outcome": "checkout-moved"}, "contract_digest": digest})
+                raise LedgerError(
+                    f"the checkout moved to {checkout or 'a detached head'} during "
+                    f"integration; promotion abandoned, run merge again on {target}"
+                )
+            dirty = git(root, "status", "--porcelain")
+            if dirty.returncode != 0 or dirty.stdout:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {**integration, "outcome": "worktree-dirty"}, "contract_digest": digest})
+                raise LedgerError(
+                    "the target worktree became dirty during integration, or its "
+                    "state could not be read; promotion abandoned rather than "
+                    "discarding your changes"
+                )
+            if out:
+                # Rechecked here: a task may have acquired one of these
+                # paths while this integration was running.
+                trespass_now = [
+                    (path, other)
+                    for path in out
+                    for other, _state, held in scope_holders(locked, task_id)
+                    for claimed in held
+                    if paths_overlap(path, claimed)
+                ]
+                if trespass_now:
+                    append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {**integration, "outcome": "out-of-scope-held"}, "contract_digest": digest})
+                    named = "; ".join(f"{path} held by {other}" for path, other in trespass_now)
+                    raise LedgerError(
+                        f"another task acquired an out-of-scope path during "
+                        f"integration: {named}"
+                    )
+            promoted = git(root, "update-ref", target, result_commit, head)
+            if promoted.returncode != 0:
+                append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "AWAITING_MERGE", "actor": "user", "reason": "lease-released", "integration": {**integration, "outcome": "target-moved"}, "contract_digest": digest})
+                raise LedgerError("target moved during integration; run merge again to re-integrate")
+            # The ref now names the verified commit while the worktree
+            # still holds the pre-merge tree, so this is a real window:
+            # synchronise and confirm it before recording the merge.
+            synchronised = git(root, "reset", "--hard", "--quiet", result_commit)
+            if synchronised.returncode != 0 or git(root, "rev-parse", "HEAD").stdout.strip() != result_commit:
+                raise LedgerError(
+                    f"the target ref advanced to {result_commit[:12]} but its "
+                    f"worktree could not be synchronised: {synchronised.stderr.strip()}"
+                )
+            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": result_commit, "accepted_out_of_scope": "--accept-out-of-scope" in flags, "contract_digest": digest, "evidence": evidence, "integration": {**integration, "outcome": "verified"}})
+        return 0
+    finally:
+        if scratch is not None and scratch.exists():
+            git(root, "worktree", "remove", "--force", str(scratch))
 
 
 def close_task(root: Path, task_id: str, flags: list[str]) -> int:
@@ -1254,9 +1922,51 @@ def cancel_task(root: Path, task_id: str, flags: list[str]) -> int:
         attempt = Path(next(r["dispatch"]["receipts"] for r in reversed(records) if "dispatch" in r))
         if dispatch_alive(attempt):
             raise LedgerError("task is still running; resume first")
-    if state != "CANCELLED":
-        with control_lock(root) as locked:
-            latest = current(locked, task_id)[1]
+    # A merge lease is a live holder exactly as a dispatch is. Revoking one
+    # out from under a running integration would leave a promoted target
+    # with no legal transition left to record.
+    with control_lock(root) as locked:
+        records, state = current(locked, task_id)
+        lease = task_merge_lease(records)
+        if lease and lease_holder_alive(lease):
+            raise LedgerError(
+                f"task {task_id} holds a live merge lease (pid {lease['pid']}); "
+                "wait for it to finish"
+            )
+        # A dead holder may have promoted before its record landed. The
+        # target already carries this task, so cancelling over it would
+        # record a lie; complete the merge instead and let the user close
+        # or revert deliberately.
+        promotion = next(
+            (
+                r["integration"]
+                for r in reversed(records)
+                if r.get("integration", {}).get("outcome") == "verified"
+            ),
+            None,
+        )
+        if promotion and state == "AWAITING_MERGE":
+            try:
+                target_ref = load_contract(locked, task_id)["target_ref"]
+            except LedgerError:
+                target_ref = None
+            if target_ref:
+                head_now = git(root, "rev-parse", "--verify", "--quiet", target_ref).stdout.strip()
+                landed = promotion.get("result_commit")
+                if head_now and landed and is_ancestor(root, landed, head_now):
+                    append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "contract_digest": records[-1]["contract_digest"], "integration": promotion})
+                    raise LedgerError(
+                        f"task {task_id} was already promoted as {landed[:12]}; "
+                        "its merge has been recorded, so cancel is refused"
+                    )
+        if lease:
+            append_record(locked, task_id, {"from": state, "to": state, "actor": "user", "reason": "lease-released", "detail": "holder is gone", "contract_digest": records[-1]["contract_digest"]})
+        # The append happens in this same transaction. Inspecting under
+        # one lock and cancelling under another leaves a window in which a
+        # merge takes its lease between the two and is then cancelled
+        # live, which is the state the liveness check exists to prevent.
+        latest = current(locked, task_id)[1]
+        if latest != "CANCELLED":
             append_record(locked, task_id, {"from": latest, "to": "CANCELLED", "actor": "user", "contract_digest": records[-1]["contract_digest"]})
     if "--discard" in flags:
         remaining = remove_worktree(root, task_id)
@@ -1350,9 +2060,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 for task_id in task_ids(store):
                     records, torn, _ = read_ledger(store, task_id)
-                    print(f"{task_id} {records[-1]['to']}")
+                    state = records[-1]["to"]
+                    print(f"{task_id} {state} {waiting_reason(root, store, task_id, state)}".rstrip())
                     if torn:
                         print(f"warning: {task_id} has a torn ledger tail")
+                active = active_dispatches(store)
+                cap = concurrency_cap(root)
+                print(f"dispatches {len(active)}/{cap}")
             return 0
         return usage()
     except (LedgerError, RuntimeConfigError) as exc:
