@@ -322,6 +322,7 @@ def close_attempt(
     exit_status: int | None,
     outcome: str,
     log_path: Path | None,
+    duration_seconds: float | None = None,
 ) -> dict[str, Any] | None:
     """Complete the open record, parsing usage from the provider's log.
 
@@ -352,6 +353,10 @@ def close_attempt(
                 gap = "provider output carried no usage record"
 
     record["ended"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    # The wrapper's own measurement, written after the child is dead and
+    # therefore beyond its reach.
+    if duration_seconds is not None:
+        record["duration_seconds"] = round(float(duration_seconds), 3)
     record["exit_status"] = exit_status
     record["outcome"] = outcome
     record["usage"] = usage["tokens"] if usage else None
@@ -384,13 +389,32 @@ def read_attempt(directory: Path) -> dict[str, Any] | None:
     return _load_attempt(directory / "attempt.json")
 
 
+# What a provider run leaves behind besides its own record. The receipts
+# directory is the delegate's writable grant, so a delegate can delete
+# the record it is accounted by; these are the traces that say a run
+# happened anyway.
+RUN_TRACES = ("receipt.json", "result.txt", "stdout.log", "stderr.log", "unit.json")
+
+
 def read_attempts(receipts: Path) -> list[dict[str, Any]]:
-    """Every attempt record under one receipts directory, oldest first."""
+    """Every attempt record under one receipts directory, oldest first.
+
+    A directory that shows a run happened but holds no record yields an
+    unknown-spend sentinel rather than nothing. Nothing would be a
+    *known* zero, and a delegate that deletes its own record before
+    exiting would turn a refusal into a pass: the ceiling reads unknown
+    spend as a stop and no spend as free, so removing one file inverted
+    the guard exactly.
+    """
     found: list[dict[str, Any]] = []
     for directory in attempt_directories(receipts):
         record = read_attempt(directory)
         if record is not None:
             found.append(record)
+        elif any((directory / name).exists() for name in RUN_TRACES):
+            found.append(
+                _unreadable("a run left artefacts but no attempt record")
+            )
     return found
 
 
@@ -428,6 +452,12 @@ def _unreadable(reason: str) -> dict[str, Any]:
     }
 
 
+# A delegated run cannot outlast the wrapper's hard budget by any
+# sensible margin, so a longer span is a forged or corrupt pair rather
+# than a measurement.
+MAX_ATTEMPT_SECONDS = 24 * 60 * 60
+
+
 def spend_of(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     """Sum attributed tokens and say plainly what is not known.
 
@@ -439,7 +469,24 @@ def spend_of(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     gaps: list[str] = []
     reported_cost = 0.0
     have_cost = False
+    # Carried into the ledger with the tokens, because the timings exist
+    # only in the attempt records and a later question about how long a
+    # role takes cannot be answered from artefacts that may be reclaimed.
+    durations: list[float] = []
     for record in attempts:
+        # Measured by the wrapper around the child, never derived from
+        # the two timestamps in the record. The receipts directory is
+        # delegate-writable, and a forged pair that is merely plausible
+        # is indistinguishable from a real one, so the only sound source
+        # is the one the delegate cannot reach. A record written before
+        # this field existed simply contributes no duration.
+        measured = record.get("duration_seconds")
+        if (
+            isinstance(measured, (int, float))
+            and not isinstance(measured, bool)
+            and 0 <= measured <= MAX_ATTEMPT_SECONDS
+        ):
+            durations.append(round(float(measured), 3))
         usage = record.get("usage")
         if isinstance(usage, dict):
             for name in TOKEN_CLASSES:
@@ -459,6 +506,7 @@ def spend_of(attempts: list[dict[str, Any]]) -> dict[str, Any]:
         "attempts": len(attempts),
         "unknown": bool(gaps),
         "gaps": gaps,
+        "durations": durations,
         "provider_cost_usd": reported_cost if have_cost else None,
     }
 

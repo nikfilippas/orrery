@@ -1,0 +1,730 @@
+#!/usr/bin/env python3
+"""Governed memory: facts that can be re-checked, decisions, and history.
+
+A fact here is a claim and the command that checks it. Nothing is
+admitted that cannot be re-run, so provenance and expiry are properties
+the runner establishes rather than metadata a writer chose.
+
+Neither half of a fact may come from a delegate. The command is executed
+outside the delegate's containment; the claim is concatenated into a
+later delegate's assignment, where ordinary prose survives the
+provider-text filter intact and would be prompt injection in a trusted
+position. A delegate proposes; the operator admits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import json
+import statistics
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import orrery_memory as memory  # noqa: E402
+from orrery_findings import sanitise_provider_text  # noqa: E402
+from orrery_ledger import (  # noqa: E402
+    LedgerError,
+    read_ledger,
+    repository_root,
+    task_ids,
+)
+import orrery_verify  # noqa: E402
+from orrery_verify import run_verification  # noqa: E402
+
+PROGRAM = "orrery-memory"
+
+
+def git(root: Path, *arguments: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        timeout=120, check=False,
+    ).stdout.strip()
+
+
+def head_commit(root: Path) -> str:
+    return git(root, "rev-parse", "--verify", "--quiet", "HEAD")
+
+
+def store_identity(root: Path) -> tuple | None:
+    """Device and inode of the control store, or None if it is gone."""
+    try:
+        info = (root / ".orrery").stat()
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino)
+
+
+def tree_state(root: Path) -> tuple[str, str]:
+    return head_commit(root), git(root, "status", "--porcelain")
+
+
+def command_add(root: Path, args: argparse.Namespace) -> int:
+    identity = memory.add_fact(
+        root,
+        claim=args.claim,
+        command=args.command,
+        workdir=args.workdir,
+        from_task=args.from_task,
+        criterion=args.criterion,
+        review_days=args.review_days,
+        anchor_commit=head_commit(root) or None,
+        supersedes=args.supersedes,
+    )
+    print(identity)
+    return 0
+
+
+def command_admit(root: Path, args: argparse.Namespace) -> int:
+    """Record a fact that a proposal prompted, without reading the proposal.
+
+    The proposal identifier is kept as provenance for how the operator
+    came to write this, and nothing else about it is used. Copying its
+    claim would put provider prose into every later handoff, and copying
+    its command would let a delegate choose what the runner executes.
+    """
+    proposals = {entry["id"]: entry for entry in memory.read_proposals(root)}
+    proposal = proposals.get(args.proposal)
+    if proposal is None:
+        print(f"{PROGRAM}: no such proposal: {args.proposal}", file=sys.stderr)
+        return 2
+    from_task, criterion = args.from_task, args.criterion
+    if (
+        not (from_task or criterion or args.claim or args.command)
+        and proposal.get("origin") == "criterion"
+    ):
+        # A seeded proposal names a sealed criterion rather than carrying
+        # delegate text, so its reference may be followed. Both halves are
+        # still re-read from the contract, digest-checked, not copied from
+        # the proposal record.
+        from_task, criterion = proposal.get("task_id"), proposal.get("criterion")
+    # A seeded proposal already names the commit its evidence proved,
+    # which is the integration result and not wherever HEAD happens to
+    # be when the operator gets round to admitting it.
+    anchor = proposal.get("anchor_commit") or head_commit(root) or None
+    identity = memory.add_fact(
+        root,
+        claim=args.claim,
+        command=args.command,
+        workdir=args.workdir,
+        from_task=from_task,
+        criterion=criterion,
+        review_days=args.review_days,
+        anchor_commit=anchor,
+        supersedes=args.supersedes,
+    )
+    print(identity)
+    return 0
+
+
+def command_propose(root: Path, args: argparse.Namespace) -> int:
+    identity = memory.propose_fact(
+        root, claim=args.claim, command=args.command, task_id=args.task
+    )
+    print(identity)
+    return 0
+
+
+def command_seed(root: Path, args: argparse.Namespace) -> int:
+    """Propose a fact per passing criterion of a merged task.
+
+    Anchored to the integration result, not to the branch commit the
+    task's own evidence names: those differ, so anchoring to the branch
+    would date a fact to a commit that is not in the target.
+    """
+    store = root / ".orrery"
+    records, torn, _boundary = read_ledger(store, args.task)
+    if torn:
+        print(f"{PROGRAM}: {args.task} has a torn ledger tail", file=sys.stderr)
+        return 2
+    merged = next(
+        (record for record in reversed(records) if record.get("to") == "MERGED"), None
+    )
+    if merged is None:
+        print(
+            f"{PROGRAM}: {args.task} has not merged, so its evidence names a "
+            "commit that is not in the target; seed it after the merge",
+            file=sys.stderr,
+        )
+        return 2
+    commit = merged.get("merge_commit") or ""
+    verified = next(
+        (
+            record for record in reversed(records)
+            if record.get("to") == "VERIFICATION_PASSED" and record.get("evidence")
+        ),
+        None,
+    )
+    if verified is None:
+        print(f"{PROGRAM}: {args.task} has no verified evidence packet", file=sys.stderr)
+        return 2
+    evidence = verified["evidence"]
+    try:
+        raw = (root / evidence).read_bytes()
+    except OSError as exc:
+        print(f"{PROGRAM}: evidence is unreadable: {exc}", file=sys.stderr)
+        return 2
+    # Checked, not merely read: a packet is accepted nowhere else in the
+    # kit on the strength of its filename, and this one decides which
+    # criteria are treated as having passed.
+    if hashlib.sha256(raw).hexdigest() != verified.get("evidence_sha256"):
+        print(
+            f"{PROGRAM}: {evidence} does not match the digest its "
+            "verification record holds; seeding from it would be seeding "
+            "from an altered packet",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        packet = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"{PROGRAM}: evidence is unreadable: {exc}", file=sys.stderr)
+        return 2
+    passed = [
+        outcome["criterion"]
+        for outcome in packet.get("verification", [])
+        if outcome.get("exit_status") == 0
+    ]
+    if not passed:
+        print(f"{PROGRAM}: {args.task} has no passing criterion to seed")
+        return 0
+    store_root = root / ".orrery"
+    for criterion in passed:
+        # A proposal, not a fact. Seeding is evidence that something is
+        # worth recording, not the operator's decision to record it, and
+        # an admitted fact carries a review-by date and reaches every
+        # later handoff. Admission re-reads both halves from the sealed
+        # contract, so nothing here is copied forward either.
+        fields = memory.criterion_source(root, store_root, args.task, criterion)
+        identity = memory.propose_fact(
+            root,
+            claim=fields["claim"],
+            command=fields["command"],
+            task_id=args.task,
+            origin="criterion",
+            criterion=criterion,
+            anchor_commit=commit,
+        )
+        print(f"{identity} proposes {args.task} {criterion} at {commit[:12]}")
+    print(
+        f"{PROGRAM}: admit what you want kept: "
+        f"orrery-memory admit <proposal> --from-task {args.task} --criterion <id>"
+    )
+    return 0
+
+
+def command_list(root: Path, args: argparse.Namespace) -> int:
+    facts = memory.read_facts(root)
+    proposals = memory.read_proposals(root)
+    head = head_commit(root)
+    rows = []
+    for fact in facts:
+        status = memory.status_of(fact)
+        verified = fact.get("last_verified") or {}
+        rows.append({
+            "id": fact["id"],
+            "status": status,
+            "claim": fact["claim"],
+            "command": fact["command"],
+            "review_by": fact.get("review_by"),
+            "last_verified_at": verified.get("at"),
+            "last_verified_commit": verified.get("commit"),
+            "commits_since": distance(root, verified.get("commit"), head),
+            "source": fact.get("source"),
+            "superseded_by": fact.get("superseded_by"),
+        })
+    for proposal in proposals:
+        rows.append({
+            "id": proposal["id"],
+            "status": "proposed",
+            # Delegate-authored, and shown to a person here, so it goes
+            # through the same filter every other provider string does.
+            "claim": sanitise_provider_text(proposal["claim"]),
+            "command": None,
+            "review_by": None,
+            "last_verified_at": None,
+            "last_verified_commit": None,
+            "commits_since": None,
+            "source": {"delegate": True, "task_id": proposal.get("task_id")},
+            "superseded_by": None,
+        })
+    if args.as_json:
+        print(json.dumps({"facts": rows}, indent=2))
+        return 0
+    if not rows:
+        print("no facts recorded")
+        return 0
+    for row in rows:
+        print(f"{row['id']:6} {row['status']:9} {row['claim']}")
+        if row["status"] == "proposed":
+            print("       (delegate-proposed; admit it with your own wording)")
+            continue
+        moved = (
+            f", {row['commits_since']} commit(s) since"
+            if isinstance(row["commits_since"], int) and row["commits_since"]
+            else ""
+        )
+        print(
+            f"       checked by: {row['command']}\n"
+            f"       last verified: {row['last_verified_at'] or 'never'}"
+            f"{moved}, review by {row['review_by']}"
+        )
+    return 0
+
+
+def distance(root: Path, since: str | None, head: str) -> int | None:
+    """How far the repository has moved since a fact was verified.
+
+    Reported and not interpreted. Nothing records which paths a fact
+    depends on, so no number of commits can be said to invalidate it;
+    presenting distance as staleness would be a guess wearing a
+    measurement's clothes.
+    """
+    if not since or not head:
+        return None
+    count = git(root, "rev-list", "--count", f"{since}..{head}")
+    try:
+        return int(count)
+    except ValueError:
+        return None
+
+
+def command_verify(root: Path, args: argparse.Namespace) -> int:
+    facts = [
+        fact for fact in memory.read_facts(root)
+        if not fact.get("superseded_by")
+        and (args.fact is None or fact["id"] == args.fact)
+    ]
+    if not facts:
+        print("no facts to verify")
+        return 0
+    # Asked once, up front. Deciding from the child's exit status let
+    # repository code return 125 itself and have a refutation quietly
+    # discarded, keeping a stale fact in every later handoff.
+    if not orrery_verify.containment_enforced():
+        if os.environ.get("ORRERY_ALLOW_UNCONFINED") != "1":
+            print(
+                f"{PROGRAM}: refusing to verify without containment. A "
+                "verification command runs whatever code this repository "
+                "holds. Nothing was checked and no fact was changed; set "
+                "ORRERY_ALLOW_UNCONFINED=1 to accept that risk.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"{PROGRAM}: verifying without enforced containment "
+            "(ORRERY_ALLOW_UNCONFINED=1).",
+            file=sys.stderr,
+        )
+    refuted: list[str] = []
+    for fact in facts:
+        # Snapshot first: the command runs outside the control lock, so
+        # what it tested has to be pinned before it starts.
+        digest = memory.fact_digest(fact)
+        revision = int(fact.get("revision", 1))
+        commit, dirty_before = tree_state(root)
+        # A pass earned with uncommitted code is not evidence about the
+        # commit it would be recorded against, so the baseline must be
+        # clean before the command runs rather than merely unchanged by
+        # it.
+        if dirty_before:
+            print(
+                f"{PROGRAM}: {fact['id']} not checked: the worktree is dirty, "
+                "so a pass would be recorded against a commit it was not "
+                "earned at. Commit or stash first.",
+                file=sys.stderr,
+            )
+            refuted.append(fact["id"])
+            continue
+        workdir = (root / (fact.get("workdir") or "")).resolve()
+        if workdir != root.resolve() and root.resolve() not in workdir.parents:
+            print(
+                f"{PROGRAM}: {fact['id']} names a workdir outside the "
+                f"repository: {workdir}",
+                file=sys.stderr,
+            )
+            refuted.append(fact["id"])
+            continue
+        before = store_identity(root)
+        status, output = run_verification(fact["command"], workdir)
+        # Before any git command. `tree_state` runs `git status`, which
+        # reads the repository's config: a replacement tree naming an
+        # attacker `core.fsmonitor` would execute it as the runner,
+        # outside containment, before a later check could notice.
+        if store_identity(root) != before:
+            # A mapping protects contents, not a path. With the
+            # repository under a granted directory a command can rename
+            # an ancestor and leave a replacement tree where the runner
+            # will look next, so the store's identity is compared rather
+            # than assumed.
+            print(
+                f"{PROGRAM}: {fact['id']} not recorded: the control store "
+                "was replaced while its command ran",
+                file=sys.stderr,
+            )
+            refuted.append(fact["id"])
+            continue
+        commit_after, dirty_after = tree_state(root)
+        detail = output.strip().splitlines()[-1][:200] if output.strip() else ""
+        if commit_after != commit or dirty_after != dirty_before:
+            outcome, detail = "failed", "the command changed the repository"
+        else:
+            outcome = "passed" if status == 0 else "failed"
+        try:
+            memory.record_verification(
+                root, fact["id"], expected_digest=digest,
+                expected_revision=revision, commit=commit, outcome=outcome,
+                detail=detail, target_reader=lambda: head_commit(root),
+            )
+        except memory.MemoryError as exc:
+            print(f"{PROGRAM}: {exc}", file=sys.stderr)
+            refuted.append(fact["id"])
+            continue
+        print(f"{fact['id']} {outcome}")
+        if outcome != "passed":
+            refuted.append(fact["id"])
+    if refuted:
+        print(
+            f"{PROGRAM}: refuted or unrecorded: {', '.join(refuted)}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def command_decide(root: Path, args: argparse.Namespace) -> int:
+    evidence, unresolved = check_evidence(root, args.evidence or [])
+    identity = memory.write_decision(
+        root,
+        {
+            "title": args.title,
+            "status": args.status,
+            "context": args.context,
+            "decision": args.decision,
+            "alternatives": args.alternatives or [],
+            "consequences": args.consequences or "",
+            "tasks": args.task or [],
+            "supersedes": args.supersedes,
+        },
+        evidence,
+    )
+    print(identity)
+    if unresolved:
+        for line in unresolved:
+            print(f"{PROGRAM}: unresolved evidence: {line}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def check_evidence(root: Path, names: list[str]) -> tuple[list[dict], list[str]]:
+    """Cited artefacts, each checked against the digest the ledger holds.
+
+    The kit accepts an evidence packet nowhere else on the strength of
+    its filename, and a decision record that cites one is making a claim
+    about what supports it. A missing or altered artefact is reported as
+    unresolved rather than quietly presented as support.
+    """
+    checked: list[dict] = []
+    unresolved: list[str] = []
+    store = root / ".orrery"
+    # Two kinds of artefact, hashed two different ways. An evidence
+    # packet's digest is over its bytes; a review's is over the canonical
+    # JSON of the document, which is what the ledger recorded, so hashing
+    # the file would never match. Integration evidence is nested inside
+    # its record rather than at the top level and was invisible before.
+    files: dict[str, str] = {}
+    reviews: dict[str, str] = {}
+    for task_id in (task_ids(store) if store.is_dir() else []):
+        try:
+            records, _torn, _boundary = read_ledger(store, task_id)
+        except LedgerError:
+            continue
+        for record in records:
+            if record.get("evidence") and record.get("evidence_sha256"):
+                files[record["evidence"]] = record["evidence_sha256"]
+            integration = record.get("integration") or {}
+            if integration.get("evidence") and integration.get("evidence_sha256"):
+                files[integration["evidence"]] = integration["evidence_sha256"]
+            review = record.get("review")
+            if review and review.get("sha256"):
+                reviews[f"review:{task_id}:{review['seq']}"] = review["sha256"]
+                reviews[f".orrery/reviews/{task_id}/{review['seq']}/review.json"] = (
+                    review["sha256"]
+                )
+    for name in names:
+        entry: dict = {"artefact": name}
+        if name in files:
+            entry["recorded_sha256"] = files[name]
+            try:
+                actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+            except OSError:
+                entry["state"] = "missing"
+                unresolved.append(f"{name} is cited but absent")
+            else:
+                entry["state"] = "verified" if actual == files[name] else "mismatched"
+                if actual != files[name]:
+                    unresolved.append(f"{name} does not match its recorded digest")
+        elif name in reviews:
+            entry["recorded_sha256"] = reviews[name]
+            path = (
+                root / name
+                if name.startswith(".orrery/")
+                else root / ".orrery" / "reviews" / name.split(":")[1]
+                / name.split(":")[2] / "review.json"
+            )
+            try:
+                document = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                entry["state"] = "missing"
+                unresolved.append(f"{name} is cited but absent or unreadable")
+            else:
+                actual = hashlib.sha256(
+                    json.dumps(document, sort_keys=True).encode()
+                ).hexdigest()
+                entry["state"] = "verified" if actual == reviews[name] else "mismatched"
+                if actual != reviews[name]:
+                    unresolved.append(f"{name} does not match its recorded digest")
+        else:
+            entry["recorded_sha256"] = None
+            entry["state"] = "no recorded digest"
+            unresolved.append(f"{name} has no digest in any ledger")
+        checked.append(entry)
+    return checked, unresolved
+
+
+def command_decisions(root: Path, args: argparse.Namespace) -> int:
+    records = memory.read_decisions(root)
+    if args.as_json:
+        print(json.dumps({"decisions": records}, indent=2))
+        return 0
+    if not records:
+        print("no decisions recorded")
+        return 0
+    for record in records:
+        marker = (
+            f" (superseded by {record['superseded_by']})"
+            if record.get("superseded_by")
+            else ""
+        )
+        print(f"{record['id']} [{record.get('status', 'Unknown')}] {record['title']}{marker}")
+    return 0
+
+
+def command_roles(root: Path, args: argparse.Namespace) -> int:
+    """How each role has performed here, computed from the ledger.
+
+    Not stored: an aggregate kept beside the ledger would become a
+    second answer to the same question and would drift from it. Every
+    figure carries the number of tasks behind it, so a rate over three
+    tasks cannot be read as a rate, and the boundary is stated: a ledger
+    is per repository.
+    """
+    store = root / ".orrery"
+    totals: dict[str, dict] = {}
+    tasks = task_ids(store) if store.is_dir() else []
+    for task_id in tasks:
+        try:
+            records, _torn, _boundary = read_ledger(store, task_id)
+        except LedgerError:
+            continue
+        role_for_attempt = None
+        for record in records:
+            if record.get("reason") == "attempt" and record.get("id"):
+                role_for_attempt = record["id"]
+                bucket = totals.setdefault(role_for_attempt, new_role())
+                bucket["dispatches"] += 1
+                bucket["tasks"].add(task_id)
+            if record.get("to") == "DISPATCH_FAILED" and role_for_attempt:
+                bucket = totals.setdefault(role_for_attempt, new_role())
+                bucket["failures"] += 1
+                bucket["reasons"][record.get("reason", "unknown")] = (
+                    bucket["reasons"].get(record.get("reason", "unknown"), 0) + 1
+                )
+            if record.get("to") == "READY" and record.get("from") in {
+                "DISPATCH_FAILED", "REVIEW_BLOCKED", "NO_CHANGE",
+            } and role_for_attempt:
+                totals.setdefault(role_for_attempt, new_role())["rework"] += 1
+            review = record.get("review")
+            if review and review.get("id"):
+                bucket = totals.setdefault(review["id"], new_role())
+                bucket["reviews"] += 1
+                # Both severities. Counting only blocking findings
+                # understates a reviewer that reports carefully, and the
+                # advisory count is recorded right beside it.
+                bucket["findings"] += len(review.get("blocking", []))
+                bucket["findings"] += int(review.get("advisory") or 0)
+                bucket["tasks"].add(task_id)
+            if record.get("integration", {}).get("outcome") not in (None, "verified"):
+                if role_for_attempt:
+                    totals.setdefault(role_for_attempt, new_role())["integration_failures"] += 1
+            spend = record.get("spend")
+            if isinstance(spend, dict):
+                # To the role that spent it. A review record's spend
+                # belongs to the reviewer, not to whichever implementer
+                # happened to run last.
+                owner = review["id"] if review and review.get("id") else role_for_attempt
+                if owner:
+                    bucket = totals.setdefault(owner, new_role())
+                    bucket["tokens"] += int(spend.get("total") or 0)
+                    bucket["tasks"].add(task_id)
+                    for value in spend.get("durations") or []:
+                        if isinstance(value, (int, float)):
+                            bucket["durations"].append(float(value))
+
+    if args.as_json:
+        print(json.dumps({
+            "tasks_scanned": len(tasks),
+            "roles": [
+                {
+                    "role": role,
+                    "tasks": len(bucket["tasks"]),
+                    "dispatches": bucket["dispatches"],
+                    "dispatch_failures": bucket["failures"],
+                    "failure_reasons": bucket["reasons"],
+                    "rework": bucket["rework"],
+                    "reviews": bucket["reviews"],
+                    "findings_raised": bucket["findings"],
+                    "integration_failures": bucket["integration_failures"],
+                    "tokens": bucket["tokens"],
+                    "median_run_seconds": (
+                        round(statistics.median(bucket["durations"]), 2)
+                        if bucket["durations"] else None
+                    ),
+                }
+                for role, bucket in sorted(totals.items())
+            ],
+        }, indent=2))
+        return 0
+
+    print(f"Role history over {len(tasks)} task(s) in this repository.")
+    print("A ledger is per repository, so this is how a role performed here.\n")
+    header = (
+        f"{'ROLE':13} {'TASKS':>5} {'DISPATCH':>8} {'FAILED':>7} {'REWORK':>7} "
+        f"{'REVIEWS':>7} {'FINDINGS':>8} {'INTEG.F':>7} {'TOKENS':>10} {'MEDIAN s':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for role, bucket in sorted(totals.items()):
+        median = (
+            f"{statistics.median(bucket['durations']):.1f}"
+            if bucket["durations"] else "-"
+        )
+        print(
+            f"{role[:13]:13} {len(bucket['tasks']):>5} {bucket['dispatches']:>8} "
+            f"{bucket['failures']:>7} {bucket['rework']:>7} {bucket['reviews']:>7} "
+            f"{bucket['findings']:>8} {bucket['integration_failures']:>7} "
+            f"{bucket['tokens']:>10,} {median:>9}"
+        )
+    if not totals:
+        print("(no delegated work recorded)")
+    for role, bucket in sorted(totals.items()):
+        if bucket["reasons"]:
+            named = ", ".join(
+                f"{reason} x{count}" for reason, count in sorted(bucket["reasons"].items())
+            )
+            print(f"\n{role} dispatch failures: {named}")
+    return 0
+
+
+def new_role() -> dict:
+    return {
+        "tasks": set(), "dispatches": 0, "failures": 0, "reasons": {},
+        "rework": 0, "reviews": 0, "findings": 0, "integration_failures": 0,
+        "tokens": 0, "durations": [],
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROGRAM, description="Governed memory: verified facts and decisions."
+    )
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    def fact_arguments(target: argparse.ArgumentParser) -> None:
+        target.add_argument("--claim", help="the fact, in the operator's own words")
+        target.add_argument("--command", help="the command that checks it")
+        target.add_argument("--workdir", help="directory to run it in, inside the repository")
+        target.add_argument("--from-task", help="take claim and command from this task's contract")
+        target.add_argument("--criterion", help="which acceptance criterion to take them from")
+        target.add_argument("--review-days", type=int, help="days until the fact needs review")
+        target.add_argument("--supersedes", help="the fact this replaces")
+
+    add = sub.add_parser("add", help="admit a fact")
+    fact_arguments(add)
+
+    admit = sub.add_parser("admit", help="admit a fact a proposal prompted")
+    admit.add_argument("proposal")
+    fact_arguments(admit)
+
+    propose = sub.add_parser("propose", help="record a delegate's suggestion, unverified")
+    propose.add_argument("--claim", required=True)
+    propose.add_argument("--command")
+    propose.add_argument("--task")
+
+    seed = sub.add_parser("seed", help="propose facts from a merged task's criteria")
+    seed.add_argument("task")
+    seed.add_argument("--review-days", type=int)
+
+    listing = sub.add_parser("list", help="every fact and its status")
+    listing.add_argument("--json", action="store_true", dest="as_json")
+
+    verify = sub.add_parser("verify", help="re-run each fact's command")
+    verify.add_argument("fact", nargs="?")
+
+    decide = sub.add_parser("decide", help="record a decision")
+    decide.add_argument("--title", required=True)
+    decide.add_argument("--status", default="Accepted")
+    decide.add_argument("--context", default="")
+    decide.add_argument("--decision", required=True)
+    decide.add_argument("--alternatives", action="append")
+    decide.add_argument("--consequences", default="")
+    decide.add_argument("--evidence", action="append")
+    decide.add_argument("--task", action="append")
+    decide.add_argument("--supersedes")
+
+    decisions = sub.add_parser("decisions", help="every decision record")
+    decisions.add_argument("--json", action="store_true", dest="as_json")
+
+    roles = sub.add_parser("roles", help="how each role has performed here")
+    roles.add_argument("--json", action="store_true", dest="as_json")
+    return parser
+
+
+COMMANDS = {
+    "add": command_add,
+    "admit": command_admit,
+    "propose": command_propose,
+    "seed": command_seed,
+    "list": command_list,
+    "verify": command_verify,
+    "decide": command_decide,
+    "decisions": command_decisions,
+    "roles": command_roles,
+}
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    try:
+        root = repository_root()
+    except LedgerError as exc:
+        print(f"{PROGRAM}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        return COMMANDS[args.action](root, args)
+    except memory.MemoryError as exc:
+        print(f"{PROGRAM}: {exc}", file=sys.stderr)
+        return 2
+    except LedgerError as exc:
+        print(f"{PROGRAM}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

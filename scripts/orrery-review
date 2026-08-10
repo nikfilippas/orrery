@@ -48,6 +48,7 @@ from orrery_fallback import (  # noqa: E402
     request_fallback_decision,
 )
 from orrery_findings import sanitise_provider_text  # noqa: E402
+from orrery_verify import systemctl_path, systemd_run_path  # noqa: E402
 import orrery_spend  # noqa: E402
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
@@ -729,7 +730,7 @@ def run_systemctl(
 ) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
-            ["systemctl", "--user", *arguments],
+            [systemctl_path(), "--user", *arguments],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
@@ -886,15 +887,26 @@ def confinement_enforced(
     # confinement was intact. ProtectHome covers home on every host, and
     # nothing grants it.
     outside = Path.home() / f".containment-probe-outside-{uuid.uuid4().hex}"
-    refused = [
-        path / f".containment-probe-{uuid.uuid4().hex}"
-        for path in dict.fromkeys(read_only_paths or [])
-    ]
+    # A protected path may be a file rather than a directory: a linked
+    # worktree's `.git` indirection and a git `config` both are. Touching
+    # an existing file is the stronger test anyway, since a read-only
+    # mapping must refuse even an mtime update, and the child form
+    # produced a path whose cleanup raised ENOTDIR and made the whole
+    # probe report failure.
+    refused: list[Path] = []
+    created: list[Path] = []
+    for path in dict.fromkeys(read_only_paths or []):
+        if path.is_file():
+            refused.append(path)
+        else:
+            candidate = path / f".containment-probe-{uuid.uuid4().hex}"
+            refused.append(candidate)
+            created.append(candidate)
     try:
         inside.mkdir(mode=0o700)
         result = subprocess.run(
             [
-                "systemd-run",
+                systemd_run_path(),
                 "--user",
                 "--quiet",
                 "--wait",
@@ -924,7 +936,10 @@ def confinement_enforced(
         # A probe file that exists is itself the finding, so it is removed
         # either way rather than left in a path the delegate was supposed
         # to be unable to touch.
-        for path in (outside, *refused):
+        # Only what the probe could have created. Unlinking a protected
+        # file that was already there would destroy the very thing the
+        # mapping exists to protect.
+        for path in (outside, *created):
             try:
                 path.unlink()
             except FileNotFoundError:
@@ -950,7 +965,7 @@ def read_only_paths_enforced(target: Path) -> bool:
         try:
             result = subprocess.run(
                 [
-                    "systemd-run",
+                    systemd_run_path(),
                     "--user",
                     "--quiet",
                     "--wait",
@@ -987,10 +1002,20 @@ def repository_read_only_paths(
 ) -> list[Path]:
     """Every path a role must not be able to write.
 
-    A read-only role gets its whole workspace. A writer must write its
-    own worktree, so it gets the narrower set that is never legitimately
-    its to touch: the common git directory, every other worktree, and
-    every control store.
+    A read-only role gets its whole workspace, the common git directory,
+    every worktree and every control store.
+
+    A writer gets nothing inside the checkout, and that is a measured
+    limit rather than an omission. Protecting any path inside a checkout
+    requires pinning its ancestors read-only, so a rename cannot swap
+    the tree beneath the mapping. The provider CLIs need /tmp granted to
+    build their sandbox mount points, so for a repository living there
+    the nearest unpinnable ancestor is the checkout itself; pinning it
+    makes a linked worktree's index unwritable and `git add` fails for
+    every delegate. Until that grant is replaced with a private
+    temporary namespace, a writer's reach is bounded by the session
+    socket block above, by the digests the merge gate verifies, and by
+    the indirection check the runner makes before it runs git.
 
     That distinction used to not exist, and the comment beside the /tmp
     grant said the quiet part out loud: that /tmp holds no Orrery
@@ -1033,18 +1058,16 @@ def repository_read_only_paths(
     # where git ran.
     common = plumbing("rev-parse", "--git-common-dir")
     if common and common.strip():
-        paths.append(workspace / common.strip())
+        if read_only:
+            paths.append(workspace / common.strip())
     listing = plumbing("worktree", "list", "--porcelain")
     for line in (listing or "").splitlines():
         if not line.startswith("worktree "):
             continue
         entry = Path(line[len("worktree "):])
-        if read_only or entry != workspace:
+        if read_only:
             paths.append(entry)
-        # The control store, wherever the checkout is. A linked worktree
-        # holds none of its own, so the one that matters belongs to the
-        # primary checkout and would otherwise sit inside a grant.
-        paths.append(entry / ".orrery")
+            paths.append(entry / ".orrery")
 
     seen: dict[Path, None] = {}
     for path in paths:
@@ -2226,7 +2249,10 @@ def main(
     # group, but a descendant that detaches from it can only be caught by
     # the surrounding Leave No Trace sweeps.
     use_systemd = all(
-        shutil.which(tool) is not None for tool in ("systemd-run", "systemctl")
+        # Resolved the same way the launch resolves them. Detecting
+        # through PATH while launching through a canonical path meant a
+        # host could pass detection on a planted executable.
+        tool is not None for tool in (systemd_run_path(), systemctl_path())
     )
     display, purpose = role_label(role_id)
     print(
@@ -2356,11 +2382,20 @@ def main(
         # worker whose workspace is meant to be writable. An empty set of
         # protected paths does not mean "guaranteed": for a read-only
         # role it means the workspace could not even be resolved.
-        workspace_guaranteed = not role_config.read_only or (
+        # A writer's protected set is smaller but no less load-bearing:
+        # it holds the control store, the hooks, the config and the git
+        # indirection. Short-circuiting to true for every writer meant
+        # that set was never probed at all, so a host that honours
+        # ProtectHome but drops explicit mappings passed preflight while
+        # protecting nothing.
+        protection_guaranteed = (
             bool(protected_paths)
             and conflict is None
             and confinement_ok
             and confinement_enforced(writable_paths, run_dir, read_only_paths)
+        )
+        workspace_guaranteed = protection_guaranteed or (
+            not role_config.read_only and not protected_paths
         )
         if not confinement_ok:
             detail = (
@@ -2481,6 +2516,7 @@ def main(
                     exit_status=status,
                     outcome=outcome,
                     log_path=log_path,
+                    duration_seconds=time.monotonic() - started,
                 )
             except OSError as exc:
                 print(
@@ -2533,7 +2569,7 @@ def main(
                 receipts,
             )
             command = [
-                "systemd-run",
+                systemd_run_path(),
                 "--user",
                 "--quiet",
                 "--wait",

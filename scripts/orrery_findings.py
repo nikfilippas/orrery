@@ -302,8 +302,17 @@ def validate_review(
                 raise FindingsError(
                     f"{field}.addresses names a finding this review was not given"
                 )
-        if "confidence" in raw and not isinstance(raw["confidence"], (int, float)):
-            raise FindingsError(f"{field}.confidence must be a number")
+        # Null is both allowed by the schema and required to be present
+        # under strict structured output, so a reviewer with nothing to
+        # claim says so with null; rejecting that threw away the whole
+        # review. The bound is the schema's and is enforced here too,
+        # because a provider that ignores the schema must not pass.
+        confidence = raw.get("confidence")
+        if confidence is not None:
+            if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+                raise FindingsError(f"{field}.confidence must be a number or null")
+            if not 0 <= confidence <= 1:
+                raise FindingsError(f"{field}.confidence must be between 0 and 1")
 
         evidence, dropped = _evidence(raw["evidence"], f"{field}.evidence", path_exists)
         finding = dict(raw)

@@ -218,6 +218,10 @@ link_file \
     "$HOME/.local/bin/orrery-task"
 
 link_file \
+    "$KIT_DIR/scripts/orrery-memory" \
+    "$HOME/.local/bin/orrery-memory"
+
+link_file \
     "$KIT_DIR/scripts/orrery-config" \
     "$HOME/.local/bin/orrery-config"
 

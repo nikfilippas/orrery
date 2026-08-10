@@ -110,6 +110,45 @@ For one release, `orrery-doctor` warns existing users with the exact
 machine-local user state store. Revoke adoption with
 `orrery-init --forget /path/to/repository`.
 
+### What a delegate may never write
+
+Every delegated run grants `/tmp` and `/var/tmp`, because the provider
+CLIs build their own sandbox mount points there. That was justified on
+the grounds that those directories hold no Orrery control state, and it
+is false for any repository that lives under one of them: `.orrery`
+holds the ledger, the sealed contracts and the evidence packets the
+merge gate trusts. Repository protection was applied only to read-only
+roles, so a write-capable delegate in such a repository could forge any
+of them, or plant a hook in the common git directory that runs on the
+next git command.
+
+What could be closed has been, and the rest is stated rather than
+implied.
+
+Closed: contained code can no longer ask the user manager for an
+unconstrained sibling unit, which had made every filesystem mapping in
+this kit decoration. The containment tools are resolved to canonical
+system paths, so a delegate cannot plant a `systemd-run` of its own for
+the next attempt to run. And a dispatch records the git directory its
+worktree pointed at, refusing to run any git command there if the
+indirection has since been repointed at one the delegate controls.
+
+Not closed, and the reason is structural. A read-only role cannot write
+its workspace at all. A writer gets nothing protected inside the
+checkout, because protecting a path there requires pinning its ancestors
+read-only so a rename cannot swap the tree beneath the mapping. The
+provider CLIs need `/tmp` granted to build their sandbox mount points,
+so for a repository under it the nearest unpinnable ancestor is the
+checkout itself, and pinning that makes a linked worktree's index
+unwritable: `git add` then fails for every delegate. Measured, not
+assumed. Replacing that grant with a private temporary namespace would
+let the protections compose, and is its own piece of work.
+
+Until then a writer's reach is bounded by the session socket block, by
+the contract, evidence and review digests the merge gate verifies, and
+by the indirection check above. The suite asserts both halves, so the
+trade stays visible and a change that silently breaks git is caught.
+
 ## Default roles
 
 The shipped configuration:
@@ -423,6 +462,173 @@ contract that actually applied.
 
 A contract that sets no ceilings and does not declare high risk decides
 exactly as it did before any of this existed.
+
+## Governed memory
+
+```bash
+orrery-memory add --claim "..." --command "..."
+orrery-memory add --from-task T-1 --criterion AC1
+orrery-memory seed T-1
+orrery-memory verify
+orrery-memory list
+orrery-memory decide --title "..." --decision "..." --evidence .orrery/evidence/T-1/1.json
+orrery-memory roles
+```
+
+A fact here is a claim **and the command that checks it**. Nothing is
+admitted that cannot be re-run, which is what turns provenance and
+expiry from metadata a writer chose into properties the runner
+establishes. A fact is *current* when its command last succeeded and its
+review-by date has not passed, *stale* when it has, *refuted* when the
+command last failed, and *proposed* when it has not been admitted. There
+is no score: a number between zero and one would have to come from
+somewhere, and there is nowhere for it to come from.
+
+Path-sensitive freshness is deliberately absent. Nothing records which
+paths a fact depends on, so nothing can say that a particular commit
+invalidated it; the listing reports the commit a fact was last verified
+at and how far the target has moved since, and leaves the inference to
+the reader.
+
+### What memory resists, and what it does not
+
+Stated plainly, because a security claim nobody can check is worse than
+none.
+
+Memory resists accident, error and a confused delegate. It does not
+claim to resist a delegate actively trying to forge it, and the kit says
+the same of receipts. The line between those is one fact about where a
+repository lives.
+
+A contained run is granted `/tmp` and `/var/tmp`, because the provider
+CLIs build their sandbox mount points there. Everywhere else the kernel
+refuses a delegate's write to `.orrery`, measured: under a home
+directory the write fails, under `/tmp` it succeeds. So for a repository
+under a broad grant a delegate can write one file into
+`.orrery/memory/facts`, and because a fact reaching `current` is placed
+in every later handoff under a heading saying it was verified, that file
+becomes an instruction every subsequent delegate reads. The same write
+reaches the ledger, whose digests the merge gate trusts.
+
+That configuration is therefore refused rather than tolerated.
+`orrery-init` will not adopt a repository under `/tmp` or `/var/tmp`,
+`orrery-task run` will not dispatch from one, and `orrery-doctor`
+reports it. `ORRERY_ALLOW_TMP_REPOSITORY=1` accepts the risk
+deliberately, and the kit's own suite sets it because it builds its
+fixtures there on purpose.
+
+What remains true even so: accounting is advisory rather than enforced,
+because the receipts directory is the delegate's own writable grant and
+plausible token counts can be written into it. Budget ceilings and role
+history are therefore honest measurements of a cooperative delegate, not
+guarantees against a hostile one.
+
+### The trust boundary
+
+Neither half of a fact may come from a delegate, and the reasons differ.
+
+The **command** is executed by the runner, outside the delegate's
+containment, so accepting one from provider output would be a route from
+a delegated run to arbitrary local execution. Admission copies the
+command from a sealed contract's own acceptance criterion, named by
+task and criterion and recorded with the contract digest it came from,
+or the operator types it.
+
+The **claim** is concatenated into every later delegate's assignment.
+The provider-text filter drops control bytes and breaks Orrery's own
+protocol token, and leaves ordinary prose exactly as written, so an
+admitted provider-authored claim would be prompt injection in a trusted
+position with a long life. Claims are therefore operator-written, or
+copied from operator-authored contract fields.
+
+A delegate may still propose. A proposal is a message to the operator:
+stored, displayed through the provider-text filter, never verified,
+never placed in a handoff, and never the source of either half of a
+fact. `orrery-memory admit` records which proposal prompted a fact and
+reads nothing else from it.
+
+### Verification is contained
+
+A verification command is chosen by an operator, but what it *does* is
+decided by whatever code the repository holds, which a delegate may have
+just written. So a verification run is exactly as trusted as a delegated
+run and now gets the same posture: `ProtectSystem=strict`,
+`ProtectHome=read-only`, `NoNewPrivileges`, and writes confined to the
+worktree plus `/tmp` and `/var/tmp`. Without that, a repository's own
+test suite could write anywhere the user can, including planting a fact
+directly into the store, and it would stay clean because `.orrery` is
+not in the worktree.
+
+A suite that legitimately writes elsewhere, to a shared cache say, is
+granted it explicitly:
+`ORRERY_VERIFY_WRITABLE=/path/one:/path/two`. A command that fails on a
+permission error has the writable set and that instruction appended to
+its output, so the boundary explains itself rather than looking like a
+broken test.
+
+Enforcement is measured rather than assumed. A host that restricts
+unprivileged user namespaces accepts the unit and silently drops its
+protections, and a unit that merely failed to start also exits non-zero,
+so the probe asserts both directions under the real property
+composition: the permitted write must succeed and the forbidden one must
+fail. `systemd-run` is resolved by absolute path from a system
+directory, so nothing earlier on `PATH` can answer for it.
+
+Where confinement cannot be enforced, verification refuses rather than
+running a repository's code over the whole home directory and calling
+the result evidence. `ORRERY_ALLOW_UNCONFINED=1` accepts that
+deliberately. The question is asked once, before any command runs, and
+not read from a child's exit status: repository code could return that
+status itself and have its own refutation discarded, keeping a stale
+fact in every later handoff.
+
+A mapping protects contents, not a path, so the control store's device
+and inode are compared across each verification run. A command that
+renames an ancestor and leaves a replacement tree where the runner will
+look next is caught there, since no mapping can prevent it.
+
+### Verification is a transaction
+
+A fact's command runs the way a contract's criteria do, under the same
+containment ladder, with a workdir validated inside the repository. It
+cannot hold the control lock while it runs, because an arbitrary command
+would block every task operation for its duration. So verification
+snapshots the fact's digest and revision, the target commit and the
+worktree state, runs outside the lock, and appends its result under the
+lock only if the fact and the target are both still the ones that were
+tested. A result that arrives against a changed fact, or after a merge
+moved the target, is reported and discarded.
+
+It also refuses to start on a dirty worktree: a pass earned with
+uncommitted code is not evidence about the commit it would be recorded
+against. A command that changes the repository while running is recorded
+as a failure naming that, never as a pass.
+
+### Facts in a handoff
+
+Current facts are selected once, under the control lock, at the moment a
+dispatch is admitted. The prompt is written once and those exact bytes
+are what the child receives, and the dispatch record names the fact
+identifiers, their digests and the prompt digest, so what a run was told
+is recoverable rather than inferred from a store that has since moved
+on. A repository with no memory store produces a byte-identical handoff
+to the one it produced before any of this existed.
+
+### Decisions and role history
+
+`orrery-memory decide` writes an architecture decision record in the
+handoff's shape, and checks every artefact it cites against the digest
+the ledger recorded for it: a missing or altered packet is reported as
+unresolved evidence rather than presented as support. Superseding is a
+link and nothing is deleted.
+
+`orrery-memory roles` computes how each role has performed from the
+ledger, rather than storing an aggregate that would become a second
+answer to the same question. Every figure carries the number of tasks
+behind it, and the boundary is stated: a ledger is per repository. There
+is no per-role resolution rate, because a finding is raised by a
+reviewer and resolved by whatever later work changed the code, and
+attributing that to one role would be an invented number.
 
 ## Visual configuration
 

@@ -802,6 +802,21 @@ else
     warn "The incident log could not be read"
 fi
 
+printf '\n=== Adopted repository location ===\n'
+ADOPTED_REAL="$(readlink -f "$(pwd)" 2>/dev/null || pwd)"
+case "$ADOPTED_REAL" in
+    /tmp | /tmp/* | /var/tmp | /var/tmp/*)
+        fail "This repository is under a directory every contained run can write"
+        printf '  Its .orrery control store is forgeable by a delegate: a\n'
+        printf '  planted memory fact reaches every later run as verified.\n'
+        printf '  Move the repository, or accept it with\n'
+        printf '  ORRERY_ALLOW_TMP_REPOSITORY=1.\n'
+        ;;
+    *)
+        pass "Control store is outside every broad write grant"
+        ;;
+esac
+
 printf '\n=== Task worktrees ===\n'
 TASK_WORKTREE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/orrery/worktrees"
 if [ ! -d "$TASK_WORKTREE_ROOT" ]; then

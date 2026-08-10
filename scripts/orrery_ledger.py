@@ -59,8 +59,12 @@ TRANSITIONS = {
     # The self-loop is how a re-review of blocked work records its own
     # outcome: it starts from REVIEW_BLOCKED and may legitimately leave it
     # blocked, exactly as NO_CHANGE and AWAITING_MERGE repeat themselves.
+    # INTERRUPTED because a re-review can fail exactly as a first review
+    # can, and its spend and its reviewer's identity have to be
+    # recordable from here too; without it the append raised and the
+    # paid run went unrecorded.
     "REVIEW_BLOCKED": frozenset(
-        {"REVIEW_BLOCKED", "READY", "REVIEW_PASSED", "CANCELLED"}
+        {"REVIEW_BLOCKED", "READY", "REVIEW_PASSED", "INTERRUPTED", "CANCELLED"}
     ),
     "VERIFICATION_FAILED": frozenset({"READY", "VERIFICATION_PASSED", "CANCELLED"}),
     "AWAITING_MERGE": frozenset({"AWAITING_MERGE", "MERGED", "CANCELLED"}),

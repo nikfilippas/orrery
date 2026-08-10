@@ -724,6 +724,17 @@ The maintained artefacts are:
   becomes a named gap rather than a zero, because a ceiling that reads a
   missing measurement as free waves through exactly the runs it cannot
   see.
+- `scripts/orrery_memory.py` and `scripts/orrery-memory` — governed
+  memory: facts that are a claim and the command that checks them,
+  architecture decision records, and role history computed from the
+  ledger. Neither half of a fact may come from a delegate, because the
+  command is executed outside the delegate's containment and the claim
+  is concatenated into a later delegate's assignment, where ordinary
+  prose survives the provider-text filter intact. A delegate proposes;
+  the operator admits, in their own words.
+- `scripts/orrery_verify.py` — running one repository command under the
+  containment ladder, shared by a contract's acceptance criteria and by
+  a memory fact's check, so how far a command may reach has one answer.
 - `scripts/orrery_standing.py` — standing fallback approvals: scoped,
   revocable prior consent recorded outside the repository.
 - `scripts/orrery-session-start` — direct Claude/Codex surface comparison and

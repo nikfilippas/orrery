@@ -259,6 +259,29 @@ for pattern in "/.orrery.json" "/CLAUDE.local.md"; do
     fi
 done
 
+# Every contained run is granted /tmp and /var/tmp so the provider CLIs
+# can build their sandbox mount points there. A repository living under
+# one of them therefore has its .orrery control store inside a write
+# grant, and a delegate can plant a ledger record, an evidence packet or
+# a memory fact that later runs are handed as verified. Refused at
+# adoption rather than left as a convention nobody reads.
+REAL_ROOT="$(readlink -f "$PROJECT_ROOT")"
+case "$REAL_ROOT" in
+    /tmp | /tmp/* | /var/tmp | /var/tmp/*)
+        if [ "${ORRERY_ALLOW_TMP_REPOSITORY:-}" != "1" ]; then
+            printf 'Refusing to adopt %s: it is under a directory every
+' "$REAL_ROOT" >&2
+            printf 'contained run can write, so its .orrery store would be
+' >&2
+            printf 'forgeable by a delegate. Move it, or set
+' >&2
+            printf 'ORRERY_ALLOW_TMP_REPOSITORY=1 to accept that.
+' >&2
+            exit 1
+        fi
+        ;;
+esac
+
 # The marker that adopts the repository: the SessionStart check and the
 # global policy apply Orrery's orchestration layer only where it exists.
 MARKER="$PROJECT_ROOT/.orrery.json"
