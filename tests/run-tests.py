@@ -9856,6 +9856,64 @@ def test_read_only_repository_under_a_grant() -> None:
         )
 
 
+@test("a write-capable delegate cannot reach the control store")
+def test_writer_cannot_reach_the_control_store() -> None:
+    """The premise beside the /tmp grant was that /tmp holds no Orrery
+    control state. It does whenever the repository lives there, and
+    `.orrery` holds the ledger, the sealed contracts and the evidence
+    packets the merge gate trusts. Repository protection applied only to
+    read-only roles, so a writer in such a repository could forge any of
+    them, and could plant a hook that runs on the user's next git
+    command. It must still write its own worktree.
+    """
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        main, linked = root / "main", root / "linked"
+        provider_home = root / "codex-home"
+        provider_home.mkdir()
+        subprocess.run(["git", "init", "-q", str(main)], check=True)
+        (main / "tracked").write_text("x\n")
+        (main / ".orrery" / "ledger").mkdir(parents=True)
+        for arguments in (
+            ["add", "tracked"],
+            ["-c", "user.name=Kit", "-c", "user.email=kit@test", "commit", "-qm", "initial"],
+            ["worktree", "add", "-q", str(linked)],
+        ):
+            subprocess.run(["git", "-C", str(main), *arguments], check=True)
+        common = (linked / subprocess.run(
+            ["git", "-C", str(linked), "rev-parse", "--git-common-dir"],
+            check=True, stdout=subprocess.PIPE, text=True,
+        ).stdout.strip()).resolve()
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps({
+            "own_worktree": str(linked / "allowed.txt"),
+            "control_store": str(main / ".orrery" / "ledger" / "T-1.jsonl"),
+            "git_hook": str(common / "hooks" / "post-checkout"),
+            "main_worktree": str(main / "planted.txt"),
+        })
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--role", "implementer", "--workspace", str(linked),
+            "--timeout", "60", "--", "prompt", cwd=linked,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        require(process.returncode == 0, f"the run failed: {stderr[-600:]}")
+        if "confinement is not enforced" in stderr:
+            return
+        writes = read_json(result_path)
+        require(
+            writes == {
+                "own_worktree": True,
+                "control_store": False,
+                "git_hook": False,
+                "main_worktree": False,
+            },
+            f"a writer reached the control store: {writes}; {stderr[-600:]}",
+        )
+
+
 @test("a read-only workspace cannot be swapped by renaming its parent")
 def test_read_only_workspace_parent_pinning() -> None:
     """A mapping protects contents; it does not protect the path.

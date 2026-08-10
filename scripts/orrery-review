@@ -838,7 +838,31 @@ def containment_properties(
             for path in dict.fromkeys(read_only_paths or [])
         ],
         "--property=NoNewPrivileges=yes",
+        # Every filesystem mapping above is defeated without these.
+        # Measured on this host: a unit composed with ReadOnlyPaths could
+        # not write a protected file directly, then asked the user
+        # manager for a sibling unit and wrote it anyway, because the
+        # sibling inherits none of this composition. Hiding the manager's
+        # private socket and the session bus, and clearing the two
+        # variables that locate them, closed it; the same probe then left
+        # the file untouched.
+        *[
+            f"--property=InaccessiblePaths={listed(path)}"
+            for path in session_control_paths()
+        ],
+        "--property=Environment=XDG_RUNTIME_DIR=",
+        "--property=Environment=DBUS_SESSION_BUS_ADDRESS=",
     ]
+
+
+def session_control_paths() -> list[Path]:
+    """The sockets through which contained code could ask for more.
+
+    Absent on a host without a user manager, and systemd refuses a unit
+    naming a path that is not there, so each is offered only if present.
+    """
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    return [path for path in (runtime / "systemd", runtime / "bus") if path.exists()]
 
 
 def confinement_enforced(
@@ -958,8 +982,22 @@ def read_only_paths_enforced(target: Path) -> bool:
         return result.returncode == 0
 
 
-def repository_read_only_paths(workspace: Path) -> list[Path]:
-    """Every path a read-only role must not be able to write.
+def repository_read_only_paths(
+    workspace: Path, *, read_only: bool = True
+) -> list[Path]:
+    """Every path a role must not be able to write.
+
+    A read-only role gets its whole workspace. A writer must write its
+    own worktree, so it gets the narrower set that is never legitimately
+    its to touch: the common git directory, every other worktree, and
+    every control store.
+
+    That distinction used to not exist, and the comment beside the /tmp
+    grant said the quiet part out loud: that /tmp holds no Orrery
+    control state. It does whenever the repository lives there, and
+    `.orrery` holds the ledger, the sealed contracts and the evidence
+    packets the merge gate trusts. A write-capable delegate in such a
+    repository could forge any of them.
 
     The workspace alone is not the repository. A linked worktree keeps
     its refs, config and hooks in the common git directory, which lives
@@ -970,7 +1008,7 @@ def repository_read_only_paths(workspace: Path) -> list[Path]:
     repository under /tmp: workspace refused, common git directory
     written.
     """
-    paths = [workspace]
+    paths = [workspace] if read_only else []
 
     def plumbing(*arguments: str) -> str | None:
         try:
@@ -998,8 +1036,15 @@ def repository_read_only_paths(workspace: Path) -> list[Path]:
         paths.append(workspace / common.strip())
     listing = plumbing("worktree", "list", "--porcelain")
     for line in (listing or "").splitlines():
-        if line.startswith("worktree "):
-            paths.append(Path(line[len("worktree "):]))
+        if not line.startswith("worktree "):
+            continue
+        entry = Path(line[len("worktree "):])
+        if read_only or entry != workspace:
+            paths.append(entry)
+        # The control store, wherever the checkout is. A linked worktree
+        # holds none of its own, so the one that matters belongs to the
+        # primary checkout and would otherwise sit inside a grant.
+        paths.append(entry / ".orrery")
 
     seen: dict[Path, None] = {}
     for path in paths:
@@ -2295,8 +2340,8 @@ def main(
         # them was writable while the wrapper said nothing at all. An
         # explicit read-only mapping is honoured against those grants, so
         # the guarantee stops depending on where the workspace sits.
-        protected_paths = (
-            repository_read_only_paths(workspace) if role_config.read_only else []
+        protected_paths = repository_read_only_paths(
+            workspace, read_only=role_config.read_only
         )
         pinned_paths, pin_conflict = ancestors_to_pin(
             protected_paths, writable_paths
