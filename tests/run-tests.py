@@ -15120,7 +15120,8 @@ def test_seeded_defect_corpus() -> None:
                 carried=[
                     {"id": "F-01", "disposition": "resolved",
                      "evidence": [{"file": "calc.py", "lines": "1-3"}]},
-                    {"id": "F-02", "disposition": "withdrawn"},
+                    {"id": "F-02", "disposition": "withdrawn",
+                     "reason": "the token is loaded from the environment, not logged"},
                 ],
             )
             looping = run_task(root, "review", "T-1", environment=environment)
@@ -17319,7 +17320,9 @@ def test_failed_review_is_retryable() -> None:
             discard_task_environment(environment)
         require(
             retried.returncode == 0
-            and task_module.current(root / ".orrery", "T-1")[1] == "REVIEW_PASSED",
+            # A clean review now walks to the gate rather than stranding
+            # in REVIEW_PASSED, which no command could advance.
+            and task_module.current(root / ".orrery", "T-1")[1] == "AWAITING_MERGE",
             f"the retry was refused: {retried.stderr[-400:]}",
         )
 
@@ -17850,6 +17853,466 @@ def test_role_history() -> None:
             all("resolutions" not in row for row in payload["roles"]),
             "resolutions were attributed to a role, which has no definition",
         )
+
+
+@test("a finding id raised again after resolution is open again")
+def test_finding_reraise_reopens() -> None:
+    """The merge gate anchors on finding ids. A flat resolved-set let an
+    id resolved once and then raised blocking again read as resolved,
+    carrying an unaddressed defect through the gate. H8, which now lets a
+    clean review reach the gate, made that reachable."""
+    first = {"id": "F-01", "statement": "first defect"}
+    reused = {"id": "F-01", "statement": "a different defect, same id"}
+    records = [
+        {"to": "REVIEW_BLOCKED", "review": {"blocking": [first]}},
+        {"to": "REVIEW_BLOCKED", "review": {"blocking": []},
+         "resolutions": [{"id": "F-01", "disposition": "fixed"}]},
+        {"to": "REVIEW_BLOCKED", "review": {"blocking": [reused]}},
+    ]
+    require(
+        [f["id"] for f in task_module.unresolved_blocking(records)] == ["F-01"],
+        "a finding id re-raised after resolution stayed masked",
+    )
+    require(
+        task_module.unresolved_blocking(records[:2]) == [],
+        "an ordinary resolution no longer clears a finding",
+    )
+
+
+@test("a review cannot both carry and newly raise one finding id")
+def test_reject_cross_list_duplicate_id() -> None:
+    """The single-review form of the same hole: resolving carried F-01
+    while raising a fresh blocking F-01 would cancel the raise in the
+    ledger. The validator forbids the overlap outright."""
+    document = json.dumps({
+        "v": 1, "task_id": "T-1", "verdict": "changes_required",
+        "findings": [{
+            "id": "F-01", "severity": "blocking", "category": "correctness",
+            "statement": "a new defect reusing a carried id",
+            "failure_scenario": "it breaks",
+            "evidence": [{"file": "a", "lines": "1-1", "reproduction": None}],
+            "proposed_resolution": None, "addresses": None, "confidence": None,
+        }],
+        "unable_to_verify": [],
+        "carried": [{"id": "F-01", "disposition": "resolved",
+                     "evidence": [{"file": "a", "lines": "1-1", "reproduction": None}],
+                     "reason": None}],
+    })
+    try:
+        findings_module.validate_review(
+            findings_module.parse_review(document),
+            task_id="T-1", carried_ids=["F-01"], path_exists=lambda _p: True,
+        )
+    except findings_module.FindingsError as exc:
+        require("reuses a carried id" in str(exc), f"the wrong refusal: {exc}")
+    else:
+        raise Failure("a review reused a carried id across its two lists")
+
+
+@test("evidence and base are scoped to the current dispatch")
+def test_current_dispatch_slice() -> None:
+    # Dispatch 1 produced a base run, evidence and a commit; dispatch 2
+    # is the current one and has produced none yet. The slice both
+    # consumers read from must carry none of dispatch 1's artefacts, or
+    # the queue would pair this attempt with the last one's.
+    records = [
+        {"to": "DISPATCHED", "dispatch": {"seq": 1}},
+        {"to": "IN_PROGRESS", "reason": "base-verification", "base_evidence": "base-1.json"},
+        {"to": "IMPLEMENTED", "commit": "aaaaaaa"},
+        {"to": "VERIFICATION_PASSED", "evidence": "1.json"},
+        {"to": "READY"},
+        {"to": "DISPATCHED", "dispatch": {"seq": 2}},
+        {"to": "IN_PROGRESS"},
+    ]
+    sl, seq = task_module.current_dispatch_slice(records)
+    require(
+        seq == 2 and sl[0]["dispatch"]["seq"] == 2
+        and not any(r.get("commit") for r in sl)
+        and not any(r.get("evidence") for r in sl)
+        and not any(r.get("base_evidence") for r in sl),
+        f"the slice carried a prior dispatch's artefacts: seq={seq}, slice={sl}",
+    )
+
+
+@test("one torn task does not hide the rest of the queue")
+def test_queue_resilient_to_a_torn_task() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the good task did not complete")
+        finally:
+            discard_task_environment(environment)
+        # A second task whose ledger tail is torn: it must be surfaced,
+        # never allowed to abort the whole queue.
+        store = root / ".orrery"
+        good = (store / "ledger" / "T-1.jsonl").read_text().splitlines()[0]
+        (store / "ledger" / "T-2.jsonl").write_text(good.replace("T-1", "T-2") + "\n{\"partial")
+        listed = run_task(root, "queue")
+        require(
+            listed.returncode == 0
+            and "T-1" in listed.stdout and "T-2" in listed.stdout
+            and "cannot be read" in listed.stdout,
+            f"a torn task hid the queue: {listed.stdout} {listed.stderr[-200:]}",
+        )
+
+
+@test("a tampered older review document is caught by the brief")
+def test_brief_verifies_every_review_digest() -> None:
+    """Two reviews, and only the older is tampered: a latest-only check
+    would pass this, so it pins that every referenced review is verified."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {**dispatch_contract(), "review": True})
+        store = root / ".orrery"
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            # Review 1 blocks with F-01; review 2 resolves it and is clean.
+            environment["CODEX_FAKE_REVIEW"] = seeded_review([{
+                "id": "F-01", "severity": "blocking", "category": "correctness",
+                "statement": "a defect", "failure_scenario": "it breaks",
+                "evidence": [{"file": "edited.txt", "lines": "1-1"}],
+            }])
+            require(run_task(root, "review", "T-1", environment=environment).returncode == 1,
+                    "the first review did not block")
+            environment["CODEX_FAKE_REVIEW"] = seeded_review([], carried=[
+                {"id": "F-01", "disposition": "resolved",
+                 "evidence": [{"file": "edited.txt", "lines": "1-1"}]}])
+            require(run_task(root, "review", "T-1", environment=environment).returncode == 0,
+                    "the second review did not clear")
+            documents = sorted(store.glob("reviews/T-1/*/review.json"),
+                               key=lambda p: int(p.parent.name))
+            require(len(documents) == 2, f"expected two reviews: {documents}")
+            # Tamper only the OLDER document; the latest stays valid.
+            older = documents[0]
+            older.write_text(older.read_text().replace('"changes_required"', '"clean"'))
+            brief = run_task(root, "queue", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            brief.returncode == 1 and "review document" in brief.stderr,
+            f"a tampered older review document was not caught: {brief.stderr[-300:]}",
+        )
+
+
+@test("a base criterion that mutates the tree reads as unavailable")
+def test_base_mutation_is_unavailable() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        # The criterion writes a file: a mutation, so its base outcome is
+        # unavailable rather than pass or fail. The same criterion also
+        # mutates at the result, which result verification rightly
+        # rejects, so the dispatch failing is expected; the base evidence
+        # is recorded regardless and is what this asserts.
+        create_dispatch_task(root, dispatch_contract(
+            command="python3 -B -c \"open('sentinel','w').write('x')\""))
+        environment = task_review_environment("edit")
+        try:
+            run_task(root, "run", "T-1", "--base", environment=environment)
+            base_record = next(r for r in task_records(root)
+                               if r.get("reason") == "base-verification")
+            base_ev = json.loads((root / base_record["base_evidence"]).read_text())
+            require(
+                base_ev["verification"][0]["state"] == "unavailable",
+                f"a mutating base criterion was not marked unavailable: {base_ev}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("the queue ranks most serious first and groups by dependency")
+def test_queue_ranking_and_grouping() -> None:
+    """Ranking and grouping as a unit, so the total order and the
+    dependency-first rule are pinned without lifecycle scaffolding."""
+    def entry(task_id, key, deps=None):
+        return {"task_id": task_id, "key": key, "depends_on": deps or []}
+    # Lower key = more serious. A is most serious and alone; B and C form
+    # a component (C depends on B); D and E form one where the dependency
+    # E is less serious than its dependent D.
+    a = entry("T-1", (1, 0, 0))
+    b = entry("T-2", (1, 5, 0))
+    c = entry("T-3", (1, 2, 0), ["T-2"])
+    d = entry("T-4", (1, 1, 0), ["T-5"])
+    e = entry("T-5", (1, 9, 0))
+    order = [x["task_id"] for x in task_module.grouped_queue([c, e, a, d, b])]
+    # A first (most serious, alone). Then the D-E group (rank = D's key,
+    # 1 < B's 5), with the dependency E before its dependent D. Then the
+    # B-C group, B before C.
+    require(
+        order == ["T-1", "T-5", "T-4", "T-2", "T-3"],
+        f"the queue order is wrong: {order}",
+    )
+
+
+@test("out-of-scope is one authoritative computation, rename-aware")
+def test_out_of_scope_unified() -> None:
+    """The discriminating case round one named: a file inside an included
+    directory renamed out of it. The legacy tab-split kept the source and
+    saw it as in scope; the shared helper sees the destination."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "lib").mkdir()
+        (root / "lib" / "a.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=k@t", "-c",
+                        "user.name=k", "commit", "-qm", "base"], check=True)
+        base = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                              stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "-C", str(root), "mv", "lib/a.txt", "a.txt"], check=True)
+        subprocess.run(["git", "-C", str(root), "-c", "user.email=k@t", "-c",
+                        "user.name=k", "commit", "-qm", "rename out"], check=True)
+        commit = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
+        out = task_module.out_of_scope_paths(root, base, commit, {"include": ["lib"], "exclude": []})
+        require(
+            "a.txt" in out,
+            f"a rename out of the included directory was not flagged: {out}",
+        )
+
+
+@test("a clean review reaches the gate and merges")
+def test_clean_review_to_merge() -> None:
+    """H8: a passing review used to strand the task in REVIEW_PASSED,
+    which no command could advance. No prior test drove a clean pass
+    through to a merge."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {**dispatch_contract(), "review": True})
+        store = root / ".orrery"
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            environment["CODEX_FAKE_REVIEW"] = seeded_review([])
+            reviewed = run_task(root, "review", "T-1", environment=environment)
+            require(
+                reviewed.returncode == 0
+                and task_module.current(store, "T-1")[1] == "AWAITING_MERGE",
+                f"a clean review did not reach the gate: {reviewed.stderr[-300:]}",
+            )
+            merged = run_task(root, "merge", "T-1", environment=environment)
+            require(
+                merged.returncode == 0
+                and task_module.current(store, "T-1")[1] == "MERGED",
+                f"the merge was refused: {merged.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a task stranded in REVIEW_PASSED is recovered by merge")
+def test_stranded_review_passed_recovered() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {**dispatch_contract(), "review": True})
+        store = root / ".orrery"
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            # Rewind to the stranded state: a REVIEW_PASSED with no
+            # advance, exactly what a crash between the two appends or a
+            # version predating the repair would leave.
+            environment["CODEX_FAKE_REVIEW"] = seeded_review([])
+            require(run_task(root, "review", "T-1", environment=environment).returncode == 0,
+                    "the review did not complete")
+            ledger = store / "ledger" / "T-1.jsonl"
+            kept = []
+            for line in ledger.read_text().splitlines():
+                kept.append(line)
+                if json.loads(line)["to"] == "REVIEW_PASSED":
+                    break
+            ledger.write_text("\n".join(kept) + "\n")
+            require(task_module.current(store, "T-1")[1] == "REVIEW_PASSED",
+                    "the rewind did not reproduce the stranded state")
+            merged = run_task(root, "merge", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            merged.returncode == 0
+            and task_module.current(store, "T-1")[1] == "MERGED",
+            f"a stranded REVIEW_PASSED task was not recovered: {merged.stderr[-300:]}",
+        )
+
+
+@test("the queue lists a blocked task and excludes a merged one")
+def test_queue_integration() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {**dispatch_contract(), "review": True})
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            environment["CODEX_FAKE_REVIEW"] = seeded_review([{
+                "id": "F-01", "severity": "blocking", "category": "correctness",
+                "statement": "a real defect", "failure_scenario": "it breaks",
+                "evidence": [{"file": "edited.txt", "lines": "1-1"}],
+            }])
+            require(run_task(root, "review", "T-1", environment=environment).returncode == 1,
+                    "the blocking review did not block")
+            listed = run_task(root, "queue", environment=environment)
+            require(
+                listed.returncode == 0
+                and "T-1" in listed.stdout
+                and "REVIEW_BLOCKED" in listed.stdout
+                and "unresolved blocking" in listed.stdout,
+                f"the blocked task was not queued with its reason: {listed.stdout}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("the brief cites artefacts, verifies digests, and reports tampering")
+def test_queue_brief() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, dispatch_contract())
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            unknown = run_task(root, "queue", "T-none", environment=environment)
+            require(unknown.returncode == 2, "an unknown task did not exit 2")
+            brief = run_task(root, "queue", "T-1", environment=environment)
+            require(
+                brief.returncode == 0
+                and "what changed" in brief.stdout
+                and "behavioural diff" in brief.stdout
+                and "not run" in brief.stdout,
+                f"the brief is malformed: {brief.stdout[-400:]} {brief.stderr[-200:]}",
+            )
+            # Tamper the evidence packet: its digest no longer matches.
+            evidence = next(r["evidence"] for r in reversed(task_records(root))
+                            if r.get("evidence"))
+            packet = root / evidence
+            packet.chmod(0o600)
+            packet.write_text(packet.read_text().replace('"v": 1', '"v": 1 '))
+            tampered = run_task(root, "queue", "T-1", environment=environment)
+            require(
+                tampered.returncode == 1 and "unresolved evidence" in tampered.stderr,
+                f"a tampered packet was not caught: {tampered.stderr[-300:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("run --base records a behavioural comparison without touching the result")
+def test_base_run() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        # A criterion that fails at the base and passes once the delegate
+        # appends the marker: base fail, result pass, "newly satisfied".
+        # python3 rather than a coreutil, because the suite runs under a
+        # PATH that carries the interpreter but not /usr/bin.
+        create_dispatch_task(root, dispatch_contract(
+            command="python3 -B -c \"import sys; sys.exit(0 if 'PHASE7MARK' in open('edited.txt').read() else 1)\""))
+        store = root / ".orrery"
+        environment = task_review_environment("edit")
+        environment["CODEX_FAKE_EDIT_PATH"] = "edited.txt"
+        environment["CODEX_FAKE_EDIT_TEXT"] = "PHASE7MARK\n"
+        try:
+            result = run_task(root, "run", "T-1", "--base", environment=environment)
+            require(result.returncode == 0, f"the base dispatch failed: {result.stderr[-400:]}")
+            base_record = next((r for r in task_records(root)
+                                if r.get("reason") == "base-verification"), None)
+            require(
+                base_record is not None
+                and base_record["from"] == "IN_PROGRESS"
+                and base_record["to"] == "IN_PROGRESS"
+                and base_record.get("base_evidence_sha256"),
+                f"the base run left no self-loop record: {base_record}",
+            )
+            base_ev = root / base_record["base_evidence"]
+            require(
+                hashlib.sha256(base_ev.read_bytes()).hexdigest()
+                == base_record["base_evidence_sha256"],
+                "the base evidence digest does not match",
+            )
+            require(
+                task_module.current(store, "T-1")[1] == "AWAITING_MERGE",
+                "a base failure changed the task state",
+            )
+            # No base worktree left behind.
+            worktrees = subprocess.run(
+                ["git", "-C", str(root), "worktree", "list"],
+                stdout=subprocess.PIPE, text=True, check=True).stdout
+            require("orrery-base." not in worktrees, "a base worktree was left behind")
+            brief = run_task(root, "queue", "T-1", environment=environment)
+            require(
+                "newly satisfied" in brief.stdout,
+                f"the behavioural diff did not show the improvement: {brief.stdout[-400:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("the brief lists disagreements with reasons or marks them absent")
+def test_brief_disagreements() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        # High risk, review declined with a waiver reason.
+        contract = {**dispatch_contract(), "review": False,
+                    "risk": {"level": "high", "reasons": ["touches the gate"]},
+                    "waiver": "mechanical change, covered by the suite"}
+        create_dispatch_task(root, contract)
+        environment = task_review_environment("edit")
+        try:
+            require(run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                    "the dispatch did not complete")
+            brief = run_task(root, "queue", "T-1", environment=environment)
+            require(
+                "high-risk review waiver (operator): mechanical change" in brief.stdout,
+                f"the waiver reason was not shown: {brief.stdout[-400:]}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a withdrawn finding without a reason is refused")
+def test_withdrawal_needs_a_reason() -> None:
+    document = json.dumps({
+        "v": 1, "task_id": "T-1", "verdict": "clean", "findings": [],
+        "unable_to_verify": [],
+        "carried": [{"id": "F-01", "disposition": "withdrawn", "evidence": None}],
+    })
+    try:
+        findings_module.validate_review(
+            findings_module.parse_review(document),
+            task_id="T-1", carried_ids=["F-01"], path_exists=lambda _p: True,
+        )
+    except findings_module.FindingsError as exc:
+        require("without a reason" in str(exc), f"the wrong refusal: {exc}")
+    else:
+        raise Failure("a reasonless withdrawal was accepted")
+
+
+@test("an optional waiver is additive; a contract without it is unchanged")
+def test_waiver_key_additive() -> None:
+    base = task_contract("T-1")
+    ledger_module.validate_contract({**base, "task_id": "T-1"}, "T-1")
+    ledger_module.validate_contract(
+        {**base, "task_id": "T-1", "waiver": "a reason"}, "T-1")
+    try:
+        ledger_module.validate_contract({**base, "task_id": "T-1", "waiver": "  "}, "T-1")
+    except ledger_module.LedgerError as exc:
+        require("non-empty" in str(exc), f"the wrong refusal: {exc}")
+    else:
+        raise Failure("an empty waiver was accepted")
 
 
 def main() -> int:

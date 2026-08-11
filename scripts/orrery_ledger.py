@@ -84,7 +84,7 @@ DISPATCH_FAILURE_REASONS = frozenset(
     }
 )
 _CONTRACT_KEYS = frozenset(
-    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review", "depends_on"}
+    {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review", "depends_on", "waiver"}
 )
 # The two time bounds are seconds and predate this table; `tokens` and
 # `dispatches` are the ceilings Phase 5 adds. Each key gets its own
@@ -299,6 +299,13 @@ def validate_contract(contract: Any, task_id: str | None = None) -> dict[str, An
         # Optional and absent means no review, so every contract written
         # before this key existed keeps its Phase 1 behaviour exactly.
         raise _error("$.review", "must be true or false")
+    if "waiver" in data:
+        # Optional, and the reason an operator gives for declining review
+        # on high-risk work. It only informs the review queue; the gate
+        # rule is unchanged, so a contract without it behaves exactly as
+        # before and one with it must at least say something.
+        if not isinstance(data["waiver"], str) or not data["waiver"].strip():
+            raise _error("$.waiver", "must be a non-empty string")
     return data
 
 

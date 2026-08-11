@@ -11,6 +11,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -173,8 +174,8 @@ def launch_alive(attempt: Path) -> bool:
     return isinstance(pid, int) and process_start_time(pid) == start
 
 
-def parse_run_flags(flags: list[str]) -> tuple[bool, bool, list[str]]:
-    local = {"--allow-dirty-baseline", "--accept-changed-worktree"}
+def parse_run_flags(flags: list[str]) -> tuple[bool, bool, bool, list[str]]:
+    local = {"--allow-dirty-baseline", "--accept-changed-worktree", "--base"}
     forwarded: list[str] = []
     index = 0
     while index < len(flags):
@@ -197,7 +198,12 @@ def parse_run_flags(flags: list[str]) -> tuple[bool, bool, list[str]]:
             index += 1
             continue
         raise LedgerError(f"invalid run argument: {flag}")
-    return "--allow-dirty-baseline" in flags, "--accept-changed-worktree" in flags, forwarded
+    return (
+        "--allow-dirty-baseline" in flags,
+        "--accept-changed-worktree" in flags,
+        "--base" in flags,
+        forwarded,
+    )
 
 
 def current(store: Path, task_id: str) -> tuple[list[dict], str]:
@@ -521,11 +527,14 @@ def complete_dispatch(
     if next_state == "IMPLEMENTED":
         patch = attempt.parent / "change.patch"
         _atomic_write(patch, git(worktree, "diff", f"{base}..{commit}").stdout.encode(), 0o600)
-        lines = git(worktree, "diff", "--name-status", f"{base}..{commit}").stdout.splitlines()
-        files = [{"path": x.split("\t", 1)[-1], "status": x.split("\t", 1)[0]} for x in lines]
-        include, exclude = contract["scope"]["include"], contract["scope"]["exclude"]
-        out = [x["path"] for x in files if not any(x["path"] == p or x["path"].startswith(p + "/") for p in include) or any(x["path"] == p or x["path"].startswith(p + "/") for p in exclude)]
-        diff = {"files": files, "stat": git(worktree, "diff", "--stat", f"{base}..{commit}").stdout, "patch": rel(root, patch)}
+        # The same rename-aware parse the gate uses, so a rename out of
+        # scope is recorded here exactly as the gate will treat it.
+        files = [
+            {"path": path, "status": status}
+            for status, path in changed_paths(worktree, base, commit)
+        ]
+        out = out_of_scope_paths(worktree, base, commit, contract["scope"])
+        diff = {"files": files, "stat": git(worktree, "diff", "--stat", f"{base}..{commit}").stdout, "patch": rel(root, patch), "out_of_scope_algo": OUT_OF_SCOPE_ALGO}
     else:
         out = []
     packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": attempt_entries(attempt, receipt), "diff": diff, "out_of_scope": out, "usage": spend, "worker_claim": (attempt / "result.txt").read_text()}
@@ -654,22 +663,36 @@ def repeated_review(records: list[dict]) -> dict | None:
 
 
 def blocking_ledger(records: list[dict]) -> tuple[dict[str, dict], set[str]]:
-    """Every finding ever recorded blocking, and those since resolved.
+    """Every finding ever recorded blocking, and those currently resolved.
 
     The gate reads this rather than a review's verdict. Anchoring on the
     latest verdict would let one rework round shed a finding: a blind
     second reviewer is never told the first objection existed, returns
     clean, and the task merges with nothing resolved.
+
+    Order matters, and a flat resolved-set got it wrong: an identifier
+    resolved once and then raised blocking again is open again. Reading
+    the records in order and letting the last event for each identifier
+    win stops a resolution from permanently masking a later re-raise of
+    the same id, which would otherwise carry an unaddressed defect
+    straight through the gate.
     """
     raised: dict[str, dict] = {}
-    resolved: set[str] = set()
+    open_now: set[str] = set()
     for record in records:
+        # Resolutions first, then raises, so a raise in the same record
+        # always wins: were the order reversed, a review resolving a
+        # carried id while raising the same id afresh would cancel its
+        # own new finding. The validator also forbids that overlap, so
+        # this is defence in depth for any record written before it.
+        for entry in record.get("resolutions", []):
+            open_now.discard(entry["id"])
         review = record.get("review")
         if review:
             for finding in review.get("blocking", []):
-                raised.setdefault(finding["id"], finding)
-        for entry in record.get("resolutions", []):
-            resolved.add(entry["id"])
+                raised[finding["id"]] = finding
+                open_now.add(finding["id"])
+    resolved = set(raised) - open_now
     return raised, resolved
 
 
@@ -839,6 +862,193 @@ def normalise_scope(path: str) -> str:
     """A scope entry reduced to the form the overlap test compares."""
     cleaned = os.path.normpath(path.strip())
     return "" if cleaned in {".", "/", ""} else cleaned.lstrip("./")
+
+
+def base_evidence_path(root: Path, task_id: str, sequence: int) -> Path:
+    return root / ".orrery" / "evidence" / task_id / f"base-{sequence}.json"
+
+
+def run_base_verification(
+    root: Path, task_id: str, sequence: int, contract: dict, base: str, digest: str
+) -> None:
+    """Run each acceptance criterion at the base commit, before the change.
+
+    The behavioural diff the review queue shows needs the pre-change
+    outcome of every criterion, so this is opt-in via `run --base` and
+    doubles verification cost. Three rules keep it safe: it runs in a
+    detached throwaway worktree pinned to the exact base, not the task
+    branch, which a retry would have left holding a prior implementation;
+    it uses the one contained verifier, so base code has no more
+    authority than result verification, and a containment-unavailable 125
+    or a timeout 124 becomes "unavailable" rather than a failure; and it
+    writes a separate artefact and an IN_PROGRESS self-loop, changing no
+    task state, so a base failure is expected and the result packet the
+    merge gate protects is never touched.
+    """
+    holder = Path(tempfile.mkdtemp(prefix="orrery-base."))
+    base_tree = holder / "tree"
+    outcomes: list[dict] = []
+    try:
+        added = git(root, "worktree", "add", "--detach", "--quiet", str(base_tree), base)
+        if added.returncode:
+            raise LedgerError(f"could not create a base worktree: {added.stderr.strip()}")
+        head = git(base_tree, "rev-parse", "HEAD").stdout.strip()
+        if head != base:
+            raise LedgerError(f"base worktree is at {head}, not the base {base}")
+        for criterion in contract["acceptance_criteria"]:
+            workdir = (base_tree / criterion["verification"].get("workdir", "")).resolve()
+            if workdir != base_tree.resolve() and base_tree.resolve() not in workdir.parents:
+                outcomes.append({"criterion": criterion["id"], "state": "unavailable",
+                                 "detail": "workdir outside the base worktree"})
+                continue
+            started = time.monotonic()
+            status, _output = run_verification(criterion["verification"]["command"], workdir)
+            duration = round(time.monotonic() - started, 3)
+            clean = git(base_tree, "status", "--porcelain").stdout == ""
+            unchanged = git(base_tree, "rev-parse", "HEAD").stdout.strip() == base
+            if status in (124, 125) or not clean or not unchanged:
+                # A timeout, a containment refusal, or a criterion that
+                # mutated the tree is not a measurement of the base: the
+                # comparison is unavailable, never "base failed". A
+                # mutation that raced a timeout is caught here too, since
+                # both conditions are checked together.
+                state = "unavailable"
+            else:
+                state = "pass" if status == 0 else "fail"
+            outcomes.append({"criterion": criterion["id"], "state": state,
+                             "exit_status": status, "duration_seconds": duration})
+            # Restore a pristine base before the next criterion, and stop
+            # if that cannot be done. `-x` removes ignored files too,
+            # which a `status` check does not see, and a criterion that
+            # left a non-removable directory would otherwise contaminate
+            # the rest silently; the remaining criteria are then recorded
+            # unavailable rather than measured against contaminated state.
+            reset = git(base_tree, "reset", "--hard", base)
+            cleaned = git(base_tree, "clean", "-fdx")
+            if reset.returncode or cleaned.returncode:
+                for later in contract["acceptance_criteria"][len(outcomes):]:
+                    outcomes.append({"criterion": later["id"], "state": "unavailable",
+                                     "detail": "base worktree could not be reset for this criterion"})
+                break
+    finally:
+        try:
+            removed = git(root, "worktree", "remove", "--force", str(base_tree))
+            if removed.returncode:
+                print(f"orrery-task: base worktree not fully removed: {base_tree}",
+                      file=sys.stderr)
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+
+    evidence = {"v": 1, "task_id": task_id, "dispatch_seq": sequence,
+                "base_commit": base, "contract_digest": digest,
+                "verification": outcomes}
+    path = base_evidence_path(root, task_id, sequence)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _atomic_write(path, (json.dumps(evidence, indent=2) + "\n").encode(), 0o600)
+    ev_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with control_lock(root) as locked:
+        # A self-loop, already legal, so no new state is introduced and
+        # the record is anchored to a dispatch without changing its flow.
+        append_record(locked, task_id, {
+            "from": "IN_PROGRESS", "to": "IN_PROGRESS", "actor": "runner",
+            "reason": "base-verification", "contract_digest": digest,
+            "base_evidence": rel(root, path), "base_evidence_sha256": ev_digest,
+            "base_commit": base, "dispatch_seq": sequence,
+        })
+
+
+def advance_passed_review(locked: Path, task_id: str) -> bool:
+    """Walk a cleanly-reviewed task from REVIEW_PASSED to the gate.
+
+    REVIEW_PASSED was a dead end: merge accepts only AWAITING_MERGE and
+    no command performed the step, so a review-requesting task that
+    passed review could never merge. Mirrors how verification walks
+    VERIFICATION_PASSED to AWAITING_MERGE, carrying the same verified
+    evidence so the gate's evidence checks still resolve to it. Called
+    from review on a clean pass and defensively from merge, so a task
+    stranded by a crash between appends or by a version predating this
+    repair is still recoverable. Returns whether it advanced.
+    """
+    records, state = current(locked, task_id)
+    if state != "REVIEW_PASSED":
+        return False
+    verified = next(
+        (r for r in reversed(records) if r.get("to") == "VERIFICATION_PASSED"),
+        None,
+    )
+    if verified is None or not verified.get("evidence"):
+        raise LedgerError("cannot merge a passed review with no verified evidence")
+    append_record(locked, task_id, {
+        "from": "REVIEW_PASSED",
+        "to": "AWAITING_MERGE",
+        "actor": "runner",
+        "reason": "review-passed",
+        "contract_digest": records[-1]["contract_digest"],
+        "evidence": verified["evidence"],
+        "evidence_sha256": verified.get("evidence_sha256"),
+    })
+    return True
+
+
+def changed_paths(cwd: Path, base: str, commit: str) -> list[tuple[str, str]]:
+    """Every path a commit range touched, with its status, rename-aware.
+
+    Parsed from `--name-status -z`, because a rename or copy carries both
+    its source and its destination and the tab-splitting form kept only
+    one of them: a rename out of a held path went unnoticed. Both paths
+    are returned so a caller sees the destination as well as the source.
+    """
+    raw = git(cwd, "diff", "--name-status", "-z", f"{base}..{commit}").stdout
+    fields = [field for field in raw.split("\0") if field]
+    entries: list[tuple[str, str]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        following = 2 if status[:1] in {"R", "C"} else 1
+        for path in fields[index + 1 : index + 1 + following]:
+            entries.append((status, path))
+        index += 1 + following
+    return entries
+
+
+def out_of_scope_paths(cwd: Path, base: str, commit: str, scope: dict) -> list[str]:
+    """The changed paths a contract's scope does not permit.
+
+    The single authority for this question, used by the packet producer,
+    the merge gate, and the review queue alike, so the packet cannot
+    record one answer while the gate enforces another.
+    """
+    include, exclude = scope["include"], scope["exclude"]
+    return [
+        path
+        for _status, path in changed_paths(cwd, base, commit)
+        if not any(paths_overlap(path, entry) for entry in include)
+        or any(paths_overlap(path, entry) for entry in exclude)
+    ]
+
+
+# Names the algorithm behind a packet's stored out_of_scope field, so a
+# reader can tell a current packet from one written by the legacy
+# tab-splitting producer that missed renames out of scope.
+OUT_OF_SCOPE_ALGO = "z-rename-v1"
+
+
+def accept_out_of_scope(flags: list[str]) -> tuple[bool, str | None]:
+    """Whether the operator accepted out-of-scope changes, and why.
+
+    The bare `--accept-out-of-scope` stays valid and records no reason,
+    so the documented command and its test are unbroken;
+    `--accept-out-of-scope=<reason>` supplies one. The reason is bound to
+    the accepted path set in the merge record, so the queue can show a
+    genuine disagreement rather than the mere presence of the flag.
+    """
+    for flag in flags:
+        if flag == "--accept-out-of-scope":
+            return True, None
+        if flag.startswith("--accept-out-of-scope="):
+            reason = flag.split("=", 1)[1].strip()
+            return True, reason or None
+    return False, None
 
 
 def paths_overlap(one: str, other: str) -> bool:
@@ -1180,19 +1390,23 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     ]
     # What is still open once this review is counted, stored so the
     # unproductive-loop stop can compare two reviews directly instead of
-    # replaying the ledger prefix that produced each of them.
+    # replaying the ledger prefix that produced each of them. A newly
+    # raised id is never cleared by a resolution in the same review, so a
+    # resolution for an id also raised here does not subtract it.
+    blocking_ids = {finding["id"] for finding in blocking}
     projected = sorted(
         (
             {finding["id"] for finding in unresolved_blocking(records)}
-            | {finding["id"] for finding in blocking}
+            | blocking_ids
         )
-        - {entry["id"] for entry in resolutions}
+        - ({entry["id"] for entry in resolutions} - blocking_ids)
     )
     review_spend = review_rounds_spend(attempt)
+    passed = not (blocking or still_present)
     with control_lock(root) as locked:
         append_record(locked, task_id, {
             "from": current(locked, task_id)[1],
-            "to": "REVIEW_BLOCKED" if blocking or still_present else "REVIEW_PASSED",
+            "to": "REVIEW_PASSED" if passed else "REVIEW_BLOCKED",
             "actor": "runner",
             "contract_digest": digest,
             "spend": review_spend,
@@ -1209,6 +1423,12 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
             },
             "resolutions": resolutions,
         })
+        # A clean review walks to the gate. Convenience only: the same
+        # step is performed defensively by merge, so a task stranded in
+        # REVIEW_PASSED here (a crash between the two appends, or a task
+        # left there before this repair existed) is still rescued.
+        if passed:
+            advance_passed_review(locked, task_id)
     print(orrery_findings.render_review(stored))
     remaining = unresolved_blocking(current(store, task_id)[0])
     return 1 if remaining else 0
@@ -1229,7 +1449,7 @@ Review packet for {task_id}:
 """
 
 def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
-    allow_dirty, accept_changed, forwarded = parse_run_flags(flags)
+    allow_dirty, accept_changed, want_base, forwarded = parse_run_flags(flags)
     store = root / ".orrery"
     tracked = git(root, "ls-files", ".orrery").stdout.strip()
     if tracked:
@@ -1472,6 +1692,11 @@ def dispatch(root: Path, task_id: str, flags: list[str]) -> int:
                 "contract_digest": digest,
             },
         )
+    # The base comparison, if asked for, runs before the delegate: the
+    # base is the pre-change state, captured in its own worktree so the
+    # delegate's worktree is untouched.
+    if want_base:
+        run_base_verification(root, task_id, sequence, contract, base, digest)
     command = [
         sys.executable,
         str(Path(__file__).with_name("orrery-review")),
@@ -1974,6 +2199,14 @@ def merge_task(root: Path, task_id: str, flags: list[str], attempts: int = 3) ->
 def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
     store = root / ".orrery"
     records, state = current(store, task_id)
+    # A cleanly-reviewed task may be stranded in REVIEW_PASSED: the
+    # review's own advance can be lost to a crash between two appends, or
+    # the task may predate that repair. Merge completes the step rather
+    # than refusing work whose review already passed.
+    if state == "REVIEW_PASSED":
+        with control_lock(root) as locked:
+            advance_passed_review(locked, task_id)
+        records, state = current(store, task_id)
     if state != "AWAITING_MERGE":
         raise LedgerError(f"task {task_id} is {state}; merge requires AWAITING_MERGE")
     substantive = next(
@@ -2020,7 +2253,14 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
             # the breach is recorded and reported rather than swallowed,
             # and the reconciliation completes.
             breach = risk_review_refusal(reconcile_contract)
-            record = {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "contract_digest": records[-1]["contract_digest"], "integration": verified_integration}
+            # The accepted out-of-scope set and the operator's reason, so
+            # a promotion completed here records the same disagreement a
+            # non-reconciled merge would. The paths are recomputed from
+            # the landed range; the reason is taken from this merge call's
+            # own flags, which is where a re-run operator supplies it.
+            reconciled_out = _merged_out_of_scope(root, records, reconcile_contract)
+            _accepted, reconciled_reason = accept_out_of_scope(flags)
+            record = {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "reason": "reconciled", "merge_commit": landed, "out_of_scope": reconciled_out, "out_of_scope_reason": reconciled_reason, "contract_digest": records[-1]["contract_digest"], "integration": verified_integration}
             if breach:
                 record["risk_breach"] = breach
             with control_lock(root) as locked:
@@ -2077,25 +2317,10 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
     if not implemented:
         raise LedgerError("implemented commit is missing")
     commit = implemented["commit"]
-    # -z, because a rename carries both its source and destination and the
-    # tab-splitting form kept only one of them: a rename out of a held path
-    # would have gone unnoticed.
-    raw = git(root, "diff", "--name-status", "-z", f"{base}..{commit}").stdout
-    fields = [field for field in raw.split("\0") if field]
-    changed: list[str] = []
-    index = 0
-    while index < len(fields):
-        status = fields[index]
-        following = 2 if status[:1] in {"R", "C"} else 1
-        changed.extend(fields[index + 1: index + 1 + following])
-        index += 1 + following
-    include, exclude = contract["scope"]["include"], contract["scope"]["exclude"]
-    out = [
-        path for path in changed
-        if not any(paths_overlap(path, entry) for entry in include)
-        or any(paths_overlap(path, entry) for entry in exclude)
-    ]
-    if out and "--accept-out-of-scope" not in flags:
+    # The one authority, shared with the packet producer and the queue.
+    out = out_of_scope_paths(root, base, commit, contract["scope"])
+    accepted, accept_reason = accept_out_of_scope(flags)
+    if out and not accepted:
         raise LedgerError("evidence has out-of-scope changes; use --accept-out-of-scope")
     if out:
         # The override is the operator's to give, but it cannot be given
@@ -2303,7 +2528,7 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
                     f"the target ref advanced to {result_commit[:12]} but its "
                     f"worktree could not be synchronised: {synchronised.stderr.strip()}"
                 )
-            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": result_commit, "accepted_out_of_scope": "--accept-out-of-scope" in flags, "contract_digest": digest, "evidence": evidence, "integration": {**integration, "outcome": "verified"}})
+            append_record(locked, task_id, {"from": "AWAITING_MERGE", "to": "MERGED", "actor": "user", "merge_commit": result_commit, "accepted_out_of_scope": accepted, "out_of_scope": out, "out_of_scope_reason": accept_reason, "contract_digest": digest, "evidence": evidence, "integration": {**integration, "outcome": "verified"}})
         return 0
     finally:
         if scratch is not None and scratch.exists():
@@ -2391,6 +2616,499 @@ def cancel_task(root: Path, task_id: str, flags: list[str]) -> int:
     return 0
 
 
+# Every state in which a task waits on a person rather than a running
+# process. NEW, DISPATCHED, IN_PROGRESS, IMPLEMENTED and
+# VERIFICATION_PASSED are transient or running; the terminal states are
+# done; a READY task is queued only when a ceiling stopped it.
+QUEUED_STATES = frozenset({
+    "REVIEW_BLOCKED", "VERIFICATION_FAILED", "DISPATCH_FAILED", "NO_CHANGE",
+    "IN_REVIEW", "REVIEW_PASSED", "AWAITING_MERGE", "INTERRUPTED",
+})
+
+
+def _task_number(task_id: str) -> int:
+    try:
+        return int(task_id.split("-", 1)[1])
+    except (IndexError, ValueError):
+        return 1 << 30
+
+
+def current_dispatch_slice(records: list[dict]) -> tuple[list[dict], int | None]:
+    """The records belonging to the latest dispatch, and its sequence.
+
+    Everything from the most recent DISPATCHED record onward is one
+    dispatch's lifecycle. Scoping evidence, commit and base-evidence to
+    this slice stops the queue pairing artefacts from different
+    dispatches: after a retry with `--base` that then failed, the latest
+    base record and the latest packet belong to different attempts, and
+    presenting one as the other's comparison would be a lie.
+    """
+    for index in range(len(records) - 1, -1, -1):
+        if "dispatch" in records[index]:
+            return records[index:], records[index]["dispatch"].get("seq")
+    return records, None
+
+
+def verify_latest_evidence(root: Path, records: list[dict]) -> tuple[bool, str | None]:
+    """Whether the task's latest evidence packet still matches its digest.
+
+    The same check the merge gate makes, so the queue and brief never
+    present a packet whose bytes no longer match what verification
+    recorded. Returns (ok, evidence_path); ok is True when no packet is
+    referenced yet, because there is then nothing to mistrust.
+    """
+    evidence = next((r.get("evidence") for r in reversed(records) if r.get("evidence")), None)
+    if not evidence:
+        return True, None
+    verified = next((r for r in reversed(records) if r.get("to") == "VERIFICATION_PASSED"), None)
+    if not verified or verified.get("evidence") != evidence:
+        return False, evidence
+    try:
+        actual = evidence_digest(root, evidence)
+    except OSError:
+        return False, evidence
+    return verified.get("evidence_sha256") == actual, evidence
+
+
+def queue_situation(root: Path, store: Path, task_id: str) -> dict | None:
+    """One task's queue standing, or None if it awaits no human decision.
+
+    Every ranking input is recomputed from the ledger, the contract and
+    the commit range rather than read from the packet, so a tampered
+    packet cannot reorder the queue. The packet's digest is still checked
+    and surfaced, because the brief cites it.
+    """
+    records, torn, _boundary = read_ledger(store, task_id)
+    number = _task_number(task_id)
+    unreadable_key = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, number)
+    if torn or not records:
+        return {
+            "task_id": task_id, "state": "TORN" if torn else "EMPTY", "torn": True,
+            "reasons": ["ledger cannot be read; run status --repair"], "depends_on": [],
+            "key": unreadable_key,
+        }
+    state = records[-1]["to"]
+    try:
+        contract = load_contract(store, task_id)
+    except LedgerError:
+        contract = None
+    if state == "READY":
+        # A READY task whose own contract cannot be read is broken, not
+        # merely ready, and is surfaced rather than hidden.
+        if contract is None:
+            return {
+                "task_id": task_id, "state": "READY", "torn": True,
+                "reasons": ["contract cannot be read; the task cannot run"],
+                "depends_on": [], "key": unreadable_key,
+            }
+        # Only a ceiling-stopped READY awaits a human; a READY merely
+        # waiting on another task's scope proceeds on its own and is not
+        # a decision. Read from this task's own contract and ledger, not
+        # a global scan another task's torn ledger could break.
+        if not budget_conflict(contract, records):
+            return None
+    elif state not in QUEUED_STATES:
+        return None
+
+    unresolved = [f["id"] for f in unresolved_blocking(records)]
+    high_risk = bool(contract and (contract.get("risk") or {}).get("level") == "high")
+    integration_failed = any(
+        r.get("integration", {}).get("outcome") not in (None, "verified")
+        for r in records
+    )
+    verification_bad = state == "VERIFICATION_FAILED"
+    slice_records, _seq = current_dispatch_slice(records)
+    out: list[str] = []
+    diff_files = 0
+    if contract:
+        dispatched = next((r for r in reversed(slice_records) if "dispatch" in r), None)
+        implemented = next((r for r in reversed(slice_records) if r.get("commit")), None)
+        if dispatched and implemented:
+            base, commit = dispatched["gate"]["base_head"], implemented["commit"]
+            try:
+                out = out_of_scope_paths(root, base, commit, contract["scope"])
+                diff_files = len(changed_paths(root, base, commit))
+            except (OSError, KeyError):
+                out, diff_files = [], 0
+    spend = spend_so_far(records)
+    # Scoped to the current dispatch, so a stale packet from a prior
+    # attempt is not read as this one's evidence.
+    evidence_ok, _evidence = verify_latest_evidence(root, slice_records)
+
+    reasons: list[str] = []
+    if unresolved:
+        reasons.append(f"{len(unresolved)} unresolved blocking finding(s): {', '.join(unresolved)}")
+    if out:
+        reasons.append(f"{len(out)} change(s) out of scope, awaiting acceptance")
+    if high_risk:
+        reasons.append("declared high risk")
+    if integration_failed:
+        reasons.append("a prior integration failed")
+    if verification_bad:
+        reasons.append("verification failed")
+    reasons.append({
+        "REVIEW_BLOCKED": "review blocked; resolve or rework",
+        "VERIFICATION_FAILED": "verification failed; rework or cancel",
+        "DISPATCH_FAILED": "dispatch failed; retry or cancel",
+        "NO_CHANGE": "the delegate changed nothing; close or re-dispatch",
+        "IN_REVIEW": "awaiting review; run `orrery-task review`",
+        "REVIEW_PASSED": "review passed; ready for merge",
+        "AWAITING_MERGE": "awaiting the merge decision",
+        "INTERRUPTED": "interrupted; resume or investigate",
+        "READY": "stopped by a ceiling; amend the budget or override",
+    }.get(state, state))
+    if not evidence_ok:
+        reasons.append("evidence unverified: its packet does not match the recorded digest")
+
+    key = (
+        1,
+        0 if unresolved else 1, -len(unresolved),
+        0 if out else 1, -len(out),
+        0 if high_risk else 1,
+        0 if integration_failed else 1,
+        0 if verification_bad else 1,
+        -diff_files,
+        0 if spend["unknown"] else 1, -spend["total"],
+        number,
+    )
+    return {
+        "task_id": task_id, "state": state, "torn": False,
+        "unresolved": unresolved, "out_of_scope": out, "high_risk": high_risk,
+        "integration_failed": integration_failed, "verification_bad": verification_bad,
+        "diff_files": diff_files, "spend_total": spend["total"],
+        "spend_unknown": bool(spend["unknown"]), "evidence_verified": evidence_ok,
+        "depends_on": (contract or {}).get("depends_on", []) if contract else [],
+        "reasons": reasons, "key": key,
+    }
+
+
+def grouped_queue(entries: list[dict]) -> list[dict]:
+    """The queue ordered most serious first, related tasks kept together.
+
+    A flat total order by key is the foundation; grouping is a stable
+    reordering over it, so it can never contradict most-serious-first.
+    Tasks joined by a dependency edge form a component ranked by its most
+    serious member; within a component a dependency precedes its
+    dependent, ties falling through to the same key. A malformed graph
+    falls back to the flat order rather than failing.
+    """
+    by_id = {e["task_id"]: e for e in entries}
+    parent = {e["task_id"]: e["task_id"] for e in entries}
+
+    def find(node: str) -> str:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for entry in entries:
+        for dep in entry.get("depends_on", []):
+            if dep in parent:
+                parent[find(entry["task_id"])] = find(dep)
+
+    components: dict[str, list[dict]] = {}
+    for entry in entries:
+        components.setdefault(find(entry["task_id"]), []).append(entry)
+
+    ordered: list[dict] = []
+    for members in sorted(components.values(), key=lambda group: min(e["key"] for e in group)):
+        ordered.extend(_topological(members, by_id))
+    return ordered
+
+
+def _topological(members: list[dict], by_id: dict) -> list[dict]:
+    """Members with dependencies first, ties broken by seriousness."""
+    ids = {e["task_id"] for e in members}
+    remaining = sorted(members, key=lambda e: e["key"])
+    result: list[dict] = []
+    placed: set[str] = set()
+    while remaining:
+        ready = [
+            e for e in remaining
+            if all(dep not in ids or dep in placed for dep in e.get("depends_on", []))
+        ]
+        if not ready:
+            # A cycle should be impossible (the graph is validated
+            # acyclic at seal), but never spin on one.
+            result.extend(remaining)
+            break
+        chosen = ready[0]
+        result.append(chosen)
+        placed.add(chosen["task_id"])
+        remaining.remove(chosen)
+    return result
+
+
+def _comparison_label(base_state: str, result_state: str) -> str:
+    if "unavailable" in (base_state, result_state):
+        return "comparison unavailable"
+    if result_state == "not run":
+        return "result not run"
+    if base_state == "not run":
+        return "base not run"
+    return {
+        ("fail", "pass"): "newly satisfied",
+        ("pass", "fail"): "regressed",
+        ("pass", "pass"): "unchanged",
+        ("fail", "fail"): "still failing",
+    }.get((base_state, result_state), "unclear")
+
+
+def _result_state(exit_status) -> str:
+    if exit_status in (124, 125):
+        return "unavailable"
+    return "pass" if exit_status == 0 else "fail"
+
+
+def base_comparison(base_evidence: dict, packet: dict, criteria: list[str]) -> list[tuple]:
+    base_by = {o["criterion"]: o.get("state", "unavailable") for o in base_evidence.get("verification", [])}
+    result_by = {o["criterion"]: _result_state(o.get("exit_status")) for o in packet.get("verification", [])}
+    rows = []
+    for cid in criteria:
+        base_state = base_by.get(cid, "not run")
+        result_state = result_by.get(cid, "not run")
+        rows.append((cid, base_state, result_state, _comparison_label(base_state, result_state)))
+    return rows
+
+
+def queue_brief(root: Path, store: Path, task_id: str) -> int:
+    """One task's evidence summary, every element citing its artefact.
+
+    A route into the evidence, not a replacement for it: each cited
+    packet or review is verified against its ledger-recorded digest and a
+    mismatch is reported as unresolved, so tampered evidence is never
+    summarised as trusted support. Provider-authored text passes through
+    the same filter every provider string does. Exits 1 when any cited
+    artefact fails its digest, 2 when the task does not exist.
+    """
+    if not (store / "ledger" / f"{task_id}.jsonl").exists():
+        print(f"orrery-task: no such task: {task_id}", file=sys.stderr)
+        return 2
+    records, torn, _boundary = read_ledger(store, task_id)
+    inert = orrery_findings.sanitise_provider_text
+    unresolved_evidence: list[str] = []
+    state = records[-1]["to"]
+    print(f"{task_id}  {state}{'  (ledger torn)' if torn else ''}")
+    try:
+        contract = load_contract(store, task_id)
+    except LedgerError:
+        contract = None
+    if contract:
+        print(f"  goal: {contract['goal'].splitlines()[0][:100]}")
+
+    # Everything about the change is scoped to the current dispatch, so
+    # a retry cannot pair this attempt's base run with a prior attempt's
+    # packet.
+    slice_records, _seq = current_dispatch_slice(records)
+    evidence_ok, evidence = verify_latest_evidence(root, slice_records)
+    packet = None
+    if evidence and evidence_ok:
+        try:
+            packet = json.loads((root / evidence).read_text())
+        except (OSError, json.JSONDecodeError):
+            evidence_ok = False
+    if evidence and not evidence_ok:
+        unresolved_evidence.append(f"evidence packet {evidence}")
+
+    print("\n  what changed")
+    if packet and packet.get("diff"):
+        files = packet["diff"].get("files", [])
+        print(f"    {len(files)} file(s) changed [from {evidence}]")
+        for entry in files[:20]:
+            # A committed filename is delegate-controlled, so it is
+            # rendered inert like every other provider string: a path
+            # holding an escape or an Orrery marker could otherwise
+            # clear the screen or spoof control output from a
+            # digest-valid brief.
+            print(f"      {entry.get('status', '?'):3} {inert(str(entry.get('path', '?')))}")
+        if packet["diff"].get("out_of_scope_algo") != OUT_OF_SCOPE_ALGO:
+            print("      (packet predates the shared out-of-scope computation; recomputed below)")
+    else:
+        print("    not recorded" if evidence_ok else "    packet unavailable (digest mismatch)")
+
+    dispatched = next((r for r in reversed(slice_records) if "dispatch" in r), None)
+    implemented = next((r for r in reversed(slice_records) if r.get("commit")), None)
+    if contract and dispatched and implemented:
+        base, commit = dispatched["gate"]["base_head"], implemented["commit"]
+        out = out_of_scope_paths(root, base, commit, contract["scope"])
+        shown = ", ".join(inert(path) for path in out) if out else "none"
+        print(f"    out of scope, recomputed authoritatively: {shown}")
+
+    print("\n  verification")
+    if packet and packet.get("verification"):
+        for outcome in packet["verification"]:
+            mark = "pass" if outcome.get("exit_status") == 0 else f"exit {outcome.get('exit_status')}"
+            print(f"    {outcome['criterion']}: {mark} [from {evidence}]")
+    else:
+        print("    not recorded")
+
+    base_record = next((r for r in reversed(slice_records) if r.get("reason") == "base-verification"), None)
+    print("\n  behavioural diff")
+    if base_record and contract:
+        base_path = base_record.get("base_evidence")
+        try:
+            raw = (root / base_path).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != base_record.get("base_evidence_sha256"):
+                raise ValueError
+            base_evidence = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError):
+            unresolved_evidence.append(f"base evidence {base_path}")
+            base_evidence = None
+        if base_evidence and packet:
+            criteria = [c["id"] for c in contract["acceptance_criteria"]]
+            for cid, b, r, verdict in base_comparison(base_evidence, packet, criteria):
+                # Cites both sides, because the comparison reads both.
+                print(f"    {cid}: {verdict} (base {b}, result {r}) [base {base_path}, result {evidence}]")
+        elif base_evidence:
+            print(f"    base recorded but the result packet is unavailable [from {base_path}]")
+    else:
+        print("    not run (dispatch with `run --base` to record one)")
+
+    # Every referenced review is verified, not only the latest: an older
+    # review whose digest fails must be surfaced, or a tampered earlier
+    # document could make a withdrawal it recorded silently disappear
+    # while the brief still exits 0.
+    review_records = [r["review"] for r in records if r.get("review") and r["review"].get("sha256")]
+    for review in review_records:
+        if _verified_review_document(root, store, task_id, review.get("seq"), review["sha256"]) is None:
+            unresolved_evidence.append(f"review document {task_id} seq {review.get('seq')}")
+
+    print("\n  review")
+    if review_records:
+        latest = review_records[-1]
+        print(f"    verdict: {latest.get('verdict')}, "
+              f"{len(latest.get('blocking', []))} blocking, {latest.get('advisory', 0)} advisory "
+              f"[from review seq {latest.get('seq')}]")
+        for finding in unresolved_blocking(records):
+            print(f"    unresolved: {finding['id']} {inert(finding.get('statement', ''))[:100]}")
+        review_doc = _verified_review_document(root, store, task_id, latest.get("seq"), latest["sha256"])
+        for finding in (review_doc or {}).get("findings", []):
+            if finding.get("confidence") is not None:
+                print(f"    {finding['id']} reviewer confidence (uncalibrated self-report): "
+                      f"{finding['confidence']} [from review seq {latest.get('seq')}]")
+    else:
+        print("    no review recorded")
+
+    disagreements = collect_disagreements(root, store, task_id, records, contract, inert)
+    print("\n  disagreements and waivers")
+    if disagreements:
+        for line in disagreements:
+            print(f"    {line}")
+    else:
+        print("    none recorded")
+
+    spend = spend_so_far(records)
+    print("\n  cost")
+    print(f"    {spend['total']:,} token(s) attributed" + (", some spend unknown" if spend["unknown"] else ""))
+
+    if unresolved_evidence:
+        print("\n  unresolved evidence (cited but unverifiable):", file=sys.stderr)
+        for item in unresolved_evidence:
+            print(f"    {item}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _verified_review_document(root: Path, store: Path, task_id: str, seq, sha: str) -> dict | None:
+    path = store / "reviews" / task_id / str(seq) / "review.json"
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if hashlib.sha256(json.dumps(document, sort_keys=True).encode()).hexdigest() != sha:
+        return None
+    return document
+
+
+def _merged_out_of_scope(root: Path, records: list[dict], contract: dict | None) -> list[str]:
+    """The genuine out-of-scope paths of a merged change, recomputed."""
+    if not contract:
+        return []
+    dispatched = next((r for r in reversed(records) if "dispatch" in r), None)
+    implemented = next((r for r in reversed(records) if r.get("commit")), None)
+    if not (dispatched and implemented):
+        return []
+    try:
+        return out_of_scope_paths(
+            root, dispatched["gate"]["base_head"], implemented["commit"], contract["scope"]
+        )
+    except (OSError, KeyError):
+        return []
+
+
+def collect_disagreements(root, store, task_id, records, contract, inert) -> list[str]:
+    """Every place a judgement differed or a rule was set aside, with its
+    reason or a note that none was recorded."""
+    lines: list[str] = []
+    for record in records:
+        review = record.get("review")
+        if review and review.get("downgrades"):
+            for entry in review["downgrades"]:
+                lines.append(f"downgrade (reviewer): {entry['id']} - {inert(entry.get('reason', ''))}")
+        if review and review.get("sha256"):
+            document = _verified_review_document(root, store, task_id, review.get("seq"), review["sha256"])
+            for carried in (document or {}).get("carried", []):
+                if carried.get("disposition") == "withdrawn":
+                    reason = carried.get("reason")
+                    lines.append(f"withdrawn (reviewer): {carried['id']} - "
+                                 + (inert(reason) if reason else "reason not recorded"))
+        if record.get("reason") == "LOOP_OVERRIDE":
+            detail = (record.get("override") or {}).get("detail")
+            lines.append("loop override (operator): " + (inert(detail) if detail else "reason not recorded"))
+        if record.get("to") == "MERGED":
+            paths = record.get("out_of_scope")
+            if paths is None and record.get("accepted_out_of_scope"):
+                # A legacy record stored only the flag, not the paths, so
+                # the genuine accepted set is recomputed to tell a real
+                # disagreement from a flag passed when nothing was out of
+                # scope; the reason it never stored is marked absent.
+                paths = _merged_out_of_scope(root, records, contract)
+            if paths:
+                reason = record.get("out_of_scope_reason")
+                lines.append(f"out-of-scope accepted (operator): {len(paths)} path(s) - "
+                             + (inert(reason) if reason else "reason not recorded"))
+    if contract and (contract.get("risk") or {}).get("level") == "high" and contract.get("review") is False:
+        waiver = contract.get("waiver")
+        lines.append("high-risk review waiver (operator): "
+                     + (inert(waiver) if waiver else "reason not recorded"))
+    return lines
+
+
+def command_queue(root: Path, arguments: list[str]) -> int:
+    store = root / ".orrery"
+    if len(arguments) > 1:
+        return usage()
+    if arguments:
+        return queue_brief(root, store, arguments[0])
+    if not store.exists():
+        return 0
+    entries = []
+    for task_id in task_ids(store):
+        try:
+            situation = queue_situation(root, store, task_id)
+        except (LedgerError, OSError, KeyError, ValueError, IndexError) as exc:
+            # One unreadable task must not hide the rest. It is surfaced
+            # rather than dropped, ranked with the torn ledgers because a
+            # task the queue cannot read is exactly what a person needs
+            # to see first.
+            situation = {
+                "task_id": task_id, "state": "UNREADABLE", "torn": True,
+                "reasons": [f"could not be read: {exc}"], "depends_on": [],
+                "key": (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _task_number(task_id)),
+            }
+        if situation is not None:
+            entries.append(situation)
+    if not entries:
+        print("the queue is empty")
+        return 0
+    for entry in grouped_queue(entries):
+        indent = "  " if entry.get("depends_on") else ""
+        print(f"{entry['task_id']:6} {entry['state']:18} {entry['reasons'][0]}")
+        for reason in entry["reasons"][1:]:
+            print(f"       {indent}- {reason}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments:
@@ -2423,6 +3141,8 @@ def main(argv: list[str] | None = None) -> int:
             return close_task(root, arguments.pop(0), arguments)
         if command == "cancel" and arguments:
             return cancel_task(root, arguments.pop(0), arguments)
+        if command == "queue" and len(arguments) <= 1:
+            return command_queue(root, arguments)
         store = root / ".orrery"
         if command == "list" and not arguments:
             if not store.exists():

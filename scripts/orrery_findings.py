@@ -118,11 +118,15 @@ def review_schema(carried_ids: list[str] | None = None) -> dict[str, Any]:
     carried = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["id", "disposition", "evidence"],
+        "required": ["id", "disposition", "evidence", "reason"],
         "properties": {
             "id": {"type": "string", "pattern": _FINDING_ID.pattern},
             "disposition": {"type": "string", "enum": list(DISPOSITIONS)},
             "evidence": {"type": ["array", "null"], "items": evidence, "maxItems": MAX_ITEMS},
+            # Required-and-nullable, like every other optional here. A
+            # withdrawal must give one, enforced by the validator, so a
+            # reviewer cannot retract a finding without saying why.
+            "reason": {"type": ["string", "null"], "maxLength": MAX_PARAGRAPH},
         },
     }
     return {
@@ -344,6 +348,18 @@ def validate_review(
         raise FindingsError("$.verdict is changes_required with no blocking finding")
 
     carried = _carried(document.get("carried"), carried_ids, path_exists)
+
+    # A new finding may not reuse a carried finding's id. Allowing it let
+    # one review resolve carried F-01 while raising a fresh blocking
+    # F-01: the resolution then cancelled the raise in the ledger and an
+    # unaddressed defect reached the gate. An id is either carried in or
+    # newly raised, never both.
+    overlap = {f["id"] for f in accepted} & {c["id"] for c in carried}
+    if overlap:
+        raise FindingsError(
+            f"a new finding reuses a carried id: {', '.join(sorted(overlap))}"
+        )
+
     unable = _string_list(document["unable_to_verify"], "$.unable_to_verify")
 
     blocking = [f for f in accepted if f["severity"] == "blocking"]
@@ -381,7 +397,7 @@ def _carried(
     accounted: list[dict[str, Any]] = []
     for index, entry in enumerate(entries):
         field = f"$.carried[{index}]"
-        _keys(entry, {"id", "disposition", "evidence"}, {"id", "disposition"}, field)
+        _keys(entry, {"id", "disposition", "evidence", "reason"}, {"id", "disposition"}, field)
         identifier = entry["id"]
         if identifier not in carried_ids:
             raise FindingsError(f"{field}.id was not carried into this review")
@@ -398,6 +414,13 @@ def _carried(
         if entry["disposition"] == "resolved" and not _supports_blocking(evidence):
             # "I fixed it" is a claim like any other.
             raise FindingsError(f"{field} claims resolved without evidence")
+        reason = entry.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise FindingsError(f"{field}.reason must be a string or null")
+        if entry["disposition"] == "withdrawn" and not (reason and reason.strip()):
+            # Retracting a finding is a judgement the human reviewing the
+            # queue will see, so it may not be silent.
+            raise FindingsError(f"{field} withdraws a finding without a reason")
         accounted.append({**entry, "evidence": evidence})
     missing = sorted(set(carried_ids) - set(seen))
     if missing:

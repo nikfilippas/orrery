@@ -397,7 +397,14 @@ Review states sit between verification and the gate:
 VERIFICATION_PASSED -> IN_REVIEW | AWAITING_MERGE
 IN_REVIEW           -> REVIEW_PASSED | REVIEW_BLOCKED | INTERRUPTED | CANCELLED
 REVIEW_BLOCKED      -> READY | REVIEW_PASSED | REVIEW_BLOCKED | CANCELLED
+REVIEW_PASSED       -> AWAITING_MERGE
 ```
+
+A clean review walks `REVIEW_PASSED` to `AWAITING_MERGE` and merge
+completes the step defensively, because for a time nothing did: a
+review-requesting task that passed review was stranded, unable to reach
+the only state merge accepts. That repair is why a passed review now
+reaches the gate at all.
 
 A contract without the key behaves exactly as it did before this
 existed.
@@ -462,6 +469,80 @@ contract that actually applied.
 
 A contract that sets no ceilings and does not declare high risk decides
 exactly as it did before any of this existed.
+
+## Review queue
+
+```bash
+orrery-task queue
+orrery-task queue T-1
+orrery-task run T-1 --base
+```
+
+More autonomous agents produce more changes than a person can read one
+raw diff at a time, so the queue draws the scattered evidence of the
+earlier phases into one ranked, summarised view. It decides nothing: it
+ranks and explains, and the human decides.
+
+`orrery-task queue` lists every task awaiting a human decision, most
+serious first. The ordering is fixed and computed from records, never
+learned: a torn ledger first, then unresolved blocking findings, then
+out-of-scope changes awaiting acceptance, declared high risk, a failed
+integration, failed or missing verification, diff size, spend, and the
+task identifier as the always-distinct tie-breaker. Every row prints the
+reason it sits where it does. Related tasks, joined by a `depends_on`
+edge, are grouped and shown dependency-first, a stable reordering over
+the same total order so it can never contradict most-serious-first.
+
+Ranking never trusts the packet's stored fields. Out-of-scope and diff
+size are recomputed from the commit range through the same helper the
+merge gate uses, and spend is the cumulative figure from the ledger, so
+a tampered packet cannot reorder the queue. The packet's own digest is
+still checked and a mismatch is surfaced, because the brief cites it.
+
+`orrery-task queue T-1` prints one task's brief: what changed, what
+verification said, the behavioural diff, what the reviewer said and what
+remains unresolved, the disagreements and waivers, and the cost. Every
+element names the artefact it was read from and verifies that artefact's
+ledger-recorded digest, exactly as a decision verifies its evidence; a
+mismatch is reported as unresolved and the command exits non-zero rather
+than summarising tampered evidence as support. Provider-authored text
+passes through the same filter every provider string does.
+
+### The behavioural diff
+
+`run --base` runs each acceptance criterion at the base commit as well as
+the result, so the brief can say what a change did rather than only what
+it claims. It is opt-in because it doubles verification cost, and it is
+safe by construction: it runs in a detached throwaway worktree pinned to
+the exact base rather than the task branch a retry may have left holding
+a prior implementation; it uses the one contained verifier, so base code
+has no more authority than result verification and a containment-
+unavailable or timed-out criterion reads as "comparison unavailable"
+rather than a failure; and it writes a separate artefact and an
+`IN_PROGRESS` self-loop, changing no task state, so a base failure is
+expected and the result packet the merge gate protects is never touched.
+The brief shows each criterion as newly satisfied, regressed, unchanged,
+still failing, comparison unavailable, or not run.
+
+### Disagreement, confidence, and what is declined
+
+The brief lists every place a judgement differed or a rule was set aside:
+a downgraded finding, a withdrawn finding, a loop override, an accepted
+out-of-scope change, and a high-risk review waiver, each with its actor
+and the reason recorded at the time. Three of those recorded no reason
+before this phase, so the field was added where the reason originates: a
+reviewer's withdrawal reason, required and non-empty in the findings
+schema; the operator's `--accept-out-of-scope=<reason>`, bound to the
+actual accepted path set and still valid bare; and an optional contract
+`waiver`. Anything written earlier shows "reason not recorded" rather
+than an empty space.
+
+Confidence is shown as the reviewer's own uncalibrated self-report, never
+as calibration, which needs ground truth the kit does not have.
+Automatic sampling of repetitive low-risk work is declined for the same
+reason it declines an invented quality score: a contract records no task
+type or cohort, so "repetitive" is not a thing the kit can define, and a
+review queue must never guess which changes are safe to skip.
 
 ## Governed memory
 
