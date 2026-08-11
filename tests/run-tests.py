@@ -12402,6 +12402,19 @@ def run_task(
     *arguments: str,
     environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if environment is None:
+        # A subcommand that verifies (merge integration, a base run)
+        # composes the same containment the delegate does and fails
+        # closed where the host cannot enforce it. The explicit-
+        # environment callers opt into the process-group fallback through
+        # fallback_environment; a default-environment merge has to make
+        # the same choice, or it refuses on a runner that cannot contain
+        # while passing on a developer machine that can. The guarantee
+        # itself is proven by the tests that skip unless
+        # host_enforces_confinement().
+        environment = dict(os.environ)
+        if not host_enforces_confinement():
+            environment.setdefault("ORRERY_ALLOW_UNCONFINED", "1")
     return subprocess.run(
         [sys.executable, str(TASK_SCRIPT), *arguments],
         cwd=directory,
@@ -17150,6 +17163,13 @@ def run_memory(
 ) -> subprocess.CompletedProcess[str]:
     environment = dict(environment or os.environ)
     environment.setdefault("ORRERY_VERIFY_TIMEOUT_SECONDS", "60")
+    if not host_enforces_confinement():
+        # verify composes the delegate's containment and fails closed
+        # without it. Where the host cannot enforce, exercise the
+        # process-group fallback so fact flow and the transaction check
+        # stay covered; the containment guarantee is proven by the tests
+        # that skip unless host_enforces_confinement().
+        environment.setdefault("ORRERY_ALLOW_UNCONFINED", "1")
     return subprocess.run(
         [sys.executable, str(MEMORY_SCRIPT), *arguments],
         cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
