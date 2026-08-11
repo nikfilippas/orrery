@@ -203,6 +203,10 @@ def main() -> int:
     stdin_path = os.environ.get("CODEX_FAKE_STDIN")
     environment_path = os.environ.get("CODEX_FAKE_ENV")
 
+    if sys.argv[1:2] == ["--version"]:
+        print(os.environ.get("CODEX_FAKE_VERSION", "codex-cli 9.9.9"))
+        return 0
+
     if sys.argv[1:3] == ["login", "status"]:
         if os.environ.get("CODEX_FAKE_AUTH", "ready") == "logged-out":
             print("Not logged in")

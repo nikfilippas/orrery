@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A weekly run on a quiet day, so drift in the runner image or the
+  # toolchain surfaces on its own rather than in the middle of a change.
+  schedule:
+    - cron: "17 6 * * 1"
 
 jobs:
   lint:
@@ -13,6 +17,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          # The only pip dependency is the pinned ruff below; key its
+          # wheel cache on this file, which is what pins the version.
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
       # Pinned to the version used for local verification, so a ruff
       # release can never turn a locally green tree red in CI.
       - run: pip install ruff==0.13.3

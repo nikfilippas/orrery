@@ -5,6 +5,8 @@
 
 # Órrery
 
+[![CI](https://github.com/nikfilippas/orrery/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nikfilippas/orrery/actions/workflows/ci.yml)
+
 **One orchestrator, four specialist roles, any model.**
 
 Órrery, pronounced *OR-ər-ee*, is a provider-neutral **agent

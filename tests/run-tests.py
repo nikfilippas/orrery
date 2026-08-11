@@ -10608,6 +10608,44 @@ def test_doctor_claude_version_guard() -> None:
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
+@test("the doctor warns when the Codex CLI drifts from the baseline")
+def test_doctor_codex_version_guard() -> None:
+    environment = review_environment("success")
+    try:
+        drifted = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            "WARN  Codex CLI 9.9.9 differs from the validated baseline"
+            in drifted.stdout,
+            f"no drift warning for a changed CLI: {drifted.stdout[-600:]}",
+        )
+        baseline = runtime_module.VALIDATED_CODEX_CLI
+        environment["CODEX_FAKE_VERSION"] = f"codex-cli {baseline}"
+        matching = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            f"PASS  Codex CLI matches the validated baseline ({baseline})"
+            in matching.stdout,
+            f"the matching CLI did not pass: {matching.stdout[-600:]}",
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
 @test("the doctor lists standing approvals as warnings, never failures")
 def test_doctor_lists_standing() -> None:
     with until_store_only() as state_dir:

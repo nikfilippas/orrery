@@ -380,6 +380,22 @@ while IFS= read -r provider; do
     fi
 done <<< "$CONFIGURED_PROVIDERS"
 
+if command -v codex >/dev/null 2>&1; then
+    VALIDATED_CODEX="$(
+        python3 -c "import sys; sys.path.insert(0, '$KIT_DIR/scripts'); \
+from orrery_runtime import VALIDATED_CODEX_CLI; print(VALIDATED_CODEX_CLI)" \
+            2>/dev/null
+    )"
+    INSTALLED_CODEX="$(codex --version 2>/dev/null | awk '{print $2}')"
+    if [ -z "$VALIDATED_CODEX" ] || [ -z "$INSTALLED_CODEX" ]; then
+        skip "Codex CLI version could not be compared with the baseline"
+    elif [ "$INSTALLED_CODEX" = "$VALIDATED_CODEX" ]; then
+        pass "Codex CLI matches the validated baseline ($VALIDATED_CODEX)"
+    else
+        warn "Codex CLI $INSTALLED_CODEX differs from the validated baseline $VALIDATED_CODEX; re-run the delegated probe (docs/setup-guide.md) and update VALIDATED_CODEX_CLI"
+    fi
+fi
+
 printf '\n=== Potential fallback providers ===\n'
 for provider in anthropic openai; do
     if grep -Fxq "$provider" <<< "$CONFIGURED_PROVIDERS"; then

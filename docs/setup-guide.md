@@ -363,6 +363,12 @@ A `PROBE-OK` reply means delegated shell execution still works; update the
 recorded version. A bwrap error means the CLI changed behaviour again; keep
 the old baseline and investigate before trusting delegated verification.
 
+The Codex CLI is pinned the same way, as `VALIDATED_CODEX_CLI` in the same
+file: the flag surface this kit drives (`codex exec`, the dotted `-c`
+overrides that route endpoints, the responses wire) has drifted between
+releases before. After a Codex update the doctor warns until you re-run
+the probe above with a Codex-backed role and update the recorded version.
+
 Delegated Claude runs deliberately do not use the Claude CLI's own
 bubblewrap isolation (the bash sandbox and `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`
 alike): on CLI 2.1.220 its ancestor-configuration hiding walks past `$HOME`
@@ -425,6 +431,19 @@ page writes both halves of the manifest:
 each with the provider documentation it was taken from. Editing that file
 only changes what is offered; a role is routed only when its manifest
 entry says so.
+
+To prove a routed role end to end, set the key and ask for one word:
+
+```bash
+export MOONSHOT_API_KEY=...   # whichever variable the endpoint's key_env names
+orrery-agent --role implementer --timeout 120 -- \
+    "Reply with the single word: ready."
+```
+
+One completed reply proves the command, the routing, the credential and
+the containment together, at the cost of a few tokens on that service. A
+missing variable or an unreachable base URL stops the run with a named
+error rather than falling back to a first-party account.
 
 ## Adopt a repository
 
@@ -651,6 +670,20 @@ orrery-doctor
 ```
 
 The suite uses fake provider commands. The doctor makes no model calls.
+
+Two surfaces cannot be proven by the suite, because its fake browser and
+fake providers are unconfined where the real ones are not. Both classes
+of defect have shipped for exactly that reason, so after a change that
+touches either surface, smoke it by hand:
+
+- Run `orrery-config` and open the page in the desktop's real browser. A
+  snap or flatpak browser has a private `/tmp` and its own mount
+  namespace, so only the real thing proves the loopback claim-URL flow.
+- Run one live delegated dispatch that executes a shell command:
+  `ORRERY_LIVE_TESTS=1 ./tests/run-tests.py "a real dispatch"`. It spends
+  a few provider credits and proves containment, the provider CLI and the
+  task lifecycle on the live wire; `"a live reviewer"` does the same for
+  the review path.
 
 Do not add every provider release by hand. `orrery-config` discovers new
 picker-visible models and thinking levels automatically. Update
