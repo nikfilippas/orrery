@@ -35,6 +35,12 @@ single-provider session and says so.
   implementer may answer one but never close it, and a task cannot merge
   while a blocking finding is unresolved, including after rework and a
   later clean review.
+- **Parallel work, integrated on evidence.** Independent tasks run in
+  isolated worktrees and merge only through a gate that re-runs the union
+  of their acceptance checks, so one task cannot land a change that breaks
+  another's invariant. What awaits a human decision is drawn into one
+  queue, ranked most serious first, every row stating its reason and
+  verifying the evidence it cites.
 - **Enforced containment, not promised containment.** Read-only roles
   run inside a service unit whose workspace mapping is enforced by the
   kernel and probed before every run; where the guarantee cannot be
@@ -102,12 +108,13 @@ third-party endpoint, or one provider for everything.
 
 Órrery advertises no speed multipliers and no token-saving
 percentages. What it claims is what its test suite enforces: a
-deterministic 250-plus-test regression suite that spends no model
+deterministic 350-plus-test regression suite that spends no model
 credits, lint and suite on CI for every push, a doctor that validates
 the installation, kernel-level probes before every read-only delegated
-run, honest degradation messages where a guarantee cannot hold, and
-local token-usage and incident accounting (`orrery-usage`,
-`orrery-incidents`). Performance and cost effects are the subject of a
+run, honest degradation messages where a guarantee cannot hold, local
+token-usage and incident accounting (`orrery-usage`, `orrery-incidents`),
+and a memory whose every fact carries the command that re-checks it
+(`orrery-memory`). Performance and cost effects are the subject of a
 dedicated with/without benchmark programme, published with unfavourable
 numbers included; see the technical overview.
 

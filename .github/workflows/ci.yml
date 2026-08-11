@@ -16,7 +16,20 @@ jobs:
       # Pinned to the version used for local verification, so a ruff
       # release can never turn a locally green tree red in CI.
       - run: pip install ruff==0.13.3
-      - run: ruff check .
+      # `ruff check .` walks the tree by extension and never sees the
+      # extensionless CLI entry points, so a dead import in one of them
+      # shipped unlinted. Discover them by their python shebang and lint
+      # them alongside the rest; new entry points are covered
+      # automatically.
+      - name: Lint
+        run: |
+          entry=()
+          for f in scripts/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.py|*.sh) continue;; esac
+            head -1 "$f" | grep -q python && entry+=("$f")
+          done
+          ruff check . "${entry[@]}"
 
   tests:
     runs-on: ubuntu-latest

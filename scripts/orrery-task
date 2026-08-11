@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 import os
 import hashlib
-import random
-import signal
 import shutil
 import subprocess
 import sys
@@ -20,14 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orrery_findings  # noqa: E402
 import orrery_memory  # noqa: E402
 import orrery_spend  # noqa: E402
-from orrery_verify import (  # noqa: E402, F401
+from orrery_verify import (  # noqa: E402
     run_verification,
     under_broad_grant,
-    verification_timeout,
 )
 from orrery_fallback import git_workspace_fingerprint  # noqa: E402
 from orrery_ledger import (  # noqa: E402
-    STATES as LEDGER_STATES,
     LedgerError,
     _atomic_write,
     amend_task,
@@ -36,7 +32,6 @@ from orrery_ledger import (  # noqa: E402
     create_task,
     ensure_worktree,
     load_contract,
-    merge_branch,
     remove_worktree,
     read_ledger,
     repository_root,
@@ -2209,14 +2204,6 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
         records, state = current(store, task_id)
     if state != "AWAITING_MERGE":
         raise LedgerError(f"task {task_id} is {state}; merge requires AWAITING_MERGE")
-    substantive = next(
-        (
-            record
-            for record in reversed(records)
-            if record.get("reason") != "ledger-repaired"
-        ),
-        None,
-    )
     # Reconciliation reads the durable order backwards. The order is:
     # write the integration packet, record INTEGRATION_VERIFIED naming the
     # result commit, promote the ref, record MERGED. So a target head that
