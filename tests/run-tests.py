@@ -2925,7 +2925,7 @@ def test_claude_invocation_contract() -> None:
         for flag, value in (
             ("--model", "sonnet"),
             ("--effort", "max"),
-            ("--output-format", "json"),
+            ("--output-format", "stream-json"),
             ("--permission-mode", "plan"),
         ):
             require(
@@ -2935,6 +2935,8 @@ def test_claude_invocation_contract() -> None:
             )
         for flag in (
             "--print",
+            # --print with stream-json is refused without it (2.1.220).
+            "--verbose",
             "--exclude-dynamic-system-prompt-sections",
             "--no-session-persistence",
             "--settings",
@@ -3905,13 +3907,23 @@ def test_detached_descendant() -> None:
 
     assert_no_review_residue(f"orrery-review-{process.pid}-")
 
-    survivors = subprocess.run(
-        ["pgrep", "-af", "signal.SIG_IGN"],
-        stdout=subprocess.PIPE,
-        text=True,
-        timeout=20,
-        check=False,
-    ).stdout
+    # Polled rather than sampled once: under full-suite load the kernel
+    # can take a few seconds to reap the killed control group, and a
+    # single early sample read that latency as survival. A process that
+    # genuinely ignored the kill sleeps for an hour, so a bounded wait
+    # weakens nothing.
+    deadline = time.monotonic() + 20
+    while True:
+        survivors = subprocess.run(
+            ["pgrep", "-af", "signal.SIG_IGN"],
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+        ).stdout
+        if "3600" not in survivors or time.monotonic() > deadline:
+            break
+        time.sleep(1)
 
     # A survivor is a finding, not a pet: it would otherwise sleep for an
     # hour after the suite that discovered it has exited.
@@ -14082,6 +14094,42 @@ def test_read_only_linked_worktree_command_paths() -> None:
                 shutil.rmtree(runtime, ignore_errors=True)
 
 
+@test("state-side directories are created private under a permissive umask")
+def test_state_directories_ignore_umask() -> None:
+    """pathlib gives mkdir's mode to the leaf alone; the umask names the
+    rest. Under umask 002 the state-side `orrery` directory was created
+    group-writable by the first worktree (measured 0o775), and every
+    later adoption check then refused the trust store's parent outright.
+    """
+    previous_umask = os.umask(0o002)
+    saved_state = os.environ.get("XDG_STATE_HOME")
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            os.environ["XDG_STATE_HOME"] = str(state)
+            root = Path(directory) / "repo"
+            root.mkdir()
+            init_task_repository(root)
+            base = git_output(root, "rev-parse", "HEAD")
+            worktree = ledger_module.ensure_worktree(root, "T-1", base)
+            require(worktree.exists(), "no worktree was created")
+            offenders = [
+                relative
+                for relative in ("orrery", "orrery/worktrees")
+                if stat.S_IMODE((state / relative).stat().st_mode) & 0o077
+            ]
+            require(
+                not offenders,
+                f"state directories readable beyond their owner: {offenders}",
+            )
+    finally:
+        os.umask(previous_umask)
+        if saved_state is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved_state
+
+
 @test("no-change close requires a passing verification")
 def test_task_no_change_close_verification_gate() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -14801,6 +14849,32 @@ def test_adoption_refuses_every_unsafe_marker() -> None:
                 raise Failure(f"{mode:o} marker was honoured")
 
         marker.chmod(0o600)
+        # The foreign-owner refusal cannot be staged for real without
+        # another uid, so the marker's lstat result is doctored instead:
+        # the code path from the stat to the refusal is the same one a
+        # genuinely foreign file would take.
+        real_lstat = runtime_module.os.lstat
+        def foreign_lstat(path, *arguments, **keywords):
+            details = real_lstat(path, *arguments, **keywords)
+            if Path(path) == marker:
+                doctored = list(details)
+                doctored[stat.ST_UID] = details.st_uid + 1
+                return os.stat_result(doctored)
+            return details
+        runtime_module.os.lstat = foreign_lstat
+        try:
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "foreign-owned" in str(exc),
+                    f"foreign marker had wrong refusal: {exc}",
+                )
+            else:
+                raise Failure("a foreign-owned marker was honoured")
+        finally:
+            runtime_module.os.lstat = real_lstat
+
         require(runtime_module.adopted_root(root) == root, "safe untracked marker was refused")
 
 

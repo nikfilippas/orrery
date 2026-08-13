@@ -804,8 +804,17 @@ def delegated_command(
         # No --mcp-config is passed, so strict mode means a worker never
         # loads MCP servers from user, project, or ancestor configs.
         "--strict-mcp-config",
+        # stream-json rather than json, so the merged log grows with
+        # every event: the live echo has lines to mirror and the
+        # progress-aware deadline has growth to measure, neither of
+        # which the single final object of json mode provided. --print
+        # demands --verbose alongside it (measured on 2.1.220). The
+        # stream's final event is the same result object json mode
+        # printed, so verdict recovery and usage parsing read it
+        # unchanged (also measured).
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--settings",
         str(settings_path),
         "--allowedTools",

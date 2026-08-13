@@ -667,10 +667,31 @@ def worktree_path(root: Path, task_id: str) -> Path:
     return state_home / "orrery" / "worktrees" / repo_identity(root) / task_id
 
 
+def private_directory(path: Path) -> Path:
+    """Create `path` and every missing ancestor with owner-only access.
+
+    pathlib applies `mode=` to the leaf alone and lets the umask decide
+    the intermediates, so under umask 002 the state-side `orrery`
+    directory was born group-writable and the adoption trust store then
+    refused its own parent (measured). Each missing level is created
+    explicitly instead; levels that already exist keep their mode.
+    """
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
 def ensure_worktree(root: Path, task_id: str, base_commit: str) -> Path:
     """Create or reuse the dedicated branch worktree for a task."""
     path = worktree_path(root, task_id)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_directory(path.parent)
     os.chmod(path.parent, 0o700)
     branch = f"orrery/{task_id}"
     if path.exists() and (path / ".git").exists():

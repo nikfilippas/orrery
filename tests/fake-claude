@@ -239,7 +239,12 @@ def main() -> int:
         print(json.dumps({"result": ""}))
         return 0
 
-    print(json.dumps({"result": "# PASS\nfake Claude verdict\n", **usage_fields()}))
+    if "--output-format" in sys.argv and "stream-json" in sys.argv:
+        # The real CLI emits event lines before the final result object;
+        # one is enough to prove recovery reads the last line, not the
+        # first.
+        print(json.dumps({"type": "system", "subtype": "init"}))
+    print(json.dumps({"type": "result", "result": "# PASS\nfake Claude verdict\n", **usage_fields()}))
     return 0
 
 

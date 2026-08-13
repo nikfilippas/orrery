@@ -32,6 +32,7 @@ from orrery_ledger import (  # noqa: E402
     create_task,
     ensure_worktree,
     load_contract,
+    private_directory,
     remove_worktree,
     read_ledger,
     repository_root,
@@ -1310,7 +1311,7 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
         )
         this_attempt.mkdir(exist_ok=True)
         this_receipts = review_receipts_dir(root, task_id, this_attempt.name)
-        this_receipts.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_directory(this_receipts)
         assignment = prompt if validation_error is None else (
             prompt
             + "\n\nYour previous reply was refused by the schema validator:\n"

@@ -148,13 +148,15 @@ can emit hundreds of kilobytes; `--stream` lifts the cap and
 
 `--log PATH` publishes the complete working transcript, atomically and
 on every path including timeout and interruption, which is exactly when
-it is most useful. Note the provider asymmetry: `codex exec` streams its
-work, so an OpenAI role's log holds the real transcript of tool calls
-and messages, while a delegated Claude role currently runs
-`--print --output-format json` and produces only its final result
-object. The log is untrusted provider output written verbatim, so treat
-it as data; it never enters the incident log, which deliberately stores
-no provider text.
+it is most useful. Both providers stream: `codex exec` writes its
+transcript as it works, and a delegated Claude role runs
+`--print --output-format stream-json --verbose`, so its log grows with
+every event and ends with the same result object the old single-object
+format printed. That growth is also what lets the progress-aware budget
+extend a Claude run that is still working, which the final-object format
+could not show. The log is untrusted provider output written verbatim,
+so treat it as data; it never enters the incident log, which
+deliberately stores no provider text.
 
 ## Align the principal's own surface
 
