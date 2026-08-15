@@ -47,6 +47,12 @@ single-provider session and says so.
   run inside a service unit whose workspace mapping is enforced by the
   kernel and probed before every run; where the guarantee cannot be
   established the run is refused, with one named escape hatch.
+- **Authority that never escalates.** A delegate holds exactly the
+  toolset and access mode its role grants, denied by default and
+  enforced outside the model, and a delegate cannot delegate: the
+  role handoff stands its session down from orchestration, so no
+  chain of agents can accumulate authority the principal never
+  granted.
 - **Consent-gated fallback.** A failed provider yields a ranked
   candidate and a numbered consent menu; nothing crosses a provider,
   endpoint or billing boundary without your explicit approval, and
@@ -113,7 +119,9 @@ percentages. What it claims is what its test suite enforces: a
 deterministic 350-plus-test regression suite that spends no model
 credits, lint and suite on CI for every push, a doctor that validates
 the installation, kernel-level probes before every read-only delegated
-run, honest degradation messages where a guarantee cannot hold, local
+run, non-escalating delegation (a role's toolset is closed and denied
+by default, and a delegate that is asked to orchestrate stands down),
+honest degradation messages where a guarantee cannot hold, local
 token-usage and incident accounting (`orrery-usage`, `orrery-incidents`),
 and a memory whose every fact carries the command that re-checks it
 (`orrery-memory`). Performance and cost effects are the subject of a

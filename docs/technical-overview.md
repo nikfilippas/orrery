@@ -191,6 +191,14 @@ and a write that succeeds is the finding; where the guarantee cannot be
 established the run is refused rather than quietly claimed, and
 `ORRERY_ALLOW_UNCONFINED=1` is the named way to accept a degraded run.
 
+Delegated authority never escalates. A role's tool surface is declared
+closed at spawn, denied by default, and enforced by the runner and the
+service unit rather than by instructions a model could reinterpret;
+the role handoff stands the delegated session down from orchestration,
+so a delegate cannot spawn further agents, and no chain of delegations
+can hold authority the principal never granted. Instructions alone do
+not hold such a boundary; the process composition does.
+
 `global/orchestration.json` is the only role-assignment source. Every
 row may be changed to either provider. For example, Sol may be the
 principal while Fable or Opus reviews it, or all five roles may use
