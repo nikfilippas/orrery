@@ -883,7 +883,14 @@ claims conversation migration.
 A provider usage limit is the one failure the fallback machinery
 deliberately does not answer with substitution, so `orrery-pickup`
 automates the sanctioned alternative: waiting for the announced reset
-and retrying the same configured model. A park is an operator command
+and retrying the same configured model.
+
+```bash
+orrery-pickup park T-3 --priority 1   # inside the adopted repository
+orrery-pickup list
+orrery-pickup run                     # what the timer fires; also manual
+orrery-pickup revoke --all
+``` A park is an operator command
 that binds the task to its sealed contract digest, its full role
 fingerprint, and a repository-instance nonce written into the control
 store; the executor re-derives all three at fire time and refuses any
@@ -1095,6 +1102,13 @@ number on this page should be read as one.
 | `scripts/orrery-incidents` | incident aggregation and reporting command |
 | `scripts/orrery-config` | atomic visual configuration surface |
 | `scripts/orrery-usage` | local token-usage accounting from provider session logs |
+| `scripts/orrery-task` | task contracts, parallel dispatch, verification, review queue, and the evidence-gated merge |
+| `scripts/orrery_ledger.py` | append-only task ledger, sealed contracts, and worktree management |
+| `scripts/orrery_findings.py` | schema-validated review findings and their verdict recomputation |
+| `scripts/orrery_verify.py` | one contained runner for every repository verification command |
+| `scripts/orrery_spend.py` | per-attempt usage records, price table, and spend reading |
+| `scripts/orrery-memory` and `scripts/orrery_memory.py` | governed memory: facts carrying the command that re-checks them |
+| `scripts/orrery-pickup` | parked work re-dispatched at a provider limit reset, under a generation budget |
 | `scripts/orrery-sync` | projects the configured principal onto its provider's own configuration |
 | `scripts/init-project.sh` | safe project adoption and Git initialization |
 | `scripts/install.sh` | user-level instruction, skill, hook, and command links |

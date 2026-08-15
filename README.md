@@ -56,7 +56,11 @@ single-provider session and says so.
 - **Consent-gated fallback.** A failed provider yields a ranked
   candidate and a numbered consent menu; nothing crosses a provider,
   endpoint or billing boundary without your explicit approval, and
-  standing approvals are disclosed on every use and revocable.
+  standing approvals are disclosed on every use and revocable. An
+  exhausted plan is never answered by substitution: `orrery-pickup`
+  parks the stopped work instead and re-dispatches it when the
+  provider's stated limit resets, offline, under a spend ceiling, with
+  the merge gate still yours.
 - **Nothing hidden, nothing left behind.** Every standing instruction a
   session carries is a file in this repository; delegated process trees
   are contained and cleaned; failures land in a local incident log so

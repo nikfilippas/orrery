@@ -41,7 +41,9 @@ The installer:
 - merges the Orrery SessionStart check into both Claude and Codex hook
   configuration without removing unrelated hooks;
 - installs `orrery`, `orrery-agent`, `orrery-review`, `orrery-config`,
-  `orrery-init`, `orrery-doctor`, and `orrery-usage` in `~/.local/bin`;
+  `orrery-init`, `orrery-doctor`, `orrery-usage`, `orrery-incidents`,
+  `orrery-task`, `orrery-memory`, `orrery-pickup`, and `orrery-sync` in
+  `~/.local/bin`;
 - applies Claude-specific permissions plus the provider-neutral startup check;
 - removes obsolete profile links only when this checkout owns them.
 
