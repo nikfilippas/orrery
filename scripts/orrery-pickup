@@ -1,0 +1,1467 @@
+#!/usr/bin/env python3
+"""Park quota-stopped task work and pick it up when the limit resets.
+
+A park is an operator command, never an inference: it binds the sealed
+contract's digest, the full role fingerprint, and the repository
+instance, and the executor re-checks every binding at fire time. The
+kit already refuses to substitute a model for an exhausted plan; this
+command automates only the waiting for the sanctioned retry.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orrery_incidents  # noqa: E402
+import orrery_runtime  # noqa: E402
+from orrery_fallback import parse_reset_time  # noqa: E402
+from orrery_ledger import (  # noqa: E402
+    LedgerError,
+    private_directory,
+    read_ledger,
+)
+from orrery_runtime import RuntimeConfigError, load_role  # noqa: E402
+from orrery_standing import _fingerprint  # noqa: E402
+from orrery_verify import (  # noqa: E402
+    systemctl_path,
+    systemd_run_path,
+    under_broad_grant,
+)
+
+PROGRAM = "orrery-pickup"
+STORE_VERSION = 1
+STORE_NAME = "pickup.json"
+LOCK_NAME = "pickup.lock"
+NONCE_NAME = "pickup-nonce"
+EXPIRY_SLACK_SECONDS = 7 * 24 * 3600
+DEFAULT_CEILING_TOKENS = 200_000
+PARKABLE = frozenset({"READY", "DISPATCH_FAILED", "INTERRUPTED"})
+# States that mean the work moved toward or past the human's gates:
+# a record whose task reached one is done here, without a dispatch.
+# Deliberately NOT the complement of PARKABLE: VERIFICATION_FAILED and
+# REVIEW_BLOCKED are states `orrery-task run` would happily retry, and
+# an unattended executor must not extend a park's authority to them.
+ADVANCED_STATES = frozenset({
+    "VERIFICATION_PASSED", "AWAITING_MERGE", "IN_REVIEW", "REVIEW_PASSED",
+    "MERGED", "CLOSED", "CANCELLED", "NO_CHANGE",
+})
+TAIL_BYTES = 8192
+UNIT_PREFIX = "orrery-pickup-"
+ARM_DELAY_SECONDS = 120
+PENDING_GRACE_SECONDS = 180
+
+# What the timer carries to the user manager, whose environment is not
+# the arming shell's. Deliberately NOT the delegated-run builder's
+# provider prefixes: those sweep in credential variables, and no secret
+# rides a unit property or argv. The provider CLIs read their own
+# on-disk authentication at fire time; a role whose credential exists
+# only in the shell (an endpoint key) is refused at park instead.
+TIMER_ENVIRONMENT_NAMES = (
+    "PATH",
+    "XDG_STATE_HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "ALL_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "LANG",
+)
+
+_RECORD_FIELDS = {
+    "repo": str,
+    "task_id": str,
+    "contract_digest": str,
+    "priority": int,
+    "parked_at": float,
+    "reset_at": float,
+    "re_parked": bool,
+}
+
+
+def fail(message: str) -> int:
+    print(f"{PROGRAM}: {message}", file=sys.stderr)
+    return 2
+
+
+# ---------------------------------------------------------------------------
+# The store. Stricter than the standing store on purpose: standing
+# approvals gate an interactive consent path, while this store
+# authorises unattended execution, so a malformed or insecurely held
+# store refuses with a named error instead of reading as empty.
+# ---------------------------------------------------------------------------
+
+
+def _secure_paths(create: bool) -> tuple[Path, Path]:
+    """The store and lock paths, after the trust store's full walk.
+
+    Mirrors `_trust_paths`: every component of the state root is
+    refused if symlinked, and the state root, store directory, data
+    file and lock each pass the `_secure` no-follow checks.
+    """
+    state = orrery_runtime._state_root()
+    current = Path(state.anchor)
+    for part in state.parts[1:]:
+        current /= part
+        if os.path.lexists(current) and current.is_symlink():
+            raise RuntimeConfigError(
+                f"refusing pickup store with symlinked component {current}"
+            )
+    grant = under_broad_grant(state)
+    if grant and os.environ.get("ORRERY_ALLOW_TMP_REPOSITORY") != "1":
+        # A store inside a granted path is delegate-writable, and this
+        # store authorises unattended dispatches; same rule and escape
+        # as a repository under a grant.
+        raise RuntimeConfigError(
+            f"refusing a pickup store under the granted path {grant}"
+        )
+    directory = state / "orrery"
+    if create:
+        private_directory(directory)
+    if state.exists():
+        orrery_runtime._secure(state, "pickup state root")
+    if directory.exists():
+        orrery_runtime._secure(directory, "pickup store directory")
+    data = directory / STORE_NAME
+    lock = directory / LOCK_NAME
+    for path, label in ((data, "pickup store"), (lock, "pickup store lock")):
+        if os.path.lexists(path):
+            orrery_runtime._secure(path, label, regular=True)
+    return data, lock
+
+
+def empty_store() -> dict[str, Any]:
+    return {
+        "v": STORE_VERSION,
+        "generation": 0,
+        "ceiling_tokens": DEFAULT_CEILING_TOKENS,
+        "consumed_tokens": 0,
+        "timer": None,
+        "records": [],
+    }
+
+
+def _valid_record(entry: Any) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        raise RuntimeConfigError("the pickup store holds a non-object record")
+    for name, kind in _RECORD_FIELDS.items():
+        value = entry.get(name)
+        if kind is not bool and isinstance(value, bool):
+            raise RuntimeConfigError(
+                f"the pickup store record for {entry.get('task_id')!r} has an "
+                f"invalid {name}"
+            )
+        if kind is float and isinstance(value, int):
+            value = float(value)
+            entry[name] = value
+        if not isinstance(value, kind):
+            raise RuntimeConfigError(
+                f"the pickup store record for {entry.get('task_id')!r} has an "
+                f"invalid {name}"
+            )
+    instance = entry.get("instance")
+    if not (
+        isinstance(instance, dict)
+        and isinstance(instance.get("nonce_sha256"), str)
+        and isinstance(instance.get("lineage_sha256"), str)
+    ):
+        raise RuntimeConfigError(
+            f"the pickup store record for {entry.get('task_id')!r} has an "
+            "invalid instance identity"
+        )
+    fingerprint = entry.get("role_fingerprint")
+    if not (
+        isinstance(fingerprint, list)
+        and all(part is None or isinstance(part, str) for part in fingerprint)
+    ):
+        raise RuntimeConfigError(
+            f"the pickup store record for {entry.get('task_id')!r} has an "
+            "invalid role fingerprint"
+        )
+    claim = entry.get("claimed_by")
+    if claim is not None and not isinstance(claim, dict):
+        raise RuntimeConfigError(
+            f"the pickup store record for {entry.get('task_id')!r} has an "
+            "invalid claim"
+        )
+    return entry
+
+
+def load_store(data: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(data.read_bytes())
+    except json.JSONDecodeError as exc:
+        raise RuntimeConfigError(
+            f"the pickup store is malformed ({exc}); nothing was read as "
+            f"empty. Inspect or remove {data}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeConfigError(f"the pickup store is unreadable: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != STORE_VERSION
+        or not isinstance(payload.get("records"), list)
+        or not isinstance(payload.get("generation"), int)
+        or not isinstance(payload.get("ceiling_tokens"), int)
+        or not isinstance(payload.get("consumed_tokens"), int)
+    ):
+        raise RuntimeConfigError(
+            f"the pickup store has an unrecognised shape; inspect or remove {data}"
+        )
+    for entry in payload["records"]:
+        _valid_record(entry)
+    return payload
+
+
+def drop_expired(payload: dict[str, Any], now: float) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for entry in payload["records"]:
+        target = dropped if now > entry["reset_at"] + EXPIRY_SLACK_SECONDS else kept
+        target.append(entry)
+    payload["records"] = kept
+    return dropped
+
+
+def save_store(data: Path, payload: dict[str, Any]) -> None:
+    serialised = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
+    temporary = data.with_name(f".{data.name}.{os.getpid()}")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(serialised)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, data)
+        # The rename must be durable too: consumed spend restored to a
+        # pre-claim directory entry by a power loss would admit another
+        # dispatch against budget already drawn down.
+        directory_descriptor = os.open(data.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
+@contextlib.contextmanager
+def store_transaction() -> Iterator[dict[str, Any]]:
+    """One short, exclusive read-modify-write of the store.
+
+    Never held across a dispatch: the executor claims under one
+    transaction, releases, and settles under another.
+    """
+    data, lock = _secure_paths(create=True)
+    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        payload = load_store(data) if data.exists() else empty_store()
+        drop_expired(payload, time.time())
+        yield payload
+        save_store(data, payload)
+    finally:
+        os.close(descriptor)
+
+
+# ---------------------------------------------------------------------------
+# Repository and task context for a park.
+# ---------------------------------------------------------------------------
+
+
+def adopted_repository_root() -> Path:
+    root = orrery_runtime.adopted_root(Path.cwd())
+    if root is None:
+        raise RuntimeConfigError(
+            "this repository is not adopted; run orrery-init first"
+        )
+    grant = under_broad_grant(root)
+    if grant and os.environ.get("ORRERY_ALLOW_TMP_REPOSITORY") != "1":
+        # The same rule, escape and wording as dispatch: a control store
+        # inside a granted path is delegate-writable, and a park would
+        # schedule unattended work against it.
+        raise RuntimeConfigError(
+            f"this repository is under {grant}, where its .orrery store is "
+            "writable by a delegate; parking is refused exactly as dispatch "
+            "is. Move the repository outside " + grant + ", or set "
+            "ORRERY_ALLOW_TMP_REPOSITORY=1 to accept that."
+        )
+    return root
+
+
+def task_context(root: Path, task_id: str) -> tuple[list[dict[str, Any]], str, dict[str, Any], str]:
+    """Records, state, contract and sealed digest, cross-checked."""
+    store = root / ".orrery"
+    records, torn, _ = read_ledger(store, task_id)
+    if torn:
+        raise LedgerError(
+            f"task {task_id} has a torn ledger tail; run orrery-task status --repair"
+        )
+    if not records:
+        raise LedgerError(f"task {task_id} has an empty ledger")
+    state = records[-1]["to"]
+    contract_path = store / "contracts" / f"{task_id}.json"
+    try:
+        raw = contract_path.read_bytes()
+    except OSError as exc:
+        raise LedgerError(f"task {task_id} has no sealed contract: {exc}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    recorded = records[-1].get("contract_digest")
+    if recorded != digest:
+        raise LedgerError(
+            f"task {task_id}: the sealed contract and the ledger disagree "
+            "about the contract digest; refusing to bind a park to either"
+        )
+    contract = json.loads(raw)
+    return records, state, contract, digest
+
+
+def eligible_state(records: list[dict[str, Any]], state: str, task_id: str) -> None:
+    if state not in PARKABLE:
+        raise LedgerError(
+            f"task {task_id} is {state}; parking covers READY, "
+            "DISPATCH_FAILED, and implementation-phase INTERRUPTED"
+        )
+    if state == "INTERRUPTED":
+        interrupted = next(
+            (r for r in reversed(records) if r.get("to") == "INTERRUPTED"), None
+        )
+        if interrupted and interrupted.get("phase") == "review":
+            raise LedgerError(
+                f"task {task_id} was interrupted during review; parking "
+                f"cannot re-dispatch it. Run orrery-task review {task_id} "
+                "when the limit resets"
+            )
+
+
+def instance_identity(root: Path, create: bool) -> dict[str, str]:
+    """The control-store nonce plus the git lineage, both hashed.
+
+    The nonce is the instance: the control store is what the executor
+    would act on, so carrying it means being the same instance, and a
+    recreated repository without it is refused. The lineage hash stays
+    as a secondary check against a wholesale history swap.
+    """
+    nonce_path = root / ".orrery" / NONCE_NAME
+    try:
+        details = os.lstat(nonce_path)
+    except FileNotFoundError:
+        details = None
+    if details is not None:
+        if not stat.S_ISREG(details.st_mode):
+            raise RuntimeConfigError(f"refusing non-regular nonce {nonce_path}")
+        nonce = nonce_path.read_text().strip()
+    elif create:
+        nonce = secrets.token_hex(16)
+        descriptor = os.open(
+            nonce_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+        )
+        try:
+            with os.fdopen(descriptor, "w") as handle:
+                handle.write(nonce + "\n")
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(nonce_path)
+            raise
+    else:
+        raise RuntimeConfigError(
+            f"the control store carries no {NONCE_NAME}; this is not the "
+            "repository instance the park was recorded in"
+        )
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-list", "--max-parents=0", "--all"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        timeout=60, check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeConfigError(
+            f"could not establish the repository lineage: {result.stderr.strip()}"
+        )
+    lineage = "\n".join(sorted(result.stdout.split()))
+    return {
+        "nonce_sha256": hashlib.sha256(nonce.encode()).hexdigest(),
+        "lineage_sha256": hashlib.sha256(lineage.encode()).hexdigest(),
+    }
+
+
+def recovered_reset(root: Path, records: list[dict[str, Any]]) -> datetime | None:
+    """The provider-announced reset, from the preserved diagnostics.
+
+    Both channels are read: the launcher preserves stdout and stderr
+    separately, a reset can be announced on either, and consent.txt
+    exists only for approval-required outcomes.
+    """
+    dispatch = next(
+        (r["dispatch"] for r in reversed(records) if "dispatch" in r), None
+    )
+    if dispatch is None:
+        return None
+    attempt = Path(dispatch.get("receipts", ""))
+    if not attempt.is_absolute() or not attempt.exists():
+        return None
+    pieces: list[str] = []
+    for candidate in (
+        attempt / "stdout.log",
+        attempt / "stderr.log",
+        attempt.parent / "consent.txt",
+    ):
+        try:
+            with candidate.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - TAIL_BYTES))
+                pieces.append(handle.read().decode("utf-8", "replace"))
+        except OSError:
+            continue
+    return parse_reset_time("\n".join(pieces)) if pieces else None
+
+
+def ask_priority(default: int) -> int:
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        return default
+    with tty:
+        if not tty.isatty():
+            return default
+        try:
+            tty.write(
+                f"Priority for this park (1 runs first) [{default}]: "
+            )
+            tty.flush()
+            answer = tty.readline().strip()
+        except OSError:
+            return default
+    return int(answer) if answer.isdigit() and int(answer) > 0 else default
+
+
+# ---------------------------------------------------------------------------
+# The timer. One transient systemd user timer per armed store, managed
+# as the pair it really is: a timed unit is NAME.timer plus
+# NAME.service, and stopping the unsuffixed name reaches only the
+# service. Names are never reused, so an executor that re-parks arms a
+# unit distinct from the service it is itself running as.
+# ---------------------------------------------------------------------------
+
+
+def timer_environment() -> list[str]:
+    """The allowlisted names actually safe to serialise, values checked.
+
+    A proxy URL may embed userinfo, which is a credential; one that does
+    is omitted rather than written into unit properties, and the CLI at
+    fire time falls back to its own configuration.
+    """
+    names: list[str] = []
+    for name in TIMER_ENVIRONMENT_NAMES:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        if "proxy" in name.lower() and "://" in value:
+            rest = value.split("://", 1)[1]
+            if "@" in rest.split("/", 1)[0]:
+                print(
+                    f"{PROGRAM}: {name} embeds credentials and is not "
+                    "serialised to the timer",
+                    file=sys.stderr,
+                )
+                continue
+        names.append(name)
+    return names
+
+
+def linger_enabled() -> bool | None:
+    tool = shutil.which("loginctl")
+    if tool is None:
+        return None
+    try:
+        result = subprocess.run(
+            [tool, "show-user", str(os.getuid()), "-p", "Linger"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return "Linger=yes" in result.stdout
+
+
+def linger_sentence() -> str:
+    lingering = linger_enabled()
+    if lingering is True:
+        return "lingering is on: the timer fires with nobody logged in"
+    if lingering is False:
+        return (
+            "lingering is off: the timer dies at logout "
+            "(loginctl enable-linger to change that)"
+        )
+    return "lingering could not be determined"
+
+
+def disarm_unit(unit: str, *, service: bool = True) -> None:
+    """Stop a timer pair deliberately, the timer half always.
+
+    The service half is optional because it can be a live executor: a
+    timer-fired `run` is its own `.service`, and revocation promises
+    not to cancel work already in flight.
+    """
+    systemctl = systemctl_path()
+    if systemctl is None:
+        return
+    suffixes = (".timer", ".service") if service else (".timer",)
+    for suffix in suffixes:
+        for verb in ("stop", "reset-failed"):
+            subprocess.run(
+                [systemctl, "--user", verb, f"{unit}{suffix}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=20, check=False,
+            )
+
+
+def loaded_pickup_units() -> list[str] | None:
+    """Base names of every loaded orrery-pickup-* unit, or None.
+
+    None means the question could not be answered, which callers must
+    treat differently from an empty answer: clearing state because a
+    query failed would lose a live timer.
+    """
+    systemctl = systemctl_path()
+    if systemctl is None:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                systemctl, "--user", "list-units", f"{UNIT_PREFIX}*",
+                "--all", "--no-legend", "--no-pager",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=20, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        token = line.split()[0] if line.split() else ""
+        # A bullet or dot column can precede the unit name.
+        if not token.startswith(UNIT_PREFIX) and line.split()[1:]:
+            token = line.split()[1]
+        if token.startswith(UNIT_PREFIX):
+            names.add(token.rsplit(".", 1)[0])
+    return sorted(names)
+
+
+def executor_lease_live(payload: dict[str, Any]) -> bool:
+    lease = payload.get("executor")
+    return isinstance(lease, dict) and claim_is_live(lease)
+
+
+def reconcile_timer(
+    payload: dict[str, Any], now: float, keep: str | None = None
+) -> None:
+    """Make the loaded units and the store agree, fail-closed.
+
+    A crash can leave either side ahead of the other: a pending intent
+    whose systemd-run never ran, a confirmed unit lost to a user-manager
+    restart, or a loaded unit whose store record was lost. Units no
+    record claims are stopped; a lost confirmation is cleared so the
+    truth is told and `run` can re-arm; a failed query changes nothing.
+    """
+    timer = payload.get("timer")
+    claimed = timer.get("unit") if isinstance(timer, dict) else None
+    units = loaded_pickup_units()
+    if units is None:
+        return
+    for unit in units:
+        if unit != claimed and unit != keep:
+            disarm_unit(unit, service=not executor_lease_live(payload))
+    if isinstance(timer, dict) and claimed not in units:
+        if timer.get("phase") == "confirmed":
+            payload["timer"] = None
+        elif (
+            timer.get("phase") == "pending"
+            and now - float(timer.get("armed_at") or 0) > PENDING_GRACE_SECONDS
+        ):
+            payload["timer"] = None
+
+
+def arm_timer(now: float, fired_unit: str | None = None) -> None:
+    """Arm one fresh timer for the earliest future reset, intent-first.
+
+    Runs its own short store transactions; the caller holds no lock.
+    `fired_unit` is the unit a timer-fired executor is itself running
+    as: it is never stopped, because stopping it would kill the very
+    process doing the arming; --collect retires it as it elapses.
+    Where systemd is unavailable, or the arming fails, the store says
+    so honestly and the SessionStart announcement carries the pickup.
+    """
+    with store_transaction() as payload:
+        future = [
+            entry["reset_at"]
+            for entry in payload["records"]
+            if entry["reset_at"] > now
+        ]
+        previous = payload.get("timer")
+        if not future:
+            payload["timer"] = None
+            if (
+                isinstance(previous, dict)
+                and previous.get("unit")
+                and previous.get("unit") != fired_unit
+            ):
+                disarm_unit(previous["unit"], service=not executor_lease_live(payload))
+            if payload["records"]:
+                print(
+                    "parked work is already due; run orrery-pickup run"
+                )
+            return
+        fire_at = min(future) + ARM_DELAY_SECONDS
+        launcher = systemd_run_path()
+        if launcher is None:
+            payload["timer"] = None
+            print(
+                f"{PROGRAM}: systemd-run is unavailable, so no timer was "
+                "armed; the SessionStart line will announce the work when "
+                "it is due",
+                file=sys.stderr,
+            )
+            return
+        unit = f"{UNIT_PREFIX}{os.getpid()}-{secrets.token_hex(4)}"
+        if (
+            isinstance(previous, dict)
+            and previous.get("unit")
+            and previous.get("unit") != fired_unit
+        ):
+            disarm_unit(previous["unit"], service=not executor_lease_live(payload))
+        payload["timer"] = {
+            "unit": unit,
+            "phase": "pending",
+            "armed_at": now,
+            "fire_at": fire_at,
+        }
+
+    calendar = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(fire_at))
+    command = [
+        launcher,
+        "--user",
+        "--collect",
+        f"--on-calendar={calendar}",
+        f"--unit={unit}",
+        *(
+            f"--setenv={name}={os.environ[name]}"
+            for name in timer_environment()
+        ),
+        os.path.realpath(__file__),
+        "run",
+        "--fired-unit",
+        unit,
+    ]
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, timeout=60, check=False,
+        )
+        armed = result.returncode == 0
+        detail = result.stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        armed = False
+        detail = str(exc)
+
+    with store_transaction() as payload:
+        timer = payload.get("timer")
+        ours = isinstance(timer, dict) and timer.get("unit") == unit
+        if armed and ours:
+            timer["phase"] = "confirmed"
+        else:
+            if ours:
+                payload["timer"] = None
+            # A launch that failed may still have registered the unit,
+            # and a launch that succeeded after its intent was revoked
+            # or replaced is claimed by nothing: both are disarmed
+            # rather than left to fire unowned.
+            disarm_unit(unit)
+    if armed and ours:
+        print(f"timer {unit} armed for {calendar}; {linger_sentence()}")
+    elif not armed:
+        print(
+            f"{PROGRAM}: arming failed ({detail or 'systemd-run failed'}); "
+            "no timer exists and the SessionStart line will announce the "
+            "work when it is due",
+            file=sys.stderr,
+        )
+
+
+def describe(now: float | None = None) -> tuple[list[str], list[str]]:
+    """Info and warning lines for the doctor, read-only."""
+    moment = time.time() if now is None else now
+    try:
+        data, _lock = _secure_paths(create=False)
+        payload = load_store(data) if data.exists() else empty_store()
+    except RuntimeConfigError as exc:
+        return [], [str(exc)]
+    info: list[str] = []
+    warnings: list[str] = []
+    records = [
+        entry
+        for entry in payload["records"]
+        if moment <= entry["reset_at"] + EXPIRY_SLACK_SECONDS
+    ]
+    if not records:
+        return ["no parked work"], []
+    timer = payload.get("timer")
+    info.append(
+        f"{len(records)} parked task(s); generation "
+        f"{payload['generation']} has consumed {payload['consumed_tokens']} "
+        f"of {payload['ceiling_tokens']} tokens"
+    )
+    for entry in records:
+        due = entry["reset_at"] <= moment
+        info.append(
+            f"{entry['task_id']} ({entry['repo']}): "
+            + ("due now" if due else "resets " + datetime.fromtimestamp(entry["reset_at"]).isoformat())
+        )
+    if isinstance(timer, dict):
+        info.append(f"timer {timer.get('unit')} is {timer.get('phase')}")
+        if linger_enabled() is False:
+            warnings.append(
+                "parked work is armed but lingering is off: the timer "
+                "dies at logout (loginctl enable-linger)"
+            )
+    else:
+        due = [entry for entry in records if entry["reset_at"] <= moment]
+        if due:
+            warnings.append(
+                f"{len(due)} parked task(s) are due with no timer armed; "
+                "run orrery-pickup run"
+            )
+    return info, warnings
+
+
+# ---------------------------------------------------------------------------
+# Subcommands.
+# ---------------------------------------------------------------------------
+
+
+def command_park(arguments: argparse.Namespace) -> int:
+    root = adopted_repository_root()
+    state_root = orrery_runtime._state_root().resolve(strict=False)
+    if state_root.is_relative_to(root.resolve(strict=False)):
+        return fail(
+            f"the pickup state root {state_root} sits inside this "
+            "repository, where a delegate could rewrite what it "
+            "authorises; point XDG_STATE_HOME elsewhere"
+        )
+    records, state, contract, digest = task_context(root, arguments.task_id)
+    eligible_state(records, state, arguments.task_id)
+
+    role = load_role(contract["assigned_role"], cwd=root)
+    if role.endpoint is not None:
+        return fail(
+            f"role {role.id} is routed at endpoint {role.endpoint.id}, whose "
+            "credential exists only in this shell's environment; no secret "
+            "is transported to a timer, so an endpoint-routed role cannot "
+            "be parked. Re-park after the reset by hand, or route the role "
+            "first-party"
+        )
+
+    if arguments.reset_at is not None:
+        try:
+            reset = datetime.fromisoformat(arguments.reset_at)
+        except ValueError:
+            return fail(f"--reset-at is not ISO 8601: {arguments.reset_at!r}")
+    else:
+        reset = recovered_reset(root, records)
+        if reset is None:
+            return fail(
+                "no provider-announced reset time is recoverable from the "
+                "latest attempt's preserved diagnostics; state one "
+                "explicitly with --reset-at if the provider told you when"
+            )
+
+    identity = instance_identity(root, create=True)
+    fingerprint = [part for part in _fingerprint(role)]
+    now = time.time()
+
+    with store_transaction() as payload:
+        others = [
+            entry
+            for entry in payload["records"]
+            if not (
+                entry["repo"] == str(os.path.realpath(root))
+                and entry["task_id"] == arguments.task_id
+            )
+        ]
+        if not others:
+            payload["generation"] += 1
+            payload["consumed_tokens"] = 0
+        if arguments.ceiling_tokens is not None:
+            payload["ceiling_tokens"] = arguments.ceiling_tokens
+        default_priority = max(
+            (entry["priority"] for entry in others), default=0
+        ) + 1
+        priority = (
+            arguments.priority
+            if arguments.priority is not None
+            else ask_priority(default_priority)
+        )
+        others.append(
+            {
+                "repo": str(os.path.realpath(root)),
+                "task_id": arguments.task_id,
+                "instance": identity,
+                "contract_digest": digest,
+                "role_fingerprint": fingerprint,
+                "priority": priority,
+                "parked_at": now,
+                "reset_at": reset.timestamp(),
+                "re_parked": False,
+                "claimed_by": None,
+            }
+        )
+        others.sort(key=lambda entry: (entry["priority"], entry["parked_at"]))
+        payload["records"] = others
+        generation = payload["generation"]
+        ceiling = payload["ceiling_tokens"]
+
+    orrery_incidents.record(
+        "pickup-armed",
+        program=PROGRAM,
+        task=arguments.task_id,
+        reset_at=reset.isoformat(),
+        priority=priority,
+        generation=generation,
+    )
+    print(
+        f"parked {arguments.task_id} (priority {priority}) until "
+        f"{reset.isoformat()}; generation {generation} ceiling "
+        f"{ceiling} tokens"
+    )
+    arm_timer(now)
+    return 0
+
+
+def command_list() -> int:
+    with store_transaction() as payload:
+        reconcile_timer(payload, time.time())
+        records = list(payload["records"])
+        generation = payload["generation"]
+        ceiling = payload["ceiling_tokens"]
+        consumed = payload["consumed_tokens"]
+        timer = payload["timer"]
+    if not records:
+        print("no parked work")
+        return 0
+    print(
+        f"generation {generation}: {consumed} of {ceiling} tokens consumed; "
+        + (
+            f"timer {timer.get('unit')} ({timer.get('phase')})"
+            if isinstance(timer, dict)
+            else "no timer armed"
+        )
+    )
+    now = time.time()
+    for entry in records:
+        reset = datetime.fromtimestamp(entry["reset_at"]).isoformat()
+        due = "due" if entry["reset_at"] <= now else f"resets {reset}"
+        claim = entry.get("claimed_by")
+        print(
+            f"  {entry['priority']:>3}  {entry['task_id']}  {entry['repo']}"
+            f"  {due}"
+            + ("  re-parked" if entry["re_parked"] else "")
+            + (f"  claimed by pid {claim.get('pid')}" if claim else "")
+        )
+    return 0
+
+
+def command_revoke(arguments: argparse.Namespace) -> int:
+    with store_transaction() as payload:
+        before = len(payload["records"])
+        if arguments.all:
+            payload["records"] = []
+        else:
+            payload["records"] = [
+                entry
+                for entry in payload["records"]
+                if entry["task_id"] != arguments.task_id
+            ]
+        removed = before - len(payload["records"])
+        if not payload["records"]:
+            timer = payload.get("timer")
+            if isinstance(timer, dict) and timer.get("unit"):
+                # The timer half always; the service half only when it
+                # is not a live executor, because revocation promises
+                # not to cancel work already in flight.
+                disarm_unit(
+                    timer["unit"], service=not executor_lease_live(payload)
+                )
+            payload["timer"] = None
+    if removed == 0:
+        return fail(
+            "nothing revoked"
+            + ("" if arguments.all else f"; no park for {arguments.task_id}")
+        )
+    print(f"revoked {removed} parked record{'s' if removed != 1 else ''}")
+    return 0
+
+
+class PickupRefusal(Exception):
+    """A parked record that cannot be dispatched, with its named reason."""
+
+
+def process_start(pid: int) -> int | None:
+    """The /proc start token, the same field the merge leases compare."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def claim_token() -> dict[str, Any]:
+    from orrery_standing import current_boot_id
+
+    return {
+        "pid": os.getpid(),
+        "boot_id": current_boot_id(),
+        "process_start": process_start(os.getpid()),
+        "started_at": time.time(),
+    }
+
+
+def claim_is_live(claim: dict[str, Any]) -> bool:
+    """Whether the claiming executor still runs, PID reuse included.
+
+    Boot id, liveness, and the /proc start token together; where a
+    token cannot be read the comparison degrades conservatively to
+    liveness alone, exactly as the runtime owners do.
+    """
+    from orrery_standing import current_boot_id
+
+    pid = claim.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    recorded_boot = claim.get("boot_id")
+    booted = current_boot_id()
+    if recorded_boot and booted and recorded_boot != booted:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    recorded_start = claim.get("process_start")
+    current = process_start(pid)
+    if recorded_start is not None and current is not None:
+        return recorded_start == current
+    return True
+
+
+def ledger_spend_after(
+    root: Path, task_id: str, baseline_seq: int
+) -> tuple[int, list[str]]:
+    """Tokens the ledger attributes past the baseline, and any gaps."""
+    try:
+        records, torn, _ = read_ledger(root / ".orrery", task_id)
+    except LedgerError as exc:
+        return 0, [str(exc)]
+    tokens = 0
+    gaps: list[str] = []
+    for record in records:
+        if not isinstance(record.get("seq"), int) or record["seq"] <= baseline_seq:
+            continue
+        spend = record.get("spend")
+        if isinstance(spend, dict):
+            for value in (spend.get("tokens") or {}).values():
+                if isinstance(value, int) and not isinstance(value, bool):
+                    tokens += max(0, value)
+            if spend.get("unknown"):
+                gaps.extend(spend.get("gaps") or ["usage was not recorded"])
+    if torn:
+        gaps.append("the ledger tail is torn")
+    return tokens, gaps
+
+
+def settle_stale_claims(payload: dict[str, Any]) -> None:
+    """Settle claims whose executor died, outcome included, fail-closed.
+
+    A dead claim does not mean a dead dispatch: the child provider can
+    outlive the executor that spawned it. The ledger decides. A slice
+    that ends in an open dispatch keeps the claim, so the record cannot
+    be re-dispatched while work may still be running; a terminal slice
+    settles spend against the durable baseline and applies the normal
+    outcome, minus the automatic re-park, which only a live executor
+    with the failure's own diagnostics may decide.
+    """
+    settled: list[dict[str, Any]] = []
+    for entry in payload["records"]:
+        claim = entry.get("claimed_by")
+        if not isinstance(claim, dict) or claim_is_live(claim):
+            continue
+        baseline = claim.get("baseline_seq")
+        if not isinstance(baseline, int):
+            # Claimed but never dispatched: nothing landed, nothing to
+            # count, and the record is free again.
+            entry["claimed_by"] = None
+            continue
+        try:
+            records, _torn, _ = read_ledger(
+                Path(entry["repo"]) / ".orrery", entry["task_id"]
+            )
+            last_state = records[-1]["to"] if records else "UNKNOWN"
+        except LedgerError:
+            records, last_state = [], "UNKNOWN"
+        if last_state in {"DISPATCHED", "IN_PROGRESS"}:
+            # The orphaned child may still be running; the claim stays,
+            # blocking re-dispatch until the ledger reaches a terminal
+            # record or the operator intervenes.
+            continue
+        tokens, gaps = ledger_spend_after(
+            Path(entry["repo"]), entry["task_id"], baseline
+        )
+        payload["consumed_tokens"] += tokens
+        if gaps:
+            payload["consumed_tokens"] = max(
+                payload["consumed_tokens"], payload["ceiling_tokens"]
+            )
+            orrery_incidents.record(
+                "pickup-ceiling-stop",
+                program=PROGRAM,
+                task=entry["task_id"],
+                detail=f"stale claim settled with unknown spend: {gaps[0]}",
+            )
+        entry["claimed_by"] = None
+        if last_state in ADVANCED_STATES:
+            settled.append(entry)
+            orrery_incidents.record(
+                "pickup-task",
+                program=PROGRAM,
+                task=entry["task_id"],
+                repo=entry["repo"],
+                outcome=f"settled after a dead executor ({last_state})",
+                tokens=tokens,
+            )
+    for entry in settled:
+        payload["records"].remove(entry)
+
+
+def revalidate(entry: dict[str, Any]) -> tuple[Path, list[dict[str, Any]], str]:
+    """Every binding, re-checked from the world, never from the store."""
+    root = Path(entry["repo"])
+    if not root.is_dir():
+        raise PickupRefusal(f"the repository {root} no longer exists")
+    adopted = orrery_runtime.adopted_root(root)
+    if adopted is None or os.path.realpath(adopted) != os.path.realpath(root):
+        raise PickupRefusal(f"{root} is no longer an adopted repository")
+    grant = under_broad_grant(root)
+    if grant and os.environ.get("ORRERY_ALLOW_TMP_REPOSITORY") != "1":
+        raise PickupRefusal(f"{root} sits under the granted path {grant}")
+    identity = instance_identity(root, create=False)
+    if identity != entry["instance"]:
+        raise PickupRefusal(
+            f"{root} is not the repository instance the park was recorded "
+            "in; the control-store nonce or the history lineage differs"
+        )
+    records, state, contract, digest = task_context(root, entry["task_id"])
+    if digest != entry["contract_digest"]:
+        raise PickupRefusal(
+            f"the sealed contract for {entry['task_id']} changed since the "
+            "park; re-park it if the amended contract should still run"
+        )
+    role = load_role(contract["assigned_role"], cwd=root)
+    if role.endpoint is not None:
+        raise PickupRefusal(
+            f"role {role.id} is now routed at an endpoint; no credential "
+            "is transported to unattended work"
+        )
+    if _fingerprint(role) != entry["role_fingerprint"]:
+        raise PickupRefusal(
+            f"the manifest role for {entry['task_id']} changed since the "
+            "park; re-park it if the new assignment should run unattended"
+        )
+    return root, records, state
+
+
+def _task_script() -> str:
+    return str(Path(__file__).resolve().parent / "orrery-task")
+
+
+QUOTA_WORDING = re.compile(
+    r"\b(?:quota|usage limits?|rate limits?|credits?|allowance)\b",
+    re.IGNORECASE,
+)
+
+
+def quota_reset(root: Path, records: list[dict[str, Any]], combined: str):
+    """A fresh reset time, only from a verified quota diagnosis.
+
+    Reset-like wording alone is not a quota: a transient error can say
+    'try again' too, and re-parking it would wait out a reset that
+    governs nothing. Both the runner's captured output and the
+    attempt's preserved diagnostics are consulted.
+    """
+    preserved = pieces = ""
+    dispatch = next(
+        (r["dispatch"] for r in reversed(records) if "dispatch" in r), None
+    )
+    if dispatch is not None:
+        attempt = Path(dispatch.get("receipts", ""))
+        chunks: list[str] = []
+        for candidate in (
+            attempt / "stdout.log",
+            attempt / "stderr.log",
+            attempt.parent / "consent.txt",
+        ):
+            with contextlib.suppress(OSError):
+                chunks.append(candidate.read_text(errors="replace")[-TAIL_BYTES:])
+        preserved = "\n".join(chunks)
+    pieces = combined + "\n" + preserved
+    if not QUOTA_WORDING.search(pieces):
+        return None
+    return parse_reset_time(pieces)
+
+
+def command_run(fired_unit: str | None = None) -> int:
+    now = time.time()
+    with store_transaction() as payload:
+        lease = payload.get("executor")
+        if isinstance(lease, dict) and claim_is_live(lease):
+            print("another pickup executor is running; nothing was started")
+            return 0
+        payload["executor"] = claim_token()
+        timer = payload.get("timer")
+        if (
+            fired_unit
+            and isinstance(timer, dict)
+            and timer.get("unit") == fired_unit
+        ):
+            # This process IS that unit's service; the timer has elapsed
+            # and --collect retires it. Consuming the intent here keeps
+            # every later disarm away from our own service, and the
+            # reconcile below is told to keep it too.
+            payload["timer"] = None
+        reconcile_timer(payload, now, keep=fired_unit)
+        settle_stale_claims(payload)
+        due = sum(
+            1
+            for entry in payload["records"]
+            if entry["reset_at"] <= now and not entry.get("claimed_by")
+        )
+    orrery_incidents.record("pickup-started", program=PROGRAM, due=due)
+
+    skipped: set[tuple[str, str]] = set()
+    advanced = 0
+    failed = 0
+
+    def key_of(entry: dict[str, Any]) -> tuple[str, str]:
+        return (entry["repo"], entry["task_id"])
+
+    def locate(payload: dict[str, Any], key: tuple[str, str]) -> dict[str, Any] | None:
+        return next(
+            (e for e in payload["records"] if key_of(e) == key), None
+        )
+
+    try:
+        while True:
+            with store_transaction() as payload:
+                settle_stale_claims(payload)
+                if payload["consumed_tokens"] >= payload["ceiling_tokens"]:
+                    orrery_incidents.record(
+                        "pickup-ceiling-stop",
+                        program=PROGRAM,
+                        consumed=payload["consumed_tokens"],
+                        ceiling=payload["ceiling_tokens"],
+                    )
+                    print(
+                        f"the generation budget is spent "
+                        f"({payload['consumed_tokens']} of "
+                        f"{payload['ceiling_tokens']} tokens); admission "
+                        "stops here. This is an admission threshold, not a "
+                        "mid-dispatch cap"
+                    )
+                    break
+                entry = next(
+                    (
+                        e
+                        for e in payload["records"]
+                        if e["reset_at"] <= time.time()
+                        and not e.get("claimed_by")
+                        and key_of(e) not in skipped
+                    ),
+                    None,
+                )
+                if entry is None:
+                    break
+                entry["claimed_by"] = claim_token()
+                claimed = json.loads(json.dumps(entry))
+            key = key_of(claimed)
+
+            try:
+                root, records, state = revalidate(claimed)
+            except (PickupRefusal, RuntimeConfigError, LedgerError) as refusal:
+                skipped.add(key)
+                orrery_incidents.record(
+                    "pickup-refused",
+                    program=PROGRAM,
+                    task=claimed["task_id"],
+                    detail=str(refusal),
+                )
+                print(f"{PROGRAM}: {claimed['task_id']} refused: {refusal}", file=sys.stderr)
+                with store_transaction() as payload:
+                    held = locate(payload, key)
+                    if held is not None:
+                        held["claimed_by"] = None
+                continue
+
+            if state in {"DISPATCHED", "IN_PROGRESS"}:
+                # An orphaned dispatch is the resume reconciler's, never
+                # deleted and never blindly re-run. This record's task
+                # only: a park for one task confers no authority over
+                # its neighbours.
+                subprocess.run(
+                    [sys.executable, _task_script(), "resume", claimed["task_id"]],
+                    cwd=root, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, text=True, check=False,
+                )
+                try:
+                    records, _torn, _ = read_ledger(root / ".orrery", claimed["task_id"])
+                    state = records[-1]["to"]
+                except LedgerError:
+                    state = "UNKNOWN"
+
+            if state not in PARKABLE:
+                done = state in ADVANCED_STATES
+                with store_transaction() as payload:
+                    held = locate(payload, key)
+                    if held is not None:
+                        held["claimed_by"] = None
+                        if done:
+                            # The task moved on without us, toward or
+                            # past the human's gates; the record is done
+                            # and dispatching would run work the
+                            # operator never re-authorised.
+                            payload["records"].remove(held)
+                if done:
+                    advanced += 1
+                    orrery_incidents.record(
+                        "pickup-task", program=PROGRAM,
+                        task=claimed["task_id"], repo=claimed["repo"],
+                        outcome=f"already advanced ({state})", tokens=0,
+                    )
+                else:
+                    # Retryable-but-unauthorised (VERIFICATION_FAILED,
+                    # REVIEW_BLOCKED, a half-open IMPLEMENTED) or an
+                    # unreadable ledger: held for the operator, named.
+                    skipped.add(key)
+                    orrery_incidents.record(
+                        "pickup-refused", program=PROGRAM,
+                        task=claimed["task_id"],
+                        detail=f"state {state} is not a park's to run",
+                    )
+                    print(
+                        f"{PROGRAM}: {claimed['task_id']} refused: state "
+                        f"{state} is not a park's to run",
+                        file=sys.stderr,
+                    )
+                continue
+            try:
+                # The same eligibility rule park applies, re-checked at
+                # fire time: run would happily retry states like
+                # VERIFICATION_FAILED, and an unattended executor must
+                # not extend its authorisation to them.
+                eligible_state(records, state, claimed["task_id"])
+            except LedgerError as refusal:
+                skipped.add(key)
+                orrery_incidents.record(
+                    "pickup-refused", program=PROGRAM,
+                    task=claimed["task_id"], detail=str(refusal),
+                )
+                print(
+                    f"{PROGRAM}: {claimed['task_id']} refused: {refusal}",
+                    file=sys.stderr,
+                )
+                with store_transaction() as payload:
+                    held = locate(payload, key)
+                    if held is not None:
+                        held["claimed_by"] = None
+                continue
+
+            baseline = records[-1]["seq"] if records else 0
+            with store_transaction() as payload:
+                held = locate(payload, key)
+                if held is None or not isinstance(held.get("claimed_by"), dict):
+                    # Revoked between claim and dispatch: honoured.
+                    continue
+                held["claimed_by"]["baseline_seq"] = baseline
+                # Spawned while the transaction still holds the lock, so
+                # a concurrent revoke cannot report success in the gap
+                # between its removal and the provider starting: the
+                # revoke serialises behind this lock and then sees the
+                # claim it cannot cancel.
+                child = subprocess.Popen(
+                    [
+                        sys.executable, _task_script(), "run",
+                        claimed["task_id"], "--no-fallback",
+                    ],
+                    cwd=root, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True,
+                )
+            out, err = child.communicate()
+            combined = out + "\n" + err
+            tokens, gaps = ledger_spend_after(root, claimed["task_id"], baseline)
+            try:
+                after, _torn, _ = read_ledger(root / ".orrery", claimed["task_id"])
+                outcome_state = after[-1]["to"]
+            except LedgerError:
+                outcome_state = "UNKNOWN"
+
+            # An unknown on a dispatch that advanced means real work was
+            # done that the ledger cannot count, and the generation stops
+            # rather than guessing. The only exemption is a VERIFIED
+            # quota failure: a provider that refused for exhaustion did
+            # not do untracked work, and a quota attempt never recovers
+            # usage, so the strict rule would spend the budget on the
+            # very failure parking waits out. A timeout or any other
+            # failure keeps the strict rule; its provider may have
+            # worked for its whole budget unmeasured.
+            fresh = None
+            if outcome_state == "DISPATCH_FAILED":
+                fresh = quota_reset(root, after, combined)
+            counted_gaps = (
+                [] if (outcome_state == "DISPATCH_FAILED" and fresh is not None) else gaps
+            )
+            with store_transaction() as payload:
+                payload["consumed_tokens"] += tokens
+                if counted_gaps:
+                    payload["consumed_tokens"] = max(
+                        payload["consumed_tokens"], payload["ceiling_tokens"]
+                    )
+                held = locate(payload, key)
+                if held is not None:
+                    if outcome_state == "DISPATCH_FAILED":
+                        if fresh is not None and not held["re_parked"]:
+                            held["reset_at"] = fresh.timestamp()
+                            held["re_parked"] = True
+                            held["claimed_by"] = None
+                            outcome = "re-parked"
+                        else:
+                            payload["records"].remove(held)
+                            outcome = "failed"
+                            failed += 1
+                    elif outcome_state in PARKABLE or outcome_state == "UNKNOWN":
+                        held["claimed_by"] = None
+                        skipped.add(key)
+                        outcome = f"kept ({outcome_state})"
+                    elif outcome_state in ADVANCED_STATES:
+                        payload["records"].remove(held)
+                        outcome = f"advanced ({outcome_state})"
+                        advanced += 1
+                    else:
+                        # Our own dispatch ended somewhere a park may
+                        # not retry (a failed verification, a blocked
+                        # review): the operator's, not the next run's.
+                        payload["records"].remove(held)
+                        outcome = f"stopped ({outcome_state})"
+                        failed += 1
+                else:
+                    outcome = f"revoked mid-dispatch ({outcome_state})"
+            if counted_gaps:
+                orrery_incidents.record(
+                    "pickup-ceiling-stop",
+                    program=PROGRAM,
+                    task=claimed["task_id"],
+                    detail=f"unknown spend: {counted_gaps[0]}",
+                )
+                print(
+                    f"{PROGRAM}: {claimed['task_id']} spent tokens the "
+                    f"ledger cannot count ({counted_gaps[0]}); the "
+                    "generation stops rather than guessing",
+                    file=sys.stderr,
+                )
+            orrery_incidents.record(
+                "pickup-task",
+                program=PROGRAM,
+                task=claimed["task_id"],
+                repo=claimed["repo"],
+                outcome=outcome,
+                tokens=tokens,
+            )
+    finally:
+        with store_transaction() as payload:
+            payload["executor"] = None
+        arm_timer(time.time(), fired_unit)
+
+    print(
+        f"pickup finished: {advanced} advanced, {failed} failed, "
+        f"{len(skipped)} held"
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog=PROGRAM, add_help=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    park = commands.add_parser("park", help="park one task until a limit reset")
+    park.add_argument("task_id")
+    park.add_argument("--priority", type=int, default=None)
+    park.add_argument("--reset-at", dest="reset_at", default=None)
+    park.add_argument(
+        "--ceiling-tokens", dest="ceiling_tokens", type=int, default=None
+    )
+
+    commands.add_parser("list", help="show parked work and the generation budget")
+
+    revoke = commands.add_parser("revoke", help="remove parked records")
+    revoke.add_argument("task_id", nargs="?", default=None)
+    revoke.add_argument("--all", action="store_true")
+
+    run = commands.add_parser("run", help="dispatch due parked work")
+    run.add_argument("--fired-unit", dest="fired_unit", default=None)
+
+    arguments = parser.parse_args()
+    if arguments.command == "revoke" and not arguments.all and arguments.task_id is None:
+        return fail("revoke needs a task id or --all")
+
+    try:
+        if arguments.command == "park":
+            return command_park(arguments)
+        if arguments.command == "list":
+            return command_list()
+        if arguments.command == "revoke":
+            return command_revoke(arguments)
+        return command_run(arguments.fired_unit)
+    except (RuntimeConfigError, LedgerError) as exc:
+        return fail(str(exc))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

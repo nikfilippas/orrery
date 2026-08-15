@@ -222,6 +222,10 @@ link_file \
     "$HOME/.local/bin/orrery-memory"
 
 link_file \
+    "$KIT_DIR/scripts/orrery-pickup" \
+    "$HOME/.local/bin/orrery-pickup"
+
+link_file \
     "$KIT_DIR/scripts/orrery-config" \
     "$HOME/.local/bin/orrery-config"
 

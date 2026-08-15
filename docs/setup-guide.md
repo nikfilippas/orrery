@@ -628,6 +628,44 @@ Cross-provider fallback starts fresh context and drops provider-specific
 principal CLI arguments. Use `--no-fallback` when the exact configured provider
 or model is required.
 
+## Park work across a limit reset
+
+An exhausted plan is never answered by substitution; the sanctioned
+retry is the same model after the provider's stated reset. Parking
+automates only the waiting:
+
+```bash
+orrery-pickup park T-3            # inside the adopted repository
+orrery-pickup list
+orrery-pickup run                 # what the timer invokes; also manual
+orrery-pickup revoke T-3          # or --all
+```
+
+`park` reads the announced reset time from the failed attempt's own
+preserved diagnostics (state one with `--reset-at` if the provider told
+only you), binds the record to the sealed contract's digest, the full
+role fingerprint and the repository instance, and arms one transient
+systemd user timer. At the reset, `run` re-checks every binding from
+the world, dispatches due work in priority order through the ordinary
+task plane with `--no-fallback` forced, and stops at the generation
+budget: a durable admission threshold (default 200,000 tokens,
+`--ceiling-tokens` to change), not a mid-dispatch cap. A dispatch that
+fails on a fresh announced reset re-parks once; nothing a pickup runs
+can pass the merge gate, which stays yours.
+
+Honesty about offline firing: the timer survives logout only under
+`loginctl enable-linger`, and survives neither a user-manager restart
+nor a reboot; it also needs the machine awake, the network, and
+provider credentials that work without a prompt. Every one of those
+losses is caught by the SessionStart line, which announces runnable
+parked work at your next session. No credential value is ever carried
+by the timer: first-party CLIs read their own on-disk authentication,
+and an endpoint-routed role, whose key lives only in your shell, is
+refused at park. Revocation acts between dispatches; it does not cancel
+a provider run already in flight. Parking your own account's work on
+your own machine is deliberate automation, disclosed by `list` and the
+doctor, and off until you arm it.
+
 ## Token usage
 
 ```bash
@@ -767,6 +805,14 @@ The maintained artefacts are:
   is concatenated into a later delegate's assignment, where ordinary
   prose survives the provider-text filter intact. A delegate proposes;
   the operator admits, in their own words.
+- `scripts/orrery-pickup` — parked work across a provider limit reset:
+  `park` binds a quota-stopped task to its sealed contract digest, role
+  fingerprint and repository instance, arms one transient systemd user
+  timer for the announced reset, and `run` re-dispatches due work in
+  priority order under a durable generation budget, with `--no-fallback`
+  forced because no consent is possible offline. `list` shows the queue
+  and `revoke` disarms it; nothing a pickup runs can pass the merge
+  gate, which stays the operator's.
 - `scripts/orrery_verify.py` — running one repository command under the
   containment ladder, shared by a contract's acceptance criteria and by
   a memory fact's check, so how far a command may reach has one answer.

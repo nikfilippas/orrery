@@ -878,6 +878,30 @@ candidate remains, Orrery says so. Cross-provider fallback starts a
 fresh context and omits provider-specific principal arguments; it never
 claims conversation migration.
 
+## Parked work
+
+A provider usage limit is the one failure the fallback machinery
+deliberately does not answer with substitution, so `orrery-pickup`
+automates the sanctioned alternative: waiting for the announced reset
+and retrying the same configured model. A park is an operator command
+that binds the task to its sealed contract digest, its full role
+fingerprint, and a repository-instance nonce written into the control
+store; the executor re-derives all three at fire time and refuses any
+drift, so an amended contract, a changed manifest, or a recreated
+repository invalidates the park rather than running something the
+operator never authorised. One transient systemd timer per store fires
+the executor, which claims records under short store transactions
+(revocation lands between dispatches), draws every dispatch's
+ledger-recorded spend from a durable per-generation budget with
+claim-time baselines, treats unknown spend from advancing work as a
+stop, and forwards `--no-fallback` because no consent is possible
+offline. Timer environment carries no credential value; the store is
+read with the trust store's strictness; and everything a pickup
+produces still stops at the human-gated review queue and merge gate.
+Where systemd, lingering, or the machine itself is unavailable, the
+degradation is announced and the SessionStart hook names runnable
+parked work at the next session.
+
 ## Installation
 
 The installer is idempotent. It backs up displaced user files under

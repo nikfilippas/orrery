@@ -517,6 +517,7 @@ for entry in \
     "orrery-usage:scripts/orrery-usage" \
     "orrery-incidents:scripts/orrery-incidents" \
     "orrery-task:scripts/orrery-task" \
+    "orrery-pickup:scripts/orrery-pickup" \
     "orrery-sync:scripts/orrery-sync"
 do
     name="${entry%%:*}"
@@ -766,6 +767,38 @@ PY
     fi
 else
     fail "The standing-approval store could not be read"
+fi
+
+printf '\n=== Parked work ===\n'
+if PICKUP_REPORT="$(
+    python3 - "$KIT_DIR" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+loader = importlib.machinery.SourceFileLoader(
+    "doctor_pickup", str(Path(sys.argv[1]) / "scripts" / "orrery-pickup")
+)
+spec = importlib.util.spec_from_loader("doctor_pickup", loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+info, warnings = module.describe()
+for line in info:
+    print(f"INFO:{line}")
+for line in warnings:
+    print(f"WARN:{line}")
+PY
+)"; then
+    while IFS= read -r line; do
+        case "$line" in
+            INFO:*) pass "Parked work: ${line#INFO:}" ;;
+            WARN:*) warn "Parked work: ${line#WARN:}" ;;
+        esac
+    done <<< "$PICKUP_REPORT"
+else
+    warn "The parked-work store could not be described"
 fi
 
 printf '\n=== Principal surface ===\n'

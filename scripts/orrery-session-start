@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -104,7 +105,55 @@ def same_model(provider: str, configured: str, active: str) -> bool:
     ) is not None
 
 
+def parked_announcement() -> str:
+    """One line when parked pickup work is due with no timer to fire.
+
+    Tolerant on purpose, unlike orrery-pickup's own strict store
+    reading: this announces a pointer and executes nothing, and a
+    session must start whatever state the store is in. A delegated
+    session gets no announcement; its assignment is bounded.
+    """
+    if os.environ.get("ORRERY_ROLE"):
+        return ""
+    state = Path(
+        os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state"
+    )
+    # A store under a granted path is delegate-writable; even a mere
+    # pointer should not be forgeable from one. The executor's own
+    # strict checks remain the real gate.
+    resolved = os.path.realpath(state)
+    if any(
+        resolved == grant or resolved.startswith(grant + os.sep)
+        for grant in ("/tmp", "/var/tmp")
+    ) and os.environ.get("ORRERY_ALLOW_TMP_REPOSITORY") != "1":
+        return ""
+    try:
+        payload = json.loads((state / "orrery" / "pickup.json").read_text())
+        records = payload.get("records") or []
+        now = time.time()
+        due = sorted(
+            str(entry.get("task_id"))
+            for entry in records
+            if isinstance(entry, dict)
+            and isinstance(entry.get("reset_at"), (int, float))
+            and entry["reset_at"] <= now
+        )
+        timer = payload.get("timer")
+        armed = isinstance(timer, dict) and timer.get("phase") == "confirmed"
+        if due and not armed:
+            return (
+                f"Parked Orrery work is runnable ({', '.join(due)}); "
+                "run orrery-pickup run."
+            )
+    except (OSError, ValueError, TypeError):
+        return ""
+    return ""
+
+
 def hook_output(system_message: str, context: str) -> dict[str, Any]:
+    parked = parked_announcement()
+    if parked:
+        context = f"{context}\n{parked}" if context else parked
     return {
         "systemMessage": system_message,
         "hookSpecificOutput": {

@@ -353,7 +353,12 @@ def main() -> int:
         )
         return 7
     if mode == "quota":
-        print("usage limit reached; no credits remain", file=sys.stderr)
+        print(
+            os.environ.get(
+                "CODEX_FAKE_QUOTA_DETAIL", "usage limit reached; no credits remain"
+            ),
+            file=sys.stderr,
+        )
         return 7
     if mode == "model-fail":
         print("model is unavailable or not found", file=sys.stderr)

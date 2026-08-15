@@ -14130,6 +14130,1262 @@ def test_state_directories_ignore_umask() -> None:
             os.environ["XDG_STATE_HOME"] = saved_state
 
 
+PICKUP_SCRIPT = KIT_DIR / "scripts" / "orrery-pickup"
+
+
+def run_pickup(
+    directory: Path, *arguments: str, environment: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(PICKUP_SCRIPT), *arguments],
+        cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment, timeout=120, check=False,
+    )
+
+
+def recent_past_iso(minutes_ago: int = 5) -> str:
+    """A reset moment that is due but nowhere near the expiry slack."""
+    return time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - minutes_ago * 60)
+    )
+
+
+def announced_reset_line(minutes_ahead: int = 90) -> str:
+    moment = time.localtime(time.time() + minutes_ahead * 60)
+    stamp = time.strftime("%Y-%m-%d %H:%M", moment)
+    return f"Usage limit reached. Try again at {stamp}.\n"
+
+
+def parked_fixture(
+    directory: str,
+    *,
+    reset_text: str | None,
+    channel: str = "stderr.log",
+    task_ids: tuple[str, ...] = ("T-1",),
+    crafted: bool = True,
+) -> tuple[Path, dict[str, str], Path]:
+    """An adopted repository whose T-1 failed dispatch on a quota.
+
+    With crafted=False the tasks stay READY and no dispatch history is
+    invented, which is the shape the executor tests want: a first real
+    dispatch through the actual task plane.
+    """
+    root = adopted_repository(directory)
+    state = Path(directory) / "state"
+    environment = dict(os.environ)
+    environment["XDG_STATE_HOME"] = str(state)
+    # Absent tools, honoured through the runner's own overrides: a park
+    # must never arm a real timer on the developer's user manager.
+    environment["ORRERY_SYSTEMD_RUN"] = "/nonexistent/systemd-run"
+    environment["ORRERY_SYSTEMCTL"] = "/nonexistent/systemctl"
+    # An adopted marker is untracked by definition and excluded in real
+    # repositories, so the dispatch gate's dirty-baseline check must not
+    # see it.
+    exclude = root / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as handle:
+        handle.write(".orrery.json\n")
+    (root / "edited.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(root), "add", "edited.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "user.email=kit@test", "-c",
+         "user.name=Kit", "commit", "-q", "-m", "base"],
+        check=True,
+    )
+    for task_id in task_ids:
+        source = Path(directory) / "contract.json"
+        write_json(source, dispatch_contract(task_id))
+        created = run_task(root, "create", str(source))
+        require(created.returncode == 0, created.stderr)
+        source.unlink()
+    if not crafted:
+        return root, environment, state
+    base = git_output(root, "rev-parse", "HEAD")
+    attempt = root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"
+    attempt.mkdir(mode=0o700, parents=True)
+    if reset_text is not None:
+        (attempt / channel).write_text(reset_text)
+    saved_state = os.environ.get("XDG_STATE_HOME")
+    os.environ["XDG_STATE_HOME"] = str(state)
+    try:
+        worktree = ledger_module.ensure_worktree(root, "T-1", base)
+    finally:
+        if saved_state is None:
+            os.environ.pop("XDG_STATE_HOME", None)
+        else:
+            os.environ["XDG_STATE_HOME"] = saved_state
+    with ledger_module.control_lock(root) as store:
+        digest = task_records(root)[-1]["contract_digest"]
+        ledger_module.append_record(store, "T-1", {
+            "from": "READY", "to": "DISPATCHED", "actor": "user",
+            "gate": {
+                "base_head": base,
+                "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"),
+                "dirty_fingerprint": "", "dirty_baseline": False,
+            },
+            "dispatch": {
+                "seq": 1, "receipts": str(attempt),
+                "worktree": str(worktree), "branch": "orrery/T-1",
+            },
+            "contract_digest": digest,
+        })
+        ledger_module.append_record(store, "T-1", {
+            "from": "DISPATCHED", "to": "DISPATCH_FAILED", "actor": "runner",
+            "reason": "provider-exit", "contract_digest": digest,
+        })
+    return root, environment, state
+
+
+@test("a park binds the contract, the role, and the repository instance")
+def test_pickup_park_binds() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        parked = run_pickup(
+            root, "park", "T-1", "--priority", "2", environment=environment
+        )
+        require(
+            parked.returncode == 0 and "parked T-1" in parked.stdout,
+            f"{parked.stdout!r} {parked.stderr!r}",
+        )
+        store_file = state / "orrery" / "pickup.json"
+        payload = read_json(store_file)
+        require(
+            payload["generation"] == 1 and len(payload["records"]) == 1,
+            str(payload),
+        )
+        entry = payload["records"][0]
+        contract = (root / ".orrery" / "contracts" / "T-1.json").read_bytes()
+        require(
+            entry["contract_digest"] == hashlib.sha256(contract).hexdigest(),
+            "the sealed contract digest was not bound",
+        )
+        role = runtime_module.load_role("implementer", cwd=root)
+        require(
+            entry["role_fingerprint"] == standing_module._fingerprint(role),
+            f"the role fingerprint was not bound: {entry['role_fingerprint']}",
+        )
+        nonce = root / ".orrery" / "pickup-nonce"
+        require(
+            nonce.is_file()
+            and stat.S_IMODE(nonce.stat().st_mode) == 0o600
+            and entry["instance"]["nonce_sha256"]
+            == hashlib.sha256(nonce.read_text().strip().encode()).hexdigest(),
+            "the instance nonce was not bound",
+        )
+        require(entry["reset_at"] > time.time(), "the reset is not ahead")
+        require(
+            stat.S_IMODE(store_file.stat().st_mode) == 0o600
+            and stat.S_IMODE((state / "orrery").stat().st_mode) == 0o700,
+            "the store landed with loose modes",
+        )
+
+
+@test("park refuses what it cannot bind, naming each reason")
+def test_pickup_park_refusals() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, _state = parked_fixture(directory, reset_text=None)
+        unknown = run_pickup(root, "park", "T-9", environment=environment)
+        require(
+            unknown.returncode == 2 and "no ledger" in unknown.stderr,
+            unknown.stderr,
+        )
+        unrecoverable = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            unrecoverable.returncode == 2
+            and "--reset-at" in unrecoverable.stderr,
+            unrecoverable.stderr,
+        )
+        malformed = run_pickup(
+            root, "park", "T-1", "--reset-at", "next tuesday",
+            environment=environment,
+        )
+        require(
+            malformed.returncode == 2 and "ISO 8601" in malformed.stderr,
+            malformed.stderr,
+        )
+        with ledger_module.control_lock(root) as store:
+            digest = task_records(root)[-1]["contract_digest"]
+            ledger_module.append_record(store, "T-1", {
+                "from": "DISPATCH_FAILED", "to": "READY", "actor": "user",
+                "reason": "retry", "contract_digest": digest,
+            })
+            ledger_module.append_record(store, "T-1", {
+                "from": "READY", "to": "DISPATCHED", "actor": "user",
+                "gate": {
+                    "base_head": git_output(root, "rev-parse", "HEAD"),
+                    "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"),
+                    "dirty_fingerprint": "", "dirty_baseline": False,
+                },
+                "dispatch": {
+                    "seq": 2,
+                    "receipts": str(root / ".orrery" / "dispatch" / "T-1" / "2" / "attempt-1"),
+                    "worktree": str(ledger_module.worktree_path(root, "T-1")),
+                    "branch": "orrery/T-1",
+                },
+                "contract_digest": digest,
+            })
+            ledger_module.append_record(store, "T-1", {
+                "from": "DISPATCHED", "to": "INTERRUPTED", "actor": "runner",
+                "reason": "controller-death", "phase": "review",
+                "contract_digest": digest,
+            })
+        review_phase = run_pickup(
+            root, "park", "T-1", "--reset-at", "2999-01-01T00:00:00",
+            environment=environment,
+        )
+        require(
+            review_phase.returncode == 2
+            and "orrery-task review" in review_phase.stderr,
+            review_phase.stderr,
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        plain = Path(directory) / "plain"
+        plain.mkdir()
+        subprocess.run(["git", "init", "-q", str(plain)], check=True)
+        environment = dict(os.environ)
+        unadopted = run_pickup(plain, "park", "T-1", environment=environment)
+        require(
+            unadopted.returncode == 2 and "not adopted" in unadopted.stderr,
+            unadopted.stderr,
+        )
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = adopted_repository(directory)
+        environment = dict(os.environ)
+        environment.pop("ORRERY_ALLOW_TMP_REPOSITORY", None)
+        granted = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            granted.returncode == 2
+            and "refused exactly as dispatch is" in granted.stderr,
+            granted.stderr,
+        )
+
+
+@test("the pickup store refuses insecurity and never reads malformed as empty")
+def test_pickup_store_strictness() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        require(
+            run_pickup(root, "park", "T-1", environment=environment).returncode == 0,
+            "the fixture park failed",
+        )
+        store_file = state / "orrery" / "pickup.json"
+        original = store_file.read_bytes()
+
+        store_file.write_text("not json\n")
+        malformed = run_pickup(root, "list", environment=environment)
+        require(
+            malformed.returncode == 2
+            and "malformed" in malformed.stderr
+            and "empty" in malformed.stderr
+            and store_file.read_text() == "not json\n",
+            f"a malformed store was not refused intact: {malformed.stderr}",
+        )
+
+        store_file.unlink()
+        target = state / "orrery" / "elsewhere.json"
+        target.write_bytes(original)
+        store_file.symlink_to(target)
+        linked = run_pickup(root, "list", environment=environment)
+        require(
+            linked.returncode == 2 and "symlinked" in linked.stderr,
+            linked.stderr,
+        )
+        store_file.unlink()
+        target.unlink()
+
+        store_file.write_bytes(original)
+        (state / "orrery").chmod(0o770)
+        writable = run_pickup(root, "list", environment=environment)
+        require(
+            writable.returncode == 2
+            and "group- or world-writable" in writable.stderr,
+            writable.stderr,
+        )
+        (state / "orrery").chmod(0o700)
+
+        payload = json.loads(original)
+        payload["records"][0]["reset_at"] = time.time() - 8 * 24 * 3600
+        write_json(store_file, payload)
+        store_file.chmod(0o600)
+        expired = run_pickup(root, "list", environment=environment)
+        require(
+            expired.returncode == 0 and "no parked work" in expired.stdout,
+            f"{expired.stdout!r} {expired.stderr!r}",
+        )
+        require(
+            json.loads(store_file.read_text())["records"] == [],
+            "the expired record survived in the store",
+        )
+
+
+@test("an endpoint-routed role cannot be parked")
+def test_pickup_refuses_endpoint_roles() -> None:
+    module = load_script(PICKUP_SCRIPT, "kit_pickup_endpoint")
+    with tempfile.TemporaryDirectory() as directory:
+        root, _environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        routed = dataclasses.replace(
+            runtime_module.load_role("implementer", cwd=root),
+            endpoint=runtime_module.Endpoint(
+                id="kimi", label="Kimi", adapter="anthropic",
+                base_url="https://api.example", key_env="KIMI_KEY",
+            ),
+        )
+        saved_state = os.environ.get("XDG_STATE_HOME")
+        saved_cwd = os.getcwd()
+        saved_loader = module.load_role
+        os.environ["XDG_STATE_HOME"] = str(state)
+        os.chdir(root)
+        try:
+            module.load_role = lambda name, cwd=None: routed
+            arguments = types.SimpleNamespace(
+                task_id="T-1", priority=1, reset_at=None, ceiling_tokens=None
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                status = module.command_park(arguments)
+            require(
+                status == 2 and "cannot be parked" in stderr.getvalue(),
+                f"an endpoint-routed role parked: {stderr.getvalue()}",
+            )
+        finally:
+            module.load_role = saved_loader
+            os.chdir(saved_cwd)
+            if saved_state is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved_state
+
+
+@test("list orders parked work and revoke disarms records")
+def test_pickup_list_and_revoke() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory,
+            reset_text=announced_reset_line(),
+            task_ids=("T-1", "T-2"),
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--priority", "2", "--reset-at",
+                "2999-01-01T00:00:00", environment=environment,
+            ).returncode == 0,
+            "first park failed",
+        )
+        require(
+            run_pickup(
+                root, "park", "T-2", "--priority", "1", "--reset-at",
+                "2999-01-01T00:00:00", environment=environment,
+            ).returncode == 0,
+            "second park failed",
+        )
+        listed = run_pickup(root, "list", environment=environment)
+        lines = [line for line in listed.stdout.splitlines() if "  T-" in line]
+        require(
+            listed.returncode == 0
+            and "no timer armed" in listed.stdout
+            and len(lines) == 2
+            and "T-2" in lines[0]
+            and "T-1" in lines[1],
+            f"the order is wrong: {listed.stdout!r}",
+        )
+        revoked = run_pickup(root, "revoke", "T-2", environment=environment)
+        require(
+            revoked.returncode == 0 and "revoked 1" in revoked.stdout,
+            revoked.stderr,
+        )
+        missing = run_pickup(root, "revoke", "T-9", environment=environment)
+        require(
+            missing.returncode == 2 and "nothing revoked" in missing.stderr,
+            missing.stderr,
+        )
+        require(
+            run_pickup(root, "revoke", "--all", environment=environment).returncode == 0,
+            "revoke --all failed",
+        )
+        empty = run_pickup(root, "list", environment=environment)
+        require("no parked work" in empty.stdout, empty.stdout)
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", "2999-01-01T00:00:00",
+                environment=environment,
+            ).returncode == 0,
+            "re-park failed",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["generation"] == 2 and payload["consumed_tokens"] == 0,
+            f"a fresh generation was not started: {payload}",
+        )
+
+
+@test("a reset announced only on stdout still parks")
+def test_pickup_stdout_reset() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, _state = parked_fixture(
+            directory,
+            reset_text=announced_reset_line(),
+            channel="stdout.log",
+        )
+        parked = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            parked.returncode == 0 and "parked T-1" in parked.stdout,
+            f"{parked.stdout!r} {parked.stderr!r}",
+        )
+
+
+def pickup_timer_stubs(directory: Path, environment: dict[str, str]) -> Path:
+    """Stub systemd-run, systemctl and loginctl, capturing every call."""
+    stubs = directory / "timer-stubs"
+    stubs.mkdir()
+    capture = directory / "timer-calls.jsonl"
+    environment["KIT_PICKUP_CAPTURE"] = str(capture)
+    (stubs / "systemd-run").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['KIT_PICKUP_CAPTURE'], 'a') as h:\n"
+        "    h.write(json.dumps({'tool': 'systemd-run', 'argv': sys.argv[1:]}) + '\\n')\n"
+        "raise SystemExit(int(os.environ.get('KIT_SYSTEMDRUN_RC', '0')))\n"
+    )
+    (stubs / "systemctl").write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "with open(os.environ['KIT_PICKUP_CAPTURE'], 'a') as h:\n"
+        "    h.write(json.dumps({'tool': 'systemctl', 'argv': sys.argv[1:]}) + '\\n')\n"
+        "if 'list-units' in sys.argv:\n"
+        "    print(os.environ.get('KIT_PICKUP_LOADED', ''))\n"
+        "raise SystemExit(0)\n"
+    )
+    (stubs / "loginctl").write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "print('Linger=' + os.environ.get('KIT_PICKUP_LINGER', 'no'))\n"
+    )
+    for name in ("systemd-run", "systemctl", "loginctl"):
+        (stubs / name).chmod(0o755)
+    environment["ORRERY_SYSTEMD_RUN"] = str(stubs / "systemd-run")
+    environment["ORRERY_SYSTEMCTL"] = str(stubs / "systemctl")
+    environment["PATH"] = f"{stubs}{os.pathsep}{environment.get('PATH', '')}"
+    return capture
+
+
+def timer_calls(capture: Path) -> list[dict[str, Any]]:
+    if not capture.exists():
+        return []
+    return [json.loads(line) for line in capture.read_text().splitlines()]
+
+
+@test("park arms one fresh timer pair with a pinned, secret-free environment")
+def test_pickup_arms_timer() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line(), task_ids=("T-1", "T-2")
+        )
+        capture = pickup_timer_stubs(Path(directory), environment)
+        environment["ANTHROPIC_API_KEY"] = "SECRETXYZ"
+        environment["HTTPS_PROXY"] = "http://proxy.example:3128"
+        environment["HTTP_PROXY"] = "http://user:PROXYSECRET@proxy.example:3128"
+        parked = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            parked.returncode == 0 and "timer orrery-pickup-" in parked.stdout
+            and "lingering is off" in parked.stdout,
+            f"{parked.stdout!r} {parked.stderr!r}",
+        )
+        calls = timer_calls(capture)
+        runs = [c for c in calls if c["tool"] == "systemd-run"]
+        require(len(runs) == 1, f"expected one arming, saw {calls}")
+        argv = runs[0]["argv"]
+        joined = json.dumps(argv)
+        unit = next(
+            (a.split("=", 1)[1] for a in argv if a.startswith("--unit=")), ""
+        )
+        require(
+            "--user" in argv
+            and "--collect" in argv
+            and any(a.startswith("--on-calendar=") for a in argv)
+            and unit.startswith("orrery-pickup-")
+            and f"--setenv=XDG_STATE_HOME={state}" in argv
+            and any(a.startswith("--setenv=PATH=") for a in argv)
+            and f"--setenv=HTTPS_PROXY={environment['HTTPS_PROXY']}" in argv
+            and os.path.realpath(PICKUP_SCRIPT) in argv
+            and argv[argv.index(os.path.realpath(PICKUP_SCRIPT)) + 1] == "run"
+            and argv[-2:] == ["--fired-unit", unit],
+            f"the arming argv is wrong: {argv}",
+        )
+        require(
+            "SECRETXYZ" not in joined and "PROXYSECRET" not in joined,
+            "a credential value reached the timer's argv",
+        )
+        require(
+            "HTTP_PROXY embeds credentials" in parked.stderr,
+            f"the credentialed proxy was not disclosed: {parked.stderr!r}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["timer"]["phase"] == "confirmed"
+            and payload["timer"]["unit"] == unit,
+            f"the intent was not confirmed: {payload['timer']}",
+        )
+        capture.unlink()
+        second_park = run_pickup(
+            root, "park", "T-2", "--reset-at", "2999-01-01T00:00:00",
+            environment=environment,
+        )
+        require(second_park.returncode == 0, second_park.stderr)
+        calls = timer_calls(capture)
+        stops = [
+            c["argv"] for c in calls
+            if c["tool"] == "systemctl" and "stop" in c["argv"]
+        ]
+        require(
+            any(f"{unit}.timer" in argv for argv in stops)
+            and any(f"{unit}.service" in argv for argv in stops),
+            f"the prior pair was not stopped deliberately: {calls}",
+        )
+        second = [c for c in calls if c["tool"] == "systemd-run"]
+        second_unit = next(
+            (a.split("=", 1)[1] for a in second[0]["argv"] if a.startswith("--unit=")),
+            "",
+        )
+        require(
+            len(second) == 1 and second_unit and second_unit != unit,
+            "the replacement did not use a fresh name",
+        )
+
+
+@test("a failed arming clears its intent and says so")
+def test_pickup_failed_arming() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        pickup_timer_stubs(Path(directory), environment)
+        environment["KIT_SYSTEMDRUN_RC"] = "1"
+        parked = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            parked.returncode == 0
+            and "arming failed" in parked.stderr
+            and "SessionStart" in parked.stderr,
+            f"{parked.stdout!r} {parked.stderr!r}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(payload["timer"] is None, f"a dead intent survived: {payload}")
+
+
+@test("reconciliation stops unclaimed pickup units and clears stale intents")
+def test_pickup_reconciliation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        capture = pickup_timer_stubs(Path(directory), environment)
+        require(
+            run_pickup(root, "park", "T-1", environment=environment).returncode == 0,
+            "the fixture park failed",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        claimed = payload["timer"]["unit"]
+        environment["KIT_PICKUP_LOADED"] = (
+            f"{claimed}.timer loaded active waiting\n"
+            "orrery-pickup-999-dead.timer loaded failed failed\n"
+            "orrery-pickup-999-dead.service loaded inactive dead"
+        )
+        capture.unlink()
+        listed = run_pickup(root, "list", environment=environment)
+        require(listed.returncode == 0, listed.stderr)
+        stops = [
+            c["argv"] for c in timer_calls(capture)
+            if c["tool"] == "systemctl" and "stop" in c["argv"]
+        ]
+        require(
+            any("orrery-pickup-999-dead.timer" in argv for argv in stops)
+            and any("orrery-pickup-999-dead.service" in argv for argv in stops)
+            and not any(f"{claimed}.timer" in argv for argv in stops),
+            f"reconciliation stopped the wrong units: {stops}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        payload["timer"] = {
+            "unit": "orrery-pickup-777-gone", "phase": "pending",
+            "armed_at": time.time() - 400, "fire_at": time.time() + 3600,
+        }
+        write_json(state / "orrery" / "pickup.json", payload)
+        (state / "orrery" / "pickup.json").chmod(0o600)
+        environment["KIT_PICKUP_LOADED"] = ""
+        require(
+            run_pickup(root, "list", environment=environment).returncode == 0,
+            "the stale-intent list failed",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["timer"] is None,
+            f"a stale pending intent survived: {payload['timer']}",
+        )
+
+
+@test("SessionStart announces runnable parked work in one line")
+def test_pickup_session_start_line() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        state_home = Path(directory) / "state"
+        (state_home / "orrery").mkdir(mode=0o700, parents=True)
+        write_json(
+            state_home / "orrery" / "pickup.json",
+            {
+                "v": 1, "generation": 1, "ceiling_tokens": 200000,
+                "consumed_tokens": 0, "timer": None,
+                "records": [{
+                    "repo": str(repository), "task_id": "T-1",
+                    "instance": {"nonce_sha256": "x", "lineage_sha256": "y"},
+                    "contract_digest": "d", "role_fingerprint": ["v2"],
+                    "priority": 1, "parked_at": time.time() - 120,
+                    "reset_at": time.time() - 60, "re_parked": False,
+                    "claimed_by": None,
+                }],
+            },
+        )
+        surface_home = Path(directory) / "home"
+        (surface_home / ".claude").mkdir(parents=True)
+        write_json(surface_home / ".claude" / "settings.json", {})
+        environment = os.environ.copy()
+        environment["HOME"] = str(surface_home)
+        environment["XDG_STATE_HOME"] = str(state_home)
+        payload = json.dumps({
+            "hook_event_name": "SessionStart", "source": "startup",
+            "cwd": str(repository),
+        })
+        announced = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=payload, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=60, check=False,
+        )
+        require(
+            "orrery-pickup run" in announced.stdout,
+            f"no announcement: {announced.stdout!r} {announced.stderr!r}",
+        )
+        environment["ORRERY_ROLE"] = "mechanic"
+        silenced = subprocess.run(
+            [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+            input=payload, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, timeout=60, check=False,
+        )
+        require(
+            "orrery-pickup run" not in silenced.stdout,
+            f"a delegate saw the announcement: {silenced.stdout!r}",
+        )
+
+
+@test("the doctor reports parked work and its missing timer")
+def test_pickup_doctor_section() -> None:
+    environment = review_environment("success")
+    try:
+        state_home = Path(environment["XDG_STATE_HOME"])
+        (state_home / "orrery").mkdir(mode=0o700, parents=True, exist_ok=True)
+        store_file = state_home / "orrery" / "pickup.json"
+        write_json(
+            store_file,
+            {
+                "v": 1, "generation": 1, "ceiling_tokens": 200000,
+                "consumed_tokens": 0, "timer": None,
+                "records": [{
+                    "repo": "/nowhere/repo", "task_id": "T-1",
+                    "instance": {"nonce_sha256": "x", "lineage_sha256": "y"},
+                    "contract_digest": "d", "role_fingerprint": ["v2"],
+                    "priority": 1, "parked_at": time.time() - 120,
+                    "reset_at": time.time() - 60, "re_parked": False,
+                    "claimed_by": None,
+                }],
+            },
+        )
+        store_file.chmod(0o600)
+        report = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, timeout=120, check=False,
+        )
+        require(
+            "WARN  Parked work:" in report.stdout
+            and "no timer armed" in report.stdout
+            and "orrery-pickup run" in report.stdout,
+            f"the doctor missed the due parked work: {report.stdout[-800:]}",
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
+@test("the executor refuses states parking never authorised, and neighbours")
+def test_pickup_executor_state_authority() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, task_ids=("T-1", "T-2"), crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        head = git_output(root, "rev-parse", "HEAD")
+        attempt_two = root / ".orrery" / "dispatch" / "T-2" / "1" / "attempt-1"
+        attempt_two.mkdir(mode=0o700, parents=True)
+        saved_state = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = base["XDG_STATE_HOME"]
+        try:
+            worktree_two = ledger_module.ensure_worktree(root, "T-2", head)
+        finally:
+            if saved_state is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved_state
+        with ledger_module.control_lock(root) as store:
+            digest_one = task_records(root, "T-1")[-1]["contract_digest"]
+            digest_two = task_records(root, "T-2")[-1]["contract_digest"]
+            gate = {
+                "base_head": head,
+                "symbolic_ref": git_output(root, "symbolic-ref", "HEAD"),
+                "dirty_fingerprint": "", "dirty_baseline": False,
+            }
+            # T-1 advanced past dispatch into a state run would retry
+            # but parking never authorised.
+            ledger_module.append_record(store, "T-1", {
+                "from": "READY", "to": "DISPATCHED", "actor": "user",
+                "gate": gate,
+                "dispatch": {
+                    "seq": 1,
+                    "receipts": str(root / ".orrery" / "dispatch" / "T-1" / "1" / "attempt-1"),
+                    "worktree": str(ledger_module.worktree_path(root, "T-1")),
+                    "branch": "orrery/T-1",
+                },
+                "contract_digest": digest_one,
+            })
+            ledger_module.append_record(store, "T-1", {
+                "from": "DISPATCHED", "to": "IN_PROGRESS", "actor": "runner",
+                "reason": "attempt", "attempt": 1,
+                "contract_digest": digest_one,
+            })
+            ledger_module.append_record(store, "T-1", {
+                "from": "IN_PROGRESS", "to": "IMPLEMENTED", "actor": "runner",
+                "commit": head, "contract_digest": digest_one,
+            })
+            ledger_module.append_record(store, "T-1", {
+                "from": "IMPLEMENTED", "to": "VERIFICATION_FAILED",
+                "actor": "runner", "reason": "criteria",
+                "contract_digest": digest_one,
+            })
+            # T-2 is an orphaned dispatch with no park record at all.
+            ledger_module.append_record(store, "T-2", {
+                "from": "READY", "to": "DISPATCHED", "actor": "user",
+                "gate": gate,
+                "dispatch": {
+                    "seq": 1, "receipts": str(attempt_two),
+                    "worktree": str(worktree_two), "branch": "orrery/T-2",
+                },
+                "contract_digest": digest_two,
+            })
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "refused" in ran.stderr and "VERIFICATION_FAILED" in ran.stderr,
+            f"an unauthorised state was not refused: {ran.stdout!r} {ran.stderr!r}",
+        )
+        require(
+            not any(
+                r.get("to") == "DISPATCHED" and r["seq"] > 6
+                for r in task_records(root, "T-1")
+            ),
+            "the executor dispatched a state parking never authorised",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            len(payload["records"]) == 1,
+            f"the held record was dropped: {payload['records']}",
+        )
+        require(
+            task_records(root, "T-2")[-1]["to"] == "DISPATCHED",
+            "the executor touched a neighbouring task it never parked",
+        )
+
+
+@test("a timer-fired executor never stops its own service")
+def test_pickup_fired_unit_consumption() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        capture = pickup_timer_stubs(Path(directory), base)
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", "2999-01-01T00:00:00",
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        unit = read_json(state / "orrery" / "pickup.json")["timer"]["unit"]
+        base["KIT_PICKUP_LOADED"] = f"{unit}.timer loaded active running"
+        capture.unlink()
+        fired = run_pickup(
+            root, "run", "--fired-unit", unit, environment=base
+        )
+        require(fired.returncode == 0, f"{fired.stdout!r} {fired.stderr!r}")
+        stopped = [
+            c["argv"] for c in timer_calls(Path(base["KIT_PICKUP_CAPTURE"]))
+            if c["tool"] == "systemctl" and "stop" in c["argv"]
+        ]
+        require(
+            not any(unit in " ".join(argv) for argv in stopped),
+            f"the fired executor stopped its own unit: {stopped}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            isinstance(payload["timer"], dict)
+            and payload["timer"]["unit"] != unit
+            and payload["timer"]["phase"] == "confirmed",
+            f"the elapsed intent was not consumed and replaced: {payload['timer']}",
+        )
+
+
+@test("a failure that merely says try-again is no quota and stops strictly")
+def test_pickup_non_quota_failure() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        environment = pickup_executor_environment(base, "quota")
+        stamp = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(time.time() + 4 * 3600)
+        )
+        environment["CODEX_FAKE_QUOTA_DETAIL"] = (
+            f"The service is briefly unavailable. Try again at {stamp}."
+        )
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require("1 failed" in ran.stdout, f"{ran.stdout!r} {ran.stderr!r}")
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["records"] == []
+            and payload["consumed_tokens"] >= payload["ceiling_tokens"],
+            f"a non-quota failure was treated as a quota: {payload}",
+        )
+
+
+def pickup_executor_environment(
+    base: dict[str, str], mode: str
+) -> dict[str, str]:
+    """Fake providers plus the pickup store's own state home."""
+    provider = task_review_environment(mode)
+    provider["XDG_STATE_HOME"] = base["XDG_STATE_HOME"]
+    for name in (
+        "ORRERY_SYSTEMD_RUN", "ORRERY_SYSTEMCTL",
+        "KIT_PICKUP_CAPTURE", "KIT_PICKUP_LOADED",
+    ):
+        if name in base:
+            provider[name] = base[name]
+    return provider
+
+
+def pickup_incidents(state: Path) -> list[dict[str, Any]]:
+    path = state / "orrery" / "incidents.jsonl"
+    if not path.exists():
+        return []
+    events = []
+    for line in path.read_text().splitlines():
+        with contextlib.suppress(json.JSONDecodeError):
+            events.append(json.loads(line))
+    return [e for e in events if str(e.get("kind", "")).startswith("pickup-")]
+
+
+@test("the executor dispatches due parked work through the real task plane")
+def test_pickup_executor_end_to_end() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(ran.returncode == 0, f"{ran.stdout!r} {ran.stderr!r}")
+        require(
+            "1 advanced" in ran.stdout,
+            f"the dispatch did not advance: {ran.stdout!r} {ran.stderr!r}",
+        )
+        require(
+            task_records(root)[-1]["to"] == "AWAITING_MERGE",
+            str([r["to"] for r in task_records(root)]),
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["records"] == [] and payload["executor"] is None,
+            f"the store was not settled: {payload}",
+        )
+        require(
+            payload["consumed_tokens"] > 0,
+            "the dispatch's ledger spend was not drawn from the budget",
+        )
+        kinds = [e["kind"] for e in pickup_incidents(state)]
+        require(
+            "pickup-started" in kinds and "pickup-task" in kinds,
+            f"incidents missing: {kinds}",
+        )
+
+
+@test("the executor honours priority across repositories and the budget")
+def test_pickup_executor_priority_and_ceiling() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        first_dir = Path(directory) / "a"
+        second_dir = Path(directory) / "b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        root_a, base, state = parked_fixture(
+            str(first_dir), reset_text=None, crafted=False
+        )
+        root_b, base_b, _state_b = parked_fixture(
+            str(second_dir), reset_text=None, crafted=False
+        )
+        base_b["XDG_STATE_HOME"] = base["XDG_STATE_HOME"]
+        require(
+            run_pickup(
+                root_a, "park", "T-1", "--priority", "2", "--reset-at",
+                recent_past_iso(), environment=base,
+            ).returncode == 0,
+            "park A failed",
+        )
+        require(
+            run_pickup(
+                root_b, "park", "T-1", "--priority", "1", "--reset-at",
+                recent_past_iso(), environment=base_b,
+            ).returncode == 0,
+            "park B failed",
+        )
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root_a, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require("2 advanced" in ran.stdout, f"{ran.stdout!r} {ran.stderr!r}")
+        order = [
+            e["repo"] for e in pickup_incidents(state)
+            if e["kind"] == "pickup-task"
+        ]
+        require(
+            order == [str(os.path.realpath(root_b)), str(os.path.realpath(root_a))],
+            f"priority order was not honoured: {order}",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, task_ids=("T-1", "T-2"), crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--priority", "1", "--reset-at",
+                recent_past_iso(), "--ceiling-tokens", "1",
+                environment=base,
+            ).returncode == 0,
+            "park T-1 failed",
+        )
+        require(
+            run_pickup(
+                root, "park", "T-2", "--priority", "2", "--reset-at",
+                recent_past_iso(), environment=base,
+            ).returncode == 0,
+            "park T-2 failed",
+        )
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "admission stops here" in ran.stdout and "1 advanced" in ran.stdout,
+            f"{ran.stdout!r} {ran.stderr!r}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            [e["task_id"] for e in payload["records"]] == ["T-2"],
+            f"the budget did not hold the second task: {payload['records']}",
+        )
+        kinds = [e["kind"] for e in pickup_incidents(state)]
+        require("pickup-ceiling-stop" in kinds, f"no ceiling incident: {kinds}")
+
+
+@test("unknown dispatch spend stops the generation rather than guessing")
+def test_pickup_executor_unknown_spend() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, task_ids=("T-1", "T-2"), crafted=False
+        )
+        for task_id in ("T-1", "T-2"):
+            require(
+                run_pickup(
+                    root, "park", task_id, "--reset-at", recent_past_iso(),
+                    environment=base,
+                ).returncode == 0,
+                f"park {task_id} failed",
+            )
+        environment = pickup_executor_environment(base, "edit")
+        environment["CODEX_FAKE_NO_USAGE"] = "1"
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "cannot count" in ran.stderr and "admission stops here" in ran.stdout,
+            f"{ran.stdout!r} {ran.stderr!r}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["consumed_tokens"] >= payload["ceiling_tokens"]
+            and [e["task_id"] for e in payload["records"]] == ["T-2"],
+            f"unknown spend did not stop the generation: {payload}",
+        )
+
+
+@test("a quota failure with a fresh announced reset re-parks exactly once")
+def test_pickup_executor_reparks() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        environment = pickup_executor_environment(base, "quota")
+        environment["CODEX_FAKE_QUOTA_DETAIL"] = announced_reset_line(240).strip()
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(ran.returncode == 0, f"{ran.stdout!r} {ran.stderr!r}")
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            len(payload["records"]) == 1
+            and payload["records"][0]["re_parked"] is True
+            and payload["records"][0]["reset_at"] > time.time()
+            and payload["records"][0]["claimed_by"] is None,
+            f"the quota failure did not re-park: {payload['records']}",
+        )
+        records = task_records(root)
+        require(
+            records[-1]["to"] == "DISPATCH_FAILED"
+            and records[-1]["reason"] == "provider-exit",
+            f"--no-fallback did not reach the wrapper: {records[-1]}",
+        )
+        # The systemd tools are deliberately absent in this fixture, so
+        # the re-arm attempt is proven by its honest degradation; the
+        # arming mechanics themselves are pinned by the timer tests.
+        require(
+            "systemd-run is unavailable" in ran.stderr,
+            f"the re-park did not attempt to re-arm: {ran.stderr!r}",
+        )
+
+        payload["records"][0]["reset_at"] = time.time() - 60
+        write_json(state / "orrery" / "pickup.json", payload)
+        (state / "orrery" / "pickup.json").chmod(0o600)
+        environment = pickup_executor_environment(base, "quota")
+        environment["CODEX_FAKE_QUOTA_DETAIL"] = announced_reset_line(240).strip()
+        try:
+            again = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require("1 failed" in again.stdout, f"{again.stdout!r} {again.stderr!r}")
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["records"] == [],
+            f"a second quota failure re-parked again: {payload['records']}",
+        )
+
+
+@test("fire-time bindings refuse drift and stale claims settle durably")
+def test_pickup_executor_bindings_and_claims() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        amended = dispatch_contract("T-1")
+        amended["title"] = "Amended after the park"
+        source = Path(directory) / "amended.json"
+        write_json(source, amended)
+        require(
+            run_task(root, "amend", "T-1", str(source)).returncode == 0,
+            "the amendment failed",
+        )
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "changed since the park" in ran.stderr,
+            f"an amended contract dispatched: {ran.stdout!r} {ran.stderr!r}",
+        )
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            len(payload["records"]) == 1
+            and payload["records"][0]["claimed_by"] is None,
+            "the refused record was not kept unclaimed",
+        )
+        require(
+            not any(r.get("to") == "DISPATCHED" for r in task_records(root)),
+            "a refused binding still dispatched",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=announced_reset_line()
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", "2999-01-01T00:00:00",
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        with ledger_module.control_lock(root) as store:
+            digest = task_records(root)[-1]["contract_digest"]
+            ledger_module.append_record(store, "T-1", {
+                "from": "DISPATCH_FAILED", "to": "READY", "actor": "user",
+                "reason": "retry", "contract_digest": digest,
+                "spend": {"tokens": {"output": 12}, "unknown": False},
+            })
+        baseline = task_records(root)[-2]["seq"]
+        departed = subprocess.Popen([sys.executable, "-c", "pass"])
+        departed.wait(timeout=10)
+        payload = read_json(state / "orrery" / "pickup.json")
+        payload["records"][0]["claimed_by"] = {
+            "pid": departed.pid, "boot_id": standing_module.current_boot_id(),
+            "process_start": 1, "started_at": time.time() - 600,
+            "baseline_seq": baseline,
+        }
+        write_json(state / "orrery" / "pickup.json", payload)
+        (state / "orrery" / "pickup.json").chmod(0o600)
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(ran.returncode == 0, f"{ran.stdout!r} {ran.stderr!r}")
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["consumed_tokens"] >= 12
+            and payload["records"][0]["claimed_by"] is None,
+            f"the stale claim was not settled from the ledger: {payload}",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        shutil.rmtree(root)
+        recreated = adopted_repository(str(Path(directory)))
+        (recreated / "edited.txt").write_text("other\n")
+        subprocess.run(["git", "-C", str(recreated), "add", "edited.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(recreated), "-c", "user.email=kit@test", "-c",
+             "user.name=Kit", "commit", "-q", "-m", "other base"],
+            check=True,
+        )
+        source = Path(directory) / "contract.json"
+        write_json(source, dispatch_contract("T-1"))
+        require(
+            run_task(recreated, "create", str(source)).returncode == 0,
+            "the recreated task failed",
+        )
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(recreated, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "not the repository instance" in ran.stderr,
+            f"a recreated repository dispatched: {ran.stdout!r} {ran.stderr!r}",
+        )
+        require(
+            not any(r.get("to") == "DISPATCHED" for r in task_records(recreated)),
+            "the recreated repository was dispatched into",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        # A same-history clone swapped in at the recorded path: lineage
+        # matches, so only the control-store nonce can refuse it.
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        moved = Path(directory) / "moved"
+        shutil.move(str(root), str(moved))
+        subprocess.run(
+            ["git", "clone", "-q", str(moved), str(root)], check=True
+        )
+        shutil.copytree(moved / ".orrery", root / ".orrery")
+        (root / ".orrery" / "pickup-nonce").unlink()
+        marker = root / ".orrery.json"
+        marker.write_text("{}\n")
+        marker.chmod(0o600)
+        environment = pickup_executor_environment(base, "edit")
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require(
+            "pickup-nonce" in ran.stderr or "not the repository instance" in ran.stderr,
+            f"a same-history clone dispatched: {ran.stdout!r} {ran.stderr!r}",
+        )
+        require(
+            not any(r.get("to") == "DISPATCHED" for r in task_records(root)),
+            "the clone was dispatched into",
+        )
+
+
 @test("no-change close requires a passing verification")
 def test_task_no_change_close_verification_gate() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -18557,6 +19813,23 @@ def main() -> int:
                 "FAIL  the suite modified the developer's own "
                 "~/.claude/settings.json\n      a test is missing HOME "
                 "isolation or an explicit --target"
+            )
+        # The pickup feature arms real transient timers when a test lets
+        # it; a unit left loaded would fire real work on the developer's
+        # machine after the suite has exited.
+        stray_pickup = subprocess.run(
+            [
+                "systemctl", "--user", "list-units", "orrery-pickup-*",
+                "--all", "--no-legend", "--no-pager",
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=20, check=False,
+        ).stdout.strip()
+        if stray_pickup:
+            failures += 1
+            print(
+                "FAIL  the suite left orrery-pickup units loaded\n      "
+                f"{stray_pickup}"
             )
 
     total = len(TESTS) - skipped
