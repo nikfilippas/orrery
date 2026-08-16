@@ -777,6 +777,11 @@ The maintained artefacts are:
   runtime commands, the task control plane, fallback consent, caching,
   verification, and the benchmark programme. The README stays the short
   overview; deep sections live here rather than growing it.
+- `docs/badges/tests.json` — the shields endpoint behind the README's
+  test-count badge, served from GitHub Pages. The suite asserts that
+  the number it states equals the number of registered tests, so the
+  badge cannot drift from the truth it advertises; adding tests means
+  updating it, exactly as adding files means documenting them here.
 - `docs/.nojekyll` — serves this directory verbatim on GitHub Pages.
   Pages runs Jekyll by default, which would try to render Liquid tags in
   the exported page; it has none today, but the page is generated and a

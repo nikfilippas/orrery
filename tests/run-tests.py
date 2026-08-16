@@ -14817,6 +14817,25 @@ def test_pickup_doctor_section() -> None:
         shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
+@test("the tests badge states the suite's own size")
+def test_badge_matches_suite() -> None:
+    """The README's test-count badge is served from docs/badges and must
+    say exactly what the suite registers: an advertised number that can
+    drift is a small lie, and the front page promises none. When this
+    fails, set docs/badges/tests.json to the count it names.
+    """
+    payload = read_json(KIT_DIR / "docs" / "badges" / "tests.json")
+    require(
+        payload.get("schemaVersion") == 1 and payload.get("label") == "tests",
+        f"the badge endpoint shape is wrong: {payload}",
+    )
+    require(
+        payload.get("message") == str(len(TESTS)),
+        f"the badge says {payload.get('message')} but the suite registers "
+        f"{len(TESTS)} tests; update docs/badges/tests.json to match",
+    )
+
+
 @test("the executor refuses states parking never authorised, and neighbours")
 def test_pickup_executor_state_authority() -> None:
     with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,12 @@
 # Órrery
 
 [![CI](https://github.com/nikfilippas/orrery/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nikfilippas/orrery/actions/workflows/ci.yml)
+[![Weekly drift run](https://img.shields.io/github/actions/workflow/status/nikfilippas/orrery/ci.yml?event=schedule&label=weekly%20drift%20run)](https://github.com/nikfilippas/orrery/actions/workflows/ci.yml?query=event%3Aschedule)
+[![Tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fnikfilippas.github.io%2Forrery%2Fbadges%2Ftests.json)](https://github.com/nikfilippas/orrery/blob/main/tests/run-tests.py)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/nikfilippas/orrery/blob/main/docs/setup-guide.md#requirements)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Release](https://img.shields.io/github/v/release/nikfilippas/orrery)](https://github.com/nikfilippas/orrery/releases)
+[![Licence](https://img.shields.io/github/license/nikfilippas/orrery)](LICENSE)
 
 **One orchestrator, four specialist roles, any model.**
 
