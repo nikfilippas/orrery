@@ -87,6 +87,64 @@ performance and cost effects are measured by a paired with/without
 benchmark whose results will be published whichever way they fall (see
 Benchmarking below).
 
+### Nearest neighbours, dated
+
+Órrery's place in this field rests on three enforced properties, and
+stating them against the market honestly requires dates and nearest
+neighbours rather than a scoreboard. What follows was verified against
+current public sources on 2026-08-16; each claim is about what was
+published at that date, and corrections are welcome exactly as above.
+
+**Role-bound, orchestrator-enforced OS containment in a multi-agent
+topology.** Órrery's orchestrator binds each role's access mode into
+the kernel-enforced unit composition itself, read-only for reviewers
+and workspace-write for workers, and probes the enforcement
+behaviourally before every delegated run. The nearest neighbours bind
+less or elsewhere: Claude Code's experimental agent teams start every
+teammate with the lead session's permission mode, per-teammate modes
+cannot be set at spawn, and teammates run in the main session's working
+directory (https://code.claude.com/docs/en/agent-teams,
+https://code.claude.com/docs/en/sub-agents); OpenAI Symphony's
+reference implementation scopes each per-issue run to a
+workspace-write sandbox, but the enforcement is delegated to the Codex
+CLI's own single-agent sandbox rather than bound per role by the
+orchestrator (https://github.com/openai/symphony/blob/main/elixir/README.md);
+Google Antigravity's subagents inherit the parent's sandbox scopes
+rather than binding their own (https://antigravity.google/docs/subagents);
+and Agent Orchestrator by Untrivial isolates by branch and worktree,
+which is git separation, not kernel enforcement
+(https://github.com/Untrivial-ai/agent-orchestrator).
+
+**Merges gated on recomputed, contract-anchored evidence.** Órrery's
+merge gate re-derives out-of-scope changes from the commit range,
+verifies every evidence packet against digests recorded in an
+append-only ledger, re-runs the union of acceptance criteria at
+integration, and refuses while a blocking review finding stands. The
+nearest neighbours gate on less: Gas Town's Refinery is a Bors-style
+merge queue that re-runs verification gates on batched merge requests
+and bisects failures, recomputed test evidence without contract-bound
+artefacts or a findings ledger (https://github.com/steveyegge/gastown);
+Symphony demonstrates agents presenting proof of work while its spec
+mandates no verification gate, leaving landing behaviour to workflow
+prompts (https://github.com/openai/symphony/blob/main/SPEC.md); and
+Weft, first published 2026-08-10, claims signed, recomputed evidence
+as the merge gate at the protocol level, too new at the survey date
+for adoption or independent review (https://github.com/spranab/weft).
+
+**Admission control over the topology itself.** Órrery refuses a
+dispatch whose declared file scope overlaps a live task's, caps
+concurrency from the manifest, applies spend ceilings before work
+starts, and stands every delegate down from further delegation. Among
+the shipped harnesses surveyed, none admits or refuses agents by
+declared file scope: collision handling is advisory ("break the work so
+each teammate owns a different set of files",
+https://code.claude.com/docs/en/agent-teams) or structural, one
+worktree each. The idea is arriving from research: Claim Plane
+proposes deterministic admission over declared change intents
+(https://arxiv.org/abs/2607.21909) and ATM broker-level write
+admission (https://arxiv.org/abs/2607.00041), both explicitly
+prototypes at the survey date.
+
 ## How a request flows
 
 <p align="center">

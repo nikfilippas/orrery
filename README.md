@@ -141,9 +141,11 @@ numbers included; see the technical overview.
 ## Learn more
 
 - **[Technical overview](docs/technical-overview.md)**: every surface
-  in detail: positioning and terminology, roles and budgets,
-  containment, runtime commands, the task control plane, fallback and
-  consent, caching, verification, and the benchmark programme.
+  in detail: positioning and terminology, including a dated
+  nearest-neighbour comparison with the other harnesses in the field,
+  roles and budgets, containment, runtime commands, the task control
+  plane, fallback and consent, caching, verification, and the
+  benchmark programme.
 - **[Setup guide](docs/setup-guide.md)**: operation and maintenance.
 - **[Configuration page demo](https://nikfilippas.github.io/orrery/config-demo.html)**.
 
