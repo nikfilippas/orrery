@@ -14,6 +14,7 @@ import copy
 import dataclasses
 import fcntl
 import hashlib
+import importlib
 import importlib.machinery
 import importlib.util
 import io
@@ -100,6 +101,7 @@ ledger_module = load_script(LEDGER_SCRIPT, "kit_orrery_ledger")
 task_module = load_script(TASK_SCRIPT, "kit_orrery_task")
 import orrery_findings as findings_module  # noqa: E402
 import orrery_incidents as incidents_module  # noqa: E402
+import orrery_stall as stall_module  # noqa: E402
 import orrery_standing as standing_module  # noqa: E402
 
 
@@ -2708,6 +2710,513 @@ def test_fallback_timeout() -> None:
     ).stdout.strip()
     require(not survivors, f"the fake codex survived the timeout: {survivors}")
     assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("loop fake stalls in enforce mode and observes without a marker")
+def test_loop_fake_stall_modes() -> None:
+    """The real wrapper poll, rather than a detector-only fixture, owns this."""
+    for mode, expected_status in (("enforce", 114), ("observe", 0)):
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = Path(directory)
+            receipts = root / "attempt-loop"
+            receipts.mkdir()
+            environment = fallback_environment("loop")
+            environment.update({
+                "ORRERY_STALL_DETECTION": mode,
+                "ORRERY_STALL_MIN_SPAN": "0.05",
+                "ORRERY_STALL_POLL_SECONDS": "0.05",
+                "CODEX_FAKE_LOOP_DELAY": "0.08",
+            })
+            state_home = root / "incidents"
+            state_home.mkdir()
+            environment["XDG_STATE_HOME"] = str(state_home)
+            process = start_review(
+                environment, "--timeout", "5", "--receipts", str(receipts),
+                "--no-stream", "--role", "reviewer", "--", "prompt",
+            )
+            _stdout, stderr = finish_review(process, environment, timeout=30)
+            marker = receipts.parent / "terminal-attempt-loop.json"
+            require(
+                process.returncode == expected_status,
+                f"{mode} loop returned {process.returncode}: {stderr[-600:]}",
+            )
+            if mode == "enforce":
+                payload = read_json(marker)
+                require(
+                    payload["reason"] == "stalled" and payload["rule"] == "repeat",
+                    f"enforcing loop marker is wrong: {payload}",
+                )
+                require("stalled" in stderr, f"stall was not rendered: {stderr}")
+            else:
+                require(not marker.exists(), "observe mode wrote a terminal marker")
+                events = [
+                    json.loads(line)
+                    for line in (state_home / "orrery" / "incidents.jsonl").read_text().splitlines()
+                ]
+                require(
+                    [event["kind"] for event in events].count("stall-suspected") == 1,
+                    f"observe loop incidents are wrong: {events}",
+                )
+
+
+@test("both fake provider loops have parseable genuine event shapes")
+def test_loop_fake_provider_shapes() -> None:
+    for provider, executable, environment, arguments, stream_format in (
+        ("claude", FAKE_CLAUDE, {"CLAUDE_FAKE_MODE": "loop", "CLAUDE_FAKE_LOOP_DELAY": "0"},
+         ["--output-format", "stream-json"], "claude-stream-json"),
+        ("codex", FAKE_CODEX, {"CODEX_FAKE_MODE": "loop", "CODEX_FAKE_LOOP_DELAY": "0"},
+         ["--json"], "codex-jsonl"),
+    ):
+        result = subprocess.run(
+            [sys.executable, str(executable), *arguments], input="prompt",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, **environment}, timeout=10, check=False,
+        )
+        detector = __import__("orrery_stall").Detector(stream_format)
+        detector.feed(result.stdout, 0.0)
+        detector.feed("", 1.0)
+        require(
+            len(detector.ring) >= 4,
+            f"{provider} loop did not yield completed failed calls: {result.stdout}",
+        )
+
+
+@test("the launcher's merged tee keeps concurrent JSON lines whole")
+def test_launcher_merged_tee_line_integrity() -> None:
+    """Bound to the real generated launcher, not a reimplementation."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        run_dir = root / "run"
+        run_dir.mkdir()
+        tmp_dir = run_dir / "tmp"
+        tmp_dir.mkdir()
+        receipts = root / "attempt-tee"
+        receipts.mkdir()
+        launcher, _environment = review_module.write_service_launcher(
+            run_dir, tmp_dir, "openai", receipts=receipts
+        )
+        # The launcher takes its child's environment from a file; a
+        # hand-written one keeps the fake's mode out of the suite's own
+        # environment.
+        environment_file = root / "environment.json"
+        environment_file.write_text(json.dumps({
+            "PATH": os.environ.get("PATH", ""),
+            "CODEX_FAKE_MODE": "interleave",
+        }))
+        merged = root / "merged.log"
+        with merged.open("wb") as handle:
+            completed = subprocess.run(
+                [sys.executable, str(launcher), str(environment_file),
+                 sys.executable, str(FAKE_CODEX), "--json"],
+                stdin=subprocess.DEVNULL, stdout=handle, stderr=handle,
+                timeout=60, check=False,
+            )
+        require(completed.returncode == 0, f"launcher failed: {completed.returncode}")
+        payload = {
+            json.dumps({"stream": label, "number": number})
+            for label in ("stdout", "stderr") for number in range(12)
+        }
+        lines = merged.read_text().splitlines()
+        whole = [line for line in lines if line in payload]
+        torn = [line for line in lines if '"stream"' in line and line not in payload]
+        require(
+            len(whole) == 24 and not torn,
+            f"the merged tee tore lines ({len(whole)}/24 whole): {torn[:4]}",
+        )
+        stdout_log = (receipts / "stdout.log").read_text()
+        require(
+            all(json.dumps({"stream": "stdout", "number": number}) in stdout_log
+                for number in range(12)),
+            "the per-stream receipt lost raw stdout content",
+        )
+        receipt = read_json(receipts / "receipt.json")
+        require(
+            receipt["exit_status"] == 0 and receipt["stdout_bytes"] > 0,
+            f"launcher receipt is wrong: {receipt}",
+        )
+
+
+@test("a delegated Claude loop stalls through the real wrapper")
+def test_claude_loop_stall_through_wrapper() -> None:
+    """The Codex loop test proves the poll; this binds the Claude parser
+    wiring inside it, which a detector-only fixture skips. No shipped
+    delegable role is anthropic, so a kit copy's reviewer is re-pointed."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR, kit, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        next(
+            step for step in manifest["steps"] if step["id"] == "reviewer"
+        ).update(provider="anthropic", model="sonnet", thinking="max")
+        write_json(manifest_path, manifest)
+        receipts = root / "attempt-claude-loop"
+        receipts.mkdir()
+        environment = fallback_environment("loop")
+        environment.update({
+            "ORRERY_STALL_DETECTION": "enforce",
+            "ORRERY_STALL_MIN_SPAN": "0.05",
+            "ORRERY_STALL_POLL_SECONDS": "0.05",
+            "CLAUDE_FAKE_LOOP_DELAY": "0.08",
+        })
+        process = subprocess.Popen(
+            [sys.executable, str(kit / "scripts" / "orrery-review"),
+             "--timeout", "5", "--receipts", str(receipts),
+             "--no-stream", "--role", "reviewer", "--", "prompt"],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True,
+        )
+        _stdout, stderr = finish_review(process, environment, timeout=30)
+        require(
+            process.returncode == 114,
+            f"claude loop returned {process.returncode}: {stderr[-600:]}",
+        )
+        payload = read_json(receipts.parent / "terminal-attempt-claude-loop.json")
+        require(
+            payload["reason"] == "stalled" and payload["rule"] == "repeat",
+            f"claude loop marker is wrong: {payload}",
+        )
+
+
+@test("a silent run times out under enforce without a stall verdict")
+def test_silent_timeout_is_not_a_stall() -> None:
+    """Silence is a budget question, not a stall signal: the rules count
+    failing calls, so a quiet delegate must reach its deadline as a
+    timeout, never be reclassified as stalled."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        receipts = root / "attempt-silent"
+        receipts.mkdir()
+        state_home = root / "incidents"
+        state_home.mkdir()
+        environment = fallback_environment("sleep")
+        environment.update({
+            "ORRERY_STALL_DETECTION": "enforce",
+            "ORRERY_STALL_MIN_SPAN": "0.05",
+            "ORRERY_STALL_POLL_SECONDS": "0.05",
+            "XDG_STATE_HOME": str(state_home),
+        })
+        process = start_review(
+            environment, "--timeout", "5", "--receipts", str(receipts),
+            "--no-stream", "--role", "reviewer", "--", "prompt",
+        )
+        _stdout, stderr = finish_review(process, environment, timeout=180)
+        require(
+            process.returncode == 124,
+            f"silent run returned {process.returncode}: {stderr[-600:]}",
+        )
+        payload = read_json(receipts.parent / "terminal-attempt-silent.json")
+        require(
+            payload["reason"] == "timeout" and "rule" not in payload,
+            f"silent timeout marker is wrong: {payload}",
+        )
+        incidents = state_home / "orrery" / "incidents.jsonl"
+        suspected = [
+            json.loads(line)
+            for line in (
+                incidents.read_text().splitlines() if incidents.exists() else []
+            )
+            if json.loads(line).get("kind") == "stall-suspected"
+        ]
+        require(not suspected, f"silence raised a stall incident: {suspected}")
+
+
+@test("a stale terminal marker that cannot be cleared refuses the attempt")
+def test_terminal_marker_supersession_fails_closed() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        root = Path(directory)
+        receipts = root / "attempt-stale"
+        receipts.mkdir()
+        marker = root / "terminal-attempt-stale.json"
+        marker.write_text(json.dumps({
+            "v": 1, "reason": "stalled", "leaf": "attempt-stale",
+            "attempt_ordinal": 1, "started_at": "2026-01-01T00:00:00Z",
+        }))
+        environment = fallback_environment("success")
+        root.chmod(0o500)
+        try:
+            process = start_review(
+                environment, "--timeout", "60", "--receipts", str(receipts),
+                "--no-stream", "--role", "reviewer", "--", "prompt",
+            )
+            _stdout, stderr = finish_review(process, environment, timeout=30)
+        finally:
+            root.chmod(0o700)
+        require(
+            process.returncode == 1 and "stale terminal marker" in stderr,
+            f"undeletable marker did not refuse: {process.returncode} {stderr[-400:]}",
+        )
+        require(
+            marker.exists() and not (receipts / "result.txt").exists(),
+            "the attempt started despite an unclearable terminal marker",
+        )
+
+
+def codex_stall_event(item: dict[str, Any]) -> str:
+    return json.dumps({"type": "item.completed", "item": item}) + "\n"
+
+
+@test("stall detection treats successful Codex edits as progress")
+def test_stall_codex_edit_progress() -> None:
+    # Timestamps clear the thirty-second span guard, so the only reason
+    # for a None verdict is the behaviour under test; short spans would
+    # make this pass vacuously with the success parsing removed.
+    detector = stall_module.Detector("codex-jsonl")
+    for number in range(3):
+        detector.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": "pytest",
+                "aggregated_output": "specific test failure", "exit_code": 1,
+            }),
+            float(number * 62),
+        )
+        detector.feed(
+            codex_stall_event({
+                "id": f"edit-{number}", "type": "file_change",
+                "status": "completed",
+            }),
+            float(number * 62 + 31),
+        )
+    require(
+        detector.verdict() is None,
+        "a failing test separated by successful edits fired repeat",
+    )
+
+
+@test("stall detection leaves generic failures without an error class")
+def test_stall_generic_errors_do_not_cluster() -> None:
+    # Spans wide enough to pass the thirty-second guard, so this also
+    # binds the rule itself: three shared None classes must not count
+    # as one error class.
+    detector = stall_module.Detector("codex-jsonl")
+    for number, output in enumerate(("Exit code 1", "command failed", "ERROR")):
+        detector.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"test-{number}",
+                "aggregated_output": output, "exit_code": 1,
+            }),
+            float(number * 31),
+        )
+    require(
+        all(signature.failed and signature.error_class is None for signature in detector.ring),
+        "a generic failure was assigned an error class",
+    )
+    require(detector.verdict() is None, "generic failures fired error-class")
+    for number in range(3):
+        detector.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"empty-{number}",
+                "aggregated_output": "", "exit_code": 1,
+            }),
+            float(100 + number * 31),
+        )
+    require(detector.verdict() is None, "empty failures clustered into error-class")
+
+
+@test("stall detection counts successful Codex edits for no-progress")
+def test_stall_codex_edit_breaks_no_progress() -> None:
+    # Spans clear the thirty-second guard for the same reason as above.
+    detector = stall_module.Detector("codex-jsonl")
+    for number in range(12):
+        detector.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"test-{number}",
+                "aggregated_output": "specific test failure", "exit_code": 1,
+            }),
+            float(number * 62),
+        )
+        detector.feed(
+            codex_stall_event({
+                "id": f"edit-{number}", "type": "file_change",
+                "status": "succeeded",
+            }),
+            float(number * 62 + 31),
+        )
+    require(detector.verdict() is None, "successful edits fired no-progress")
+
+
+@test("an unhashable provider status is skipped, not fatal")
+def test_stall_unhashable_status_skipped() -> None:
+    detector = stall_module.Detector("codex-jsonl")
+    detector.feed(
+        codex_stall_event({
+            "id": "edit-odd", "type": "file_change", "status": ["completed"],
+        }),
+        0.0,
+    )
+    require(not detector.ring, "an unhashable status produced a signature")
+    detector.feed(
+        codex_stall_event({
+            "id": "edit-good", "type": "file_change", "status": "completed",
+        }),
+        1.0,
+    )
+    require(
+        len(detector.ring) == 1 and not detector.ring[0].failed,
+        "a well-formed event no longer parses after an unhashable status",
+    )
+
+
+@test("stall span override is limited to fake-bin tests")
+def test_stall_span_override_gate() -> None:
+    saved_override = os.environ.get("ORRERY_STALL_MIN_SPAN")
+    saved_marker = os.environ.get("KIT_FAKE_BIN")
+    try:
+        os.environ["ORRERY_STALL_MIN_SPAN"] = "0.05"
+        os.environ.pop("KIT_FAKE_BIN", None)
+        importlib.reload(stall_module)
+        require(
+            stall_module.MIN_SPAN_SECONDS == 30.0,
+            "production accepted a shortened stall span",
+        )
+        os.environ["KIT_FAKE_BIN"] = "/tmp/fake-bin"
+        importlib.reload(stall_module)
+        require(
+            stall_module.MIN_SPAN_SECONDS == 0.05,
+            "the fake-bin marker did not allow a shortened stall span",
+        )
+    finally:
+        if saved_override is None:
+            os.environ.pop("ORRERY_STALL_MIN_SPAN", None)
+        else:
+            os.environ["ORRERY_STALL_MIN_SPAN"] = saved_override
+        if saved_marker is None:
+            os.environ.pop("KIT_FAKE_BIN", None)
+        else:
+            os.environ["KIT_FAKE_BIN"] = saved_marker
+        importlib.reload(stall_module)
+
+
+def claude_stall_events(
+    commands: list[str], outcomes: list[str], *, same_input: bool = False,
+) -> list[str]:
+    lines = []
+    for number, (command, outcome) in enumerate(zip(commands, outcomes)):
+        identifier = f"tool-{number}"
+        lines.extend((
+            json.dumps({"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "id": identifier, "name": "Bash",
+                "input": {"command": commands[0] if same_input else command},
+            }]}}),
+            json.dumps({"type": "user", "message": {"content": [{
+                "type": "tool_result", "tool_use_id": identifier,
+                "content": outcome, "is_error": True,
+            }]}}),
+        ))
+    return lines
+
+
+def codex_stall_events(
+    commands: list[str], outcomes: list[str], *, same_input: bool = False,
+) -> list[str]:
+    return [codex_stall_event({
+        "type": "command_execution", "id": f"command-{number}",
+        "command": commands[0] if same_input else command,
+        "aggregated_output": outcome, "exit_code": 1, "status": "failed",
+    }).rstrip("\n") for number, (command, outcome) in enumerate(zip(commands, outcomes))]
+
+
+def stall_verdict_from_lines(stream_format: str, lines: list[str]) -> dict | None:
+    detector = stall_module.Detector(stream_format)
+    for number, line in enumerate(lines):
+        # One line per poll makes the observation condition part of every case.
+        detector.feed(line + "\n", float(number))
+    return detector.verdict()
+
+
+@test("each stall rule fires for both provider shapes and is mutation checked")
+def test_stall_rules_both_shapes_mutation_checked() -> None:
+    cases = (
+        ("repeat", "REPEAT_RUN", 4,
+         ["same"] * 3, ["specific repeat failure"] * 3, True),
+        ("error-class", "ERROR_RUN", 4,
+         ["one", "two", "three"], ["permission denied: path"] * 3, False),
+        ("no-progress", "NO_PROGRESS_RUN", 13,
+         [f"command-{number}" for number in range(12)],
+         [f"specific failure {number}" for number in range(12)], False),
+    )
+    original_span = stall_module.MIN_SPAN_SECONDS
+    stall_module.MIN_SPAN_SECONDS = 0.0
+    try:
+        for rule, constant, disabled_value, commands, outcomes, same_input in cases:
+            for stream_format, builder in (
+                ("claude-stream-json", claude_stall_events),
+                ("codex-jsonl", codex_stall_events),
+            ):
+                lines = builder(commands, outcomes, same_input=same_input)
+                verdict = stall_verdict_from_lines(stream_format, lines)
+                require(
+                    verdict is not None and verdict["rule"] == rule,
+                    f"{stream_format} did not fire {rule}: {verdict}",
+                )
+                original = getattr(stall_module, constant)
+                setattr(stall_module, constant, disabled_value)
+                try:
+                    disabled = stall_verdict_from_lines(stream_format, lines)
+                    require(
+                        disabled is None or disabled["rule"] != rule,
+                        f"disabling {rule} did not break its {stream_format} "
+                        f"fixture: {disabled}",
+                    )
+                finally:
+                    setattr(stall_module, constant, original)
+    finally:
+        stall_module.MIN_SPAN_SECONDS = original_span
+
+
+@test("genuine streams are load-bearing corpus inputs for both parsers")
+def test_stall_genuine_corpus() -> None:
+    for filename, stream_format in (
+        ("claude-implementer-genuine.jsonl", "claude-stream-json"),
+        ("codex-principal-genuine.jsonl", "codex-jsonl"),
+    ):
+        lines = (KIT_DIR / "tests" / "streams" / filename).read_text().splitlines()
+        detector = stall_module.Detector(stream_format)
+        for number, line in enumerate(lines):
+            # Deliberately irregular chunks cover framed input, including a
+            # final line that is only completed by the following feed.
+            offset = 0
+            width = 1 + number % 17
+            while offset < len(line):
+                detector.feed(line[offset:offset + width], float(number))
+                offset += width
+            detector.feed("\n", float(number) + 0.1)
+        require(detector.ring, f"{filename} yielded no signatures")
+        require(detector.events_seen <= len(lines), f"{filename} over-read input")
+        require(detector.verdict() is None, f"{filename} falsely fired: {detector.verdict()}")
+
+
+@test("scripted error and no-progress loop fakes drive their detector rules")
+def test_scripted_loop_fake_rules() -> None:
+    variants = (
+        (FAKE_CLAUDE, "CLAUDE_FAKE_MODE", "error-loop", ["--output-format", "stream-json"],
+         "claude-stream-json", "error-class"),
+        (FAKE_CODEX, "CODEX_FAKE_MODE", "error-loop", ["--json"],
+         "codex-jsonl", "error-class"),
+        (FAKE_CODEX, "CODEX_FAKE_MODE", "no-progress", ["--json"],
+         "codex-jsonl", "no-progress"),
+    )
+    original_span = stall_module.MIN_SPAN_SECONDS
+    stall_module.MIN_SPAN_SECONDS = 0.0
+    try:
+        for executable, variable, mode, arguments, stream_format, rule in variants:
+            result = subprocess.run(
+                [sys.executable, str(executable), *arguments], input="prompt",
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env={**os.environ, variable: mode, variable.replace("MODE", "LOOP_DELAY"): "0"},
+                timeout=10, check=False,
+            )
+            lines = result.stdout.splitlines()
+            verdict = stall_verdict_from_lines(stream_format, lines)
+            require(
+                verdict is not None and verdict["rule"] == rule,
+                f"{executable.name} {mode} did not fire {rule}: {verdict}",
+            )
+    finally:
+        stall_module.MIN_SPAN_SECONDS = original_span
 
 
 @test("without systemd a same-group descendant dies with the run")
@@ -8657,11 +9166,35 @@ def test_standing_identity_binding() -> None:
         require(standing_module.match(dataclasses.replace(configured, access="workspace-write")) is None, "an approval survived an access change")
         endpoint = runtime_module.Endpoint("test", "Test", "anthropic", "https://example.test", "TEST_KEY")
         require(standing_module.match(dataclasses.replace(configured, endpoint=endpoint)) is None, "an approval survived an endpoint change")
+        require(
+            standing_module._fingerprint(configured)
+            != standing_module._fingerprint(
+                dataclasses.replace(configured, stall_detection="enforce")
+            ),
+            "a stall-detection change did not change the role fingerprint",
+        )
+        require(
+            standing_module._fingerprint(configured)
+            != standing_module._fingerprint(
+                dataclasses.replace(configured, timeout_seconds=31)
+            )
+            and standing_module._fingerprint(configured)
+            != standing_module._fingerprint(
+                dataclasses.replace(configured, hard_timeout_seconds=1801)
+            ),
+            "a role budget change did not change the role fingerprint",
+        )
         store = state_dir / "orrery" / "standing.json"
         data = read_json(store)
-        data["approvals"][0]["fingerprint"] = [configured.provider, configured.model, configured.thinking]
+        data["approvals"][0]["fingerprint"] = [
+            "v2", configured.provider, configured.model, configured.thinking,
+            configured.access, None, None,
+        ]
         write_json(store, data)
-        require(standing_module.match(configured) is None, "an old-format approval was honoured")
+        require(
+            standing_module.match(configured) is None,
+            "an old-version approval was honoured instead of re-deriving",
+        )
 
 
 @test("a concurrent record cannot resurrect revoked standing approvals")
@@ -10541,6 +11074,106 @@ def test_role_timeout_budgets() -> None:
         )
 
 
+@test("role stall detection validates and the environment overrides it")
+def test_role_stall_detection() -> None:
+    manifest = read_json(KIT_DIR / "global" / "orchestration.json")
+    saved = os.environ.get("ORRERY_STALL_DETECTION")
+    os.environ.pop("ORRERY_STALL_DETECTION", None)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "orchestration.json"
+            for value in (None, "off", "observe", "enforce"):
+                changed = copy.deepcopy(manifest)
+                step = next(item for item in changed["steps"] if item["id"] == "reviewer")
+                if value is None:
+                    step.pop("stall_detection", None)
+                else:
+                    step["stall_detection"] = value
+                write_json(path, changed)
+                expected = "observe" if value is None else value
+                require(
+                    runtime_module.load_role("reviewer", path).stall_detection == expected,
+                    f"stall_detection did not load {expected!r}",
+                )
+            changed = copy.deepcopy(manifest)
+            next(item for item in changed["steps"] if item["id"] == "reviewer")["stall_detection"] = "loop"
+            write_json(path, changed)
+            try:
+                runtime_module.load_role("reviewer", path)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "reviewer" in str(exc) and "loop" in str(exc),
+                    f"the invalid role value was not named: {exc}",
+                )
+            else:
+                raise Failure("an invalid role stall_detection was accepted")
+            for value in ([], {}):
+                changed = copy.deepcopy(manifest)
+                next(
+                    step for step in changed["steps"] if step["id"] == "reviewer"
+                )["stall_detection"] = value
+                write_json(path, changed)
+                try:
+                    runtime_module.load_role("reviewer", path)
+                except runtime_module.RuntimeConfigError as exc:
+                    require(
+                        "reviewer" in str(exc) and "stall_detection" in str(exc),
+                        f"the non-scalar role value was not named: {exc}",
+                    )
+                else:
+                    raise Failure("a non-scalar role stall_detection was accepted")
+            os.environ["ORRERY_STALL_DETECTION"] = "enforce"
+            require(
+                runtime_module.load_role("reviewer", path).stall_detection == "enforce",
+                "the stall-detection environment override lost to the manifest",
+            )
+            os.environ["ORRERY_STALL_DETECTION"] = "loop"
+            try:
+                runtime_module.load_role("reviewer", path)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "reviewer" in str(exc) and "loop" in str(exc),
+                    f"the invalid environment value was not named: {exc}",
+                )
+            else:
+                raise Failure("an invalid ORRERY_STALL_DETECTION was accepted")
+    finally:
+        if saved is None:
+            os.environ.pop("ORRERY_STALL_DETECTION", None)
+        else:
+            os.environ["ORRERY_STALL_DETECTION"] = saved
+
+
+@test("the doctor names non-scalar stall detection values")
+def test_doctor_non_scalar_stall_detection() -> None:
+    with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        kit = Path(directory) / "kit"
+        shutil.copytree(
+            KIT_DIR, kit, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        manifest = read_json(manifest_path)
+        next(
+            step for step in manifest["steps"] if step["id"] == "reviewer"
+        )["stall_detection"] = []
+        write_json(manifest_path, manifest)
+        result = subprocess.run(
+            ["bash", str(kit / "scripts" / "doctor.sh")],
+            cwd=kit,
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        require(
+            "role stall_detection must be off, observe, or enforce" in result.stdout
+            and "TypeError" not in result.stdout,
+            f"the doctor did not name the non-scalar refusal: {result.stdout[-800:]}",
+        )
+
+
 @test("the doctor warns about zero-byte sandbox residue in HOME")
 def test_doctor_home_residue() -> None:
     environment = review_environment("success")
@@ -11660,8 +12293,11 @@ def test_progress_extends_run() -> None:
             f"the progressing run did not complete: {stderr}",
         )
         require(
+            # With the launcher tee reading incrementally, progress
+            # surfaces as the delegate's own lines; the byte-counter
+            # heartbeat only ever appeared because the old blocking
+            # read starved the stream until exit.
             "budget extended" in stderr
-            and "B output" in stderr
             and "examined a hunk" in stderr,
             f"progress was not surfaced: {stderr}",
         )
@@ -13683,6 +14319,88 @@ def craft_dead_dispatch(root: Path, *, receipt: bool) -> tuple[str, Path, Path]:
     return base, attempt, worktree
 
 
+@test("terminal markers classify stalled and timed-out attempts")
+def test_terminal_marker_receipt_failure() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        for name, reason, receipt in (
+            ("stalled", "stalled", None),
+            ("timeout", "timeout", None),
+            ("nonzero", "stalled", '{"v": 1, "exit_status": 7}'),
+        ):
+            attempt = root / name / "attempt-1"
+            attempt.mkdir(parents=True)
+            if receipt is not None:
+                (attempt / "receipt.json").write_text(receipt)
+            write_json(
+                attempt.parent / "terminal-attempt-1.json",
+                {"v": 1, "reason": reason, "leaf": "attempt-1", "attempt_ordinal": 1},
+            )
+            require(
+                task_module.receipt_failure(attempt, 7) == reason,
+                f"the {reason} terminal marker was not consumed for {name}",
+            )
+        mismatch = root / "mismatch" / "attempt-1"
+        mismatch.mkdir(parents=True)
+        write_json(
+            mismatch.parent / "terminal-attempt-1.json",
+            {"v": 1, "reason": "stalled", "leaf": "another-attempt", "attempt_ordinal": 1},
+        )
+        require(
+            task_module.receipt_failure(mismatch, 124) == "timeout",
+            "a marker for another receipts leaf was accepted",
+        )
+        leaf_a = root / "parent" / "attempt-a"
+        leaf_b = root / "parent" / "attempt-b"
+        leaf_a.mkdir(parents=True)
+        leaf_b.mkdir()
+        write_json(
+            leaf_a.parent / "terminal-attempt-a.json",
+            {"v": 1, "reason": "stalled", "leaf": "attempt-a", "attempt_ordinal": 1},
+        )
+        require(
+            review_module.terminal_marker_path(leaf_a).name
+            == "terminal-attempt-a.json"
+            and review_module.terminal_marker_path(leaf_b).name
+            == "terminal-attempt-b.json",
+            "terminal marker names collapsed across receipt leaves",
+        )
+        require(
+            task_module.receipt_failure(leaf_b, 0) != "stalled",
+            "a stale sibling terminal marker classified a successful leaf",
+        )
+        require(
+            (leaf_a.parent / "terminal-attempt-a.json").exists(),
+            "classifying a sibling leaf erased its marker",
+        )
+
+
+@test("terminal marker reader rejects stale leaves and ordinals")
+def test_terminal_marker_reader_validation() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        attempt = Path(directory) / "attempt"
+        attempt.mkdir()
+        write_json(attempt.parent / "terminal-attempt.json", {
+            "v": 1, "leaf": "other", "reason": "stalled", "attempt_ordinal": 1,
+        })
+        require(task_module.read_terminal_marker(attempt) is None, "wrong leaf was consumed")
+        (attempt / "attempt.json").write_text("{}")
+        write_json(attempt.parent / "terminal-attempt.json", {
+            "v": 1, "leaf": "attempt", "reason": "stalled", "attempt_ordinal": 2,
+        })
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            require(task_module.read_terminal_marker(attempt) is None, "stale ordinal was consumed")
+        require("ordinal mismatch" in stderr.getvalue(), stderr.getvalue())
+        write_json(attempt.parent / "terminal-attempt.json", {
+            "v": 1, "leaf": "attempt", "reason": "stalled", "attempt_ordinal": 1,
+            "rule": "repeat", "counts": {"repeat": 3},
+            "started_at": "2026-01-01T00:00:00Z", "finished_at": "2026-01-01T00:01:00Z",
+        })
+        marker = task_module.read_terminal_marker(attempt)
+        require(marker and marker["rule"] == "repeat" and marker["counts"] == {"repeat": 3}, str(marker))
+
+
 @test("different dispatch failures never share a reason string")
 def test_task_reason_strings_distinct() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -13692,6 +14410,7 @@ def test_task_reason_strings_distinct() -> None:
             "approval-with-unit": ({"unit.json": '{"v": 1}'}, 75),
             "consent-marker-no-receipt": ({"consent-stop.json": '{"v": 1}'}, None),
             "timeout-with-proposal": ({"consent-stop.json": '{"v": 1}'}, 124),
+            "stalled": ({"terminal-attempt-1.json": '{"v": 1, "reason": "stalled", "leaf": "attempt-1", "attempt_ordinal": 1}'}, None),
             "consent-after-provider-failure": (
                 {
                     "consent-stop.json": '{"v": 1}',
@@ -13732,7 +14451,7 @@ def test_task_reason_strings_distinct() -> None:
             for filename, content in files.items():
                 # The consent marker lives in the receipts directory's
                 # runner-owned PARENT, exactly where the wrapper writes it.
-                base = attempt.parent if filename == "consent-stop.json" else attempt
+                base = attempt.parent if filename in {"consent-stop.json", "terminal-attempt-1.json"} else attempt
                 if isinstance(content, bytes):
                     (base / filename).write_bytes(content)
                 else:
@@ -13744,6 +14463,7 @@ def test_task_reason_strings_distinct() -> None:
             "approval-with-unit": "approval-required",
             "consent-marker-no-receipt": "approval-required",
             "timeout-with-proposal": "timeout",
+            "stalled": "stalled",
             "consent-after-provider-failure": "provider-exit",
             "spawn": "spawn-failure",
             "launcher-died": "receipt-missing",
@@ -13758,7 +14478,7 @@ def test_task_reason_strings_distinct() -> None:
         require(observed == expected, str(observed))
         names = {reason for reason in expected.values() if reason}
         require(
-            len(names) == 7,
+            len(names) == 8,
             f"the classifier collapsed distinct failure names: {sorted(names)}",
         )
         require(
@@ -13766,6 +14486,15 @@ def test_task_reason_strings_distinct() -> None:
             f"the ledger refuses classifier reasons: "
             f"{sorted(names - ledger_module.DISPATCH_FAILURE_REASONS)}",
         )
+
+
+@test("review reason strings keep stalled and timeout outcomes distinct")
+def test_review_reason_strings_distinct() -> None:
+    names = {"review-stalled", "review-timeout", "review-missing-result"}
+    require(
+        names <= ledger_module.INTERRUPTED_REASONS and len(names) == 3,
+        f"review terminal reasons collapsed or are refused: {sorted(names)}",
+    )
 
 
 @test("a launcher that dies before its receipt records receipt-missing")
@@ -13904,6 +14633,39 @@ def test_task_resume_interrupts_receiptless_dead_dispatch() -> None:
         finally:
             discard_task_environment(environment)
         require(retried.returncode == 0 and task_records(root)[-1]["to"] == "AWAITING_MERGE", retried.stderr)
+
+
+@test("task resume consumes a stall marker when no receipt landed")
+def test_task_resume_consumes_stall_marker() -> None:
+    """A wrapper killed after the marker but before any receipt must
+    resume as stalled, with the rule and counts in the ledger record,
+    not as a generic interruption."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        _base, attempt, _worktree = craft_dead_dispatch(root, receipt=False)
+        write_json(
+            attempt.parent / f"terminal-{attempt.name}.json",
+            {
+                "v": 1, "reason": "stalled", "rule": "repeat",
+                "counts": {"repeat": 3}, "leaf": attempt.name,
+                "attempt_ordinal": 1,
+                "started_at": "2026-01-01T00:00:00Z",
+                "finished_at": "2026-01-01T00:00:05Z",
+            },
+        )
+        resumed = run_task(root, "resume")
+        interrupted = task_records(root)[-1]
+        require(
+            resumed.returncode == 0 and resumed.stdout.strip() == "T-1 stalled",
+            f"{resumed.stdout!r} {resumed.stderr!r}",
+        )
+        require(
+            interrupted["to"] == "INTERRUPTED"
+            and interrupted["reason"] == "stalled"
+            and interrupted["stall"] == {"rule": "repeat", "counts": {"repeat": 3}},
+            str(interrupted),
+        )
 
 
 @test("task resume leaves a live dispatch alone")
@@ -16826,6 +17588,357 @@ def test_review_receipts_outside_mappings() -> None:
             root.resolve() not in receipts.resolve().parents
             and worktree.resolve() not in receipts.resolve().parents,
             str(receipts),
+        )
+
+
+@test("a live review lease refuses a second holder and a fully dead lease clears")
+def test_review_lease_serialises_same_task_reviews() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        state = Path(directory) / "state"
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            path = task_module.review_lease_path(root, "T-1")
+            task_module.write_review_lease(
+                path,
+                {"v": 1, "pid": os.getpid(),
+                 "start": task_module.process_start_time(os.getpid()),
+                 "leaf": "1", "unit": None},
+                exclusive=True,
+            )
+            try:
+                task_module.acquire_review_lease(root, "T-1", "2")
+                raise Failure("a second review acquired a live holder's lease")
+            except task_module.LedgerError as exc:
+                require(
+                    f"holder pid {os.getpid()}" in str(exc), str(exc)
+                )
+            departed = subprocess.Popen([sys.executable, "-c", "pass"])
+            departed_start = task_module.process_start_time(departed.pid)
+            departed.wait(timeout=10)
+            path.unlink()
+            task_module.write_review_lease(
+                path,
+                {"v": 1, "pid": departed.pid, "start": departed_start,
+                 "leaf": "1", "unit": None},
+                exclusive=True,
+            )
+            acquired = task_module.acquire_review_lease(root, "T-1", "2")
+            require(
+                task_module.read_review_lease(acquired)["leaf"] == "2",
+                "a fully departed review lease was not replaced",
+            )
+            task_module.release_review_lease(acquired)
+        finally:
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+
+
+@test("a dead review holder retains its lease while the recorded unit lives")
+def test_review_lease_retains_dead_holder_live_unit() -> None:
+    """Each liveness branch is proven alone: production ORs the unit and
+    wrapper checks, so a combined fixture would leave either branch free
+    to rot behind the other."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        state = Path(directory) / "state"
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        original_run = task_module.subprocess.run
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            departed = subprocess.Popen([sys.executable, "-c", "pass"])
+            departed_start = task_module.process_start_time(departed.pid)
+            departed.wait(timeout=10)
+            path = task_module.review_lease_path(root, "T-1")
+
+            def seed(lease: dict) -> None:
+                path.unlink(missing_ok=True)
+                task_module.write_review_lease(
+                    path,
+                    {"v": 1, "pid": departed.pid, "start": departed_start,
+                     "leaf": "1", **lease},
+                    exclusive=True,
+                )
+
+            def refused(expected: str) -> None:
+                try:
+                    task_module.acquire_review_lease(root, "T-1", "2")
+                    raise Failure(f"a dead holder was reclaimed despite {expected!r}")
+                except task_module.LedgerError as exc:
+                    require(
+                        expected in str(exc) and "use resume" in str(exc), str(exc)
+                    )
+
+            # Unit branch alone: no wrapper record, unit reported active.
+            seed({"unit": "orrery-review-live-test"})
+            task_module.subprocess.run = lambda *args, **kwargs: types.SimpleNamespace(
+                returncode=0, stdout="active\n"
+            )
+            refused("holder dead, unit live orrery-review-live-test")
+
+            # Wrapper branch alone: no unit anywhere, recorded child live.
+            task_module.subprocess.run = original_run
+            seed({"unit": None,
+                  "wrapper": {"pid": child.pid,
+                              "start": task_module.process_start_time(child.pid)}})
+            refused(f"wrapper live pid {child.pid}")
+
+            # Spawn-intent record alone: pid-less wrapper is inconclusive
+            # liveness and must retain.
+            seed({"unit": None, "wrapper": {"pid": None, "start": None}})
+            refused("wrapper starting")
+        finally:
+            task_module.subprocess.run = original_run
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=10)
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+
+
+@test("a failed wrapper spawn keeps its dated intent for evidence to settle")
+def test_spawn_recorded_wrapper_intent() -> None:
+    """No exception class proves Popen created no child, so every spawn
+    failure must leave the dated intent in place; recovery is by
+    evidence and time, never by exception type."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        state = Path(directory) / "state"
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        original_popen = task_module.subprocess.Popen
+        try:
+            path = task_module.review_lease_path(root, "T-1")
+
+            def own_lease() -> None:
+                path.unlink(missing_ok=True)
+                task_module.write_review_lease(
+                    path,
+                    {"v": 1, "pid": os.getpid(),
+                     "start": task_module.process_start_time(os.getpid()),
+                     "leaf": "1", "unit": None},
+                    exclusive=True,
+                )
+
+            def raising(exception: BaseException):
+                def popen(*_args, **_kwargs):
+                    raise exception
+                return popen
+
+            for exception in (KeyboardInterrupt(), OSError("post-fork read failed")):
+                own_lease()
+                task_module.subprocess.Popen = raising(exception)
+                try:
+                    task_module.spawn_recorded_wrapper(path, ["true"], root)
+                    raise Failure("a failed spawn did not propagate")
+                except (KeyboardInterrupt, OSError):
+                    pass
+                wrapper = task_module.read_review_lease(path).get("wrapper")
+                require(
+                    isinstance(wrapper, dict)
+                    and wrapper.get("pid") is None
+                    and isinstance(wrapper.get("intent_at"), float),
+                    f"{type(exception).__name__} did not keep a dated intent: {wrapper}",
+                )
+
+            own_lease()
+            task_module.subprocess.Popen = original_popen
+            process = task_module.spawn_recorded_wrapper(
+                path, [sys.executable, "-c", "pass"], root
+            )
+            recorded = task_module.read_review_lease(path).get("wrapper")
+            process.wait(timeout=10)
+            require(
+                isinstance(recorded, dict) and recorded.get("pid") == process.pid,
+                f"a live spawn was not recorded: {recorded}",
+            )
+        finally:
+            task_module.subprocess.Popen = original_popen
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+
+
+@test("a settled spawn intent recovers the review lane")
+def test_review_lease_intent_settlement() -> None:
+    """The dated intent retains within its window and while the leaf's
+    work record shows live work, and settles dead otherwise, so an
+    interrupted spawn cannot wedge a task's reviews forever."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        state = Path(directory) / "state"
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        sleeper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            start_new_session=True,
+        )
+        try:
+            departed = subprocess.Popen([sys.executable, "-c", "pass"])
+            departed_start = task_module.process_start_time(departed.pid)
+            departed.wait(timeout=10)
+            path = task_module.review_lease_path(root, "T-1")
+            old = time.time() - 2 * task_module.SPAWN_SETTLE_SECONDS
+
+            def seed(intent_at: float) -> None:
+                path.unlink(missing_ok=True)
+                task_module.write_review_lease(
+                    path,
+                    {"v": 1, "pid": departed.pid, "start": departed_start,
+                     "leaf": "1", "unit": None,
+                     "wrapper": {"pid": None, "start": None,
+                                 "intent_at": intent_at}},
+                    exclusive=True,
+                )
+
+            # Fresh intent: retained regardless of other evidence.
+            seed(time.time())
+            try:
+                task_module.acquire_review_lease(root, "T-1", "2")
+                raise Failure("a fresh spawn intent was reclaimed")
+            except task_module.LedgerError as exc:
+                require("wrapper starting" in str(exc), str(exc))
+
+            # Old intent, live process group in the leaf's work record:
+            # retained on evidence.
+            unit_record = path.parent / "1" / "unit.json"
+            unit_record.parent.mkdir(parents=True, exist_ok=True)
+            write_json(unit_record, {"v": 1, "unit": None, "pgid": sleeper.pid})
+            seed(old)
+            try:
+                task_module.acquire_review_lease(root, "T-1", "2")
+                raise Failure("an intent with a live process group was reclaimed")
+            except task_module.LedgerError as exc:
+                require("wrapper starting" in str(exc), str(exc))
+
+            # The group dies: the same lease settles and is reclaimed.
+            os.killpg(sleeper.pid, signal.SIGKILL)
+            sleeper.wait(timeout=10)
+            acquired = task_module.acquire_review_lease(root, "T-1", "2")
+            require(
+                task_module.read_review_lease(acquired)["leaf"] == "2",
+                "a settled intent with a dead process group was not reclaimed",
+            )
+
+            # Inconclusive work records prove nothing and retain: corrupt
+            # JSON, a non-dict document, a record with neither unit nor
+            # process group, and an unreadable file.
+            for label, seed_record in (
+                ("corrupt", lambda: unit_record.write_text("{not json")),
+                ("invalid-utf8", lambda: unit_record.write_bytes(b"\xff\xfe{")),
+                ("non-dict", lambda: unit_record.write_text('"a string"')),
+                ("empty", lambda: write_json(unit_record, {"v": 1, "unit": None})),
+                ("unreadable", lambda: (
+                    write_json(unit_record, {"v": 1, "unit": None, "pgid": 1}),
+                    unit_record.chmod(0o000),
+                )),
+            ):
+                seed_record()
+                seed(old)
+                try:
+                    task_module.acquire_review_lease(root, "T-1", "2")
+                    raise Failure(f"a {label} work record settled the intent")
+                except task_module.LedgerError as exc:
+                    require("wrapper starting" in str(exc), f"{label}: {exc}")
+                finally:
+                    unit_record.chmod(0o600)
+
+            # Old intent with no work record at all: settled dead.
+            unit_record.unlink()
+            seed(old)
+            acquired = task_module.acquire_review_lease(root, "T-1", "2")
+            require(
+                task_module.read_review_lease(acquired)["leaf"] == "2",
+                "a settled recordless intent was not reclaimed",
+            )
+        finally:
+            if sleeper.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(sleeper.pid, signal.SIGKILL)
+                sleeper.wait(timeout=10)
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+
+
+@test("releasing a lease with a live wrapper retains it until the wrapper dies")
+def test_review_lease_release_retains_live_wrapper() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        state = Path(directory) / "state"
+        previous = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            path = task_module.review_lease_path(root, "T-1")
+            task_module.write_review_lease(
+                path,
+                {"v": 1, "pid": os.getpid(),
+                 "start": task_module.process_start_time(os.getpid()),
+                 "leaf": "1", "unit": None,
+                 "wrapper": {"pid": child.pid,
+                             "start": task_module.process_start_time(child.pid)}},
+                exclusive=True,
+            )
+            task_module.release_review_lease(path)
+            require(
+                path.exists(),
+                "release dropped the lease while the recorded wrapper lived",
+            )
+            child.kill()
+            child.wait(timeout=10)
+            task_module.release_review_lease(path)
+            require(
+                not path.exists(),
+                "release kept the lease after the wrapper fully died",
+            )
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+            if previous is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = previous
+
+
+@test("review terminal markers classify missing documents distinctly")
+def test_review_terminal_marker_classification() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        parent = Path(directory) / "receipts"
+        for leaf, marker, expected in (
+            ("stalled", {"v": 1, "leaf": "stalled", "reason": "stalled", "rule": "repeat", "counts": {"repeat": 3}, "attempt_ordinal": 1},
+             "review-stalled"),
+            ("timeout", {"v": 1, "leaf": "timeout", "reason": "timeout", "attempt_ordinal": 1},
+             "review-timeout"),
+            ("missing", None, None),
+        ):
+            receipts = parent / leaf
+            receipts.mkdir(parents=True)
+            if marker is not None:
+                write_json(parent / f"terminal-{leaf}.json", marker)
+            result, marker = task_module.review_terminal_failure(receipts)
+            require(
+                result == expected and (marker is None or marker["attempt_ordinal"] == 1),
+                f"review marker classification was wrong for {leaf}",
+            )
+        require(
+            {"review-stalled", "review-timeout", "review-missing-result"}
+            <= ledger_module.INTERRUPTED_REASONS,
+            "the ledger refuses a review terminal classification",
         )
 
 

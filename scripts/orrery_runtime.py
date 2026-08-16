@@ -92,6 +92,7 @@ class Role:
     access: str
     timeout_seconds: int | None = None
     hard_timeout_seconds: int | None = None
+    stall_detection: str = "observe"
     endpoint: Endpoint | None = None
 
     @property
@@ -512,6 +513,16 @@ def load_role(
                 f"{role_id} hard_timeout_seconds must not be smaller "
                 "than timeout_seconds"
             )
+    stall_detection = os.environ.get(
+        "ORRERY_STALL_DETECTION", step.get("stall_detection", "observe")
+    )
+    if (
+        not isinstance(stall_detection, str)
+        or stall_detection not in {"off", "observe", "enforce"}
+    ):
+        raise RuntimeConfigError(
+            f"{role_id} has invalid stall_detection: {stall_detection!r}"
+        )
     if role_id == "orchestrator" and access != "principal":
         raise RuntimeConfigError("the orchestrator must use principal access")
     if role_id != "orchestrator" and access == "principal":
@@ -536,6 +547,7 @@ def load_role(
             access=access,
             timeout_seconds=timeout_seconds,
             hard_timeout_seconds=hard_timeout_seconds,
+            stall_detection=stall_detection,
             endpoint=endpoint,
         )
     catalogue = load_catalogue()
@@ -570,6 +582,7 @@ def load_role(
         access=access,
         timeout_seconds=timeout_seconds,
         hard_timeout_seconds=hard_timeout_seconds,
+        stall_detection=stall_detection,
     )
 
 

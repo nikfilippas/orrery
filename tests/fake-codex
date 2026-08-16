@@ -12,6 +12,7 @@ import json
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -47,6 +48,75 @@ def emit_usage() -> None:
         }
     )
     print(json.dumps({"type": "turn.completed", "usage": usage}), flush=True)
+
+
+def emit_loop() -> None:
+    """Emit genuine-shaped failed command executions across poll turns."""
+    delay = float(os.environ.get("CODEX_FAKE_LOOP_DELAY", "0.2"))
+    for number in range(4):
+        identifier = f"cmd-loop-{number}"
+        item = {
+            "id": identifier, "type": "command_execution", "command": "false",
+            "aggregated_output": "command failed: loop failure", "exit_code": 1,
+            "status": "failed",
+        }
+        print(json.dumps({"type": "item.started", "item": item}), flush=True)
+        print(json.dumps({"type": "item.completed", "item": item}), flush=True)
+        time.sleep(delay)
+
+
+def emit_error_loop() -> None:
+    """Different commands which retain one meaningful error class."""
+    delay = float(os.environ.get("CODEX_FAKE_LOOP_DELAY", "0.08"))
+    for number in range(4):
+        item = {
+            "id": f"cmd-error-{number}", "type": "command_execution",
+            "command": f"probe-{number}",
+            "aggregated_output": "permission denied: protected path",
+            "exit_code": 1, "status": "failed",
+        }
+        print(json.dumps({"type": "item.completed", "item": item}), flush=True)
+        time.sleep(delay)
+
+
+def emit_no_progress() -> None:
+    """Mixed failing commands, with no successful work item."""
+    delay = float(os.environ.get("CODEX_FAKE_LOOP_DELAY", "0.03"))
+    for number in range(13):
+        item = {
+            "id": f"cmd-no-progress-{number}", "type": "command_execution",
+            "command": f"probe-{number}",
+            "aggregated_output": f"specific failure {number}",
+            "exit_code": 1, "status": "failed",
+        }
+        print(json.dumps({"type": "item.completed", "item": item}), flush=True)
+        time.sleep(delay)
+
+
+def emit_interleaved() -> None:
+    """Concurrent piece-wise writers exercise the wrapper's line-framed tee.
+
+    Every line is written as two separately flushed halves with a pause
+    between them, so a tee that forwards raw chunks interleaves halves
+    across the two streams and tears the merged log's lines. Whole-line
+    writes cannot catch that: each chunk then already is a full line.
+    """
+    def writer(stream, label: str, stagger: float) -> None:
+        time.sleep(stagger)
+        for number in range(12):
+            line = json.dumps({"stream": label, "number": number}) + "\n"
+            half = len(line) // 2
+            stream.write(line[:half])
+            stream.flush()
+            time.sleep(0.002)
+            stream.write(line[half:])
+            stream.flush()
+    first = threading.Thread(target=writer, args=(sys.stdout, "stdout", 0.0))
+    second = threading.Thread(target=writer, args=(sys.stderr, "stderr", 0.001))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
 
 
 def probe_writes() -> None:
@@ -310,6 +380,15 @@ def main() -> int:
     if mode == "sleep":
         time.sleep(3600)
         return 0
+
+    if mode == "loop":
+        emit_loop()
+    if mode == "error-loop":
+        emit_error_loop()
+    if mode == "no-progress":
+        emit_no_progress()
+    if mode == "interleave":
+        emit_interleaved()
 
     if mode == "drip":
         # Emits one line per second so the wrapper's log grows, the way

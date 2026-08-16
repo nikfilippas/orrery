@@ -59,6 +59,13 @@ single-provider session and says so.
   role handoff stands its session down from orchestration, so no
   chain of agents can accumulate authority the principal never
   granted.
+- **Loops caught by behaviour, not by the clock.** A delegated run's
+  deadline already extends while output keeps arriving, but output is
+  not progress. The wrapper also reduces each provider's tool events to
+  counts and digests, never their content, and recognises three
+  conservative repetition signatures whose evidence must span several
+  polls. It observes and records by default, and stops a run only for a
+  role that opts in.
 - **Consent-gated fallback.** A failed provider yields a ranked
   candidate and a numbered consent menu; nothing crosses a provider,
   endpoint or billing boundary without your explicit approval, and
@@ -126,7 +133,7 @@ third-party endpoint, or one provider for everything.
 
 Órrery advertises no speed multipliers and no token-saving
 percentages. What it claims is what its test suite enforces: a
-deterministic 350-plus-test regression suite that spends no model
+deterministic 400-plus-test regression suite that spends no model
 credits, lint and suite on CI for every push, a doctor that validates
 the installation, kernel-level probes before every read-only delegated
 run, non-escalating delegation (a role's toolset is closed and denied

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +61,7 @@ from orrery_standing import (  # noqa: E402
     revoke_all,
 )
 import orrery_incidents as incident_log  # noqa: E402
+import orrery_stall  # noqa: E402
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
 PROGRAM_NAME = Path(sys.argv[0]).name
@@ -88,6 +90,10 @@ EXTEND_STEP_SECONDS = 120.0
 # lines each poll may print and says how many it dropped; `--stream`
 # lifts the cap and `--no-stream` leaves only the byte counters.
 STREAM_LINES_PER_POLL = 4
+try:
+    STALL_POLL_SECONDS = max(0.01, float(os.environ.get("ORRERY_STALL_POLL_SECONDS", "30")))
+except ValueError:
+    STALL_POLL_SECONDS = 30.0
 STREAM_LINE_LIMIT = 200
 # Explicitly supplied hard caps (flag, environment, manifest) must sit
 # in this range; a cap derived from the base inherits the base's
@@ -124,6 +130,70 @@ def receipt_path_is_safe(path: Path) -> bool:
 
 def receipt_open(path: Path, flags: int) -> int:
     return os.open(path, flags | os.O_NOFOLLOW, 0o600)
+
+
+def terminal_marker_path(receipts: Path) -> Path:
+    return receipts.parent / f"terminal-{receipts.name}.json"
+
+
+def clear_terminal_marker(receipts: Path) -> None:
+    """Remove only this attempt's terminal record before it starts."""
+    try:
+        terminal_marker_path(receipts).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise OSError(
+            f"could not clear stale terminal marker {terminal_marker_path(receipts)}"
+        ) from exc
+
+
+def write_terminal_marker(
+    receipts: Path | None,
+    *,
+    reason: str,
+    attempt_ordinal: int,
+    started_at: str,
+    rule: str | None = None,
+    counts: dict[str, int] | None = None,
+) -> None:
+    """Best-effort, atomic terminal fact in runner-owned storage."""
+    if receipts is None:
+        return
+    path = terminal_marker_path(receipts)
+    temporary = path.with_name(f".{path.name}.tmp")
+    payload: dict[str, Any] = {
+        "v": 1,
+        "reason": reason,
+        "leaf": receipts.name,
+        "attempt_ordinal": attempt_ordinal,
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+    }
+    if rule is not None:
+        payload["rule"] = rule
+    if counts is not None:
+        payload["counts"] = counts
+    try:
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        path.chmod(0o600)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 class Invocation:
@@ -684,6 +754,20 @@ def stream_new_lines(path: Path, offset: int, mode: str) -> int:
         if rendered.strip():
             print(f"  | {rendered}", file=sys.stderr, flush=True)
     return offset + len(complete)
+
+
+def feed_stall_detector(
+    detector: orrery_stall.Detector, path: Path, offset: int, now: float
+) -> int:
+    """Feed the detector through its own cursor, independent of display."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            chunk = handle.read()
+    except OSError:
+        chunk = b""
+    detector.feed(chunk.decode("utf-8", "replace"), now)
+    return offset + len(chunk)
 
 
 def newest_log_line(path: Path) -> str:
@@ -1364,15 +1448,36 @@ def write_service_launcher(
             "    while chunk:\n"
             "        written = os.write(fd, chunk)\n"
             "        chunk = chunk[written:]\n"
+            "merge_lock = threading.Lock()\n"
             "def copy(source, log_fd, output_fd, index):\n"
+            "    # The two streams share one merged destination, so the\n"
+            "    # merged copy is framed to complete lines under a lock:\n"
+            "    # raw incremental chunks from two threads split JSON\n"
+            "    # lines mid-write, and a split line breaks the verdict\n"
+            "    # recovery and usage parsing the merged log exists for.\n"
+            "    # The per-stream file still receives raw chunks.\n"
+            "    pending = b''\n"
             "    while True:\n"
-            "        chunk = source.read(65536)\n"
+            "        # read1 returns what is available: a buffered read(65536)\n"
+            "        # blocks until a full 64KiB or EOF, so a quiet\n"
+            "        # delegate's bytes all arrived at exit and the\n"
+            "        # merged log, the growth signal and the stall\n"
+            "        # detector starved together.\n"
+            "        chunk = source.read1(65536)\n"
             "        if not chunk:\n"
+            "            if pending:\n"
+            "                with merge_lock:\n"
+            "                    write_all(output_fd, pending)\n"
             "            return\n"
             "        counts[index] += len(chunk)\n"
             "        write_all(log_fd, chunk)\n"
             "        os.fsync(log_fd)\n"
-            "        write_all(output_fd, chunk)\n"
+            "        pending += chunk\n"
+            "        complete, newline, rest = pending.rpartition(b'\\n')\n"
+            "        if newline:\n"
+            "            with merge_lock:\n"
+            "                write_all(output_fd, complete + newline)\n"
+            "            pending = rest\n"
             "threads = [threading.Thread(target=copy, args=(child.stdout, stdout_log, 1, 0)), threading.Thread(target=copy, args=(child.stderr, stderr_log, 2, 1))]\n"
             "[thread.start() for thread in threads]\n"
             "status = child.wait()\n"
@@ -1851,7 +1956,11 @@ def handle_failed_attempt(
         kind,
         program=PROGRAM_NAME,
         role=failed,
-        detail=reason,
+        detail=(
+            f"{reason} (counts={json.dumps(incident_fields['counts'], sort_keys=True)})"
+            if kind == "stalled-loop" and incident_fields and "counts" in incident_fields
+            else reason
+        ),
         status=status,
         **extra_fields,
     )
@@ -2457,6 +2566,10 @@ def main(
             receipts / "result.txt" if receipts is not None else run_dir / "verdict.txt"
         )
         run_id = uuid.uuid4().hex
+        attempt_ordinal = 1
+        attempt_started_at = datetime.now(timezone.utc).isoformat(
+            timespec="milliseconds"
+        )
         if receipts is not None:
             try:
                 # A retry and an approved fallback both re-enter here with
@@ -2465,7 +2578,9 @@ def main(
                 # O_EXCL below found the earlier attempt's result.txt and
                 # every retry under --receipts died with EEXIST instead of
                 # running again.
-                orrery_spend.rotate_attempt(receipts)
+                clear_terminal_marker(receipts)
+                rotated = orrery_spend.rotate_attempt(receipts)
+                attempt_ordinal = (rotated or 0) + 1
                 descriptor = receipt_open(
                     verdict_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 )
@@ -2742,9 +2857,21 @@ def main(
                 )
 
             timed_out = False
+            stalled_verdict: dict[str, Any] | None = None
             final_growth_age: float | None = None
             last_size = 0
             stream_offset = 0
+            detector_offset = 0
+            detector = (
+                None
+                if role_config.stall_detection == "off"
+                else orrery_stall.Detector(
+                    "claude-stream-json"
+                    if role_config.provider == "anthropic"
+                    else "codex-jsonl"
+                )
+            )
+            stall_observed = False
             extension_recorded = False
             while True:
                 now = time.monotonic()
@@ -2780,10 +2907,36 @@ def main(
 
                 try:
                     return_code = process.wait(
-                        timeout=min(30.0, deadline - now)
+                        timeout=min(STALL_POLL_SECONDS, deadline - now)
                     )
                     break
                 except subprocess.TimeoutExpired:
+                    # The budget is the outer authority at a boundary.
+                    if time.monotonic() >= deadline:
+                        continue
+                    if detector is not None:
+                        detector_offset = feed_stall_detector(
+                            detector, log_path, detector_offset, time.monotonic()
+                        )
+                        verdict = detector.verdict()
+                        if verdict is not None:
+                            rule = verdict["rule"]
+                            counts = verdict["counts"]
+                            detail = f"rule={rule} counts={json.dumps(counts, sort_keys=True)}"
+                            if role_config.stall_detection == "observe":
+                                if not stall_observed:
+                                    stall_observed = True
+                                    incident_log.record(
+                                        "stall-suspected",
+                                        program=PROGRAM_NAME,
+                                        role=role_config,
+                                        detail=detail,
+                                        rule=rule,
+                                        counts=counts,
+                                    )
+                            else:
+                                stalled_verdict = verdict
+                                break
                     try:
                         size = log_path.stat().st_size
                     except OSError:
@@ -2807,7 +2960,7 @@ def main(
             # written after its last poll, so the remainder is flushed
             # once the process is done. A timed-out run is excluded:
             # its diagnostics tail already prints the same bytes.
-            if not timed_out and invocation.stream_mode != "off":
+            if not timed_out and stalled_verdict is None and invocation.stream_mode != "off":
                 stream_offset = stream_new_lines(
                     log_path, stream_offset, invocation.stream_mode
                 )
@@ -2827,6 +2980,12 @@ def main(
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
+                write_terminal_marker(
+                    receipts,
+                    reason="timeout",
+                    attempt_ordinal=attempt_ordinal,
+                    started_at=attempt_started_at,
+                )
                 if diagnostics:
                     print(
                         "--- provider diagnostic output ---",
@@ -2878,6 +3037,52 @@ def main(
                         "hard_timeout_seconds": hard_timeout_seconds,
                         "stalled_seconds": stalled_seconds,
                     },
+                )
+
+            if stalled_verdict is not None:
+                rule = stalled_verdict["rule"]
+                counts = stalled_verdict["counts"]
+                elapsed_total = int(time.monotonic() - started)
+                print(
+                    f"{display} stalled after {elapsed_total}s ({rule}).",
+                    file=sys.stderr,
+                )
+                diagnostics = tail_text(log_path)
+                write_terminal_marker(
+                    receipts,
+                    reason="stalled",
+                    rule=rule,
+                    counts=counts,
+                    attempt_ordinal=attempt_ordinal,
+                    started_at=attempt_started_at,
+                )
+                stopped = True
+                if use_systemd:
+                    try:
+                        stop_unit(unit)
+                    except RuntimeError as exc:
+                        stopped = False
+                        print(f"{PROGRAM_NAME}: {exc}", file=sys.stderr)
+                terminate_client(process)
+                if stopped:
+                    close_run("stalled", 114)
+                return handle_failed_attempt(
+                    invocation,
+                    state,
+                    reason=(
+                        f"{role_config.provider}/{role_config.model} stalled "
+                        f"after {elapsed_total}s ({rule})"
+                    ),
+                    status=114,
+                    scope=FailureScope.MODEL,
+                    diagnostics=diagnostics,
+                    context_warning=not role_config.read_only,
+                    require_rerun_after_inspection=(
+                        workspace_requires_inspection()
+                    ),
+                    approval_required_status=114,
+                    kind="stalled-loop",
+                    incident_fields={"rule": rule, "counts": counts},
                 )
 
         if return_code != 0:

@@ -75,6 +75,7 @@ TRANSITIONS = {
 DISPATCH_FAILURE_REASONS = frozenset(
     {
         "timeout",
+        "stalled",
         "provider-exit",
         "missing-result",
         "spawn-failure",
@@ -82,6 +83,15 @@ DISPATCH_FAILURE_REASONS = frozenset(
         "receipt-corrupt",
         "approval-required",
     }
+)
+# The review runner's own interruption vocabulary. Deliberately NOT
+# enforced by the record validator: INTERRUPTED reasons are open,
+# because other writers legitimately author their own, the pickup
+# parker's quota wording among them, and closing the set here broke
+# exactly that. Distinctness of these strings is a test-suite
+# guarantee, not a ledger refusal.
+INTERRUPTED_REASONS = frozenset(
+    {"review-missing-result", "review-invalid", "review-stalled", "review-timeout"}
 )
 _CONTRACT_KEYS = frozenset(
     {"task_id", "title", "goal", "acceptance_criteria", "scope", "risk", "assigned_role", "target_ref", "budget", "notes", "review", "depends_on", "waiver"}

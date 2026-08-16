@@ -149,6 +149,43 @@ def serve_catalogue() -> int:
     return 0
 
 
+def emit_loop() -> None:
+    """Emit genuine-shaped failed tool calls slowly enough to be polled."""
+    delay = float(os.environ.get("CLAUDE_FAKE_LOOP_DELAY", "0.2"))
+    for number in range(4):
+        identifier = f"toolu_loop_{number}"
+        print(json.dumps({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": identifier, "name": "Bash",
+                "input": {"command": "false"}, "caller": "assistant",
+            }]},
+        }), flush=True)
+        print(json.dumps({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": identifier,
+                "content": "command failed: loop failure", "is_error": True,
+            }]},
+        }), flush=True)
+        time.sleep(delay)
+
+
+def emit_error_loop() -> None:
+    delay = float(os.environ.get("CLAUDE_FAKE_LOOP_DELAY", "0.08"))
+    for number in range(4):
+        identifier = f"toolu_error_{number}"
+        print(json.dumps({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": identifier, "name": "Bash",
+            "input": {"command": f"probe-{number}"},
+        }]}}), flush=True)
+        print(json.dumps({"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": identifier,
+            "content": "permission denied: protected path", "is_error": True,
+        }]}}), flush=True)
+        time.sleep(delay)
+
+
 def main() -> int:
     mode = os.environ.get("CLAUDE_FAKE_MODE", "success")
 
@@ -214,6 +251,10 @@ def main() -> int:
     if mode == "sleep":
         time.sleep(3600)
         return 0
+    if mode == "loop":
+        emit_loop()
+    if mode == "error-loop":
+        emit_error_loop()
     if mode == "fail":
         print("simulated Claude failure", file=sys.stderr)
         return 8

@@ -260,6 +260,14 @@ for step in manifest["steps"]:
                 "role hard_timeout_seconds requires timeout_seconds "
                 "and must not be smaller"
             )
+    stall_detection = step.get("stall_detection", "observe")
+    if (
+        not isinstance(stall_detection, str)
+        or stall_detection not in {"off", "observe", "enforce"}
+    ):
+        raise SystemExit(
+            "role stall_detection must be off, observe, or enforce"
+        )
 
 chart = manifest.get("chart", {})
 nodes = chart.get("nodes")

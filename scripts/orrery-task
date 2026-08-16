@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import hashlib
@@ -255,8 +257,13 @@ def dispatch_alive(attempt: Path) -> bool:
 
 
 def receipt_failure(attempt: Path, returncode: int | None = None) -> str | None:
+    marker = read_terminal_marker(attempt)
+    marker_reason = marker["reason"] if marker else None
+
     receipt_path = attempt / "receipt.json"
     if not receipt_path.exists():
+        if marker_reason is not None:
+            return marker_reason
         # A timed-out attempt is a timeout even when the wrapper also
         # proposed a fallback on the way down: the reason carries the
         # attempt's terminal fact, and the proposal survives as
@@ -298,6 +305,8 @@ def receipt_failure(attempt: Path, returncode: int | None = None) -> str | None:
     ):
         return "receipt-corrupt"
     if receipt["exit_status"] != 0:
+        if marker_reason is not None:
+            return marker_reason
         return "provider-exit"
     result = attempt / "result.txt"
     if not result.exists() or not result.read_text().strip():
@@ -311,6 +320,46 @@ def receipt_failure(attempt: Path, returncode: int | None = None) -> str | None:
             pass
         return "missing-result"
     return None
+
+
+def read_terminal_marker(attempt: Path) -> dict | None:
+    """Read the trusted terminal fact for this receipts leaf, if current."""
+    path = attempt.parent / f"terminal-{attempt.name}.json"
+    try:
+        marker = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict) or marker.get("leaf") != attempt.name:
+        return None
+    reason = marker.get("reason")
+    ordinal = marker.get("attempt_ordinal")
+    if reason not in {"stalled", "timeout"} or not isinstance(ordinal, int) or ordinal < 1:
+        return None
+    rule = marker.get("rule")
+    counts = marker.get("counts")
+    if rule is not None and not isinstance(rule, str):
+        return None
+    if counts is not None and (
+        not isinstance(counts, dict)
+        or any(not isinstance(key, str) or not isinstance(value, int) for key, value in counts.items())
+    ):
+        return None
+    timestamps = {key: marker.get(key) for key in ("started_at", "finished_at")}
+    if any(value is not None and not isinstance(value, str) for value in timestamps.values()):
+        return None
+    attempts = [entry for entry in orrery_spend.attempt_directories(attempt)
+                if (entry / "attempt.json").exists()]
+    if attempts and ordinal != len(attempts):
+        print(
+            f"orrery-task: ignoring stale terminal marker {path}: ordinal mismatch "
+            f"({ordinal} rather than {len(attempts)})",
+            file=sys.stderr,
+        )
+        return None
+    return {
+        "reason": reason, "rule": rule, "counts": counts,
+        "attempt_ordinal": ordinal, **timestamps,
+    }
 
 
 def verify(
@@ -477,6 +526,7 @@ def complete_dispatch(
     spend = orrery_spend.spend_of(attempt_records)
     reason = receipt_failure(attempt, returncode)
     if reason:
+        marker = read_terminal_marker(attempt)
         partial = None
         if git(worktree, "status", "--porcelain").stdout:
             partial_path = attempt.parent / "partial.patch"
@@ -493,7 +543,7 @@ def complete_dispatch(
             consent = rel(root, consent_path)
         with control_lock(root) as locked:
             state = current(locked, task_id)[1]
-            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "consent": consent, "spend": spend})
+            append_record(locked, task_id, {"from": state, "to": "DISPATCH_FAILED", "actor": "runner", "reason": reason, "attempt": 1, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "consent": consent, "spend": spend, **({"stall": {"rule": marker["rule"], "counts": marker["counts"]}} if reason == "stalled" and marker else {})})
         return returncode or 1
     changed = git(worktree, "status", "--porcelain").stdout != ""
     if changed:
@@ -788,6 +838,302 @@ def review_receipts_dir(root: Path, task_id: str, name: str) -> Path:
         state_home / "orrery" / "review-receipts"
         / repo_identity(root) / task_id / name
     )
+
+
+def review_lease_path(root: Path, task_id: str) -> Path:
+    """The runner-owned serialisation record for one task's reviews."""
+    return review_receipts_dir(root, task_id, "lease").parent / "review-lease.json"
+
+
+@contextlib.contextmanager
+def review_lease_lock(path: Path):
+    """Serialise every lease decision, including stale-lease reclamation."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def recorded_process_alive(pid: object, start: object) -> bool:
+    """Three-state liveness for a recorded pid and start token.
+
+    A pid conclusively absent from the process table is dead; that is
+    the ordinary end of every holder and must clear. A pid that exists
+    while its start token cannot be read is inconclusive and counts as
+    alive, because clearing a lease on a procfs hiccup would sweep a
+    paid run. A readable token decides by comparison.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return True  # an unreadable record proves nothing; retain
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    actual = process_start_time(pid)
+    if actual is None:
+        return True
+    return start is None or actual == start
+
+
+def review_lease_holder_alive(lease: dict) -> bool:
+    return recorded_process_alive(lease.get("pid"), lease.get("start"))
+
+
+def review_lease_owned(lease: dict) -> bool:
+    return (
+        lease.get("pid") == os.getpid()
+        and lease.get("start") == process_start_time(os.getpid())
+    )
+
+
+def review_lease_child_alive(lease: dict) -> bool:
+    child = lease.get("wrapper")
+    if not isinstance(child, dict):
+        return False
+    if child.get("pid") is None:
+        # A pid-less spawn intent is not a recorded process; its
+        # liveness is resolved separately, from receipts and time.
+        return False
+    return recorded_process_alive(child.get("pid"), child.get("start"))
+
+
+# How long a pid-less spawn intent stays conclusive on its own. A
+# wrapper that was actually born records its unit or process group in
+# the leaf's unit.json within seconds; an intent past this window with
+# no such record is settled dead, so an interrupted spawn cannot wedge
+# a task's reviews forever.
+SPAWN_SETTLE_SECONDS = 600.0
+
+
+def review_lease_intent_live(path: Path, lease: dict) -> bool:
+    """Liveness for a pid-less wrapper intent, resolved from evidence.
+
+    No exception from Popen proves the child was never created, so the
+    intent is never withdrawn on failure; instead it stays live within
+    the settle window or while the leaf's own work record shows a live
+    unit or process group, and settles dead otherwise."""
+    wrapper = lease.get("wrapper")
+    if not isinstance(wrapper, dict) or wrapper.get("pid") is not None:
+        return False
+    recorded_at = wrapper.get("intent_at")
+    if not isinstance(recorded_at, (int, float)) or isinstance(recorded_at, bool):
+        return True
+    if time.time() - recorded_at < SPAWN_SETTLE_SECONDS:
+        return True
+    leaf = lease.get("leaf")
+    if not isinstance(leaf, str) or not leaf:
+        return True
+    # Absence is evidence: a wrapper that was born records its work here
+    # within seconds, so no record after the window settles the intent.
+    # An unreadable or corrupt record proves nothing and retains.
+    try:
+        text = (path.parent / leaf / "unit.json").read_text()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError):
+        return True
+    try:
+        record = json.loads(text)
+    except ValueError:
+        return True
+    if not isinstance(record, dict):
+        return True
+    unit = record.get("unit")
+    if isinstance(unit, str) and unit:
+        return review_lease_unit_alive({"unit": unit})
+    pgid = record.get("pgid")
+    if not isinstance(pgid, int) or pgid <= 0:
+        # A record with neither a unit nor a usable process group is
+        # malformed, and malformed evidence retains.
+        return True
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def review_lease_unit_alive(lease: dict) -> bool:
+    unit = lease.get("unit")
+    if not isinstance(unit, str) or not unit:
+        return False
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "is-active", unit],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            check=False, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        # An unavailable status command cannot prove that a paid unit ended.
+        return True
+    return str(getattr(result, "stdout", "")).strip() not in {"inactive", "failed"}
+
+
+def review_lease_unit(path: Path, lease: dict) -> str | None:
+    unit = lease.get("unit")
+    if isinstance(unit, str) and unit:
+        return unit
+    leaf = lease.get("leaf")
+    if not isinstance(leaf, str) or not leaf:
+        return None
+    try:
+        unit = json.loads((path.parent / leaf / "unit.json").read_text()).get("unit")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return unit if isinstance(unit, str) and unit else None
+
+
+def read_review_lease(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def write_review_lease(path: Path, lease: dict, *, exclusive: bool = False) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    data = (json.dumps(lease, sort_keys=True) + "\n").encode()
+    if not exclusive:
+        _atomic_write(path, data, 0o600)
+        return
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        raise
+
+
+def acquire_review_lease(root: Path, task_id: str, leaf: str) -> Path:
+    """Claim this task's review lane, reconciling only fully departed work."""
+    path = review_lease_path(root, task_id)
+    mine = {"v": 1, "pid": os.getpid(), "start": process_start_time(os.getpid()),
+            "leaf": leaf, "unit": None}
+    with review_lease_lock(path):
+        try:
+            write_review_lease(path, mine, exclusive=True)
+            return path
+        except FileExistsError:
+            lease = read_review_lease(path)
+            if lease is None or review_lease_holder_alive(lease):
+                holder = lease.get("pid") if lease else "unknown"
+                raise LedgerError(
+                    f"review in progress; holder pid {holder}; use resume after it finishes"
+                )
+            unit = review_lease_unit(path, lease)
+            if unit is not None:
+                lease["unit"] = unit
+            unit_live = review_lease_unit_alive(lease)
+            child_live = review_lease_child_alive(lease) or review_lease_intent_live(
+                path, lease
+            )
+            if unit_live or child_live:
+                live = []
+                if unit_live:
+                    named = f" {unit}" if isinstance(unit, str) and unit else ""
+                    live.append(f"unit live{named}")
+                if child_live:
+                    child = lease.get("wrapper")
+                    pid = child.get("pid") if isinstance(child, dict) else None
+                    live.append(
+                        f"wrapper live pid {pid}"
+                        if isinstance(pid, int)
+                        else "wrapper starting"
+                    )
+                raise LedgerError(
+                    f"review in progress; holder dead, {', '.join(live)}; "
+                    "use resume"
+                )
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                raise LedgerError("review lease changed while reclaiming; use resume")
+            write_review_lease(path, mine, exclusive=True)
+            return path
+
+
+def update_review_lease(path: Path, **changes: object) -> None:
+    with review_lease_lock(path):
+        lease = read_review_lease(path)
+        if lease is None or not review_lease_owned(lease):
+            return
+        lease.update(changes)
+        write_review_lease(path, lease)
+
+
+def release_review_lease(path: Path, *, failed_unit_stop: bool = False) -> None:
+    with review_lease_lock(path):
+        lease = read_review_lease(path)
+        if lease is None or not review_lease_owned(lease):
+            return
+        unit = review_lease_unit(path, lease)
+        # The recorded wrapper is checked as well as the unit: an
+        # exception between spawn and unit registration reaches this
+        # release with paid work still running, and dropping the lease
+        # then would admit a concurrent second review.
+        if (
+            failed_unit_stop
+            or (unit is not None and review_lease_unit_alive(lease))
+            or review_lease_child_alive(lease)
+            or review_lease_intent_live(path, lease)
+        ):
+            what = unit or "the review wrapper"
+            print(
+                f"orrery-task: retaining review lease for {what}; work may still be running; use resume",
+                file=sys.stderr,
+            )
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def spawn_recorded_wrapper(lease: Path, command: list[str], cwd: Path):
+    """Spawn the review wrapper with its liveness recorded fail-closed.
+
+    The pid-less intent lands before the spawn and the real pid replaces
+    it after, so no moment leaves paid work invisible to a rival's
+    liveness check. No exception withdraws the intent: Popen can raise
+    even after the child exists (an interrupt, or the parent side of the
+    error pipe failing post-fork), so no exception class proves
+    childlessness. The intent instead settles by evidence and time in
+    review_lease_intent_live, which is what keeps a failed spawn from
+    wedging the task's reviews forever.
+    """
+    update_review_lease(
+        lease, wrapper={"pid": None, "start": None, "intent_at": time.time()}
+    )
+    process = subprocess.Popen(command, cwd=cwd)
+    update_review_lease(
+        lease,
+        wrapper={"pid": process.pid, "start": process_start_time(process.pid)},
+    )
+    return process
+
+
+def review_terminal_failure(receipts: Path) -> tuple[str | None, dict | None]:
+    """Classify only the current marker for this review dispatch."""
+    marker = read_terminal_marker(receipts)
+    if marker is None:
+        return None, None
+    if marker["reason"] == "stalled":
+        return "review-stalled", marker
+    return "review-timeout", marker
 
 
 def harvest_receipts(storage: Path, receipts: Path) -> None:
@@ -1143,6 +1489,22 @@ def dependency_conflict(
     return None
 
 def review_task(root: Path, task_id: str, flags: list[str]) -> int:
+    """Serialise task reviews before preparing their durable artefacts."""
+    store = root / ".orrery"
+    records, state = current(store, task_id)
+    if state not in {"IN_REVIEW", "REVIEW_BLOCKED", "INTERRUPTED"}:
+        raise LedgerError(f"task {task_id} is {state}")
+    sequence = 1 + sum(1 for record in records if record.get("review"))
+    while (store / "reviews" / task_id / str(sequence)).exists():
+        sequence += 1
+    lease = acquire_review_lease(root, task_id, str(sequence))
+    try:
+        return _review_task(root, task_id, flags, lease)
+    finally:
+        release_review_lease(lease)
+
+
+def _review_task(root: Path, task_id: str, flags: list[str], lease: Path) -> int:
     """Dispatch one blind review and record what it found.
 
     The reviewer runs in the task worktree, so `.orrery` is simply not
@@ -1272,10 +1634,23 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
     # review short.
     def dispatch_review(receipts_dir: Path, assignment: str) -> Path | None:
         """Run one reviewer and return its document, or None if it gave none."""
-        process = subprocess.run(
-            command_for(receipts_dir) + flags + ["--", assignment],
-            cwd=worktree, check=False,
+        process = spawn_recorded_wrapper(
+            lease, command_for(receipts_dir) + flags + ["--", assignment], worktree
         )
+        while process.poll() is None:
+            try:
+                unit = json.loads((receipts_dir / "unit.json").read_text()).get("unit")
+            except (OSError, ValueError, AttributeError):
+                unit = None
+            if isinstance(unit, str) and unit:
+                update_review_lease(lease, unit=unit)
+            time.sleep(0.05)
+        try:
+            unit = json.loads((receipts_dir / "unit.json").read_text()).get("unit")
+        except (OSError, ValueError, AttributeError):
+            unit = None
+        if isinstance(unit, str) and unit:
+            update_review_lease(lease, unit=unit)
         produced = receipts_dir / "result.txt"
         if process.returncode != 0 or not produced.exists():
             return None
@@ -1318,14 +1693,20 @@ def review_task(root: Path, task_id: str, flags: list[str]) -> int:
             + validation_error
             + "\nReturn the same judgement in a document that conforms.\n"
         )
+        update_review_lease(lease, leaf=this_attempt.name, unit=None, wrapper=None)
         produced = dispatch_review(this_receipts, assignment)
         harvest_receipts(this_attempt, this_receipts)
         if produced is None:
+            reason, marker = review_terminal_failure(this_receipts)
+            reason = reason or "review-missing-result"
+            detail = f"review stall rule: {marker['rule']}" if reason == "review-stalled" and marker and marker["rule"] else None
             with control_lock(root) as locked:
                 append_record(locked, task_id, {
                     "from": current(locked, task_id)[1], "to": "INTERRUPTED",
-                    "actor": "runner", "reason": "review-missing-result",
+                    "actor": "runner", "reason": reason,
                     "phase": "review", "contract_digest": digest,
+                    **({"detail": detail} if detail else {}),
+                    **({"stall": {"rule": marker["rule"], "counts": marker["counts"]}} if reason == "review-stalled" and marker else {}),
                     "spend": review_rounds_spend(attempt),
                     # Named, so the spend is attributed to the reviewer
                     # rather than to whichever implementer ran last.
@@ -1834,10 +2215,12 @@ def resume_task(root: Path, task_id: str) -> int:
     # ledger held no spend for it and the next dispatch passed a token
     # ceiling it had already crossed.
     interrupted_spend = orrery_spend.spend_of(orrery_spend.read_attempts(attempt))
+    marker = read_terminal_marker(attempt)
+    reason = marker["reason"] if marker else None
     with control_lock(root) as locked:
         latest = current(locked, task_id)[1]
-        append_record(locked, task_id, {"from": latest, "to": "INTERRUPTED", "actor": "runner", "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "spend": interrupted_spend})
-    print(f"{task_id} interrupted")
+        append_record(locked, task_id, {"from": latest, "to": "INTERRUPTED", "actor": "runner", "reason": reason, "contract_digest": digest, "worktree_fingerprint": git_workspace_fingerprint(worktree), "partial": partial, "spend": interrupted_spend, **({"stall": {"rule": marker["rule"], "counts": marker["counts"]}} if reason == "stalled" else {})})
+    print(f"{task_id} {'stalled' if reason == 'stalled' else 'timed out' if reason == 'timeout' else 'interrupted'}")
     return 0
 
 
@@ -2877,6 +3260,16 @@ def queue_brief(root: Path, store: Path, task_id: str) -> int:
     unresolved_evidence: list[str] = []
     state = records[-1]["to"]
     print(f"{task_id}  {state}{'  (ledger torn)' if torn else ''}")
+    terminal = records[-1]
+    stall = terminal.get("stall")
+    if isinstance(stall, dict):
+        rule = stall.get("rule")
+        counts = stall.get("counts")
+        if isinstance(rule, str):
+            print(f"  stall rule: {inert(rule)}")
+        if isinstance(counts, dict):
+            rendered = json.dumps(counts, sort_keys=True, ensure_ascii=False)
+            print(f"  stall counts: {inert(rendered)}")
     try:
         contract = load_contract(store, task_id)
     except LedgerError:

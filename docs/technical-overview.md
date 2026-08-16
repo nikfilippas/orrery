@@ -260,6 +260,38 @@ of minutes so slow progress is visible rather than silent, with
 provider-derived text sanitised so it can never forge Orrery's consent
 markers or inject terminal escapes.
 
+### Trajectory stall detection
+
+Output growth is not progress by itself. The wrapper also reduces provider
+tool events to counts and digests, never their content, and looks for three
+conservative signatures: three identical failing calls (`repeat`), three
+failures in the same tool and normalised-error class (`error-class`), or
+twelve failed calls with no successful call (`no-progress`). Every rule needs
+evidence from at least two polls and the configured span; a successful call
+breaks the consecutive run behind the first two rules and resets the
+no-progress count, so ongoing real work cannot accumulate into a verdict.
+
+Each role has `stall_detection: off | observe | enforce`; `observe` is the
+default and `ORRERY_STALL_DETECTION` overrides it for one session. Observe
+records one `stall-suspected` incident and leaves the run alone. Enforce stops
+the run, writes a runner-owned `terminal-<receipts-leaf>.json` marker with the
+rule and counts, and records `stalled`. Markers are per attempt, so a stale
+or sibling attempt cannot classify a later success. The vocabulary keeps
+`stalled` distinct from `timeout`, and review outcomes `review-stalled` and
+`review-timeout` distinct from `review-missing-result`.
+
+With detection `off`, the wrapper creates no detector and records no stall
+incident, marker, or classification, while the run keeps its existing outcome.
+The timeout marker and the line-framed stdout/stderr tee are unconditional
+robustness improvements and remain active. `ORRERY_STALL_MIN_SPAN` is a
+suite-only gate accepted only with `KIT_FAKE_BIN`; production keeps at least
+thirty seconds. `ORRERY_STALL_POLL_SECONDS` controls polling and is clamped to
+the wrapper's minimum interval.
+
+Observe is promoted to enforce only by a separately reviewed default change
+after accumulated incident evidence shows genuine loops without genuine-work
+false positives.
+
 Read-only roles additionally run inside a service unit that maps the
 workspace read-only, together with the git directory behind it and
 every worktree of the same repository, enforced by the kernel rather

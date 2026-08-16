@@ -136,7 +136,7 @@ lets a run whose merged output grew within the last three minutes extend
 in two-minute steps up to the cap. `codex exec` streams its work
 continuously, so growth is a live progress signal; delegated Claude
 runs print only their final JSON and therefore keep plain base-deadline
-behaviour. A stalled, silent, or capped run times out exactly as
+behaviour. A silent or capped run times out exactly as
 before, `--hard-timeout` and `ORRERY_AGENT_HARD_TIMEOUT_SECONDS`
 override per run, and an explicitly chosen `--timeout` without a hard
 cap remains its own bound. The runner echoes the delegate's newest
@@ -145,6 +145,22 @@ never forge Orrery's consent markers or smuggle terminal escapes into
 the transcript; extensions record a `budget-extended` incident, which
 deliberately surfaces in the doctor's seven-day summary as
 budget-tuning evidence.
+
+Separately from the clock, each role carries `stall_detection`, one of
+`off`, `observe` (the default) or `enforce`, overridable for a session
+with `ORRERY_STALL_DETECTION`. The wrapper reduces the delegate's tool
+events to counts and digests, never their content, and looks for three
+signatures: three identical failing calls, three failures sharing one
+specific error class, or twelve failed calls with no successful one. A
+verdict needs evidence spanning at least two polls and thirty seconds,
+and a successful call breaks the consecutive run all three rules
+require, so ongoing real work cannot accumulate into one. Under
+`observe` the run continues and a single `stall-suspected` incident is
+recorded; under `enforce` the run is stopped and reported as `stalled`
+with status 114, distinct from a timeout, carrying its rule and counts
+into the ledger and `orrery-task show`. The deadline remains the outer
+authority: a run that reaches its budget is a timeout even if a
+signature was forming.
 
 The manifest's top-level `verbosity` steers how delegated roles write:
 `1` (the default) injects a terse plain-prose report style into every
@@ -777,6 +793,14 @@ The maintained artefacts are:
   runtime commands, the task control plane, fallback consent, caching,
   verification, and the benchmark programme. The README stays the short
   overview; deep sections live here rather than growing it.
+- `scripts/orrery_stall.py` — stdlib-only provider event signatures and
+  conservative trajectory stall rules used by the review wrapper.
+- `tests/streams/` — redacted genuine provider stream fixtures for parser
+  fidelity and no-false-trigger coverage.
+- `tests/streams/claude-implementer-genuine.jsonl` — a real delegated
+  Claude stream-json run, minted live for the corpus.
+- `tests/streams/codex-principal-genuine.jsonl` — a real headless Codex
+  principal event stream from the benchmark smoke.
 - `docs/badges/tests.json` — the shields endpoint behind the README's
   test-count badge, served from GitHub Pages. The suite asserts that
   the number it states equals the number of registered tests, so the

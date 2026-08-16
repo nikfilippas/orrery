@@ -44,6 +44,7 @@ STORE_NAME = "standing.json"
 LOCK_NAME = "standing.lock"
 GLOBAL_LOCK_NAME = "standing-all.lock"
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+FINGERPRINT_VERSION = "v3"
 _FAILURE_SCOPES = frozenset({"provider", "model", "transient"})
 
 
@@ -133,7 +134,14 @@ def parse_approval_scope(value: str) -> tuple[str, float | None]:
 def _fingerprint(role: Role) -> list[str | None]:
     endpoint = role.endpoint
     return [
-        "v2", role.provider, role.model, role.thinking, role.access,
+        FINGERPRINT_VERSION, role.provider, role.model, role.thinking, role.access,
+        str(role.timeout_seconds) if role.timeout_seconds is not None else None,
+        (
+            str(role.hard_timeout_seconds)
+            if role.hard_timeout_seconds is not None
+            else None
+        ),
+        role.stall_detection,
         endpoint.id if endpoint else None,
         endpoint.base_url if endpoint else None,
     ]
@@ -204,8 +212,8 @@ def _valid_record(entry: Any) -> dict[str, Any] | None:
             and not isinstance(expires_at, bool)
         )
         and isinstance(fingerprint, list)
-        and len(fingerprint) == 7
-        and fingerprint[0] == "v2"
+        and len(fingerprint) == 10
+        and fingerprint[0] == FINGERPRINT_VERSION
         and isinstance(entry.get("created_at"), (int, float))
     ):
         return None
