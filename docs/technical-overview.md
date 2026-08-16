@@ -7,6 +7,28 @@ flow, what each role may do and for how long, how containment and
 fallback consent are enforced, what is cached, what is measured, and
 how the whole thing is verified.
 
+## Contents
+
+- [Positioning and terminology](#positioning-and-terminology)
+- [How a request flows](#how-a-request-flows)
+- [Adoption and trust](#adoption-and-trust)
+- [Default roles](#default-roles)
+- [Runtime commands](#runtime-commands)
+- [Task control plane](#task-control-plane)
+- [Review queue](#review-queue)
+- [Governed memory](#governed-memory)
+- [Visual configuration](#visual-configuration)
+- [Shared instructions and prompt caching](#shared-instructions-and-prompt-caching)
+- [Provider failure](#provider-failure)
+- [Parked work](#parked-work)
+- [Installation](#installation)
+- [Leave No Trace](#leave-no-trace)
+- [Token usage](#token-usage)
+- [Incident log](#incident-log)
+- [Verification](#verification)
+- [Benchmarking](#benchmarking)
+- [Repository layout](#repository-layout)
+
 ## Positioning and terminology
 
 Industry calls this category **agent orchestration**: LangGraph brands

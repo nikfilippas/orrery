@@ -4,6 +4,27 @@ Orrery runs a configurable principal orchestrator plus four bounded roles:
 mechanic, implementer, plan reviewer, and final reviewer. Anthropic and OpenAI
 are adapters, not workflow roles. Every role can use either provider.
 
+## Contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [Configure roles](#configure-roles)
+- [Watch and capture a delegated run](#watch-and-capture-a-delegated-run)
+- [Align the principal's own surface](#align-the-principals-own-surface)
+- [Start and delegate](#start-and-delegate)
+- [Route a role at another model service](#route-a-role-at-another-model-service)
+- [Adopt a repository](#adopt-a-repository)
+- [Instruction and caching design](#instruction-and-caching-design)
+- [Task control plane](#task-control-plane)
+- [Leave No Trace](#leave-no-trace)
+- [Provider exhaustion and failures](#provider-exhaustion-and-failures)
+- [Park work across a limit reset](#park-work-across-a-limit-reset)
+- [Token usage](#token-usage)
+- [Incident log](#incident-log)
+- [Verification and maintenance](#verification-and-maintenance)
+- [Repository map](#repository-map)
+- [Troubleshooting](#troubleshooting)
+
 ## Requirements
 
 - Python 3.11 or newer
