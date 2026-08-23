@@ -45,8 +45,9 @@ single-provider session and says so.
   later clean review.
 - **Parallel work, integrated on evidence.** Independent tasks run in
   isolated worktrees and merge only through a gate that re-runs the union
-  of their acceptance checks, so one task cannot land a change that breaks
-  another's invariant. What awaits a human decision is drawn into one
+  of the acceptance checks of the tasks integrating together, so tasks in
+  flight at the same time cannot land changes that break each other's
+  invariants. What awaits a human decision is drawn into one
   queue, ranked most serious first, every row stating its reason and
   verifying the evidence it cites.
 - **Enforced containment, not promised containment.** Read-only roles
@@ -70,7 +71,9 @@ single-provider session and says so.
   candidate and a numbered consent menu; nothing crosses a provider,
   endpoint or billing boundary without your explicit approval, and
   standing approvals are disclosed on every use and revocable. An
-  exhausted plan is never answered by substitution: `orrery-pickup`
+  exhausted plan is never answered by an *automatic* substitution;
+  crossing to another provider always needs your explicit consent, and
+  the sanctioned alternative is `orrery-pickup`, which
   parks the stopped work instead and re-dispatches it when the
   provider's stated limit resets, offline, under a spend ceiling, with
   the merge gate still yours.

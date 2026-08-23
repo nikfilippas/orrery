@@ -93,7 +93,10 @@ def parse_approval_scope(value: str) -> tuple[str, float | None]:
 
     The until scope must carry its own timestamp because an approved rerun
     makes no configured-provider attempt and so has no diagnostics left to
-    parse a reset time from.
+    parse a reset time from. Parsing an until value is still permitted, but
+    the fallback consent refuses an until scope supplied non-interactively:
+    a standing until approval can be granted only from the interactive
+    menu, so this value is usable there rather than from a flag rerun.
     """
     if value == RUN_SCOPE:
         return RUN_SCOPE, None
@@ -101,7 +104,8 @@ def parse_approval_scope(value: str) -> tuple[str, float | None]:
         if not session_scope_available():
             raise RuntimeConfigError(
                 "--approval-scope session requires a login-session runtime "
-                "directory (XDG_RUNTIME_DIR); use run or until:<ISO8601>"
+                "directory (XDG_RUNTIME_DIR); use run, or set a standing "
+                "until approval at the interactive menu"
             )
         return SESSION_SCOPE, None
     if value == UNTIL_SCOPE:
@@ -242,11 +246,16 @@ def _write_records(path: Path, records: list[dict[str, Any]]) -> None:
 def _expired(record: dict[str, Any], now: float) -> bool:
     if record["scope"] == UNTIL_SCOPE:
         return record["expires_at"] is None or record["expires_at"] <= now
+    # The 24h cap applies to every session record, boot-stamped or not: a
+    # boot id expires it early on reboot, but must not let a long login
+    # session keep it alive past the cap.
+    if now >= record["created_at"] + SESSION_CAP_SECONDS:
+        return True
     boot_id = record.get("boot_id")
     if boot_id:
         current = current_boot_id()
         return current is not None and current != boot_id
-    return now >= record["created_at"] + SESSION_CAP_SECONDS
+    return False
 
 
 def _store_for_scope(scope: str) -> Path:

@@ -1032,6 +1032,27 @@ def request_fallback_decision(
                 if approval_scope is not None
                 else (RUN_SCOPE, None)
             )
+            # A non-interactive rerun carries no first-run diagnostics to
+            # bind a scope against, so it may not mint a multi-day standing
+            # approval: `until` is refused here and can be granted only from
+            # the interactive menu, which is bound to the offered scopes. A
+            # `session` scope is accepted only where it was actually
+            # offerable, so an unoffered session cannot be forged either.
+            if scope == UNTIL_SCOPE:
+                _safe_print(
+                    "An 'until' standing approval cannot be granted "
+                    "non-interactively; approve it from the interactive menu, "
+                    "or approve run or session scope here.",
+                    stream=stream,
+                )
+                return ConsentDecision(Consent.REQUIRED)
+            if scope == SESSION_SCOPE and SESSION_SCOPE not in scopes:
+                _safe_print(
+                    "A session-scope approval is not available here; approve "
+                    "run scope, or set the scope from the interactive menu.",
+                    stream=stream,
+                )
+                return ConsentDecision(Consent.REQUIRED)
             _safe_print(
                 f"Fallback approved for {proposal.approval_key} "
                 f"{_scope_phrase(scope, expires_at)}.",
@@ -1098,11 +1119,26 @@ def request_fallback_decision(
         stream=stream,
     )
     _safe_print(f"Scopes: {', '.join(scope_entries)}", stream=stream)
+    # A non-interactive rerun may not mint an `until` standing approval, so
+    # it is not advised as a rerun scope even when it is offered; it stays
+    # in the Scopes line above because the interactive menu can still grant
+    # it.
+    rerun_entries = [
+        entry
+        for entry in scope_entries
+        if entry != UNTIL_SCOPE and not entry.startswith(f"{UNTIL_SCOPE}:")
+    ]
     _safe_print(
         f"Rerun with: --approve-fallback {proposal.approval_key} "
-        f"--approval-scope {'|'.join(scope_entries)}",
+        f"--approval-scope {'|'.join(rerun_entries)}",
         stream=stream,
     )
+    if len(rerun_entries) != len(scope_entries):
+        _safe_print(
+            "An 'until' standing approval is available only from the "
+            "interactive menu, not from a non-interactive rerun.",
+            stream=stream,
+        )
     _safe_print(
         "Ask the user for explicit approval, then rerun the same command with "
         f"`--approve-fallback {proposal.approval_key}` before `--`.",

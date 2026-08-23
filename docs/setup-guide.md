@@ -301,18 +301,21 @@ user agrees, repeat the same command with the exact approval before `--`:
 orrery-agent --role reviewer \
   --approve-fallback anthropic:fable -- "PROMPT"
 orrery-agent --role reviewer --approve-fallback anthropic:fable \
-  --approval-scope until:2026-08-05T16:49 -- "PROMPT"
+  --approval-scope session -- "PROMPT"
 ```
 
 The flag approves only that provider/model, starts it directly rather than
 retrying the process that produced the proposal, and never changes
-`global/orchestration.json`. `--approval-scope` defaults to `run`; `session`
-and `until:<ISO8601>` record a standing approval, which is prior recorded
-consent. A later invocation whose configured role still matches starts the
-recorded candidate directly, never re-ranked, and prints a disclosure line
-on every use. Session-scope records live under
-`$XDG_RUNTIME_DIR/orrery/standing.json` and die with the login session
-(stamped with the boot id, or capped at 24 hours where none is readable);
+`global/orchestration.json`. `--approval-scope` defaults to `run` and, on a
+non-interactive rerun, also accepts `session`; a multi-day `until:<ISO8601>`
+standing approval is refused from a flag rerun and can be granted only from
+the interactive consent menu, which is bound to the scopes actually
+offered. A recorded standing approval is prior recorded consent: a later
+invocation whose configured role still matches starts the recorded
+candidate directly, never re-ranked, and prints a disclosure line on every
+use. Session-scope records live under
+`$XDG_RUNTIME_DIR/orrery/standing.json` and die with the login session and
+at a 24-hour cap regardless of the boot id;
 until-scope records live under `${XDG_STATE_HOME:-~/.local/state}/orrery/
 standing.json` and expire at their recorded time. Standing approvals are
 listed by `orrery-doctor` and on the configuration page, are removed by
@@ -382,6 +385,36 @@ On systemd systems the delegated process runs in a transient service with:
   roles are refused and workers are unaffected. `ORRERY_ALLOW_UNCONFINED=1`
   accepts a degraded run explicitly, and a read-only run that proceeds
   without the guarantee is fingerprinted and inspected as a writer is.
+  What the probe proves, stated precisely: `ProtectHome=read-only` and
+  each explicit read-only mapping (the workspace and the git directories),
+  written to directly. Its generic negative target is under `$HOME`
+  because no portable path outside home is both writable by an
+  unprivileged user and protected by `ProtectSystem`; `ProtectSystem=strict`
+  is therefore asserted from the unit composition rather than probed, and a
+  host that honoured home and the explicit mappings but silently dropped
+  `ProtectSystem` would pass the probe.
+
+The provider's own configuration is composed read-only over its otherwise
+writable home, so a delegate cannot change the hooks, hook target scripts,
+config, or skills that define the operator's next interactive session. What
+remains, accepted as the deferred hostile-delegate scope rather than the
+confused-delegate model the confinement is built for:
+
+- Instruction injection is not fully closed. A behaviour file the home does
+  not yet contain can be created (a read-only mapping cannot name an absent
+  path), and an instruction file the kit installs as a symlink
+  (`CLAUDE.md`/`AGENTS.md`) leaves a replaceable entry in the writable home,
+  as does a new higher-priority `AGENTS.override.md`. The code-execution
+  channels that exist are closed; instruction injection is the residual.
+  Closing it entirely needs an isolated provider home.
+- The no-delegation guard reads the kernel cgroup, which a delegate can
+  hide only by creating a cgroup namespace where the host permits
+  unprivileged namespaces; the provider's own sandbox needs namespaces, so
+  they are not blanket-restricted.
+- The standing-approval and control stores are trusted because they sit
+  under `ProtectHome`. Do not set `XDG_STATE_HOME` or `XDG_RUNTIME_DIR`
+  under a delegate-writable grant (`/tmp`, `/var/tmp`, a provider home): a
+  store there could be forged by a delegate.
 
 The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
 stops the whole control group and removes the private prompt, settings, log,
@@ -669,9 +702,10 @@ or model is required.
 
 ## Park work across a limit reset
 
-An exhausted plan is never answered by substitution; the sanctioned
-retry is the same model after the provider's stated reset. Parking
-automates only the waiting:
+An exhausted plan is never answered by an automatic substitution; a
+cross-provider move always requires explicit consent, and the other
+sanctioned alternative is the same model after the provider's stated
+reset. Parking automates only the waiting:
 
 ```bash
 orrery-pickup park T-3            # inside the adopted repository

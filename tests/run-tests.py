@@ -2664,6 +2664,76 @@ def test_unenforceable_confinement_refusal() -> None:
     )
 
 
+@test("a delegate cgroup listing is recognised for both unit prefixes")
+def test_delegate_unit_in_cgroup() -> None:
+    detect = review_module.delegate_unit_in_cgroup
+    task = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/orrery-task-4821-9f3ac1b2de.service\n"
+    review = "0::/user.slice/user-1000.slice/orrery-review-771-0a1b2c3d4e.service\n"
+    require(detect(task) == "orrery-task-4821-9f3ac1b2de", "task-unit cgroup not recognised")
+    require(detect(review) == "orrery-review-771-0a1b2c3d4e", "review-unit cgroup not recognised")
+    require(detect("0::/user.slice/user-1000.slice/app-code-3517.scope\n") is None, "a principal cgroup was misread as a delegate")
+    require(detect("0::/orrery-agent-1-abcdef0123.service\n") is None, "a non-existent orrery-agent unit was matched")
+
+
+@test("nesting refusal reads the kernel cgroup and the env marker")
+def test_nesting_refusal_signals() -> None:
+    saved_reader = review_module._self_cgroup_text
+    saved_role = os.environ.get("ORRERY_ROLE")
+    try:
+        os.environ.pop("ORRERY_ROLE", None)
+        review_module._self_cgroup_text = lambda: "0::/user.slice/app-code-3517.scope\n"
+        require(review_module.nesting_refusal() is None, "a principal session was refused")
+
+        review_module._self_cgroup_text = lambda: "0::/user.slice/orrery-task-9-aabbccddee.service\n"
+        reason = review_module.nesting_refusal()
+        require(
+            reason is not None and "orrery-task-9-aabbccddee" in reason,
+            f"a delegate cgroup was not refused: {reason!r}",
+        )
+
+        # The env marker still refuses where no cgroup boundary exists
+        # (the unconfined path), even though it is the weaker signal.
+        review_module._self_cgroup_text = lambda: ""
+        os.environ["ORRERY_ROLE"] = "reviewer"
+        reason = review_module.nesting_refusal()
+        require(
+            reason is not None and "ORRERY_ROLE" in reason,
+            f"the env marker did not refuse: {reason!r}",
+        )
+    finally:
+        review_module._self_cgroup_text = saved_reader
+        if saved_role is None:
+            os.environ.pop("ORRERY_ROLE", None)
+        else:
+            os.environ["ORRERY_ROLE"] = saved_role
+
+
+@test("the wrapper refuses to start a delegated run from inside a delegate")
+def test_nesting_refused_end_to_end() -> None:
+    environment = review_environment("success")
+    environment["ORRERY_ROLE"] = "reviewer"
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    stdout, stderr = finish_review(process, environment)
+    require(
+        process.returncode == review_module.NESTING_REFUSED,
+        f"a nested delegate was not refused ({process.returncode}): {stderr!r}",
+    )
+    require(
+        "a delegate cannot start another delegated run" in stderr and not stdout,
+        f"the nesting refusal was not reported: {stderr!r}",
+    )
+    # And a normal invocation (no delegate marker, principal cgroup) is
+    # not caught by the guard: it runs to a real verdict.
+    clean = review_environment("success")
+    clean_process = start_review(clean, "--timeout", "60", "--", "prompt")
+    clean_stdout, _clean_stderr = finish_review(clean_process, clean)
+    require(
+        clean_process.returncode != review_module.NESTING_REFUSED
+        and "# PASS" in clean_stdout,
+        f"a principal invocation was wrongly refused: {clean_process.returncode}",
+    )
+
+
 @test("workspace overlap resolves every trusted path through symlinks")
 def test_workspace_overlap_refusal_matrix() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -3057,6 +3127,98 @@ def test_stall_unhashable_status_skipped() -> None:
     require(
         len(detector.ring) == 1 and not detector.ring[0].failed,
         "a well-formed event no longer parses after an unhashable status",
+    )
+
+
+@test("a shared banner does not cluster distinct failures into an error class")
+def test_stall_banner_not_a_class() -> None:
+    # A realistic multi-line pytest header, with ANSI colour, that three
+    # unrelated failing commands would all print. The class must come from
+    # the specific error line beneath it, not the shared header.
+    banner = (
+        "\x1b[1m=========== test session starts ===========\x1b[0m\n"
+        "platform linux -- Python 3.11.8, pytest-8.2.0\n"
+        "rootdir: /work\ncollected 3 items\n"
+    )
+    distinct = stall_module.Detector("codex-jsonl")
+    for number, err in enumerate(
+        ("AssertionError: assert 1 == 2", "KeyError: 'x'", "ValueError: bad input")
+    ):
+        distinct.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"pytest -k t{number}",
+                "aggregated_output": banner + f"E   {err}\n", "exit_code": 1,
+            }),
+            float(number * 31),
+        )
+    require(
+        distinct.verdict() is None,
+        "distinct errors under one banner clustered into error-class",
+    )
+    require(
+        all(sig.error_class is not None for sig in distinct.ring),
+        "the specific error lines produced no class at all",
+    )
+    require(
+        len({sig.error_class for sig in distinct.ring}) == 3,
+        "distinct errors were assigned the same class",
+    )
+
+    # The same real error under the same banner is one class and fires.
+    shared = stall_module.Detector("codex-jsonl")
+    for number in range(3):
+        shared.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"pytest -k t{number}",
+                "aggregated_output": banner + "E   AssertionError: assert 1 == 2\n",
+                "exit_code": 1,
+            }),
+            float(number * 31),
+        )
+    verdict = shared.verdict()
+    require(
+        verdict is not None and verdict["rule"] == "error-class",
+        f"a shared real error under a banner did not cluster: {verdict}",
+    )
+
+    # A shared line that only carries a zero count or success word is not
+    # an error line, even though it contains a signal word: distinct
+    # failures beneath it must not cluster on it.
+    summary = "typecheck completed with 0 errors\n"
+    benign = stall_module.Detector("codex-jsonl")
+    for number, err in enumerate(
+        ("AssertionError: a", "KeyError: b", "RuntimeError: c")
+    ):
+        benign.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"check t{number}",
+                "aggregated_output": summary + f"{err}\n", "exit_code": 1,
+            }),
+            float(number * 31),
+        )
+    require(
+        benign.verdict() is None
+        and len({sig.error_class for sig in benign.ring}) == 3,
+        "distinct failures clustered on a shared benign summary line",
+    )
+
+    # A real error line that merely contains a success word ("completed")
+    # is still an error and must cluster: the benign filter matches only
+    # zero-count phrasings, not any line with a success word.
+    real = stall_module.Detector("codex-jsonl")
+    for number in range(3):
+        real.feed(
+            codex_stall_event({
+                "type": "command_execution", "command": f"job t{number}",
+                "aggregated_output": "RuntimeError: cleanup completed with status 1\n",
+                "exit_code": 1,
+            }),
+            float(number * 31),
+        )
+    real_verdict = real.verdict()
+    require(
+        real_verdict is not None and real_verdict["rule"] == "error-class",
+        f"a real error containing a success word did not cluster: {real_verdict}",
     )
 
 
@@ -9393,16 +9555,39 @@ def test_consent_required_block() -> None:
         require(
             decision.consent is fallback_module.Consent.REQUIRED
             and "Candidate: openai:gpt-5.6-sol" in text
+            # until stays in the Scopes line (the interactive menu can
+            # grant it) but is dropped from the non-interactive rerun advice.
             and "Scopes: run, session, until:2091-08-05T16:49" in text
             and (
                 "Rerun with: --approve-fallback openai:gpt-5.6-sol "
-                "--approval-scope run|session|until:2091-08-05T16:49" in text
+                "--approval-scope run|session" in text
             )
+            and "--approval-scope run|session|until" not in text
+            and "available only from the interactive menu" in text
             and "ORRERY FALLBACK APPROVAL REQUIRED" in text
             and "same model as the configured principal" in text,
             f"the REQUIRED block is incomplete: {text}",
         )
 
+    # A non-interactive rerun may not mint an until standing approval; it
+    # is refused rather than recorded.
+    until_stream = io.StringIO()
+    refused = fallback_module.request_fallback_decision(
+        proposal,
+        approval=("openai", "gpt-5.6-sol"),
+        no_fallback=False,
+        program_name="orrery-agent",
+        stream=until_stream,
+        tty_opener=lambda: None,
+        approval_scope=("until", reset.timestamp()),
+    )
+    require(
+        refused.consent is fallback_module.Consent.REQUIRED
+        and "cannot be granted non-interactively" in until_stream.getvalue(),
+        f"a non-interactive until approval was not refused: {until_stream.getvalue()}",
+    )
+
+    # A run-scope explicit approval is still carried through.
     approved = fallback_module.request_fallback_decision(
         proposal,
         approval=("openai", "gpt-5.6-sol"),
@@ -9410,13 +9595,12 @@ def test_consent_required_block() -> None:
         program_name="orrery-agent",
         stream=io.StringIO(),
         tty_opener=lambda: None,
-        approval_scope=("until", reset.timestamp()),
+        approval_scope=("run", None),
     )
     require(
         approved.consent is fallback_module.Consent.APPROVED
-        and approved.scope == "until"
-        and approved.expires_at == reset.timestamp(),
-        "an explicit approval scope was not carried into the decision",
+        and approved.scope == "run",
+        "an explicit run approval was not carried into the decision",
     )
 
 
@@ -9606,8 +9790,8 @@ def test_no_fallback_ignores_standing() -> None:
         )
 
 
-@test("an until approval records from the flag and is honoured next run")
-def test_until_scope_records_and_replays() -> None:
+@test("a non-interactive until approval is refused, not recorded")
+def test_until_scope_refused_noninteractive() -> None:
     with until_store_only() as state_dir:
         failed_environment = review_environment(
             "success", standing_state=state_dir
@@ -9624,12 +9808,14 @@ def test_until_scope_records_and_replays() -> None:
             f"the REQUIRED block lost its scope lines: {failed_stderr}",
         )
 
-        approved_environment = review_environment(
+        # A delegate reruns with an until scope that was never offered.
+        # It is refused rather than minted into a standing approval.
+        refused_environment = review_environment(
             "success", standing_state=state_dir
         )
-        approved_environment["CODEX_FAKE_MODE"] = "quota"
-        approved = start_review(
-            approved_environment,
+        refused_environment["CODEX_FAKE_MODE"] = "quota"
+        refused = start_review(
+            refused_environment,
             "--timeout",
             "60",
             "--approve-fallback",
@@ -9639,41 +9825,46 @@ def test_until_scope_records_and_replays() -> None:
             "--",
             "prompt",
         )
-        stdout, stderr = finish_review(approved, approved_environment)
+        _stdout, stderr = finish_review(refused, refused_environment)
         require(
-            approved.returncode == 0
-            and "fake Claude verdict" in stdout
-            and "for every project until 2091-08-05" in stderr
-            and "standing fallback recorded" in stderr,
-            f"the until approval was not recorded: {stderr}",
+            refused.returncode == 75
+            and "cannot be granted non-interactively" in stderr,
+            f"a non-interactive until approval was not refused: {refused.returncode} {stderr}",
         )
-        stored = json.loads(
-            (state_dir / "orrery" / "standing.json").read_text()
-        )["approvals"]
+        store = state_dir / "orrery" / "standing.json"
+        recorded = (
+            json.loads(store.read_text())["approvals"] if store.exists() else []
+        )
         require(
-            len(stored) == 1
-            and stored[0]["scope"] == "until"
-            and stored[0]["candidate_model"] == "fable",
-            f"the until store content is wrong: {stored}",
+            not recorded,
+            f"a refused until approval was still recorded: {recorded}",
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            codex_arguments = Path(directory) / "codex-args"
-            replay_environment = review_environment(
-                "success", standing_state=state_dir
-            )
-            replay_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
-            replay = start_review(
-                replay_environment, "--timeout", "60", "--", "prompt"
-            )
-            stdout, stderr = finish_review(replay, replay_environment)
-            require(
-                replay.returncode == 0
-                and "fake Claude verdict" in stdout
-                and "standing fallback active" in stderr
-                and not codex_arguments.exists(),
-                f"the recorded until approval was not honoured: {stderr}",
-            )
+
+@test("a session approval expires at the 24h cap even within one boot")
+def test_session_cap_within_boot() -> None:
+    saved_boot = standing_module.current_boot_id
+    try:
+        standing_module.current_boot_id = lambda: "boot-a"
+        now = 1_000_000.0
+        cap = standing_module.SESSION_CAP_SECONDS
+        fresh = {"scope": "session", "created_at": now - cap + 60, "boot_id": "boot-a"}
+        stale = {"scope": "session", "created_at": now - cap - 60, "boot_id": "boot-a"}
+        require(
+            not standing_module._expired(fresh, now),
+            "a within-cap boot-stamped session was expired early",
+        )
+        require(
+            standing_module._expired(stale, now),
+            "a boot-stamped session outlived the 24h cap",
+        )
+        standing_module.current_boot_id = lambda: "boot-b"
+        require(
+            standing_module._expired(fresh, now),
+            "a reboot did not expire a within-cap session",
+        )
+    finally:
+        standing_module.current_boot_id = saved_boot
 
 
 @test("revocation clears standing approvals from both binaries")
@@ -10190,6 +10381,136 @@ def test_worker_confinement_real_configuration() -> None:
                 "workspace": True,
             },
             f"worker confinement was incomplete: {writes}; {stderr[-600:]}",
+        )
+
+
+@test("a delegate cannot write its own provider's behaviour files")
+def test_active_provider_behaviour_read_only() -> None:
+    """The active provider's home is granted writable so its state files
+    work, but its behaviour-bearing files (config, hooks and their target
+    scripts, skills) must be read-only inside that grant. The earlier
+    guard pointed a scratch CODEX_HOME at the other provider's settings,
+    so it passed while the active provider's own config stayed writable;
+    this plants the active provider's files and proves the real property.
+    """
+    with confinable_scratch() as directory:
+        root = Path(directory)
+        workspace = root / "workspace"
+        provider_home = root / "codex-home"
+        workspace.mkdir()
+        provider_home.mkdir()
+        if not review_module.read_only_paths_enforced(root):
+            print("      (skipped: this host cannot enforce confinement)")
+            return
+        (provider_home / "config.toml").write_text("# provider config\n")
+        (provider_home / "hooks.json").write_text("{}\n")
+        (provider_home / "hooks").mkdir()
+        (provider_home / "hooks" / "run.sh").write_text("#!/bin/sh\n")
+        (provider_home / "skills").mkdir()
+        (provider_home / "skills" / "a.md").write_text("skill\n")
+        # A version-numbered state file beside them, to prove the home
+        # stays writable for state even while the behaviour files do not.
+        (provider_home / "state_5.sqlite").write_text("state\n")
+        result_path = provider_home / "writes.json"
+        environment = review_environment("success")
+        environment["CODEX_HOME"] = str(provider_home)
+        environment["CODEX_FAKE_PROBE_WRITES"] = json.dumps({
+            "config": str(provider_home / "config.toml"),
+            "hooks_json": str(provider_home / "hooks.json"),
+            "hook_target": str(provider_home / "hooks" / "run.sh"),
+            "skill": str(provider_home / "skills" / "a.md"),
+            "state": str(provider_home / "state_5.sqlite"),
+            "new_override": str(provider_home / "AGENTS.override.md"),
+            "workspace": str(workspace / "allowed.txt"),
+        })
+        environment["CODEX_FAKE_PROBE_RESULT"] = str(result_path)
+        process = start_review(
+            environment, "--role", "implementer", "--timeout", "60", "--", "prompt",
+            cwd=workspace,
+        )
+        _stdout, stderr = finish_review(process, environment)
+        writes = read_json(result_path)
+        require(
+            process.returncode == 0
+            and writes.get("config") is False
+            and writes.get("hooks_json") is False
+            and writes.get("hook_target") is False
+            and writes.get("skill") is False
+            and writes.get("state") is True
+            and writes.get("workspace") is True,
+            f"behaviour files were not read-only over a writable home: {writes}; {stderr[-600:]}",
+        )
+        # Documented residual (option A): creating a NEW higher-priority
+        # instruction file in the still-writable home is not prevented,
+        # because a read-only mapping cannot name a path that does not
+        # exist yet. Asserted so a future closure flips it deliberately.
+        require(
+            writes.get("new_override") is True,
+            f"the override-creation residual changed unexpectedly: {writes}",
+        )
+
+
+@test("provider behaviour paths map real in-home files and skip symlinks out")
+def test_provider_behaviour_paths_classification() -> None:
+    """Binds the classification for both providers and documents its
+    boundary: an out-of-home symlink (the kit's CLAUDE.md/AGENTS.md) and a
+    not-yet-existing name are NOT mapped, which is the instruction-injection
+    residual accepted for the cheap-hardening option."""
+    saved = {name: os.environ.get(name) for name in ("CODEX_HOME", "CLAUDE_CONFIG_DIR")}
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        outside = root / "outside-tree"
+        outside.mkdir()
+        (outside / "AGENTS.md").write_text("kit instructions\n")
+
+        codex_home = root / "codex"
+        codex_home.mkdir()
+        for name in ("config.toml", "hooks.json"):
+            (codex_home / name).write_text("x\n")
+        for name in ("hooks", "skills", "rules"):
+            (codex_home / name).mkdir()
+        # A symlink out of the home (as the installer makes AGENTS.md) and a
+        # state file that is not behaviour-bearing.
+        (codex_home / "AGENTS.md").symlink_to(outside / "AGENTS.md")
+        (codex_home / "state_5.sqlite").write_text("state\n")
+        # hooks.json exists here; a home missing it would not get it mapped
+        # (the not-yet-existing-name residual), which the next assertion
+        # documents by omission.
+
+        claude_home = root / "claude"
+        claude_home.mkdir()
+        (claude_home / "settings.json").write_text("{}\n")
+        (claude_home / "skills").mkdir()
+        (claude_home / "CLAUDE.md").symlink_to(outside / "AGENTS.md")
+        # No hooks dir here: a missing name is simply not mapped.
+
+        try:
+            os.environ["CODEX_HOME"] = str(codex_home)
+            os.environ["CLAUDE_CONFIG_DIR"] = str(claude_home)
+            codex_mapped = {p.name for p in review_module.provider_behaviour_paths("openai")}
+            claude_mapped = {p.name for p in review_module.provider_behaviour_paths("anthropic")}
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        require(
+            codex_mapped == {"config.toml", "hooks.json", "hooks", "skills", "rules"},
+            f"codex behaviour set is wrong: {codex_mapped}",
+        )
+        require(
+            "AGENTS.md" not in codex_mapped,
+            "an out-of-home symlink was mapped (residual boundary changed)",
+        )
+        require(
+            claude_mapped == {"settings.json", "skills"},
+            f"claude behaviour set is wrong: {claude_mapped}",
+        )
+        require(
+            "CLAUDE.md" not in claude_mapped and "hooks" not in claude_mapped,
+            "the symlink/missing-name residual boundary changed",
         )
 
 
@@ -13517,6 +13838,36 @@ def test_task_dispatch_maps_timeout() -> None:
         )
 
 
+@test("branch verification refuses a workdir symlink that escapes the worktree")
+def test_branch_verify_workdir_symlink_escape() -> None:
+    """Binds the branch call site of resolved_workdir, not only the helper.
+    The contract schema already refuses a `../` traversal, so the check's
+    real job is a committed symlink whose innocuous name passes the schema
+    but resolves outside; an unchecked join would cd through it and fail
+    with a different reason, so the specific refusal reason is asserted."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        (root / "sub").symlink_to("/tmp")
+        git_output(root, "add", "sub")
+        git_output(root, "commit", "-m", "add sub link")
+        contract = dispatch_contract(command="true")
+        contract["acceptance_criteria"][0]["verification"]["workdir"] = "sub"
+        create_dispatch_task(root, contract)
+        environment = task_review_environment("edit")
+        try:
+            result = run_task(root, "run", "T-1", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        records = task_records(root)
+        require(
+            result.returncode == 1
+            and records[-1]["to"] == "VERIFICATION_FAILED"
+            and "outside the task worktree" in records[-1]["reason"],
+            f"an escaping workdir symlink was not refused: {records[-1]}",
+        )
+
+
 @test("task verification rejects a tree-mutating command")
 def test_task_verification_rejects_tree_mutation() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -14612,6 +14963,27 @@ def test_task_resume_completes_dead_dispatch() -> None:
         require(resumed.returncode == 0 and resumed.stdout.strip() == "T-1 completed", f"{resumed.stdout!r} {resumed.stderr!r} {records!r}")
         require([record["to"] for record in records][-3:] == ["IMPLEMENTED", "VERIFICATION_PASSED", "AWAITING_MERGE"], str(records))
         require(evidence["worker_claim"] == "done\n" and ahead == "1", str(evidence))
+
+
+@test("a verification workdir escaping its worktree is refused at both sites")
+def test_resolved_workdir_escape() -> None:
+    """Branch and integration verification share this check; the
+    integration path previously joined the workdir unchecked, so a
+    committed workdir symlink swapped in by a concurrent task could run a
+    borrowed criterion outside the scratch tree with that directory
+    writable."""
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory) / "tree"
+        (base / "sub").mkdir(parents=True)
+        require(task_module.resolved_workdir(base, "") == base.resolve(), "the base itself was refused")
+        require(task_module.resolved_workdir(base, ".") == base.resolve(), "'.' was refused")
+        require(task_module.resolved_workdir(base, "sub") == (base / "sub").resolve(), "a real subdirectory was refused")
+        require(task_module.resolved_workdir(base, "../elsewhere") is None, "a parent-relative escape was allowed")
+        require(task_module.resolved_workdir(base, "/etc") is None, "an absolute path was allowed")
+        outside = Path(directory) / "outside"
+        outside.mkdir()
+        (base / "link").symlink_to(outside)
+        require(task_module.resolved_workdir(base, "link") is None, "a symlink escaping the tree was allowed")
 
 
 @test("task resume marks a receiptless dead dispatch interrupted")

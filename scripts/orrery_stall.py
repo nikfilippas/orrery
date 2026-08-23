@@ -57,19 +57,63 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _first_line(text: str) -> str:
-    return text.strip().splitlines()[0].strip()[:200] if text.strip() else ""
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# A line carries a specific error only if it names one of these. A banner
+# or a progress header ("test session starts", "collecting ...") does not,
+# so it is skipped rather than taken as the class: three different
+# failing commands that merely share a banner must not cluster.
+# Substrings, not whole words: real error names are compounds
+# ("AssertionError", "KeyError", "ValueError") whose signal has no word
+# boundary. Matched only on already-failing calls, so the first line
+# carrying one of these is the actual error rather than incidental prose.
+_ERROR_SIGNAL = re.compile(
+    r"(?:error|errno|exception|traceback|failed|failure|assert|panic|"
+    r"fatal|segfault|abort|denied|refused|not found|no such|cannot|"
+    r"unable|unresolved|undefined|invalid|timeout|timed out)",
+    re.I,
+)
+# Even an error-signal line is too generic to be a class when it is only a
+# bare outcome: "error", "failed", "command failed", "exit code 1".
+_GENERIC_FAILURE = re.compile(
+    r"(?:exit code \d+|command failed|failed|failure|error)", re.I
+)
 
 
-_GENERIC_FAILURE = re.compile(r"(?:exit code \d+|command failed|error)", re.I)
+# A line whose signal is only a zero count is not an error line:
+# "typecheck completed with 0 errors", "0 failures", "warnings: 0". Such a
+# line is a constant a tool prints on every run, so three different
+# failures that share it must not cluster on it. Only unambiguous
+# zero-count phrasings are matched: a bare success word like "completed"
+# or "ok" is deliberately NOT here, because it also appears inside real
+# errors ("RuntimeError: cleanup completed with status 1"), which must
+# still form a class.
+_BENIGN_SUMMARY = re.compile(
+    r"\b(?:0|no|zero)\s+(?:error|errors|failure|failures|warning|warnings)\b"
+    r"|\b(?:errors?|failures?|warnings?)\s*[:=]\s*0\b",
+    re.I,
+)
 
 
 def _error_class(tool: str, text: str) -> str | None:
-    """Classify a specific error line, never a generic exit outcome."""
-    line = _first_line(text)
-    if not line or _GENERIC_FAILURE.fullmatch(line):
-        return None
-    return _digest(f"{tool}:{line}")
+    """The first specific error line's class, or None if there is none.
+
+    Scans past decoration, progress banners, and benign summaries
+    ("0 errors", "all passed") to the first line that names an actual
+    error and is more than a bare outcome, so the class reflects what
+    failed rather than a constant a tool prints on every run. ANSI colour
+    is stripped so the same error in colour and in plain text is one class.
+    """
+    for raw in text.splitlines():
+        line = _ANSI.sub("", raw).strip()[:200]
+        if (
+            not line
+            or not _ERROR_SIGNAL.search(line)
+            or _GENERIC_FAILURE.fullmatch(line)
+            or _BENIGN_SUMMARY.search(line)
+        ):
+            continue
+        return _digest(f"{tool}:{line}")
+    return None
 
 
 @dataclass(frozen=True)

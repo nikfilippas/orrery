@@ -4,8 +4,9 @@
 A park is an operator command, never an inference: it binds the sealed
 contract's digest, the full role fingerprint, and the repository
 instance, and the executor re-checks every binding at fire time. The
-kit already refuses to substitute a model for an exhausted plan; this
-command automates only the waiting for the sanctioned retry.
+kit never answers an exhausted plan with an automatic substitution (a
+cross-provider move needs explicit consent); this command automates the
+other sanctioned alternative, waiting for the same model's reset.
 """
 
 from __future__ import annotations

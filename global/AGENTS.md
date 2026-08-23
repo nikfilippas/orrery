@@ -301,9 +301,10 @@ run, `ORRERY FALLBACK APPROVAL REQUIRED` means stop and ask the user,
 relaying the listed candidate and scopes as a multiple-choice question.
 After approval, rerun the same command with
 `--approve-fallback PROVIDER:MODEL` before `--`, adding
-`--approval-scope session` or `--approval-scope until:<ISO8601>` only when
-the user chose that standing lifetime. Never add those flags without the
-user's go-ahead. A standing approval is prior recorded consent: it starts
+`--approval-scope session` only when the user chose a session lifetime; a
+multi-day `until:<ISO8601>` standing approval is granted only at the
+interactive menu, not from a flag rerun, which refuses it. Never add that
+flag without the user's go-ahead. A standing approval is prior recorded consent: it starts
 its recorded candidate directly with a disclosure line on every use,
 expires by itself, is listed by the doctor and the configuration page, is
 removed by `--revoke-fallbacks`, and is always overridden by

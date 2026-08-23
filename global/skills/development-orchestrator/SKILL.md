@@ -246,9 +246,11 @@ Always check exit status and usable final output.
   scopes to the user as a multiple-choice question, and wait. Only after
   explicit approval rerun the same command with
   `--approve-fallback PROVIDER:MODEL` before `--`, adding
-  `--approval-scope session` or `--approval-scope until:<ISO8601>` only
-  when the user chose that standing lifetime. The rerun starts that exact
-  candidate directly; it does not retry the failed configured process. A
+  `--approval-scope session` only when the user chose a session lifetime;
+  a multi-day `until:<ISO8601>` standing approval is granted only at the
+  interactive menu, not from a flag rerun, which refuses it. The rerun
+  starts that exact candidate directly; it does not retry the failed
+  configured process. A
   live standing approval is prior recorded consent: it starts its recorded
   candidate with a disclosure line on every use and is removed with
   `--revoke-fallbacks`.

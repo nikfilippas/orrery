@@ -100,6 +100,10 @@ STREAM_LINE_LIMIT = 200
 # freedom.
 HARD_TIMEOUT_MINIMUM = 30
 HARD_TIMEOUT_MAXIMUM = 14400
+# A delegate that tries to start another delegated run is refused with
+# this status: distinct from a usage error (2) and from any provider
+# exit, so a caller can tell a nesting refusal from work that ran.
+NESTING_REFUSED = 77
 
 
 class UsageError(Exception):
@@ -950,6 +954,56 @@ def session_control_paths() -> list[Path]:
     return [path for path in (runtime / "systemd", runtime / "bus") if path.exists()]
 
 
+# A delegated provider runs inside an orrery-task-* (any run with
+# --receipts: every task dispatch and every review) or orrery-review-*
+# (ad-hoc, no receipts) transient unit; the launcher composes both names
+# in write_service_launcher. There is no orrery-agent-* unit.
+DELEGATE_UNIT = re.compile(r"orrery-(?:task|review)-\d+-[0-9a-f]+")
+
+
+def delegate_unit_in_cgroup(cgroup_text: str) -> str | None:
+    """The Órrery delegate transient unit a cgroup listing names, if any.
+
+    A process cannot leave its own cgroup without privilege, so a delegate
+    unit in this process's cgroup is a kernel-backed statement that the
+    caller is itself a delegate. Unlike the ORRERY_ROLE environment marker,
+    it cannot be unset from inside the delegate.
+    """
+    match = DELEGATE_UNIT.search(cgroup_text)
+    return match.group(0) if match else None
+
+
+def _self_cgroup_text() -> str:
+    """This process's cgroup listing, or empty when it cannot be read.
+
+    Factored out so a test can substitute a cgroup posture in-process
+    without an environment override, which a delegate could otherwise set
+    to a clean value to defeat the guard.
+    """
+    try:
+        return Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return ""
+
+
+def nesting_refusal() -> str | None:
+    """Why this process may not start a delegated run, or None if it may.
+
+    A delegate cannot delegate. The cgroup ancestor is the enforceable
+    signal wherever confinement is active; the ORRERY_ROLE env marker is a
+    secondary signal that also covers the unconfined path, where there is
+    no cgroup boundary and the guard is necessarily best-effort (that path
+    already announces that it is unconfined).
+    """
+    unit = delegate_unit_in_cgroup(_self_cgroup_text())
+    if unit is not None:
+        return f"this process runs inside delegate unit {unit}"
+    role = os.environ.get("ORRERY_ROLE")
+    if role:
+        return f"ORRERY_ROLE={role} marks this session a delegate"
+    return None
+
+
 def confinement_enforced(
     writable_paths: list[Path],
     probe_root: Path,
@@ -961,6 +1015,16 @@ def confinement_enforced(
     claimed. Each is composed into the probe exactly as the run will
     compose it, and each is written to, so a claim the host cannot
     honour fails here rather than silently at the delegate.
+
+    Scope, stated honestly: this proves `ProtectHome=read-only` (the
+    generic negative target is under `$HOME`, since no portable non-home
+    path exists that an unprivileged user can write and `ProtectSystem`
+    would protect) and each explicit read-only mapping passed here.
+    `ProtectSystem=strict` is asserted from the unit composition in
+    `containment_properties`, not separately probed; a host that honoured
+    home and the explicit mappings but silently dropped `ProtectSystem`
+    would pass this probe. The workspace and git mappings a run relies on
+    are passed as `read_only_paths` and so are probed directly.
     """
     inside = probe_root / ".containment-probe-inside"
     # Home rather than the run directory's parent. That parent is
@@ -1533,6 +1597,60 @@ def provider_state_paths(provider: str) -> list[Path]:
     if resolved.is_dir():
         paths.append(resolved)
     return paths
+
+
+# Behaviour-bearing names in each provider home. Stable across versions,
+# unlike the numbered state files (state_5.sqlite, logs_2.sqlite, ...)
+# beside them, so a delegate's home stays writable for its state while
+# these are composed read-only over it.
+BEHAVIOUR_NAMES = {
+    "openai": ("config.toml", "hooks.json", "hooks", "skills", "rules"),
+    "anthropic": ("settings.json", "hooks", "skills"),
+}
+
+
+def provider_behaviour_paths(provider: str) -> list[Path]:
+    """Behaviour-bearing paths in the provider home to compose read-only.
+
+    Config, hook definitions and their directory, and the installed skills
+    tree define what the operator's next interactive session executes; a
+    delegate must not modify them even though its home is otherwise
+    writable so its state files work. A read-only mapping nested in the
+    home grant wins over the grant and makes each a mount point that
+    cannot be renamed, and ProtectHome keeps the home's parent chain
+    unrenameable, so the mapping holds.
+
+    Only paths that really live in the home are mapped; a name the kit
+    installs as a symlink out of the home (its AGENTS.md/CLAUDE.md, which
+    point at the kit tree) is not mapped here.
+
+    Residual, accepted as the deferred hostile-delegate scope: this closes
+    the code-execution channels that exist (hooks, hook targets under
+    hooks/, config, the skills tree), but instruction INJECTION is not
+    fully closed. A read-only mapping cannot name a path that does not
+    exist yet, so a behaviour file the home happens to lack can be created;
+    and a name the kit installs as a symlink (CLAUDE.md/AGENTS.md) leaves a
+    replaceable directory entry in the still-writable home, so its
+    instructions can be swapped, as can a new higher-priority
+    AGENTS.override.md. An empty placeholder cannot help: it would itself
+    shadow the real instruction file. Closing instruction injection
+    entirely needs an isolated provider home (a private view), which was
+    weighed and deferred; the test asserts the residual so a later closure
+    flips it deliberately.
+    """
+    home_paths = provider_state_paths(provider)
+    if not home_paths:
+        return []
+    home = home_paths[0]
+    behaviour: list[Path] = []
+    for name in BEHAVIOUR_NAMES.get(provider, ()):
+        candidate = home / name
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve(strict=False)
+        if resolved == home or home in resolved.parents:
+            behaviour.append(resolved)
+    return behaviour
 
 
 def write_receipt_unit(receipts: Path, unit: str | None, pgid: int | None = None) -> None:
@@ -2148,6 +2266,18 @@ def main(
         print(usage(), file=sys.stderr, end="")
         return 2
 
+    # A delegate cannot delegate. Enforced here in code rather than only
+    # by the role handoff prompt, and by the kernel cgroup boundary rather
+    # than only the unsettable-from-inside environment marker.
+    refusal = nesting_refusal()
+    if refusal is not None:
+        print(
+            f"{PROGRAM_NAME}: a delegate cannot start another delegated run "
+            f"({refusal}).",
+            file=sys.stderr,
+        )
+        return NESTING_REFUSED
+
     if invocation.revoke:
         try:
             removed = revoke_all()
@@ -2481,7 +2611,17 @@ def main(
         pinned_paths, pin_conflict = ancestors_to_pin(
             protected_paths, writable_paths
         )
-        read_only_paths = protected_paths + pinned_paths
+        # The provider's behaviour-bearing files are composed read-only
+        # over its otherwise-writable home. They are appended after the
+        # workspace pinning rather than folded into protected_paths: their
+        # ancestor chain is kept unrenameable by ProtectHome (the home's
+        # parent is home itself, read-only), not by pinning the home,
+        # which must stay writable for the provider's state files. A
+        # read-only mapping nested in the home grant makes each a mount
+        # point that cannot be renamed. They are probed with the workspace
+        # mappings below, so a host that cannot enforce them fails closed.
+        provider_read_only = provider_behaviour_paths(role_config.provider)
+        read_only_paths = protected_paths + pinned_paths + provider_read_only
         conflict = pin_conflict or grant_defeating(protected_paths, writable_paths)
         confinement_ok = use_systemd and confinement_enforced(
             writable_paths, run_dir
@@ -2497,14 +2637,37 @@ def main(
         # that set was never probed at all, so a host that honours
         # ProtectHome but drops explicit mappings passed preflight while
         # protecting nothing.
+        # Probes only the workspace mappings, not the provider ones, so a
+        # provider-mapping failure is reported by its own branch below
+        # rather than masked as a workspace failure. The provider mappings
+        # have their own guarantee (provider_guaranteed) and are still
+        # composed into the real unit through read_only_paths.
         protection_guaranteed = (
             bool(protected_paths)
             and conflict is None
             and confinement_ok
-            and confinement_enforced(writable_paths, run_dir, read_only_paths)
+            and confinement_enforced(
+                writable_paths, run_dir, protected_paths + pinned_paths
+            )
         )
         workspace_guaranteed = protection_guaranteed or (
             not role_config.read_only and not protected_paths
+        )
+        # The provider behaviour mappings are a guarantee of their own, and
+        # a worker with an empty protected set takes the guaranteed branch
+        # above without protection_guaranteed ever probing them. Probe them
+        # directly so a host that honours ProtectHome but drops the nested
+        # read-only mappings degrades here rather than silently leaving the
+        # provider's hooks and config writable.
+        # Probed on its own: protection_guaranteed now covers only the
+        # workspace mappings, so it can no longer stand in for the provider
+        # ones. When there are provider mappings they are always probed.
+        provider_guaranteed = (
+            not provider_read_only
+            or (
+                confinement_ok
+                and confinement_enforced(writable_paths, run_dir, provider_read_only)
+            )
         )
         if not confinement_ok:
             detail = (
@@ -2555,6 +2718,25 @@ def main(
                 return 1
             print(
                 f"{PROGRAM_NAME}: the workspace is not read-only "
+                "(ORRERY_ALLOW_UNCONFINED=1).",
+                file=sys.stderr,
+            )
+        elif not provider_guaranteed:
+            incident_log.record(
+                "containment-degraded",
+                program=PROGRAM_NAME,
+                role=role_config,
+                detail="provider configuration read-only mapping unenforceable",
+            )
+            if os.environ.get("ORRERY_ALLOW_UNCONFINED") != "1":
+                print(
+                    f"{PROGRAM_NAME}: the provider's configuration cannot be "
+                    "mapped read-only; set ORRERY_ALLOW_UNCONFINED=1 to proceed.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(
+                f"{PROGRAM_NAME}: the provider configuration is not read-only "
                 "(ORRERY_ALLOW_UNCONFINED=1).",
                 file=sys.stderr,
             )

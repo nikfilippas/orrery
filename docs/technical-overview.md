@@ -388,7 +388,7 @@ orrery --approve-fallback openai:gpt-5.6-sol
 orrery-agent --role reviewer \
   --approve-fallback anthropic:fable -- "review the final diff"
 orrery-agent --role reviewer --approve-fallback anthropic:fable \
-  --approval-scope until:2026-08-05T16:49 -- "review the final diff"
+  --approval-scope session -- "review the final diff"  # until: is interactive-only
 orrery --revoke-fallbacks
 orrery --no-fallback
 ```
@@ -398,8 +398,10 @@ run only, every project in this login session, every project until the
 provider-stated reset time (offered only when the failure diagnostics
 state one), or stop. The approval flag is for rerunning a
 non-interactive command after the user accepts that exact
-provider/model; `--approval-scope` defaults to `run`. A session or
-until choice records a standing approval that later invocations start
+provider/model; `--approval-scope` defaults to `run` and also accepts
+`session`, while a multi-day `until` standing approval is granted only
+from the interactive menu. A session choice, or an until choice at the
+menu, records a standing approval that later invocations start
 directly, disclosed on every use and revocable at any time. The rerun
 starts the approved candidate directly instead of retrying the failed
 configured process. It never changes the saved role configuration.
@@ -964,8 +966,9 @@ grants permission to use it:
   `ORRERY FALLBACK APPROVAL REQUIRED` with the candidate, the offerable
   scopes, and the exact rerun flags, and must ask the user;
 - candidate approval is bound to the exact `PROVIDER:MODEL`; a lifetime
-  beyond the run additionally requires `--approval-scope session` or
-  `--approval-scope until:<ISO8601>`;
+  beyond the run additionally requires `--approval-scope session` on a
+  non-interactive rerun, while a multi-day `until:<ISO8601>` standing
+  approval is granted only at the interactive menu;
 - a session or until choice records a standing approval: prior consent
   stored outside the repository, disclosed on every use, listed by the
   doctor and the configuration page, self-expiring, revocable with
@@ -992,10 +995,12 @@ claims conversation migration.
 
 ## Parked work
 
-A provider usage limit is the one failure the fallback machinery
-deliberately does not answer with substitution, so `orrery-pickup`
-automates the sanctioned alternative: waiting for the announced reset
-and retrying the same configured model.
+A provider usage limit is the one failure the fallback machinery never
+answers with an *automatic* substitution: crossing to another provider
+is offered only with explicit consent, so the model is never silently
+swapped for an exhausted plan. `orrery-pickup` automates the other
+sanctioned alternative: waiting for the announced reset and retrying the
+same configured model.
 
 ```bash
 orrery-pickup park T-3 --priority 1   # inside the adopted repository

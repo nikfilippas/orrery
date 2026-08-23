@@ -362,6 +362,22 @@ def read_terminal_marker(attempt: Path) -> dict | None:
     }
 
 
+def resolved_workdir(base: Path, workdir_value: str) -> Path | None:
+    """The verification workdir resolved under `base`, or None if it escapes.
+
+    A criterion runs only inside the worktree it verifies. Branch
+    verification and integration verification share this one check so the
+    two cannot drift: a committed workdir symlink that resolves outside
+    the tree is refused at both, rather than at the branch alone while
+    integration ran it with that external directory writable.
+    """
+    resolved = (base / (workdir_value or ".")).resolve()
+    base_resolved = base.resolve()
+    if resolved == base_resolved or base_resolved in resolved.parents:
+        return resolved
+    return None
+
+
 def verify(
     root: Path,
     store: Path,
@@ -377,9 +393,9 @@ def verify(
     outcomes = []
     failed = None
     for criterion in contract["acceptance_criteria"]:
-        workdir = (worktree / criterion["verification"].get("workdir", "")).resolve()
-        if workdir != worktree.resolve() and worktree.resolve() not in workdir.parents:
-            failed = f"workdir {workdir} is outside the task worktree"
+        workdir = resolved_workdir(worktree, criterion["verification"].get("workdir", ""))
+        if workdir is None:
+            failed = f"workdir {criterion['verification'].get('workdir', '')!r} is outside the task worktree"
             outcomes.append({"criterion": criterion["id"], "command": criterion["verification"]["command"], "exit_status": 1, "duration_seconds": 0, "log": ""})
             break
         log = (
@@ -2808,16 +2824,27 @@ def _merge_once(root: Path, task_id: str, flags: list[str]) -> int:
         failed = None
         for owner, criterion, verification in union:
             command = verification["command"]
-            workdir = scratch / verification.get("workdir", ".")
-            before = git_workspace_fingerprint(scratch)
-            status, log = run_verification(command, workdir)
-            after = git_workspace_fingerprint(scratch)
-            if before is None or after is None or after != before:
+            # Shares resolved_workdir with branch verification: a committed
+            # workdir symlink that resolves outside the scratch tree is
+            # refused here too, not run with that external directory
+            # writable and undetected by the scratch-only fingerprint.
+            workdir = resolved_workdir(scratch, verification.get("workdir", "."))
+            if workdir is None:
                 status, log = 1, (
-                    log + f"\n[{criterion} from {owner} modified the tree it "
-                    "was verifying, or that could not be established; "
-                    "refused]\n"
+                    f"[{criterion} from {owner}] workdir "
+                    f"{verification.get('workdir', '.')!r} resolves outside the "
+                    "integration worktree; refused\n"
                 )
+            else:
+                before = git_workspace_fingerprint(scratch)
+                status, log = run_verification(command, workdir)
+                after = git_workspace_fingerprint(scratch)
+                if before is None or after is None or after != before:
+                    status, log = 1, (
+                        log + f"\n[{criterion} from {owner} modified the tree it "
+                        "was verifying, or that could not be established; "
+                        "refused]\n"
+                    )
             log_path = evidence_path(root, task_id, f"{sequence_of(records)}-integration-{attempt}-{owner}-{criterion}").with_suffix(".log")
             log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             _atomic_write(log_path, log.encode(), 0o600)
