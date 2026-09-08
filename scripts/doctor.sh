@@ -404,6 +404,167 @@ from orrery_runtime import VALIDATED_CODEX_CLI; print(VALIDATED_CODEX_CLI)" \
     fi
 fi
 
+printf '\n=== Catalogue currency ===\n'
+if CURRENCY_REPORT="$(
+    python3 - "$KIT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_fallback import (  # noqa: E402
+    Availability,
+    model_status,
+    provider_status,
+    thinking_status,
+)
+from orrery_model_catalogue import discover_catalogue  # noqa: E402
+from orrery_runtime import (  # noqa: E402
+    PROVIDERS,
+    RuntimeConfigError,
+    ROLE_IDS,
+    load_catalogue,
+    load_manifest,
+    load_role,
+    provider_installs,
+    version_tuple,
+)
+
+
+def emit(kind, message):
+    # One line per verdict, and never more: the report is parsed by
+    # prefix, so anything carrying a newline is folded to spaces rather
+    # than allowed to forge a second verdict.
+    print(f"{kind}:" + " ".join(str(message).split()))
+
+
+# Diagnostics only: an install found here is reported, never dispatched.
+for provider in sorted(PROVIDERS):
+    try:
+        installs = provider_installs(provider)
+    except RuntimeConfigError:
+        continue
+    dispatched = next(
+        (item for item in installs if item["origin"] == "PATH"), None
+    )
+    for item in installs:
+        if item["refused"]:
+            emit("SKIP", f"{provider}: not inspected at {item['path']}: {item['refused']}")
+    if dispatched is None or not version_tuple(dispatched["version"]):
+        continue
+    current = version_tuple(dispatched["version"])
+    for item in installs:
+        if item["origin"] != "sibling" or item["refused"]:
+            continue
+        other = version_tuple(item["version"])
+        if other and other > current:
+            emit(
+                "WARN",
+                f"{provider}: a newer CLI is installed elsewhere "
+                f"({item['version']} at {item['path']}) than the one Orrery "
+                f"dispatches ({dispatched['version']}). The catalogue is "
+                "served per client version, so the older one is told about "
+                "fewer models.",
+            )
+
+manifest = load_manifest()
+bundled = load_catalogue()
+
+# Discovered once per provider, then handed to every check: asking each
+# question separately spawned a CLI per question, so one slow provider
+# multiplied its timeout by the number of roles.
+statuses = {}
+live = {}
+try:
+    discovered = discover_catalogue(bundled)
+except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
+    emit("SKIP", f"live catalogue could not be discovered: {exc}")
+    discovered = None
+else:
+    for provider, entries in discovered.providers.items():
+        confirmed = discovered.sources.get(provider) == "installed CLI"
+        live[provider] = (
+            entries,
+            "installed CLI catalogue" if confirmed else "bundled catalogue",
+        )
+
+for step in manifest.get("steps", []):
+    role_id = step.get("id")
+    if role_id not in ROLE_IDS:
+        continue
+    try:
+        role = load_role(role_id)
+    except RuntimeConfigError as exc:
+        emit("WARN", f"{role_id} could not be loaded: {exc}")
+        continue
+    if role.endpoint is not None:
+        emit("INFO", f"{role_id} is endpoint-routed; its service serves its own models")
+        continue
+    if role.provider not in statuses:
+        statuses[role.provider] = provider_status(role.provider)
+    status = statuses[role.provider]
+    if status.state is not Availability.READY:
+        emit("SKIP", f"{role_id}: {role.provider} is unavailable, so drift was not checked")
+        continue
+    shared = live.get(role.provider)
+    visibility, reason = model_status(role, status, live=shared)
+    if visibility is Availability.UNAVAILABLE:
+        emit("WARN", f"{role_id}: {reason}")
+    elif visibility is Availability.UNKNOWN:
+        emit("SKIP", f"{role_id}: {reason}")
+    level, level_reason = thinking_status(role, status, live=shared)
+    if level is Availability.UNAVAILABLE:
+        emit("FAIL", f"{role_id}: {level_reason}")
+    elif level is Availability.READY:
+        emit("PASS", f"{role_id}: {level_reason}")
+
+if discovered is not None:
+    for provider, entries in sorted(discovered.providers.items()):
+        if discovered.sources.get(provider) != "installed CLI":
+            emit("SKIP", f"{provider} live catalogue unavailable; drift not checked")
+            continue
+        offered = {entry["id"] for entry in entries}
+        known = {entry.get("id") for entry in bundled.get(provider, [])}
+        fresh = sorted(offered - known)
+        if fresh:
+            emit(
+                "WARN",
+                f"{provider}: the bundled fallback does not list "
+                + ", ".join(fresh)
+                + "; add them to global/model-catalogue.json when they "
+                "should be offered offline",
+            )
+        # The other direction matters just as much: a bundled model the
+        # picker no longer offers stays in the automatic fallback ladder
+        # that orrery-sync installs, so it would be attempted.
+        retired = sorted(known - offered)
+        if retired:
+            emit(
+                "WARN",
+                f"{provider}: the bundled fallback still lists "
+                + ", ".join(retired)
+                + ", which the installed CLI no longer offers; the "
+                "automatic fallback ladder can still propose them",
+            )
+        for entry in entries:
+            resolved = entry.get("resolved")
+            if resolved and resolved != entry["id"]:
+                emit("INFO", f"{provider}: {entry['id']} resolves to {resolved}")
+PY
+)"; then
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            PASS:*) pass "${line#PASS:}" ;;
+            INFO:*) pass "${line#INFO:}" ;;
+            WARN:*) warn "${line#WARN:}" ;;
+            SKIP:*) skip "${line#SKIP:}" ;;
+            FAIL:*) fail "${line#FAIL:}" ;;
+        esac
+    done <<< "$CURRENCY_REPORT"
+else
+    warn "Catalogue currency could not be checked"
+fi
+
 printf '\n=== Potential fallback providers ===\n'
 for provider in anthropic openai; do
     if grep -Fxq "$provider" <<< "$CONFIGURED_PROVIDERS"; then

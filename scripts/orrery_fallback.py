@@ -279,8 +279,14 @@ def model_status(
     provider: ProviderStatus,
     *,
     environment: dict[str, str] | None = None,
+    live: tuple[list[dict[str, Any]], str] | None = None,
 ) -> tuple[Availability, str]:
-    """Check a bundled-known model against a live picker without inference."""
+    """Check a bundled-known model against a live picker without inference.
+
+    `live` lets a caller that has already discovered pass the result in,
+    so a diagnostic checking several roles spawns one CLI per provider
+    rather than one per question. Omitted, the behaviour is unchanged.
+    """
     bundled = load_catalogue().get(role.provider, [])
     if not any(entry.get("id") == role.model for entry in bundled):
         return (
@@ -288,7 +294,7 @@ def model_status(
             f"{role.provider}/{role.model} is a custom model identifier",
         )
     env = dict(os.environ if environment is None else environment)
-    entries, source = _catalogue_entries(
+    entries, source = live if live is not None else _catalogue_entries(
         role.provider,
         status=provider,
         environment=env,
@@ -307,6 +313,100 @@ def model_status(
     return (
         Availability.UNAVAILABLE,
         f"{role.provider}/{role.model} is not picker-visible in the installed CLI",
+    )
+
+
+def thinking_status(
+    role: Role,
+    provider: ProviderStatus,
+    *,
+    environment: dict[str, str] | None = None,
+    live: tuple[list[dict[str, Any]], str] | None = None,
+) -> tuple[Availability, str]:
+    """Check a configured thinking level against the live picker.
+
+    `model_status` answers whether the model is still offered; nothing
+    answered whether the level configured against it still exists. A
+    provider that renames or withdraws a level therefore stayed PASS in
+    the doctor and failed at dispatch instead, which is the worst place
+    to learn it.
+
+    Deliberately conservative, and never a source of new failures on its
+    own: an endpoint-routed role, a custom identifier, a provider whose
+    live catalogue could not be read, and a model that is itself no
+    longer picker-visible all return UNKNOWN. Only a bundled-known,
+    picker-visible model whose live levels genuinely lack the configured
+    one is reported UNAVAILABLE.
+    """
+    if role.endpoint is not None:
+        return (
+            Availability.UNKNOWN,
+            f"{role.id} is routed at endpoint {role.endpoint.id}, which "
+            "serves its own thinking levels",
+        )
+    if role.thinking is None:
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} has no configured thinking level",
+        )
+    bundled = load_catalogue().get(role.provider, [])
+    if not any(entry.get("id") == role.model for entry in bundled):
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} is a custom model identifier",
+        )
+    env = dict(os.environ if environment is None else environment)
+    entries, source = live if live is not None else _catalogue_entries(
+        role.provider,
+        status=provider,
+        environment=env,
+        discover_live=True,
+    )
+    if source != "installed CLI catalogue":
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider} thinking levels could not be confirmed",
+        )
+    entry = next(
+        (item for item in entries if item.get("id") == role.model),
+        None,
+    )
+    if entry is None:
+        # model_status already reports this; do not fail it twice.
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} is not picker-visible",
+        )
+    levels = entry.get("thinking_levels")
+    if not isinstance(levels, list):
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} reports no thinking levels",
+        )
+    if not levels:
+        # The provider saying "this model has no effort levels" is a
+        # verdict about a configured level; the provider saying nothing
+        # is not. Only the first may fail.
+        if entry.get("thinking_stated") is True:
+            return (
+                Availability.UNAVAILABLE,
+                f"{role.provider}/{role.model} no longer supports thinking "
+                f"{role.thinking}; available: none",
+            )
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} reports no thinking levels",
+        )
+    if role.thinking in levels:
+        return (
+            Availability.READY,
+            f"{role.provider}/{role.model} supports thinking {role.thinking}",
+        )
+    available = ", ".join(str(level) for level in levels)
+    return (
+        Availability.UNAVAILABLE,
+        f"{role.provider}/{role.model} no longer supports thinking "
+        f"{role.thinking}; available: {available}",
     )
 
 

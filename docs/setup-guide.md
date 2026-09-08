@@ -133,10 +133,11 @@ Delegated budgets are progress-aware. A role's `timeout_seconds` is its
 base budget; an optional `hard_timeout_seconds` (30 to 14400, at least
 the base; the implementer ships with 1800 and both reviewers with 3600)
 lets a run whose merged output grew within the last three minutes extend
-in two-minute steps up to the cap. `codex exec` streams its work
-continuously, so growth is a live progress signal; delegated Claude
-runs print only their final JSON and therefore keep plain base-deadline
-behaviour. A silent or capped run times out exactly as
+in two-minute steps up to the cap. Both providers stream, so growth is
+a live progress signal for either: `codex exec` writes its transcript as
+it works, and delegated Claude runs use
+`--print --output-format stream-json --verbose`. A silent or capped run
+times out exactly as
 before, `--hard-timeout` and `ORRERY_AGENT_HARD_TIMEOUT_SECONDS`
 override per run, and an explicitly chosen `--timeout` without a hard
 cap remains its own bound. The runner echoes the delegate's newest
@@ -797,6 +798,29 @@ touches either surface, smoke it by hand:
   a few provider credits and proves containment, the provider CLI and the
   task lifecycle on the live wire; `"a live reviewer"` does the same for
   the review path.
+
+`orrery-doctor` also reports catalogue currency, which is the answer to
+"why has my new model not appeared". It names three things: a newer
+provider CLI installed elsewhere than the one Orrery dispatches, a
+configured thinking level the installed CLI no longer offers for that
+model, and a live model the bundled fallback has never heard of.
+
+The first matters more than it looks. Each provider serves its model
+catalogue per client version, so an out-of-date CLI is told about fewer
+models even when it refreshes its own cache. A stale binary on `PATH`
+therefore hides new models completely while everything else looks
+healthy, which is exactly how a flagship release can go unnoticed. An
+IDE extension commonly ships its own newer copy, which is why the check
+looks there; that copy is reported and never dispatched, because
+silently preferring a different binary would change what runs without
+anyone asking for it.
+
+A withdrawn thinking level is the one condition reported as a failure,
+because it breaks a configured role. Everything else is a warning or a
+note: a custom or exactly pinned identifier is a supported choice and is
+never judged, and nothing is reported at all for a provider whose live
+catalogue could not be read, since a verdict from stale bundled data
+would be worse than silence.
 
 Do not add every provider release by hand. `orrery-config` discovers new
 picker-visible models and thinking levels automatically. Update

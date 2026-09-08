@@ -1316,6 +1316,25 @@ function roleControls(card) {
   custom.dataset.kind = "custom";
   custom.placeholder = "exact identifier";
   custom.value = listed ? "" : step.model;
+  // Say why the box is showing rather than leaving the operator to infer
+  // it. A configured model the installed CLI does not currently offer
+  // looks identical to one typed by hand, and the difference matters:
+  // the first means the catalogue moved underneath a working
+  // configuration. The value is never substituted, only annotated.
+  // Deliberately does not assert unavailability. This page cannot tell
+  // a model the installed CLI has withdrawn from one it never listed,
+  // or from a choice made when discovery had fallen back to the bundled
+  // catalogue, and an endpoint serves its own models entirely. It says
+  // what is true in every case and points at the check that can tell
+  // them apart.
+  custom.title = listed
+    ? "Name a model the picker does not list."
+    : preset
+      ? `${step.model} is served by the ${preset.label} endpoint, not by ` +
+        "this picker. It is kept exactly as configured."
+      : `${step.model} is not among the choices offered here. It is kept ` +
+        "exactly as configured; orrery-doctor reports whether the " +
+        "installed CLI still offers it.";
   place(box, card, card.fields[1].slot, custom, "ctl");
 
   box.dataset.custom = String(!listed);

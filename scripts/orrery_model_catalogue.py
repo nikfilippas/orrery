@@ -28,6 +28,12 @@ from typing import Any, Callable
 DEFAULT_TIMEOUT_SECONDS = 15.0
 EFFORT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 CLAUDE_ALIASES = ("fable", "opus", "sonnet", "haiku")
+# Identities are retained and later printed by the doctor, which reads
+# its report line by line: an identifier carrying a newline could forge
+# a verdict, so nothing that is not a plain identifier is kept at all.
+# It has to accept exactly what orrery_runtime.MODEL_ID accepts, `~`
+# included, or a legitimate identifier would abort the whole catalogue.
+_IDENTIFIER = re.compile(r"[A-Za-z0-9~][A-Za-z0-9._:@/+~\-\[\]]{0,119}")
 
 
 class CatalogueDiscoveryError(Exception):
@@ -163,29 +169,50 @@ def _send(process: subprocess.Popen[bytes], message: dict[str, Any]) -> None:
         ) from exc
 
 
-def _claude_alias(value: str, resolved: str, seen: set[str]) -> str:
-    """Return a stable family alias while preserving distinct version rows."""
-    without_context = re.sub(r"\[[^\]]+\]$", "", value)
-    if without_context in CLAUDE_ALIASES:
-        return without_context
+def _claude_family(resolved: str) -> str | None:
+    """The alias family a resolved identifier belongs to, if any."""
+    for family in CLAUDE_ALIASES:
+        if re.search(rf"(?:^|-){family}(?:-|$)", resolved):
+            return family
+    return None
 
-    # Current Claude Code exposes Fable as a full identifier while the other
-    # current families have aliases. Preserve Orrery's documented Fable alias
-    # for the first resolved family row, but leave any additional explicit
-    # versions visible by their exact identifiers.
-    if "fable" not in seen and re.search(r"(?:^|-)fable(?:-|$)", resolved):
-        return "fable"
-    return value
+
+def _family_version(resolved: str, family: str) -> tuple[int, ...]:
+    """Numeric components following a family name, for ordering rows.
+
+    `claude-fable-5-1` yields (5, 1) and `claude-opus-5` yields (5,), so
+    two rows of one family order by version rather than by the order the
+    provider happened to list them in. A row carrying no version yields
+    the empty tuple and therefore loses to any versioned row.
+    """
+    match = re.search(rf"(?:^|-){re.escape(family)}((?:-\d+)*)", resolved)
+    if match is None or not match.group(1):
+        return ()
+    return tuple(int(part) for part in match.group(1).split("-") if part)
+
+
+def _strip_context(value: str) -> str:
+    return re.sub(r"\[[^\]]+\]$", "", value)
 
 
 def _normalise_claude_models(raw_models: Any) -> list[dict[str, Any]]:
+    """Selectable Claude models, with identity retained.
+
+    Each entry keeps three things rather than one: `id`, the alias a
+    manifest is written against; `selectable`, the exact value the picker
+    offers; and `resolved`, the provider's own resolved identifier. The
+    alias used to be assigned to whichever family row appeared first,
+    which let a reordering silently move `fable` onto a different
+    version and could collapse an exactly pinned identifier away. It is
+    now assigned to the highest version of its family, and every other
+    row of that family keeps its exact identifier.
+    """
     if not isinstance(raw_models, list):
         raise CatalogueDiscoveryError(
             "Claude initialization did not return a model list"
         )
-    entries: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    seen_resolved: set[str] = set()
+
+    rows: list[dict[str, Any]] = []
     for raw in raw_models:
         if not isinstance(raw, dict):
             continue
@@ -193,37 +220,130 @@ def _normalise_claude_models(raw_models: Any) -> list[dict[str, Any]]:
         resolved = raw.get("resolvedModel")
         if not isinstance(value, str) or not value or value == "default":
             continue
-        if not isinstance(resolved, str):
+        if not isinstance(resolved, str) or not resolved:
             resolved = value
-        model = _claude_alias(value, resolved, seen_ids)
+        native = _strip_context(value)
+        family = native if native in CLAUDE_ALIASES else _claude_family(resolved)
+        declared = raw.get("supportsEffort")
+        offered = raw.get("supportedEffortLevels")
+        supports_effort = declared is True
+        levels = _safe_levels(
+            offered,
+            f"Claude model {value}",
+        ) if supports_effort else []
+        # An empty level list means two different things: the provider
+        # said this model has no effort levels, or it said nothing
+        # usable. Only the first justifies calling a configured level
+        # withdrawn, so which one it was is recorded rather than
+        # guessed. `supportsEffort: true` carrying no level list is the
+        # second case however loudly it asserts the first: it says
+        # effort exists without saying which levels, so the levels are
+        # unknown, not withdrawn.
+        stated = declared is False or (
+            supports_effort and isinstance(offered, list)
+        )
+        for identity in (value, resolved):
+            if not _IDENTIFIER.fullmatch(identity):
+                raise CatalogueDiscoveryError(
+                    f"Claude reported an unsafe model identifier: {identity!r}"
+                )
+        rows.append(
+            {
+                "value": value,
+                "resolved": resolved,
+                "resolved_identity": _strip_context(resolved),
+                "native": native if native in CLAUDE_ALIASES else None,
+                "family": family,
+                "levels": levels,
+                "thinking_stated": stated,
+            }
+        )
+
+    # A family's alias goes to its highest version, deterministically,
+    # and only among rows that do not already carry a native alias.
+    alias_winner: dict[str, str] = {}
+    reserved = {row["native"] for row in rows if row["native"] is not None}
+    for family in CLAUDE_ALIASES:
+        # A provider that offers the alias itself owns it. Letting an
+        # exact row also claim it produced two rows with one id, and
+        # de-duplication then dropped whichever arrived second, which is
+        # order-dependence wearing a deterministic hat.
+        if family in reserved:
+            continue
+        contenders = [
+            row for row in rows
+            if row["native"] is None and row["family"] == family
+        ]
+        if not contenders:
+            continue
+        best = max(
+            contenders,
+            key=lambda row: (
+                _family_version(row["resolved_identity"], family),
+                row["value"],
+            ),
+        )
+        alias_winner[family] = best["value"]
+
+    def rank(row: dict[str, Any]) -> tuple[int, str]:
+        """How strong a claim a row has on its resolved identity."""
+        if row["native"] is not None:
+            return (0, row["value"])
+        if alias_winner.get(row["family"]) == row["value"]:
+            return (1, row["value"])
+        return (2, row["value"])
+
+    # Two picker rows can resolve to one underlying model, and only one
+    # of them is kept. Reserving the alias was not enough on its own:
+    # the survivor was still whichever row the provider happened to
+    # list first, so a native `sonnet` sitting behind an exact
+    # `claude-sonnet-5[1m]` with the same resolved identity vanished,
+    # and a role configured on `sonnet` was then reported unavailable.
+    # The winner is now chosen before anything is emitted.
+    resolved_winner: dict[str, str] = {}
+    for row in rows:
+        identity = row["resolved_identity"]
+        current = resolved_winner.get(identity)
+        if current is None:
+            resolved_winner[identity] = row["value"]
+            continue
+        held = next(item for item in rows if item["value"] == current)
+        if rank(row) < rank(held):
+            resolved_winner[identity] = row["value"]
+
+    entries: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        if row["native"] is not None:
+            model = row["native"]
+        elif alias_winner.get(row["family"]) == row["value"]:
+            model = row["family"]
+        else:
+            model = row["value"]
         if (
             not EFFORT_NAME.fullmatch(model)
-            and not re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._:@/+\-\[\]]{0,119}",
-                model,
-            )
+            and not _IDENTIFIER.fullmatch(model)
         ):
             raise CatalogueDiscoveryError(
                 f"Claude reported an unsafe model identifier: {model!r}"
             )
-        resolved_identity = re.sub(r"\[[^\]]+\]$", "", resolved)
-        if model in seen_ids or resolved_identity in seen_resolved:
+        if resolved_winner[row["resolved_identity"]] != row["value"]:
             continue
-        supports_effort = raw.get("supportsEffort") is True
-        levels = _safe_levels(
-            raw.get("supportedEffortLevels"),
-            f"Claude model {model}",
-        ) if supports_effort else []
+        if model in seen_ids:
+            continue
+        levels = row["levels"]
         entries.append(
             {
                 "id": model,
                 "label": model,
+                "selectable": row["value"],
+                "resolved": row["resolved_identity"],
                 "thinking_levels": levels,
+                "thinking_stated": row["thinking_stated"],
                 "default_thinking": levels[-1] if levels else None,
             }
         )
         seen_ids.add(model)
-        seen_resolved.add(resolved_identity)
     if not entries:
         raise CatalogueDiscoveryError("Claude returned no selectable models")
     return entries
@@ -306,7 +426,8 @@ def _normalise_codex_models(raw_models: Any) -> list[dict[str, Any]]:
         if model in seen:
             continue
         efforts = raw.get("supportedReasoningEfforts")
-        if not isinstance(efforts, list):
+        stated = isinstance(efforts, list)
+        if not stated:
             efforts = []
         levels = _safe_levels(
             [
@@ -323,7 +444,13 @@ def _normalise_codex_models(raw_models: Any) -> list[dict[str, Any]]:
             {
                 "id": model,
                 "label": model,
+                # Codex exposes exact identifiers rather than aliases, so
+                # all three identities coincide; they are recorded anyway
+                # so consumers need not special-case the provider.
+                "selectable": model,
+                "resolved": model,
                 "thinking_levels": levels,
+                "thinking_stated": stated,
                 "default_thinking": default,
             }
         )

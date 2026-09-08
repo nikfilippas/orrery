@@ -6,7 +6,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import contextlib
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -33,7 +35,7 @@ VALIDATED_CLAUDE_CLI = "2.1.220"
 # was validated against this CLI version, and it has drifted between
 # releases before. The doctor warns when the installed version differs,
 # until a delegated probe revalidates the behaviour.
-VALIDATED_CODEX_CLI = "0.146.0"
+VALIDATED_CODEX_CLI = "0.153.4"
 ROLE_IDS = frozenset(
     {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"}
 )
@@ -640,6 +642,238 @@ def provider_executable(provider: str) -> str:
             f"required command unavailable for {provider}: {command}"
         )
     return resolved
+
+
+# Where a provider's CLI is also shipped by an IDE extension. Consulted
+# only by diagnostics: an install found here is never dispatched, because
+# silently preferring a different binary would change what runs without
+# the operator asking for it.
+SIBLING_INSTALL_GLOBS = {
+    "anthropic": (
+        ".vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude",
+        ".vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude",
+    ),
+    "openai": (
+        ".vscode/extensions/openai.chatgpt-*/bin/*/codex",
+        ".vscode-server/extensions/openai.chatgpt-*/bin/*/codex",
+    ),
+}
+SIBLING_VERSION_TIMEOUT_SECONDS = 20
+# `claude --version` prints "2.1.261 (Claude Code)" and `codex --version`
+# prints "codex-cli 0.153.4". Each layout names where the version sits,
+# so nothing else on the line can be mistaken for one.
+VERSION_BANNERS = (
+    re.compile(r"(\S+)\s+\(Claude Code\)"),
+    re.compile(r"codex-cli\s+(\S+)"),
+)
+
+
+def version_tuple(text: str) -> tuple[int, ...]:
+    """The dotted numeric prefix of a version string, for ordering.
+
+    Comparison is tuple-wise on integers so `0.10.0` orders above
+    `0.9.9`, which a string comparison gets backwards. Anything without a
+    leading numeric component is incomparable and yields the empty
+    tuple; callers must treat that as "unknown", never as "older".
+    """
+    if not isinstance(text, str):
+        return ()
+    match = re.fullmatch(r"\s*v?(\d+(?:\.\d+)*)\s*", text)
+    if match is None:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _sibling_version(path: str) -> str:
+    """The version an install reports, or "" when it will not say.
+
+    Only the two banner layouts below are read. Scanning the line for
+    the first token that happens to parse as a version accepted
+    `codex-cli 1.2.beta build 123` as version 123, which orders above
+    every real release and would have reported a broken install as the
+    newer one. An unrecognised layout is unreadable, which the doctor
+    prints as a named SKIP; a banner that changes wording therefore
+    stops being read out loud rather than being read wrongly.
+
+    Run in its own session so a timeout kills the whole process group:
+    `subprocess.run`'s timeout reaps only the direct child, and a
+    wrapper script that has spawned its own would otherwise survive this
+    diagnostic and outlive the command that caused it.
+    """
+    process = None
+    try:
+        process = subprocess.Popen(
+            [path, "--version"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            start_new_session=True,
+        )
+        output, _ = process.communicate(
+            timeout=SIBLING_VERSION_TIMEOUT_SECONDS
+        )
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            process.communicate(timeout=5)
+        return ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if process.returncode != 0:
+        return ""
+    line = output.strip().splitlines()[:1]
+    if not line:
+        return ""
+    banner = line[0].strip()
+    for pattern in VERSION_BANNERS:
+        match = pattern.fullmatch(banner)
+        if match is None:
+            continue
+        reported = match.group(1)
+        return reported if version_tuple(reported) else ""
+    return ""
+
+
+def _writable_ancestor(path: str) -> str | None:
+    """An ancestor directory another *account* could rewrite.
+
+    The mode is checked on a pathname and the binary is executed by the
+    same pathname, so a directory another account may write is a swap
+    waiting to happen in between. The whole chain is walked. An earlier
+    version stopped at home, which meant a sibling that is a symlink
+    out of home, to a user-owned file under a world-writable directory
+    somebody else controls, was checked not at all; it also compared
+    prefixes as text, so `/home/aliceing` counted as inside `/home/alice`.
+
+    Refused: an ancestor owned by neither this user nor root, and any
+    world-writable ancestor that is not sticky. Root-owned system
+    directories pass, since root can replace the binary whatever this
+    check decides. Sticky passes because that is exactly the bit that
+    stops one account unlinking another's entry, which is the swap
+    being guarded against; `/tmp` carries it, and refusing on it would
+    have rejected every install reached through a temporary directory.
+
+    Group-writable is deliberately allowed. A umask of 002 makes
+    ordinary directories under home group-writable, and on a machine
+    where the user's primary group is their own that grants nobody
+    anything. Refusing on it rejected every install on this developer's
+    own host, including the ones Orrery dispatches, which is a worse
+    failure than the race it was meant to close.
+
+    Residual, stated rather than implied: on a host with a genuinely
+    shared primary group, a group-writable ancestor still permits the
+    swap. This is a diagnostic that runs `--version` and never
+    dispatches what it finds, so the exposure is bounded by that.
+    """
+    current = os.path.dirname(os.path.realpath(path))
+    while True:
+        try:
+            details = os.stat(current)
+        except OSError:
+            return current
+        if details.st_uid not in (os.getuid(), 0):
+            return current
+        if details.st_mode & stat.S_IWOTH and not details.st_mode & stat.S_ISVTX:
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def provider_installs(provider: str) -> list[dict[str, Any]]:
+    """Every install of a provider's CLI this host can see. Diagnostics.
+
+    Never used to choose what runs: `provider_executable` still returns
+    the PATH hit, unchanged. This exists because a stale PATH binary is
+    invisible otherwise, and the provider catalogue is served per client
+    version, so an out-of-date CLI is told about fewer models even when
+    it refreshes.
+
+    Every candidate is canonicalised and must be a regular file owned by
+    this user and not group or world writable before it is executed, and
+    the version call is bounded. A candidate failing any of those is
+    reported with an empty version rather than raising, so a hostile or
+    hanging extension binary cannot wedge the caller.
+    """
+    if provider not in PROVIDERS:
+        raise RuntimeConfigError(f"unknown provider: {provider}")
+    command = "claude" if provider == "anthropic" else "codex"
+    found: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    candidates: list[tuple[str, str]] = []
+    resolved = shutil.which(command)
+    if resolved is not None:
+        candidates.append((os.path.realpath(resolved), "PATH"))
+    home = Path.home()
+    for pattern in SIBLING_INSTALL_GLOBS.get(provider, ()):
+        for match in sorted(home.glob(pattern)):
+            candidates.append((os.path.realpath(match), "sibling"))
+
+    for path, origin in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            details = os.stat(path)
+        except OSError as exc:
+            found.append({"path": path, "origin": origin, "version": "",
+                          "refused": f"unreadable ({exc.strerror})"})
+            continue
+        if not stat.S_ISREG(details.st_mode):
+            found.append({"path": path, "origin": origin, "version": "",
+                          "refused": "not a regular file"})
+            continue
+        writable = _writable_ancestor(path)
+        if writable is not None:
+            found.append({"path": path, "origin": origin, "version": "",
+                          "refused": f"writable parent {writable}"})
+            continue
+        if details.st_uid != os.getuid():
+            found.append({"path": path, "origin": origin, "version": "",
+                          "refused": "foreign-owned"})
+            continue
+        if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            found.append({"path": path, "origin": origin, "version": "",
+                          "refused": "group- or world-writable"})
+            continue
+        version = _sibling_version(path)
+        found.append({
+            "path": path,
+            "origin": origin,
+            "version": version,
+            "refused": "" if version else "version unreadable",
+        })
+    return found
+
+
+def newer_sibling(provider: str) -> dict[str, Any] | None:
+    """A sibling install strictly newer than the dispatched one, or None.
+
+    Equality is not newer, and an unparseable version on either side
+    makes the comparison unknown rather than newer.
+    """
+    installs = provider_installs(provider)
+    dispatched = next(
+        (entry for entry in installs if entry["origin"] == "PATH"), None
+    )
+    if dispatched is None:
+        return None
+    current = version_tuple(dispatched["version"])
+    if not current:
+        return None
+    best = None
+    for entry in installs:
+        if entry["origin"] != "sibling" or entry["refused"]:
+            continue
+        other = version_tuple(entry["version"])
+        if not other or other <= current:
+            continue
+        if best is None or other > version_tuple(best["version"]):
+            best = entry
+    if best is None:
+        return None
+    return {"dispatched": dispatched, "sibling": best}
 
 
 def codex_endpoint_arguments(endpoint: Endpoint) -> list[str]:

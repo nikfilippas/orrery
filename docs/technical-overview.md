@@ -21,6 +21,7 @@ how the whole thing is verified.
 - [Shared instructions and prompt caching](#shared-instructions-and-prompt-caching)
 - [Provider failure](#provider-failure)
 - [Parked work](#parked-work)
+- [Catalogue currency](#catalogue-currency)
 - [Installation](#installation)
 - [Leave No Trace](#leave-no-trace)
 - [Token usage](#token-usage)
@@ -1025,6 +1026,39 @@ produces still stops at the human-gated review queue and merge gate.
 Where systemd, lingering, or the machine itself is unavailable, the
 degradation is announced and the SessionStart hook names runnable
 parked work at the next session.
+
+## Catalogue currency
+
+Orrery reads each provider's model catalogue from the installed CLI
+rather than from a hand-maintained list, so a new model appears in the
+configuration page by itself. Two things can still put that picture
+behind reality, and both are now reported by `orrery-doctor`.
+
+A provider serves its catalogue per client version. An out-of-date CLI
+is therefore told about fewer models even when it refreshes, so a stale
+binary hides new releases entirely while nothing else looks wrong. The
+doctor reports any newer install it can see, including the copies IDE
+extensions ship, and never dispatches one: which binary runs stays
+whatever `PATH` resolves, because preferring another silently would
+change what runs without the operator asking. Version comparison is
+semantic rather than lexical, and an unparseable version is reported as
+unknown rather than treated as older.
+
+Model identity was already checked against the live picker before every
+dispatch; the configured thinking level was not, and a level withdrawn
+upstream failed at dispatch instead. That check now exists beside the
+other, and is deliberately the only condition reported as a failure. A
+custom or exactly pinned identifier is a supported choice and is never
+judged by the first-party catalogue, and no verdict is reported for a
+provider whose live catalogue could not be read.
+
+Discovered models also keep their identity rather than only their alias:
+the alias a manifest is written against, the exact value the picker
+offers, and the provider's own resolved identifier. An alias binds to
+the highest version of its family, so a provider listing two versions
+cannot move it by reordering its response, and a pinned exact identifier
+is never collapsed away. This is how a family moving underneath a stable
+alias, `fable` becoming `claude-fable-5-1`, is visible at all.
 
 ## Installation
 

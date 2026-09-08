@@ -4061,6 +4061,415 @@ def test_principal_auth_fallback_requires_approval() -> None:
         )
 
 
+def write_stub_cli(path: Path, output: str, *, sleep: float = 0.0) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "#!/bin/sh\n"
+    if sleep:
+        # Absolute, because these stubs run with a deliberately narrow
+        # PATH: a bare `sleep` would not be found and the stub would
+        # fall through to echo, quietly not testing the timeout at all.
+        #
+        # A backgrounded child as well as a foreground wait, because a
+        # shell running one command execs it and leaves no descendant at
+        # all: killing the direct child would then look identical to
+        # killing the group, and the containment would go untested.
+        body += f"/bin/sleep {sleep} >/dev/null 2>&1 &\n"
+        body += f"/bin/sleep {sleep}\n"
+    body += f"echo '{output}'\n"
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+@test("version comparison orders releases, never strings")
+def test_version_ordering_is_semantic() -> None:
+    """String comparison puts 0.9.9 above 0.10.0, which would report a
+    newer sibling as older and hide exactly the staleness this exists to
+    surface. The repository had no ordering semantics to inherit: the
+    doctor only ever compared versions for equality.
+    """
+    version = runtime_module.version_tuple
+    require(
+        version("0.10.0") > version("0.9.9"),
+        "0.10.0 did not order above 0.9.9",
+    )
+    require(
+        version("2.1.263") > version("2.1.261"),
+        "patch releases did not order",
+    )
+    require(
+        not version("1.2") > version("1.2.0"),
+        "a shorter version outranked its own point release",
+    )
+    require(
+        version("v0.153.4") == (0, 153, 4),
+        f"a v prefix was not tolerated: {version('v0.153.4')}",
+    )
+    require(
+        version("1.2.beta") == (),
+        "a partly numeric version was treated as comparable, which lets "
+        f"it claim to be newer: {version('1.2.beta')}",
+    )
+    for bad in ("", "not-a-version", "beta", "1.2.beta", "1.2-rc1", None):
+        require(
+            version(bad) == (),
+            f"{bad!r} produced a comparable version: {version(bad)}",
+        )
+
+
+@test("sibling inspection refuses what it must not execute")
+def test_sibling_inspection_is_safe() -> None:
+    """A newer CLI installed by an IDE extension is worth reporting: the
+    provider serves its catalogue per client version, so a stale PATH
+    binary is told about fewer models and silently hides new ones. It is
+    never dispatched, and inspecting it must not become a way to execute
+    an arbitrary or hanging binary.
+    """
+    saved_home = os.environ.get("HOME")
+    saved_path = os.environ.get("PATH")
+    saved_timeout = runtime_module.SIBLING_VERSION_TIMEOUT_SECONDS
+    saved_stat = runtime_module.os.stat
+    # Resolved before PATH is narrowed to the stub directory, or the
+    # residue check silently cannot run.
+    pgrep = shutil.which("pgrep")
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            os.environ["HOME"] = str(home)
+            runtime_module.SIBLING_VERSION_TIMEOUT_SECONDS = 1
+
+            dispatched = home / "bin" / "claude"
+            write_stub_cli(dispatched, "2.1.100 (Claude Code)")
+            os.environ["PATH"] = str(home / "bin")
+
+            def extension(version: str) -> Path:
+                return (
+                    home / ".vscode" / "extensions"
+                    / f"anthropic.claude-code-{version}-linux-x64"
+                    / "resources" / "native-binary" / "claude"
+                )
+
+            newer = extension("2.1.200")
+            write_stub_cli(newer, "2.1.200 (Claude Code)")
+            pair = runtime_module.newer_sibling("anthropic")
+            require(
+                pair is not None
+                and pair["sibling"]["version"] == "2.1.200"
+                and pair["dispatched"]["version"] == "2.1.100",
+                f"a newer sibling was not reported: {pair}",
+            )
+            require(
+                os.path.realpath(runtime_module.provider_executable("anthropic"))
+                == os.path.realpath(dispatched),
+                "inspection changed which binary would be dispatched",
+            )
+
+            # Group-writable: another local account could rewrite it
+            # between the check and the call, so it is never executed.
+            newer.chmod(0o775)
+            entries = {
+                entry["path"]: entry
+                for entry in runtime_module.provider_installs("anthropic")
+            }
+            refused = entries[os.path.realpath(newer)]
+            require(
+                refused["refused"] == "group- or world-writable"
+                and refused["version"] == "",
+                f"a group-writable install was executed: {refused}",
+            )
+            require(
+                runtime_module.newer_sibling("anthropic") is None,
+                "a refused install was still reported as newer",
+            )
+            newer.chmod(0o755)
+
+            # A hanging binary must not wedge the caller.
+            slow = extension("2.1.300")
+            write_stub_cli(slow, "2.1.300 (Claude Code)", sleep=30)
+            started = time.monotonic()
+            entries = {
+                entry["path"]: entry
+                for entry in runtime_module.provider_installs("anthropic")
+            }
+            elapsed = time.monotonic() - started
+            require(
+                entries[os.path.realpath(slow)]["version"] == ""
+                and entries[os.path.realpath(slow)]["refused"]
+                == "version unreadable",
+                f"a timing-out binary reported a version: {entries[os.path.realpath(slow)]}",
+            )
+            # Bounded by the timeout, not merely by the stub's own sleep:
+            # a generous ceiling passes even with no enforcement at all.
+            require(
+                elapsed < 4,
+                f"inspection was not bounded by the timeout: {elapsed:.1f}s",
+            )
+            # The stub is run in its own session so a timeout kills the
+            # group; a surviving descendant outlives this suite.
+            time.sleep(0.5)
+            require(pgrep is not None, "pgrep is needed for the residue check")
+            listing = subprocess.run(
+                [pgrep, "-af", "sleep 30"],
+                stdout=subprocess.PIPE, text=True, timeout=20, check=False,
+            ).stdout.splitlines()
+            # Only actual sleep processes count. `pgrep -f` matches any
+            # command line containing the text, which includes the shell
+            # that invoked this suite, and a false positive here would
+            # be indistinguishable from the leak it is looking for.
+            residue = [
+                line for line in listing
+                if line.split(maxsplit=1)[1:2] and
+                line.split(maxsplit=1)[1].startswith("/bin/sleep")
+            ]
+            require(
+                not residue,
+                f"a timed-out inspection left descendants: {residue}",
+            )
+
+            # A sibling can be a symlink whose real target lies outside
+            # home entirely. Candidates are canonicalised before they
+            # are checked, and an ancestor walk that stopped at home
+            # therefore checked such a target not at all: another
+            # account owning that directory could swap the file between
+            # the check and the call.
+            with tempfile.TemporaryDirectory() as outside:
+                exposed = Path(outside) / "open"
+                exposed.mkdir()
+                target = exposed / "claude"
+                write_stub_cli(target, "2.1.400 (Claude Code)")
+                exposed.chmod(0o777)
+                escaped = extension("2.1.400")
+                escaped.parent.mkdir(parents=True, exist_ok=True)
+                escaped.symlink_to(target)
+                entries = {
+                    entry["path"]: entry
+                    for entry in runtime_module.provider_installs("anthropic")
+                }
+                escapee = entries[os.path.realpath(escaped)]
+                require(
+                    escapee["refused"].startswith("writable parent")
+                    and escapee["version"] == "",
+                    "a symlink to a file under a world-writable directory "
+                    f"outside home was executed: {escapee}",
+                )
+                # An earlier legitimate sibling is still present, so
+                # the check is that the escapee is not what gets named.
+                reported = runtime_module.newer_sibling("anthropic")
+                require(
+                    reported is None
+                    or reported["sibling"]["path"]
+                    != os.path.realpath(escaped),
+                    f"an escaped sibling was reported as newer: {reported}",
+                )
+                exposed.chmod(0o755)
+                escaped.unlink()
+
+            # The version has to be read from the version field, not
+            # from whatever else on the line happens to be a number:
+            # `codex-cli 1.2.beta build 123` once reported 123, which
+            # orders above every real release.
+            noisy = extension("2.1.500")
+            write_stub_cli(noisy, "claude-cli 1.2.beta build 123")
+            entries = {
+                entry["path"]: entry
+                for entry in runtime_module.provider_installs("anthropic")
+            }
+            require(
+                entries[os.path.realpath(noisy)]["version"] == "",
+                "an unrelated number on the banner was read as a version: "
+                f"{entries[os.path.realpath(noisy)]}",
+            )
+            reported = runtime_module.newer_sibling("anthropic")
+            require(
+                reported is None
+                or reported["sibling"]["path"] != os.path.realpath(noisy),
+                f"a malformed banner produced a newer-sibling claim: {reported}",
+            )
+            noisy.unlink()
+
+            # Foreign ownership cannot be staged without another uid, so
+            # the stat result is doctored: the refusal path is the same.
+            real_stat = saved_stat
+
+            def foreign(path, *arguments, **keywords):
+                details = real_stat(path, *arguments, **keywords)
+                if str(path) == os.path.realpath(newer):
+                    doctored = list(details)
+                    doctored[stat.ST_UID] = details.st_uid + 1
+                    return os.stat_result(doctored)
+                return details
+
+            runtime_module.os.stat = foreign
+            entries = {
+                entry["path"]: entry
+                for entry in runtime_module.provider_installs("anthropic")
+            }
+            require(
+                entries[os.path.realpath(newer)]["refused"] == "foreign-owned",
+                "a foreign-owned install was executed",
+            )
+    finally:
+        runtime_module.os.stat = saved_stat
+        runtime_module.SIBLING_VERSION_TIMEOUT_SECONDS = saved_timeout
+        for name, value in (("HOME", saved_home), ("PATH", saved_path)):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@test("catalogue currency changes nothing about what is dispatched")
+def test_currency_work_leaves_dispatch_untouched() -> None:
+    """The first design for this work would have made load_catalogue
+    live, which would have disabled the pre-dispatch model_status guard
+    and rewritten the automatic fallback ladder orrery-sync installs.
+    Both must keep reading the bundled catalogue and neither may
+    discover.
+    """
+    discovery = sys.modules.get("orrery_model_catalogue")
+    if discovery is None:
+        load_script(CONFIG_SCRIPT, f"kit_config_purity_{time.time_ns()}")
+        discovery = sys.modules["orrery_model_catalogue"]
+    saved = discovery.discover_catalogue
+
+    def forbidden(*arguments, **keywords):
+        raise AssertionError("a load-time path performed live discovery")
+
+    try:
+        # Installed before anything under test runs, so a load-time path
+        # that discovers is caught rather than quietly permitted.
+        discovery.discover_catalogue = forbidden
+        role = runtime_module.load_role("plan-reviewer")
+        bundled = runtime_module.load_catalogue()
+        require(
+            any(
+                entry.get("id") == role.model
+                for entry in bundled.get(role.provider, [])
+            ),
+            "the bundled catalogue no longer describes the configured role",
+        )
+        ladder = fallback_module.same_provider_ladder(role)
+        require(
+            isinstance(ladder, list),
+            f"the ladder stopped returning a list: {ladder!r}",
+        )
+        known = {
+            entry["id"] for entry in bundled.get(role.provider, [])
+        }
+        require(
+            ladder and set(ladder) <= known,
+            f"the ladder was empty or left the bundled file: {ladder}",
+        )
+        require(
+            role.model not in ladder,
+            f"the ladder proposed the configured model itself: {ladder}",
+        )
+    finally:
+        discovery.discover_catalogue = saved
+
+
+@test("a withdrawn thinking level is caught before it costs a dispatch")
+def test_thinking_status_live_check() -> None:
+    """model_status answers whether the model is still offered; nothing
+    answered whether the level configured against it still exists. A
+    renamed or withdrawn level therefore stayed PASS and failed at
+    dispatch. This pins the new check and, just as importantly, pins
+    every case in which it must stay silent.
+    """
+    fallback = fallback_module
+    role = runtime_module.Role(
+        id="reviewer", title="Final reviewer", provider="anthropic",
+        model="fable", thinking="max", access="read-only",
+    )
+    status = fallback.ProviderStatus(
+        provider="anthropic",
+        state=fallback.Availability.READY,
+        executable="/nonexistent/claude",
+        reason="stub",
+    )
+    original = fallback._catalogue_entries
+
+    def stub(levels, source="installed CLI catalogue"):
+        def entries(provider, *, status, environment, discover_live):
+            return (
+                [{"id": "fable", "thinking_levels": list(levels)}],
+                source,
+            )
+        return entries
+
+    try:
+        # The level is gone: the one case that may fail.
+        fallback._catalogue_entries = stub(["low", "medium", "high"])
+        state, reason = fallback.thinking_status(role, status)
+        require(
+            state is fallback.Availability.UNAVAILABLE
+            and "no longer supports thinking max" in reason
+            and "low, medium, high" in reason,
+            f"a withdrawn level was not caught: {state} {reason}",
+        )
+
+        # Still present: ready, and silent.
+        fallback._catalogue_entries = stub(["low", "max"])
+        state, _ = fallback.thinking_status(role, status)
+        require(
+            state is fallback.Availability.READY,
+            "a supported level was reported as a problem",
+        )
+
+        # Live discovery failed: never fail from bundled data.
+        fallback._catalogue_entries = stub(["low"], source="bundled catalogue")
+        state, reason = fallback.thinking_status(role, status)
+        require(
+            state is fallback.Availability.UNKNOWN
+            and "could not be confirmed" in reason,
+            f"fallback data produced a verdict: {state} {reason}",
+        )
+
+        # The model itself is gone: model_status reports that, not this.
+        def absent(provider, *, status, environment, discover_live):
+            return ([], "installed CLI catalogue")
+        fallback._catalogue_entries = absent
+        state, _ = fallback.thinking_status(role, status)
+        require(
+            state is fallback.Availability.UNKNOWN,
+            "an absent model was failed twice",
+        )
+
+        # A custom identifier is a supported interface, never a failure.
+        custom = dataclasses.replace(role, model="my-own-model")
+        fallback._catalogue_entries = stub(["low"])
+        state, reason = fallback.thinking_status(custom, status)
+        require(
+            state is fallback.Availability.UNKNOWN
+            and "custom model identifier" in reason,
+            f"a custom identifier was judged: {state} {reason}",
+        )
+
+        # An endpoint-routed role serves its own levels.
+        routed = dataclasses.replace(
+            role,
+            endpoint=runtime_module.Endpoint(
+                id="kimi", label="Kimi", adapter="anthropic",
+                base_url="https://api.example", key_env="KIMI_KEY",
+            ),
+        )
+        state, reason = fallback.thinking_status(routed, status)
+        require(
+            state is fallback.Availability.UNKNOWN
+            and "serves its own thinking levels" in reason,
+            f"an endpoint role was judged: {state} {reason}",
+        )
+
+        # No level configured: nothing to check.
+        bare = dataclasses.replace(role, thinking=None)
+        state, _ = fallback.thinking_status(bare, status)
+        require(
+            state is fallback.Availability.UNKNOWN,
+            "an unconfigured level produced a verdict",
+        )
+    finally:
+        fallback._catalogue_entries = original
+
+
 @test("the principal detects a missing known model before inference")
 def test_principal_model_visibility_fallback() -> None:
     environment = review_environment("success")
@@ -6616,6 +7025,170 @@ def test_model_catalogue() -> None:
         defaults.get("gpt-5.6-sol") == "ultra",
         "gpt-5.6-sol does not default to its maximum thinking level, ultra",
     )
+
+
+@test("an alias binds to its family's highest version, whatever the order")
+def test_claude_alias_is_deterministic() -> None:
+    """The alias used to go to whichever family row came first.
+
+    A provider listing two Fable versions could therefore move `fable`,
+    and the manifests written against it, onto a different model purely
+    by reordering its response, and could collapse an exactly pinned
+    identifier out of the catalogue entirely.
+    """
+    load_script(CONFIG_SCRIPT, f"kit_config_alias_{time.time_ns()}")
+    discovery = sys.modules["orrery_model_catalogue"]
+
+    older = {
+        "value": "claude-fable-5[1m]",
+        "resolvedModel": "claude-fable-5",
+        "supportsEffort": True,
+        "supportedEffortLevels": ["low", "high"],
+    }
+    newer = {
+        "value": "claude-fable-5-1[1m]",
+        "resolvedModel": "claude-fable-5-1",
+        "supportsEffort": True,
+        "supportedEffortLevels": ["low", "medium", "high"],
+    }
+
+    for order in ((older, newer), (newer, older)):
+        entries = discovery._normalise_claude_models(list(order))
+        by_id = {entry["id"]: entry for entry in entries}
+        require(
+            by_id.get("fable", {}).get("resolved") == "claude-fable-5-1",
+            f"the alias did not bind to the highest version: {by_id}",
+        )
+        require(
+            by_id["fable"]["selectable"] == "claude-fable-5-1[1m]",
+            f"the alias lost its selectable identifier: {by_id['fable']}",
+        )
+        require(
+            by_id["fable"]["thinking_levels"] == ["low", "medium", "high"],
+            f"the alias took another row's levels: {by_id['fable']}",
+        )
+        # The loser keeps its exact identifier rather than vanishing, so
+        # a manifest pinning that version still resolves.
+        pinned = by_id.get("claude-fable-5[1m]")
+        require(
+            pinned is not None and pinned["resolved"] == "claude-fable-5",
+            f"the older row was collapsed away: {sorted(by_id)}",
+        )
+
+    # The collision that matters: a native alias row and an exact row of
+    # the SAME family. Both once claimed the alias, and de-duplication
+    # then dropped whichever arrived second, so the surviving row and its
+    # thinking levels depended purely on provider ordering.
+    native_row = {
+        "value": "sonnet", "resolvedModel": "claude-sonnet-5",
+        "supportsEffort": True, "supportedEffortLevels": ["low"],
+    }
+    exact_row = {
+        "value": "claude-sonnet-6[1m]", "resolvedModel": "claude-sonnet-6",
+        "supportsEffort": True, "supportedEffortLevels": ["low", "max"],
+    }
+    for order in ((native_row, exact_row), (exact_row, native_row)):
+        entries = discovery._normalise_claude_models(list(order))
+        by_id = {entry["id"]: entry for entry in entries}
+        require(
+            by_id.get("sonnet", {}).get("resolved") == "claude-sonnet-5",
+            f"the native alias was displaced by an exact row: {by_id}",
+        )
+        require(
+            "claude-sonnet-6[1m]" in by_id,
+            f"the exact same-family row was dropped: {sorted(by_id)}",
+        )
+        require(
+            by_id["sonnet"]["thinking_levels"] == ["low"],
+            f"the native alias took the other row's levels: {by_id['sonnet']}",
+        )
+
+    # A provider stating a model has no effort levels is a fact about a
+    # configured level; saying nothing at all is not.
+    stated = discovery._normalise_claude_models([
+        {"value": "haiku", "resolvedModel": "claude-haiku-9",
+         "supportsEffort": False},
+    ])[0]
+    require(
+        stated["thinking_levels"] == [] and stated["thinking_stated"] is True,
+        f"explicit absence of levels was not recorded: {stated}",
+    )
+    silent = discovery._normalise_claude_models([
+        {"value": "haiku", "resolvedModel": "claude-haiku-9"},
+    ])[0]
+    require(
+        silent["thinking_stated"] is False,
+        f"missing metadata was reported as stated: {silent}",
+    )
+
+    # The sharper collision, and the one the pair above cannot catch
+    # because those two resolve to different models: a native alias and
+    # an exact row resolving to the SAME identity. De-duplication kept
+    # whichever the provider listed first, so a role configured on
+    # `sonnet` was reported unavailable purely because an exact row
+    # preceded it.
+    twin_native = {
+        "value": "sonnet", "resolvedModel": "claude-sonnet-5",
+        "supportsEffort": True, "supportedEffortLevels": ["low"],
+    }
+    twin_exact = {
+        "value": "claude-sonnet-5[1m]", "resolvedModel": "claude-sonnet-5",
+        "supportsEffort": True, "supportedEffortLevels": ["low", "max"],
+    }
+    for order in ((twin_native, twin_exact), (twin_exact, twin_native)):
+        by_id = {
+            entry["id"]: entry
+            for entry in discovery._normalise_claude_models(list(order))
+        }
+        require(
+            "sonnet" in by_id,
+            "a native alias sharing a resolved identity with an exact row "
+            f"was dropped by provider ordering: {sorted(by_id)}",
+        )
+        require(
+            by_id["sonnet"]["selectable"] == "sonnet",
+            f"the alias kept the wrong selectable value: {by_id['sonnet']}",
+        )
+        require(
+            by_id["sonnet"]["thinking_levels"] == ["low"],
+            f"the alias took the other row's levels: {by_id['sonnet']}",
+        )
+
+    # `supportsEffort: true` with no level list asserts that effort
+    # exists without saying which levels do, so the levels are unknown.
+    # Recording that as an explicit statement made the doctor fail a
+    # healthy install over an incomplete provider response.
+    partial = discovery._normalise_claude_models([
+        {"value": "sonnet", "resolvedModel": "claude-sonnet-5",
+         "supportsEffort": True},
+    ])[0]
+    require(
+        partial["thinking_levels"] == []
+        and partial["thinking_stated"] is False,
+        f"a capability flag was read as a level list: {partial}",
+    )
+
+    # The identifier grammar has to accept what the rest of the kit
+    # accepts. Rejecting `~` would abort the entire catalogue over one
+    # endpoint-style identifier the manifest grammar allows.
+    tilde = discovery._normalise_claude_models([
+        {"value": "sonnet", "resolvedModel": "~anthropic/claude-sonnet-latest"},
+    ])
+    require(
+        [entry["id"] for entry in tilde] == ["sonnet"],
+        f"a legitimate identifier was refused: {tilde}",
+    )
+
+    # An identity carrying a newline would be printed into the doctor's
+    # line-oriented report and could forge a verdict there.
+    try:
+        discovery._normalise_claude_models([
+            {"value": "sonnet", "resolvedModel": "claude-sonnet-5\nFAIL: forged"},
+        ])
+    except discovery.CatalogueDiscoveryError:
+        pass
+    else:
+        raise Failure("an identity containing a newline was accepted")
 
 
 @test("model thinking levels are discovered per model from both CLIs")
