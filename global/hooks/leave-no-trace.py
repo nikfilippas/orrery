@@ -113,6 +113,92 @@ def runtime_root() -> Path:
     raise RuntimeError("Cannot create a writable Leave No Trace runtime directory")
 
 
+# Exactly the actions that need the runtime root. `hook-guard` is
+# deliberately absent: it reads its decision from stdin and touches no
+# state, so it works perfectly inside a delegate and must keep running
+# there. Exempting it admitted the unregistered detached work it exists
+# to deny. `start`, `register`, `cleanup` and `status` are absent too,
+# because a caller asking for those has asked for something this cannot
+# deliver and should be told so.
+HOOK_ACTIONS = frozenset({"hook-start", "hook-sweep", "hook-cleanup"})
+# Kept in step with the unit names scripts/orrery-review composes: a
+# prefix, the launcher's pid, and ten hex characters of a uuid4.
+DELEGATE_UNIT = re.compile(r"orrery-(?:task|review)-\d+-[0-9a-f]{10}\.service")
+
+
+def self_cgroup_text() -> str:
+    """This process's cgroup listing, or empty when it cannot be read."""
+    try:
+        return Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return ""
+
+
+def systemd_cgroup_paths(text: str) -> list[str]:
+    """The cgroup paths systemd controls, from a /proc/N/cgroup listing.
+
+    Lines are `hierarchy:controllers:path`. The unified hierarchy leaves
+    the controller field empty; under v1 only `name=systemd` names the
+    unit, and reading any other controller's path would let an unrelated
+    hierarchy supply a unit name systemd never assigned.
+    """
+    paths = []
+    for line in text.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[1] in {"", "name=systemd"}:
+            paths.append(fields[2])
+    return paths
+
+
+def contained_delegate() -> bool:
+    """True inside an Orrery delegate whose sandbox denies a runtime root.
+
+    `orrery-agent` runs each delegate in a transient systemd unit with
+    `ProtectHome=read-only` and an emptied `XDG_RUNTIME_DIR`, so every
+    candidate root above is unwritable by design, not by accident.
+    Raising instead made the hooks that need that root fail, and a
+    failing `Stop` hook does not let a turn end: a Claude delegate
+    answered on its first turn, then looped reporting the hook error
+    until it returned nothing at all, which the wrapper read as a
+    provider failure. Only those hooks are exempted; `hook-guard` needs
+    no root, worked throughout, and keeps running.
+
+    Membership is read from the cgroup, not from `ORRERY_ROLE`. A
+    process cannot leave its own cgroup without privilege, so the unit
+    name is a kernel-backed statement. The environment marker is set by
+    the runner for unconfined delegates too and can be set by anything
+    else, so it would have handed the exemption to sessions that no unit
+    was containing. On a host that cannot enforce confinement there is
+    no unit, so no exemption, and the hook keeps failing loudly instead
+    of quietly doing nothing.
+
+    Scope, stated rather than implied: the unit reclaims the process
+    tree through `KillMode=control-group` and bounds what it could reach
+    through `ProtectSystem=strict`, but it does not replace every
+    guarantee these hooks provide. A delegate is given the host's `/tmp`
+    and `/var/tmp`, and an automation browser profile left there is
+    removed by `sweep_orphan_browser_profiles` in a principal session
+    and by nothing at all in a delegate. That gap is not introduced
+    here, since the hook previously raised and swept nothing either, but
+    it is real and is recorded in the setup guide rather than papered
+    over by this exemption.
+    """
+    # Whole path components only. An unanchored search accepted
+    # `not-orrery-review-1-a-fake.scope`, so any process able to name
+    # its own scope could have claimed the exemption.
+    if not any(
+        DELEGATE_UNIT.fullmatch(component)
+        for path in systemd_cgroup_paths(self_cgroup_text())
+        for component in path.split("/")
+    ):
+        return False
+    try:
+        runtime_root()
+    except RuntimeError:
+        return True
+    return False
+
+
 def log_root() -> Path:
     return private_dir(Path.home() / ".cache" / "claude-lnt" / "logs")
 
@@ -1630,6 +1716,8 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.action in HOOK_ACTIONS and contained_delegate():
+            return 0
         if args.action == "hook-start":
             return hook_start()
         if args.action == "hook-guard":

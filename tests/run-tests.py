@@ -4317,6 +4317,366 @@ def test_sibling_inspection_is_safe() -> None:
                 os.environ[name] = value
 
 
+@test("a contained delegate's hooks stay out of its way")
+def test_lnt_inert_inside_a_contained_delegate() -> None:
+    """`orrery-agent` denies the delegate a writable runtime root on
+    purpose: `ProtectHome=read-only` covers home and `/run/user`, and
+    `XDG_RUNTIME_DIR` is emptied. Every candidate root therefore fails,
+    the hook raised on each event, and a failing `Stop` hook does not
+    let a turn end. A Claude delegate answered on turn one and then
+    looped reporting the hook error until it returned nothing at all,
+    which the wrapper read as a provider failure.
+    """
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        f"kit_lnt_{time.time_ns()}",
+    )
+    saved_root = hook.runtime_root
+    saved_cgroup = hook.self_cgroup_text
+    saved_argv = sys.argv
+    saved_role = os.environ.get("ORRERY_ROLE")
+
+    def denied() -> Path:
+        raise RuntimeError(
+            "Cannot create a writable Leave No Trace runtime directory"
+        )
+
+    # Ten hex characters, as scripts/orrery-review composes them. A
+    # shorter fixture would pass an implementation that rejects every
+    # real unit.
+    inside = "0::/user.slice/user-1000.slice/orrery-review-1234-a1b2c3d4e5.service\n"
+    outside = "0::/user.slice/user-1000.slice/app.slice/anything.scope\n"
+
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            granted = Path(directory)
+
+            hook.runtime_root = denied
+            hook.self_cgroup_text = lambda: inside
+            require(
+                hook.contained_delegate(),
+                "a delegate denied a runtime root was not recognised",
+            )
+
+            # The second half is load-bearing. A host that cannot
+            # enforce confinement still gives the delegate a writable
+            # root, and there it must keep cleaning up.
+            hook.runtime_root = lambda: granted
+            require(
+                not hook.contained_delegate(),
+                "a delegate with a usable runtime root was excused anyway",
+            )
+
+            # Membership is read from the cgroup, which a process cannot
+            # leave without privilege. ORRERY_ROLE is set by the runner
+            # for unconfined delegates too and can be set by anything at
+            # all, so on its own it must buy nothing: a session no unit
+            # is containing would otherwise skip hook-guard, and
+            # detached work could then escape the process group that the
+            # runner kills.
+            hook.runtime_root = denied
+            hook.self_cgroup_text = lambda: outside
+            os.environ["ORRERY_ROLE"] = "implementer"
+            require(
+                not hook.contained_delegate(),
+                "an environment marker alone bought the exemption; only "
+                "the cgroup can be trusted for this",
+            )
+            os.environ.pop("ORRERY_ROLE", None)
+            require(
+                not hook.contained_delegate(),
+                "a session outside any delegate unit was excused",
+            )
+
+            # Whole components in a systemd-controlled hierarchy, and
+            # nothing else. Any process able to name its own scope could
+            # otherwise claim the exemption.
+            for label, listing in (
+                ("a near-miss scope name",
+                 "0::/user.slice/not-orrery-review-1-a-fake.scope"),
+                ("a unit name embedded in a longer component",
+                 "0::/user.slice/evil-orrery-task-9-f0e1d2c3b4.scope"),
+                ("a v1 controller systemd does not name",
+                 "3:cpu:/orrery-review-1234-a1b2c3d4e5.service"),
+                ("a short hex suffix no launcher produces",
+                 "0::/user.slice/orrery-review-1234-a1b2c3d4.service"),
+            ):
+                hook.self_cgroup_text = lambda value=listing: value + "\n"
+                require(
+                    not hook.contained_delegate(),
+                    f"{label} was accepted as a delegate unit",
+                )
+            hook.self_cgroup_text = lambda: (
+                "1:name=systemd:/user.slice/orrery-task-77-0123456789.service\n"
+            )
+            require(
+                hook.contained_delegate(),
+                "a cgroup v1 name=systemd delegate unit was not recognised",
+            )
+
+            # The dispatcher: every session hook returns success inside a
+            # contained delegate, and nothing else does.
+            hook.self_cgroup_text = lambda: inside
+            for action in sorted(hook.HOOK_ACTIONS):
+                sys.argv = ["leave-no-trace.py", action]
+                require(
+                    hook.main() == 0,
+                    f"{action} still failed inside a contained delegate",
+                )
+            for action in ("status", "cleanup"):
+                sys.argv = ["leave-no-trace.py", action]
+                require(
+                    hook.main() == 2,
+                    f"{action} was silently excused; only the session hooks "
+                    "may be skipped, because a caller asking for the others "
+                    "has asked for something the sandbox cannot deliver",
+                )
+
+            # hook-guard reads its decision from stdin and touches no
+            # state, so it works inside a delegate and must keep running
+            # there. Exempting it admitted exactly the unregistered
+            # detached work it exists to deny.
+            require(
+                "hook-guard" not in hook.HOOK_ACTIONS,
+                "the guard was exempted; it needs no runtime root and "
+                "denies detached work a delegate can still start",
+            )
+            hook.self_cgroup_text = lambda: inside
+            sys.argv = ["leave-no-trace.py", "hook-guard"]
+            spoken = io.StringIO()
+            saved_stdin = sys.stdin
+            try:
+                sys.stdin = io.StringIO(json.dumps({
+                    "tool_name": "Bash",
+                    "tool_input": {
+                        "command": "sleep 300",
+                        "run_in_background": True,
+                    },
+                }))
+                with contextlib.redirect_stdout(spoken):
+                    code = hook.main()
+            finally:
+                sys.stdin = saved_stdin
+            require(
+                code == 0 and '"permissionDecision": "deny"' in spoken.getvalue(),
+                "the guard stopped denying detached work inside a contained "
+                f"delegate: {spoken.getvalue()!r}",
+            )
+
+            # Every exempt action must be one the kit installs, and what
+            # the kit installs beyond the exempt set must be exactly the
+            # guard. A subset test alone would let a later action join
+            # the exempt set and quietly excuse a command that must not.
+            canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+            installed = {
+                entry["command"].rsplit(" ", 1)[-1].strip('"')
+                for handlers in canonical.get("hooks", {}).values()
+                for handler in handlers
+                for entry in handler.get("hooks", [])
+                if "leave-no-trace" in entry.get("command", "")
+            }
+            require(
+                installed - set(hook.HOOK_ACTIONS) == {"hook-guard"},
+                "the exempt set is not the installed set less the guard: "
+                f"{installed} against {sorted(hook.HOOK_ACTIONS)}",
+            )
+    finally:
+        hook.runtime_root = saved_root
+        hook.self_cgroup_text = saved_cgroup
+        sys.argv = saved_argv
+        if saved_role is None:
+            os.environ.pop("ORRERY_ROLE", None)
+        else:
+            os.environ["ORRERY_ROLE"] = saved_role
+
+
+@test("the doctor names a principal that has lost its fallback ladder")
+def test_doctor_reports_a_ladderless_principal() -> None:
+    """`same_provider_ladder` reads `fallback_tier`, which live
+    discovery cannot supply, so a principal selected from the live
+    picker but absent from the bundled catalogue gets no ladder at all.
+    That is deliberate, and it was also completely silent.
+
+    Every verdict here is pinned with its severity: the warning would
+    still have been "found" by a substring search after being rendered
+    as a PASS, which is the failure this is guarding.
+    """
+    no_tier = (
+        "WARN",
+        "the principal anthropic/claude-fable-5-1 has no automatic "
+        "same-provider fallback ladder: it carries no fallback_tier in "
+        "global/model-catalogue.json, so orrery-sync cannot arm one and "
+        "an overloaded service goes unanswered",
+    )
+    no_neighbour = (
+        "WARN",
+        "the principal anthropic/fable has a fallback tier but no "
+        "catalogued neighbour within one tier of it, so orrery-sync arms "
+        "an empty ladder",
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR, kit, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        manifest_path = kit / "global" / "orchestration.json"
+        catalogue_path = kit / "global" / "model-catalogue.json"
+        home = root / "home"
+        home.mkdir()
+
+        def doctor(cwd: Path | None = None) -> set[tuple[str, str]]:
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["XDG_STATE_HOME"] = str(home / "state")
+            # The ladder comes from the bundled catalogue alone, so
+            # discovery would only add a live dependency to the check.
+            environment["ORRERY_MODEL_DISCOVERY"] = "0"
+            output = subprocess.run(
+                ["bash", str(kit / "scripts" / "doctor.sh")],
+                env=environment,
+                cwd=str(cwd) if cwd is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=300,
+                check=False,
+            ).stdout
+            verdicts = set()
+            for line in output.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2 and parts[0] in {"PASS", "WARN", "FAIL", "SKIP"}:
+                    verdicts.add((parts[0], " ".join(parts[1].split())))
+            return verdicts
+
+        def ladder_lines(verdicts: set[tuple[str, str]]) -> set[tuple[str, str]]:
+            return {
+                verdict for verdict in verdicts
+                if "ladder" in verdict[1]
+                or "principal_auto_fallback" in verdict[1]
+            }
+
+        def set_principal(**fields: Any) -> None:
+            manifest = read_json(manifest_path)
+            for step in manifest["steps"]:
+                if step.get("id") == "orchestrator":
+                    step.update(fields)
+            write_json(manifest_path, manifest)
+
+        require(
+            not ladder_lines(doctor()),
+            "a catalogued principal produced a ladder verdict",
+        )
+
+        # A model the picker offers and the bundle does not: exactly
+        # what selecting a newly shipped flagship produces.
+        set_principal(model="claude-fable-5-1")
+        require(
+            ladder_lines(doctor()) == {no_tier},
+            f"a ladderless principal went unreported: {ladder_lines(doctor())}",
+        )
+
+        # orrery-sync projects from the global manifest alone. A
+        # repository override that disagrees must not change the
+        # verdict, or the doctor describes a principal sync never arms.
+        repository = root / "adopted"
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(repository)],
+            check=True, timeout=60,
+        )
+        marker = repository / ".orrery.json"
+        write_json(marker, {"orchestrator": {"model": "fable"}})
+        marker.chmod(0o600)
+        # If the override were not live the next assertion would pass
+        # for the wrong reason, so prove it is honoured first.
+        require(
+            runtime_module.project_override(repository) == {"model": "fable"},
+            "the override fixture is inert, so the check below would be "
+            "vacuous rather than meaningful",
+        )
+        require(
+            ladder_lines(doctor(cwd=repository)) == {no_tier},
+            "a repository override changed a verdict about the machine-wide "
+            f"principal: {ladder_lines(doctor(cwd=repository))}",
+        )
+
+        # Only the Anthropic surface is given a ladder. sync_codex
+        # writes a model and an effort and no fallback list, so an
+        # OpenAI principal has none to lose and a tier would not give
+        # it one.
+        set_principal(provider="openai", model="gpt-6-astra", thinking="medium")
+        require(
+            not ladder_lines(doctor()),
+            "an OpenAI principal was told a missing tier cost it a ladder "
+            "that orrery-sync never arms for Codex at all",
+        )
+
+        # A tier with no neighbour within one step of it is a different
+        # fault from having no tier, and says so.
+        set_principal(provider="anthropic", model="fable", thinking="max")
+        catalogue = read_json(catalogue_path)
+        catalogue["providers"]["anthropic"] = [
+            entry for entry in catalogue["providers"]["anthropic"]
+            if entry.get("id") == "fable"
+        ]
+        write_json(catalogue_path, catalogue)
+        require(
+            ladder_lines(doctor()) == {no_neighbour},
+            f"an isolated tier went unreported: {ladder_lines(doctor())}",
+        )
+        write_json(catalogue_path, read_json(KIT_DIR / "global" / "model-catalogue.json"))
+
+        # Switching the ladder off is a decision, not a defect.
+        manifest = read_json(manifest_path)
+        manifest["principal_auto_fallback"] = False
+        write_json(manifest_path, manifest)
+        require(
+            ladder_lines(doctor())
+            == {("PASS", "the principal's automatic fallback ladder is switched off")},
+            f"a deliberate opt-out was reported as a fault: {ladder_lines(doctor())}",
+        )
+
+        # A value orrery-sync refuses is not an opt-out. Reporting it as
+        # one said the surface was deliberately unmanaged while sync was
+        # in fact refusing to manage it at all.
+        manifest["principal_auto_fallback"] = "false"
+        write_json(manifest_path, manifest)
+        malformed = ladder_lines(doctor())
+        require(
+            (
+                "FAIL",
+                "principal_auto_fallback must be true or false; "
+                "orrery-sync refuses this manifest, so no surface is "
+                "being projected at all",
+            ) in malformed,
+            f"a malformed opt-out was read as deliberate: {malformed}",
+        )
+        # The surface section already refuses the same value. The two
+        # verdicts must agree: reporting the ladder as deliberately
+        # switched off beside "the surface could not be checked" told
+        # two different stories about one broken manifest.
+        require(
+            not any("switched off" in message for _severity, message in malformed),
+            f"a refused manifest was also called an opt-out: {malformed}",
+        )
+
+        # orrery-sync refuses a non-boolean before it reaches its own
+        # provider branch, so it projects nothing for a Codex principal
+        # either, model and effort included. Gating the type check
+        # behind the Anthropic-only ladder verdicts left that silent.
+        set_principal(provider="openai", model="gpt-5.6-sol", thinking="ultra")
+        require(
+            any(
+                severity == "FAIL" and "principal_auto_fallback" in message
+                for severity, message in ladder_lines(doctor())
+            ),
+            "a manifest orrery-sync refuses went unreported for an OpenAI "
+            f"principal: {ladder_lines(doctor())}",
+        )
+
+
 @test("catalogue currency changes nothing about what is dispatched")
 def test_currency_work_leaves_dispatch_untouched() -> None:
     """The first design for this work would have made load_catalogue

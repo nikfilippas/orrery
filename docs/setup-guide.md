@@ -646,6 +646,51 @@ Claude-specific. Principal-mismatch notification is installed for both Claude
 and Codex, while both receive the same cleanup requirements through
 `AGENTS.md`.
 
+Inside a delegate the hooks that need session state deliberately do nothing.
+`orrery-agent` runs each delegate in a transient systemd unit with
+`ProtectHome=read-only` and an emptied `XDG_RUNTIME_DIR`, so every runtime
+directory those hooks could use is unwritable by design. The hook recognises
+that case from two conditions together: this process's cgroup names a delegate
+unit, matched as a whole path component in a systemd-controlled hierarchy, and
+no runtime root can be created. It then returns success without acting.
+
+The exemption covers `hook-start`, `hook-sweep` and `hook-cleanup`, and
+deliberately not `hook-guard`. The guard reads its decision from the tool call
+on stdin and touches no state, so it worked inside delegates all along;
+exempting it admitted exactly the unregistered detached work it exists to
+deny, which the unit would then reclaim only at teardown.
+
+Membership is read from the cgroup rather than from the `ORRERY_ROLE`
+environment marker. A process cannot leave its own cgroup without privilege,
+so the unit name is a kernel-backed statement, whereas the marker is set for
+unconfined delegates too and can be set by anything at all. Trusting it would
+have handed the exemption to sessions no unit was containing, where skipping
+`hook-guard` lets detached work escape the process group the runner kills. On
+a host that cannot enforce confinement there is no unit, so there is no
+exemption and the hook keeps failing loudly. `claude-lnt-start`,
+`claude-lnt-register`, `claude-lnt-cleanup` and `claude-lnt-status` still fail
+loudly too, because a caller asking for those has asked for something the
+sandbox cannot deliver.
+
+Before this, the state-dependent hooks raised on every event inside a
+delegate, and a failing `Stop` hook does not let a turn end: a Claude delegate
+answered its assignment on the first turn and then looped reporting the hook
+error until it returned nothing at all, which the wrapper correctly read as a
+provider failure.
+
+Accepted residual, and the reason the exemption is scoped rather than
+general: the unit does not replace every guarantee these hooks provide. It
+reclaims the process tree through `KillMode=control-group` and bounds what
+that tree could reach through `ProtectSystem=strict`, but a delegate is given
+the host's `/tmp` and `/var/tmp`, and an automation browser profile abandoned
+there is swept by `sweep_orphan_browser_profiles` in a principal session and
+by nothing at all in a delegate. The process is killed; the directory stays.
+This is not introduced by the exemption, since the hook previously raised and
+swept nothing either, but it is now silent where it used to be loud. Closing
+it means snapshotting the profile roots before launch and removing what
+appeared once the unit is confirmed stopped, which belongs to the wrapper
+rather than to the hook.
+
 Accepted residual: delegate confinement closes what a hostile repository can
 write, not what it can read. With the provider CLI sandbox disabled and no
 hook-suppression flag, repository hooks running inside a delegate can read the
@@ -800,10 +845,11 @@ touches either surface, smoke it by hand:
   the review path.
 
 `orrery-doctor` also reports catalogue currency, which is the answer to
-"why has my new model not appeared". It names three things: a newer
+"why has my new model not appeared". It names four things: a newer
 provider CLI installed elsewhere than the one Orrery dispatches, a
 configured thinking level the installed CLI no longer offers for that
-model, and a live model the bundled fallback has never heard of.
+model, a live model the bundled fallback has never heard of, and a
+principal that has no automatic fallback ladder.
 
 The first matters more than it looks. Each provider serves its model
 catalogue per client version, so an out-of-date CLI is told about fewer
@@ -815,12 +861,35 @@ looks there; that copy is reported and never dispatched, because
 silently preferring a different binary would change what runs without
 anyone asking for it.
 
+The last one is the practical cost of the third. The ladder that
+`orrery-sync` arms on the Claude surface is built from
+`fallback_tier` in `global/model-catalogue.json`, a judgement about
+capability class that live discovery cannot supply and that this kit
+will not guess: arming an automatic same-provider substitution on an
+inferred ranking is exactly what it refuses to do everywhere else. So a
+principal selected from the live picker but absent from the bundled
+catalogue gets no ladder at all, and an overloaded service goes
+unanswered rather than being retried a tier down. That is intended, and
+it used to be silent. The verdict is reported for an Anthropic principal
+only: `sync_codex` writes a model and an effort and no fallback list, so
+a Codex principal has no ladder to lose and a tier would not give it
+one. Give the model a `fallback_tier` in that file to
+put it on the scale, or leave it off deliberately; either way the
+doctor now says which you have. Switching the ladder off through
+`principal_auto_fallback` is reported as a note rather than a warning,
+because it is a decision.
+
 A withdrawn thinking level is the one condition reported as a failure,
 because it breaks a configured role. Everything else is a warning or a
-note: a custom or exactly pinned identifier is a supported choice and is
-never judged, and nothing is reported at all for a provider whose live
-catalogue could not be read, since a verdict from stale bundled data
-would be worse than silence.
+note. Two of those rules apply to the availability checks only, which
+are the ones that consult the live picker: a custom or exactly pinned
+identifier is a supported choice and is never judged for availability,
+and nothing is reported at all about a provider whose live catalogue
+could not be read, since a verdict from stale bundled data would be
+worse than silence. The ladder verdict is not an availability check. It
+reads the bundled catalogue alone, so it is reported whether or not
+discovery ran, and it does judge an exactly pinned identifier, because
+pinning one is exactly how a principal ends up without a ladder.
 
 Do not add every provider release by hand. `orrery-config` discovers new
 picker-visible models and thinking levels automatically. Update

@@ -415,6 +415,7 @@ from orrery_fallback import (  # noqa: E402
     Availability,
     model_status,
     provider_status,
+    same_provider_ladder,
     thinking_status,
 )
 from orrery_model_catalogue import discover_catalogue  # noqa: E402
@@ -516,6 +517,63 @@ for step in manifest.get("steps", []):
         emit("FAIL", f"{role_id}: {level_reason}")
     elif level is Availability.READY:
         emit("PASS", f"{role_id}: {level_reason}")
+
+# The ladder orrery-sync arms comes from the bundled catalogue's
+# fallback_tier, a judgement about capability class that live discovery
+# cannot supply. A principal on a model the bundle does not carry
+# therefore gets no ladder at all, silently, which is exactly what
+# happens the day a new flagship is selected from the live picker.
+# orrery-sync projects from the GLOBAL manifest with
+# apply_override=False, so a repository override must not be read here:
+# the verdict would otherwise describe a principal that sync never
+# arms, and disagree with it in both directions. Only the Anthropic
+# surface is given a ladder at all; sync_codex writes a model and an
+# effort and no fallback list, so an OpenAI principal has none to lose
+# and must not be told that a missing tier is what cost it one.
+try:
+    principal = load_role("orchestrator", apply_override=False)
+except RuntimeConfigError:
+    principal = None
+if principal is not None and principal.endpoint is None:
+    automatic = load_manifest().get("principal_auto_fallback", True)
+    # The type is checked for every provider, because orrery-sync
+    # refuses a non-boolean before it reaches its own provider branch
+    # and then projects nothing at all, model and effort included. Only
+    # the ladder verdicts below are Anthropic-only.
+    if not isinstance(automatic, bool):
+        emit(
+            "FAIL",
+            "principal_auto_fallback must be true or false; orrery-sync "
+            "refuses this manifest, so no surface is being projected at all",
+        )
+    elif principal.provider != "anthropic":
+        pass
+    elif not automatic:
+        emit("INFO", "the principal's automatic fallback ladder is switched off")
+    else:
+        tier = next(
+            (
+                entry.get("fallback_tier")
+                for entry in bundled.get(principal.provider, [])
+                if entry.get("id") == principal.model
+            ),
+            None,
+        )
+        if not isinstance(tier, int) or isinstance(tier, bool):
+            emit(
+                "WARN",
+                f"the principal {principal.provider}/{principal.model} has no "
+                "automatic same-provider fallback ladder: it carries no "
+                "fallback_tier in global/model-catalogue.json, so orrery-sync "
+                "cannot arm one and an overloaded service goes unanswered",
+            )
+        elif not same_provider_ladder(principal):
+            emit(
+                "WARN",
+                f"the principal {principal.provider}/{principal.model} has a "
+                "fallback tier but no catalogued neighbour within one tier of "
+                "it, so orrery-sync arms an empty ladder",
+            )
 
 if discovered is not None:
     for provider, entries in sorted(discovered.providers.items()):
