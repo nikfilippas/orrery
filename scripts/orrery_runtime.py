@@ -29,7 +29,7 @@ PROVIDERS = frozenset({"anthropic", "openai"})
 # unit-level ReadOnlyPaths) was live-validated against this Claude CLI
 # version. The doctor warns when the installed version drifts, until a
 # fresh delegated shell probe revalidates the behaviour.
-VALIDATED_CLAUDE_CLI = "2.1.220"
+VALIDATED_CLAUDE_CLI = "2.1.261"
 # The Codex flag surface this kit drives (codex exec, the dotted -c
 # model_providers overrides that route endpoints, the responses wire)
 # was validated against this CLI version, and it has drifted between
