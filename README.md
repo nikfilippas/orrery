@@ -77,6 +77,17 @@ single-provider session and says so.
   parks the stopped work instead and re-dispatches it when the
   provider's stated limit resets, offline, under a spend ceiling, with
   the merge gate still yours.
+- **New models arrive on their own, and the doctor says when they have
+  not.** The configuration page lists what the installed CLIs actually
+  offer, discovered afresh on every run, so a newly shipped model is
+  selectable without editing anything. Each provider serves that
+  catalogue *per client version*, so a stale binary is told about fewer
+  models however often it refreshes, which is how a flagship release
+  goes unnoticed while everything looks healthy. `orrery-doctor`
+  therefore reports a newer CLI installed elsewhere than the one being
+  dispatched, a thinking level withdrawn since a role was configured, a
+  live model the offline fallback has never heard of, and a principal
+  left with no automatic fallback ladder.
 - **Nothing hidden, nothing left behind.** Every standing instruction a
   session carries is a file in this repository; delegated process trees
   are contained and cleaned; failures land in a local incident log so
