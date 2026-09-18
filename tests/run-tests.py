@@ -21084,6 +21084,229 @@ def test_unrecorded_marker_doctor_warning() -> None:
         )
 
 
+@test("orrery-init repairs a 0777 marker and reports the repair")
+def test_init_reports_marker_mode_repair() -> None:
+    """A marker left mode 0777 is the condition measured in the field.
+
+    The repair is not new: orrery-init has always chmod'ed the marker.
+    What is asserted here is that the run now says what it changed, and
+    that the doctor's refusal names the command that performs it, so a
+    user whose repository silently stopped being adopted is told both
+    what is wrong and what to run. Inspection must also leave the mode
+    alone: a check that quietly repaired it would leave orrery-init
+    with nothing to report and the user with no idea what happened.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        marker = root / ".orrery.json"
+        content = '{"personal": true}\n'
+        marker.write_text(content)
+        marker.chmod(0o777)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(Path(directory) / "home"),
+                "CODEX_HOME": str(Path(directory) / "codex"),
+                "XDG_STATE_HOME": str(Path(directory) / "state"),
+            }
+        )
+
+        doctor = subprocess.run(["bash", str(DOCTOR_SCRIPT)], cwd=root, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(
+            "group- or world-writable" in doctor.stdout
+            and "run orrery-init" in doctor.stdout,
+            f"the doctor did not name the repair: {doctor.stdout}",
+        )
+        require(
+            stat.S_IMODE(marker.stat().st_mode) == 0o777,
+            "inspecting the marker changed its mode",
+        )
+
+        repaired = subprocess.run(["bash", str(KIT_DIR / "scripts" / "init-project.sh"), str(root)], env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(repaired.returncode == 0, f"adoption failed: {repaired.stderr}")
+        require(
+            f"Repaired adoption marker mode from 777 to 600: {marker}"
+            in repaired.stdout,
+            f"the repair was not reported: {repaired.stdout}",
+        )
+        require(
+            stat.S_IMODE(marker.stat().st_mode) == 0o600
+            and marker.read_text() == content,
+            "the marker was not repaired in place",
+        )
+
+        saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(Path(directory) / "state")
+        try:
+            require(
+                runtime_module.adopted_root(root) == root,
+                "the repaired marker was still refused",
+            )
+        finally:
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+@test("a mount that cannot carry the mode is trusted by content digest")
+def test_adoption_verifies_content_where_mode_cannot_be_set() -> None:
+    """Some mounts fix every mode from their options, so the group- and
+    world-writable refusal can never be cleared and the repository could
+    never be adopted at all. Where the mode cannot be set, the digest
+    the trust record holds is checked in its place: the record is a 0600
+    file in the user state store, so it is protected where the
+    repository's own mount is not. The condition is probed by clearing
+    the write bits and re-reading the mode, so both real shapes are
+    staged here, a chmod that succeeds and does nothing and one that
+    refuses outright.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        marker = root / ".orrery.json"
+        content = '{"orchestrator": {"model": "fable"}}\n'
+        marker.write_text(content)
+        marker.chmod(0o600)
+        state = Path(directory) / "state"
+        store = state / "orrery" / "adopted.json"
+        saved = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = str(state)
+        real_chmod = runtime_module.os.chmod
+
+        def ignoring_chmod(path, mode, *arguments, **keywords):
+            if Path(path) == marker:
+                return None
+            return real_chmod(path, mode, *arguments, **keywords)
+
+        def refusing_chmod(path, mode, *arguments, **keywords):
+            if Path(path) == marker:
+                raise PermissionError(1, "Operation not permitted", str(path))
+            return real_chmod(path, mode, *arguments, **keywords)
+
+        try:
+            runtime_module.trust_adoption(root)
+            record = read_json(store)["records"][str(root)]
+            require(
+                record.get("digest")
+                == hashlib.sha256(content.encode()).hexdigest(),
+                f"adoption recorded no digest of the marker: {record}",
+            )
+
+            # The control: where the mode can be set, it is still the
+            # check, and the probe puts back what it found.
+            marker.chmod(0o666)
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "group- or world-writable" in str(exc),
+                    f"wrong refusal where the mode can be set: {exc}",
+                )
+            else:
+                raise Failure("a writable marker was adopted on a mount that carries modes")
+            require(
+                stat.S_IMODE(marker.stat().st_mode) == 0o666,
+                "the probe did not put back the mode it found",
+            )
+
+            for fake in (ignoring_chmod, refusing_chmod):
+                runtime_module.os.chmod = fake
+                require(
+                    runtime_module.adopted_root(root) == root,
+                    f"a matching digest was refused under {fake.__name__}",
+                )
+                require(
+                    runtime_module.project_override(root) == {"model": "fable"},
+                    f"the verified marker supplied no override under {fake.__name__}",
+                )
+                # What the mode would otherwise have prevented: another
+                # local account rewriting the marker to redirect the
+                # principal onto its own service.
+                marker.write_text(
+                    '{"orchestrator": {"provider": "openai", "model": "other"}}\n'
+                )
+                try:
+                    runtime_module.adopted_root(root)
+                except runtime_module.RuntimeConfigError as exc:
+                    require(
+                        "not the ones adoption recorded" in str(exc)
+                        and "run orrery-init" in str(exc),
+                        f"wrong refusal for rewritten contents: {exc}",
+                    )
+                else:
+                    raise Failure(f"a rewritten marker was adopted under {fake.__name__}")
+                marker.write_text(content)
+
+            # A record written before contents were digested is not an
+            # authorisation for whatever the marker holds now: it binds
+            # the repository root, not the file.
+            data = read_json(store)
+            del data["records"][str(root)]["digest"]
+            write_json(store, data)
+            try:
+                runtime_module.adopted_root(root)
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "recorded no digest" in str(exc),
+                    f"wrong refusal for an undigested record: {exc}",
+                )
+            else:
+                raise Failure("a record without a digest adopted an unverifiable marker")
+        finally:
+            runtime_module.os.chmod = real_chmod
+            if saved is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved
+
+
+@test("orrery-init adopts a repository whose mount fixes the marker mode")
+def test_init_adopts_where_the_mode_cannot_be_set() -> None:
+    """Such a repository could not be adopted at all before the digest:
+    the chmod that normalises the marker aborted the run under `set -e`,
+    and the mode it could not change was refused afterwards. The mount
+    is staged with a chmod that fails, which is what vfat does, so the
+    run has to report the mode it could not set and record the digest
+    that stands in for it.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = adopted_repository(directory)
+        marker = root / ".orrery.json"
+        marker.write_text('{"orchestrator": {"model": "fable"}}\n')
+        marker.chmod(0o777)
+        stubs = Path(directory) / "bin"
+        stubs.mkdir()
+        (stubs / "chmod").write_text("#!/bin/sh\nexit 1\n")
+        (stubs / "chmod").chmod(0o755)
+        state = Path(directory) / "state"
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "HOME": str(Path(directory) / "home"),
+                "CODEX_HOME": str(Path(directory) / "codex"),
+                "XDG_STATE_HOME": str(state),
+                "PATH": f"{stubs}:{environment['PATH']}",
+            }
+        )
+
+        adopted = subprocess.run(["bash", str(KIT_DIR / "scripts" / "init-project.sh"), str(root)], env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+        require(adopted.returncode == 0, f"a fixed mode stopped adoption: {adopted.stderr}")
+        require(
+            stat.S_IMODE(marker.stat().st_mode) == 0o777,
+            "the stubbed chmod did not stage the condition",
+        )
+        require(
+            f"This filesystem fixes {marker} at mode 777" in adopted.stdout,
+            f"the mode it could not set was not reported: {adopted.stdout}",
+        )
+        record = read_json(state / "orrery" / "adopted.json")["records"][str(root)]
+        require(
+            record.get("digest")
+            == hashlib.sha256(marker.read_bytes()).hexdigest(),
+            f"no digest was recorded for an unprotected marker: {record}",
+        )
+
+
 @test("orrery-init --forget revokes adoption immediately")
 def test_init_forget_revokes_adoption() -> None:
     with tempfile.TemporaryDirectory() as directory:

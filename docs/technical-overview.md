@@ -191,6 +191,20 @@ For one release, `orrery-doctor` warns existing users with the exact
 machine-local user state store. Revoke adoption with
 `orrery-init --forget /path/to/repository`.
 
+A mount that fixes every mode from its own options can never satisfy
+that check, so a repository on one could never be adopted at all. The
+condition is probed rather than inferred from the filesystem type:
+adoption clears the marker's write bits, re-reads the mode, and puts
+back what it found. Where the mode did not take, the SHA-256 digest of
+the marker's contents recorded in the trust record is checked in its
+place. The record is a `0600` file in the user state store, which is
+protected where the repository's mount is not, and the marker chooses
+the principal's provider, model, thinking level and endpoint, so on
+such a mount the digest is what stops another local account redirecting
+the principal onto a different service and credential. A marker whose
+contents adoption never recorded is refused there, rather than trusted
+for having a record of the repository.
+
 ### What a delegate may never write
 
 Every delegated run grants `/tmp` and `/var/tmp`, because the provider

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import contextlib
+import hashlib
 import shutil
 import signal
 import stat
@@ -264,6 +265,70 @@ def _marker_error(reason: str, marker: Path) -> RuntimeConfigError:
     )
 
 
+def _marker_content_error(reason: str, marker: Path) -> RuntimeConfigError:
+    return RuntimeConfigError(
+        f"refusing adoption marker {marker}: this filesystem cannot express "
+        f"its mode, and {reason}; run orrery-init"
+    )
+
+
+def _marker_digest(marker: Path) -> str | None:
+    try:
+        return hashlib.sha256(marker.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _mode_is_expressible(marker: Path, mode: int) -> bool:
+    """Whether this filesystem can carry the marker's mode at all.
+
+    Some mounts fix every file's mode from mount options, so the group-
+    and world-writable refusal can never be cleared there and such a
+    repository could never be adopted. The condition is probed rather
+    than inferred from the mount type: the write bits are cleared and
+    the marker re-stat'ed. A mount that refuses the chmod, or keeps the
+    bits regardless, cannot carry a mode.
+
+    The mode found is put back where the filesystem did take it, so the
+    probe leaves the marker as it was. The refusal is what tells a user
+    to run orrery-init; repairing the mode here would leave that
+    command nothing to report.
+    """
+    try:
+        os.chmod(marker, stat.S_IMODE(mode) & ~(stat.S_IWGRP | stat.S_IWOTH))
+        applied = os.lstat(marker).st_mode
+    except OSError:
+        return False
+    if applied & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    with contextlib.suppress(OSError):
+        os.chmod(marker, stat.S_IMODE(mode))
+    return True
+
+
+def _verify_marker_content(root: Path, marker: Path) -> None:
+    """Stand in for the mode where the filesystem cannot carry one.
+
+    The marker's contents select the principal's provider, model,
+    thinking level and endpoint, so a marker another local account can
+    rewrite redirects the principal onto a different service and
+    credential. Where the mode cannot say who may write it, the digest
+    recorded at adoption says what was written: the trust record is a
+    0600 file in the user state store, which is protected even when the
+    repository's own mount is not.
+    """
+    record = _trust_record(root)
+    recorded = record.get("digest") if record is not None else None
+    if recorded is None:
+        raise _marker_content_error(
+            "adoption recorded no digest of its contents", marker
+        )
+    if _marker_digest(marker) != recorded:
+        raise _marker_content_error(
+            "its contents are not the ones adoption recorded", marker
+        )
+
+
 def _trusted_marker(root: Path) -> Path | None:
     marker = root / ".orrery.json"
     try:
@@ -279,7 +344,9 @@ def _trusted_marker(root: Path) -> Path | None:
     if details.st_uid != os.getuid():
         raise _marker_error("foreign-owned", marker)
     if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise _marker_error("group- or world-writable", marker)
+        if _mode_is_expressible(marker, details.st_mode):
+            raise _marker_error("group- or world-writable", marker)
+        _verify_marker_content(root, marker)
     if _git(root, "ls-files", "--error-unmatch", "--", ".orrery.json").returncode == 0:
         raise _marker_error("tracked", marker)
     return marker
@@ -335,7 +402,7 @@ def _trust_paths(root: Path, create: bool = False) -> tuple[Path, Path]:
     return parent, parent / "adopted.json"
 
 
-def _read_trust(root: Path) -> str | None:
+def _trust_record(root: Path) -> dict[str, Any] | None:
     _parent, store = _trust_paths(root)
     if not store.exists():
         return None
@@ -362,7 +429,14 @@ def _read_trust(root: Path) -> str | None:
         record.get("timestamp"), str
     ):
         raise RuntimeConfigError(f"refusing malformed trust record {store}")
-    return record["status"]
+    if "digest" in record and not isinstance(record["digest"], str):
+        raise RuntimeConfigError(f"refusing malformed trust record {store}")
+    return record
+
+
+def _read_trust(root: Path) -> str | None:
+    record = _trust_record(root)
+    return None if record is None else record["status"]
 
 
 def _write_trust(root: Path, status: str) -> None:
@@ -386,10 +460,18 @@ def _write_trust(root: Path, status: str) -> None:
                 or not isinstance(data.get("records"), dict)
             ):
                 raise RuntimeConfigError(f"refusing malformed trust record {store}")
-        data["records"][str(root.resolve(strict=False))] = {
+        record: dict[str, Any] = {
             "status": status,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+        # Kept here rather than beside the marker because this store is
+        # a 0600 file in the user state directory: where the
+        # repository's own mount cannot carry a mode, this digest is
+        # what proves the marker still holds what adoption approved.
+        digest = _marker_digest(root / ".orrery.json")
+        if digest is not None:
+            record["digest"] = digest
+        data["records"][str(root.resolve(strict=False))] = record
         descriptor, name = tempfile.mkstemp(prefix=".adopted.", dir=parent)
         temporary = Path(name)
         try:

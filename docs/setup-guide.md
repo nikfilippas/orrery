@@ -389,8 +389,15 @@ repository root. It must be a user-owned regular file with mode `0600`, with a
 machine-local trust record in the user state store. The developer umask made
 markers created before this change group-writable, so they are refused. For one
 release, `orrery-doctor` warns existing users to re-run `orrery-init` and names
-the command for that repository. Revoke a repository with `orrery-init --forget
-/path/to/repository`.
+the command for that repository. `orrery-init` resets the mode and says what it
+changed. Where a mount fixes the mode from its own options, which adoption
+probes by clearing the write bits and re-reading the mode rather than inferring
+it from the filesystem type, the mode can never pass and the SHA-256 digest of
+the marker's contents recorded in the trust record is checked in its place. The
+marker chooses the principal's provider, model, thinking level and endpoint, so
+on such a mount the digest is what stops another local account redirecting the
+principal onto a different service. Revoke a repository with `orrery-init
+--forget /path/to/repository`.
 
 What the ladder actually covers was measured against the installed CLI
 rather than inferred, and the distinction matters: an **overloaded**

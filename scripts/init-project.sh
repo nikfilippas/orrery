@@ -289,11 +289,27 @@ if [ -L "$MARKER" ] || { [ -e "$MARKER" ] && [ ! -f "$MARKER" ]; }; then
     printf 'Refusing unsafe adoption marker: %s\n' "$MARKER" >&2
     exit 1
 fi
+MARKER_EXISTED=1
 if [ ! -e "$MARKER" ]; then
+    MARKER_EXISTED=0
     printf '{}\n' > "$MARKER"
     printf 'Created adoption marker %s\n' "$MARKER"
 fi
-chmod 600 "$MARKER"
+# This is the repair path for a marker adoption refuses, so it says what
+# it changed: a user whose repository stopped being adopted has no other
+# way to see that this run is what fixed it. A mount that fixes the mode
+# from its own options cannot be repaired and is not a failure; adoption
+# verifies such a marker against the content digest recorded below.
+MARKER_MODE="$(stat -c '%a' "$MARKER")"
+chmod 600 "$MARKER" 2>/dev/null || true
+MARKER_MODE_NOW="$(stat -c '%a' "$MARKER")"
+if [ "$MARKER_MODE_NOW" != "600" ]; then
+    printf 'This filesystem fixes %s at mode %s; adoption will verify it by content digest instead.\n' \
+        "$MARKER" "$MARKER_MODE_NOW"
+elif [ "$MARKER_EXISTED" = 1 ] && [ "$MARKER_MODE" != "600" ]; then
+    printf 'Repaired adoption marker mode from %s to 600: %s\n' \
+        "$MARKER_MODE" "$MARKER"
+fi
 
 if [ -n "$MODEL" ]; then
     IFS=$'\t' read -r MODEL_PROVIDER MODEL_VALUE MODEL_THINKING <<< "$MODEL_SPEC"
