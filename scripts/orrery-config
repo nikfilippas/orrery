@@ -1032,8 +1032,10 @@ stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   </div>
   __STANDING__
   <div class="actions">
-    <button id="preview" class="btn btn-primary" type="button">Preview changes</button>
-    <button id="apply" class="btn btn-go" type="button" disabled>Apply</button>
+    <button id="preview" class="btn btn-primary" type="button"
+      title="Show exactly which lines would change, in every file, before anything is written">Preview changes</button>
+    <button id="apply" class="btn btn-go" type="button" disabled
+      title="Preview the changes first. Apply turns on once the exact diff is on screen, so nothing is ever written unseen.">Apply</button>
     <button id="revert" class="btn btn-ghost" type="button">Revert edits</button>
   </div>
   <div id="result"></div>
@@ -2059,6 +2061,16 @@ document.addEventListener("change", event => {
     );
   }
   applyButton.disabled = true;
+  // The control that was just changed is in the legend, and the buttons
+  // are in the bar at the top of the page, so a user who changes a model
+  // and looks for a way to save it may never see them. Say what happens
+  // next, where they are already looking.
+  if (!result.innerHTML) {
+    result.innerHTML =
+      "<p>Changed. Choose <strong>Preview changes</strong> at the top of " +
+      "the page to see exactly which lines would change; " +
+      "<strong>Apply</strong> turns on once you have seen them.</p>";
+  }
 });
 
 document.getElementById("preview").addEventListener("click", async () => {
