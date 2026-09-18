@@ -179,14 +179,24 @@ every session in an adopted repository, on the channel the surface
 renders itself rather than as a request the model may or may not honour:
 
 ```
-Orrery principal mismatch: configured Anthropic / fable / thinking max; ...
-  🟦 principal       anthropic  Fable 5.1  max
-  ⬜ mechanic        anthropic  Opus 5     medium
-  🟩 implementer     anthropic  Opus 5     high
-  🟪 plan reviewer   anthropic  Opus 5     max
-  🟨 final reviewer  anthropic  Opus 5     max
+Orrery principal: Anthropic / opus / thinking max, matched by this session.
+  🟦 principal       anthropic  Opus 5     max
+  ⬜ mechanic        anthropic  Fable 5.1  low
+  🟩 implementer     openai     Terra      medium
+  🟪 plan reviewer   openai     Astra      ultra
+  🟨 final reviewer  openai     Astra      ultra
   ⬛ plan review     2 rounds at most
 ```
+
+That spread is worth reading as a worked example rather than a sample.
+The mechanic shares the principal's provider on purpose: it does
+precisely specified, repetitive work where an independent judgement buys
+nothing, so the cheaper model on an account already open costs least.
+Everything that forms a judgement sits on the other provider, so a plan
+review and a final review are genuinely cross-provider rather than the
+same model reading its own reasoning back. The thinking levels rise with
+what the role is asked to decide: low to apply a change that was already
+specified, medium to write one, ultra to find what is wrong with it.
 
 The first line is the status: whether this session matches the
 configured principal, or why that could not be determined. The table

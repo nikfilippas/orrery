@@ -14976,18 +14976,26 @@ def test_d3_doctor_reports_the_missing_allowance() -> None:
     # `review_environment`, whose confinement probe belongs to delegate
     # dispatch and has nothing to say about a diagnostic that starts no
     # provider at all.
-    with standing_stores(), provider_binaries_on_path():
+    # In a repository it adopts itself, never the checkout. The kit's own
+    # tree is adopted on a developer's machine and is not on a CI runner,
+    # so a test that inherits that condition passes locally and fails
+    # there. Adoption is what the allowance line is gated on, so the test
+    # has to establish it rather than borrow it.
+    with standing_stores(), provider_binaries_on_path(), (
+        tempfile.TemporaryDirectory()
+    ) as directory:
+        repository = adopted_repository(directory)
         result = subprocess.run(
             ["bash", str(DOCTOR_SCRIPT)],
             env=os.environ.copy(),
-            cwd=str(KIT_DIR),
+            cwd=str(repository),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             timeout=300,
             check=False,
         )
-    principal = runtime_module.load_role("orchestrator", cwd=KIT_DIR)
+        principal = runtime_module.load_role("orchestrator", cwd=repository)
     configured = allowance_module.load_allowances()
     expected = (
         f"WARN  Allowance: no allowance is configured for {principal.provider}"
