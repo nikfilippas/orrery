@@ -143,6 +143,31 @@ Anthropic and the workers and reviewers on OpenAI; every row of
 `global/orchestration.json` may be changed to either provider, a
 third-party endpoint, or one provider for everything.
 
+## The commands
+
+Every command `./scripts/install.sh` puts on your `PATH`. All of them
+are read-only unless the description says otherwise.
+
+| Command | What it does |
+| --- | --- |
+| `orrery` | Starts and supervises the configured principal orchestrator, on the right model and thinking level. |
+| `orrery-init` | Adopts a repository: writes the marker, records trust, and optionally pins a per-repository principal. Writes. |
+| `orrery-agent --role <role>` | Runs one configured role in its own provider process, with that role's model, access mode, timeout and containment. Writes, for a write-capable role. |
+| `orrery-review` | The final reviewer, and a compatibility alias for `orrery-agent --role reviewer`. |
+| `orrery-config` | The visual configuration surface: change a role's provider, model or thinking level, preview the exact diff, then apply. Writes on apply. |
+| `orrery-sync` | Projects the configured principal onto the surface that starts it, so a new session begins on the right model. Writes. |
+| `orrery-doctor` | Validates the whole installation and reports what it could not verify. |
+| `orrery-task` | Creates, dispatches and verifies durable task contracts, with evidence-gated merges. Writes. |
+| `orrery-memory` | Governed memory: facts carrying the command that re-checks them, decisions, and history. Writes. |
+| `orrery-pickup` | Parks work a provider limit stopped, and re-dispatches it when the limit resets. Writes. |
+| `orrery-usage` | Aggregates Claude Code and Codex token usage from local session logs. |
+| `orrery-incidents` | Reports provider failures, fallbacks, spend and stalls from the local incident log. |
+
+Two more are installed as hooks rather than commands, and run on their
+own: `orrery-session-start` states whether a session matches the
+configured principal, and `orrery-prompt-submit` warns when the running
+provider has crossed its allowance.
+
 ## Evidence, not adjectives
 
 Órrery advertises no speed multipliers and no token-saving

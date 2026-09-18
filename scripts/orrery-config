@@ -829,6 +829,11 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     --ink: #1b2226; --soft: #4c5a63; --accent: #38617f; --accent-ink: #ffffff;
     --mechanic: #737d94; --implementer: #587b50; --plan-reviewer: #8a6a9c; --reviewer: #a97a24;
     --wire: #8b969d; --code: #1d2428; --code-ink: #d7e0e5; --bad: #a33b3b; --good: #3d7a4a;
+    /* The code panel is dark under both schemes, so the diff reads the
+       same in either and these are not repeated in the dark block. */
+    --diff-add: rgba(63, 185, 80, .16); --diff-add-ink: #8ddba0;
+    --diff-del: rgba(248, 81, 73, .16); --diff-del-ink: #f0a6a0;
+    --diff-hunk-ink: #8fa6c4; --diff-meta-ink: #8b98a5;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -1023,6 +1028,23 @@ stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
     background: var(--code); color: var(--code-ink);
     border-radius: 8px; padding: 10px 12px; font-size: 12px;
   }
+  /* A unified diff reads by line, so each line is its own block and the
+     tint runs the full width rather than stopping at the text. The sign
+     in column one is kept: colour alone should not carry the meaning. */
+  #result pre.diff { padding: 10px 0; }
+  #result pre.diff .dl {
+    display: block; padding: 0 12px; border-left: 3px solid transparent;
+  }
+  #result pre.diff .d-add {
+    background: var(--diff-add); color: var(--diff-add-ink);
+    border-left-color: var(--diff-add-ink);
+  }
+  #result pre.diff .d-del {
+    background: var(--diff-del); color: var(--diff-del-ink);
+    border-left-color: var(--diff-del-ink);
+  }
+  #result pre.diff .d-hunk { color: var(--diff-hunk-ink); }
+  #result pre.diff .d-meta { color: var(--diff-meta-ink); }
 </style>
 </head>
 <body>
@@ -1077,6 +1099,23 @@ const S = CHART.scale || 1;
 function esc(text) {
   return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;")
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// A unified diff, line by line, so a removal and an addition can be told
+// apart at a glance. The file headers are tested before the +/- lines,
+// since `---` and `+++` start with the same characters.
+function diffHtml(text) {
+  // Split on a character code rather than an escape: this script is
+  // emitted through the page template, which consumes a backslash-n
+  // and would leave a real newline inside the string literal.
+  return String(text).split(String.fromCharCode(10)).map(line => {
+    let kind = "";
+    if (line.startsWith("---") || line.startsWith("+++")) kind = "d-meta";
+    else if (line.startsWith("@@")) kind = "d-hunk";
+    else if (line.startsWith("+")) kind = "d-add";
+    else if (line.startsWith("-")) kind = "d-del";
+    return `<span class="dl ${kind}">${esc(line) || "&nbsp;"}</span>`;
+  }).join("");
 }
 
 function element(name, attributes) {
@@ -2098,7 +2137,7 @@ document.getElementById("preview").addEventListener("click", async () => {
     result.innerHTML = "<p>Everything already matches.</p>"; return;
   }
   result.innerHTML = "<h3>Exactly this will change:</h3>" +
-    reply.edits.map(e => `<pre>${esc(e.diff)}</pre>`).join("");
+    reply.edits.map(e => `<pre class="diff">${diffHtml(e.diff)}</pre>`).join("");
   applyButton.disabled = false;
 });
 
