@@ -38,7 +38,9 @@ from orrery_fallback import (  # noqa: E402
     Consent,
     ConsentDecision,
     FailureScope,
+    authorising_failure,
     classify_failure,
+    delegate_allowance_refusal,
     git_workspace_fingerprint,
     model_status,
     nearest_fallback,
@@ -48,6 +50,7 @@ from orrery_fallback import (  # noqa: E402
     provider_status,
     request_fallback_decision,
 )
+import orrery_allowance as allowance  # noqa: E402
 from orrery_findings import sanitise_provider_text  # noqa: E402
 from orrery_verify import systemctl_path, systemd_run_path  # noqa: E402
 import orrery_spend  # noqa: E402
@@ -104,6 +107,11 @@ HARD_TIMEOUT_MAXIMUM = 14400
 # this status: distinct from a usage error (2) and from any provider
 # exit, so a caller can tell a nesting refusal from work that ran.
 NESTING_REFUSED = 77
+# A dispatch refused because the provider's configured allowance is
+# already spent. Distinct for the same reason: the caller has to be able
+# to tell an exhausted ceiling, which another provider or a raised
+# ceiling answers, from a broken invocation, which neither does.
+ALLOWANCE_EXHAUSTED = 78
 
 
 class UsageError(Exception):
@@ -245,6 +253,10 @@ class DelegationState:
         self.excluded_models: set[tuple[str, str]] = set()
         self.transient_retries: set[tuple[str, str]] = set()
         self.is_fallback = False
+        # An approval no recorded failure authorises yet. A read-only
+        # role keeps it here and runs its configured model; the first
+        # real failure then spends it without a second prompt.
+        self.held_approval: tuple[str, str] | None = None
 
 
 class NextAttempt(Exception):
@@ -1956,8 +1968,33 @@ def record_standing(
     reason: str,
     failure_scope: str,
 ) -> None:
-    """Persist an approved standing scope, tolerating storage failure."""
+    """Persist an approved standing scope, tolerating storage failure.
+
+    The gate sits here, at creation, rather than on every later read: a
+    live record is documented to start its recorded candidate directly
+    on every use, so a read-time check would silently stop honouring a
+    legitimately granted approval once its failure aged out of the log,
+    and every dispatch after that would re-run the provider already
+    known to be broken. Closing the creation path instead means every
+    record that exists implies a verified failure.
+    """
     if decision.scope == RUN_SCOPE:
+        return
+    if authorising_failure(configured) is None:
+        print(
+            f"{PROGRAM_NAME}: no recorded failure of "
+            f"{configured.provider}/{configured.model} for {configured.id} "
+            "in this repository authorises a standing approval; it applies "
+            "to this run only.",
+            file=sys.stderr,
+        )
+        incident_log.record(
+            "standing-refused",
+            program=PROGRAM_NAME,
+            role=configured,
+            candidate=f"{candidate.provider}:{candidate.model}",
+            approval_scope=decision.scope,
+        )
         return
     try:
         record = record_approval(
@@ -2005,6 +2042,27 @@ def adopt_standing_approval(state: DelegationState) -> dict | None:
     if record is None:
         return None
     candidate = candidate_role(state.configured, record)
+    # A record minted before the principal-allowance rule, or before the
+    # principal moved, goes inert rather than silently: the run says the
+    # candidate was excluded and dispatches the configured role.
+    refusal = delegate_allowance_refusal(
+        state.configured, (candidate.provider, candidate.model)
+    )
+    if refusal is not None:
+        print(
+            f"{PROGRAM_NAME}: the standing fallback candidate is not "
+            f"available to this role: {refusal}. The configured role will "
+            "be attempted.",
+            file=sys.stderr,
+        )
+        incident_log.record(
+            "standing-excluded",
+            program=PROGRAM_NAME,
+            role=state.configured,
+            detail=refusal,
+            candidate=f"{candidate.provider}:{candidate.model}",
+        )
+        return None
     availability = provider_status(candidate.provider)
     if availability.state is Availability.UNAVAILABLE:
         print(
@@ -2040,6 +2098,73 @@ def adopt_standing_approval(state: DelegationState) -> dict | None:
         candidate=f"{candidate.provider}:{candidate.model}",
     )
     return record
+
+
+def unverified_approval(
+    approval: tuple[str, str],
+    state: DelegationState,
+) -> int | None:
+    """Hold or refuse an approval no recorded failure authorises.
+
+    `--approve-fallback` exists for a rerun after a failure a previous
+    process observed and this one cannot see. With no such failure on
+    record it pre-authorises nothing, and what happens next depends on
+    whether the role can write. A read-only role costs one wasted read
+    if the configured model is in fact fine, so it is dispatched
+    normally and the approval waits. A write-capable role is not
+    started at all: that would begin a process the user never approved
+    over a workspace they may have been told to inspect.
+    """
+    configured = state.configured
+    absent = (
+        f"no recorded failure of {configured.provider}/{configured.model} "
+        f"for {configured.id} in this repository"
+    )
+    key = f"{approval[0]}:{approval[1]}"
+    if configured.read_only:
+        print(
+            f"{PROGRAM_NAME}: {absent} authorises a substitution, so the "
+            f"approval of {key} is held in reserve and the configured role "
+            "will run; a genuine failure applies it without asking again.",
+            file=sys.stderr,
+        )
+        incident_log.record(
+            "approval-held",
+            program=PROGRAM_NAME,
+            role=configured,
+            detail=absent,
+            candidate=key,
+        )
+        state.held_approval = approval
+        return None
+    print("", file=sys.stderr)
+    print("ORRERY FALLBACK APPROVAL REQUIRED", file=sys.stderr)
+    print(
+        f"There is {absent}, so --approve-fallback {key} authorises "
+        "nothing here.",
+        file=sys.stderr,
+    )
+    print(
+        f"{configured.id} is write-capable, so the configured role was not "
+        "dispatched either: that would start a write-capable process over a "
+        "workspace you may have been told to inspect.",
+        file=sys.stderr,
+    )
+    print(
+        "Ask the user which they want: the configured role, or "
+        f"{key} with no failure to justify it.",
+        file=sys.stderr,
+    )
+    print(f"{PROGRAM_NAME} started no process.", file=sys.stderr)
+    incident_log.record(
+        "approval-unverified",
+        program=PROGRAM_NAME,
+        role=configured,
+        detail=absent,
+        candidate=key,
+        status=APPROVAL_REQUIRED,
+    )
+    return APPROVAL_REQUIRED
 
 
 def handle_failed_attempt(
@@ -2120,12 +2245,42 @@ def handle_failed_attempt(
     else:
         state.excluded_providers.add(failed.provider)
 
-    proposal = nearest_fallback(
-        state.configured,
-        reason,
-        excluded_providers=state.excluded_providers,
-        excluded_models=state.excluded_models,
-    )
+    proposal = None
+    if state.held_approval is not None:
+        # Spent whatever happens, so an approval held in reserve applies
+        # to the first failure and never silently to a later one.
+        held = state.held_approval
+        state.held_approval = None
+        # Resolved from the approval rather than from a fresh ranking:
+        # the approved identity may sit deeper than today's nearest
+        # candidate, which request_fallback_decision would reject as
+        # naming a different candidate.
+        held_proposal, excluded_providers, excluded_models = (
+            proposal_for_approval(state.configured, held)
+        )
+        if held_proposal is None:
+            refusal = delegate_allowance_refusal(state.configured, held)
+            detail = refusal or (
+                f"{held[0]}:{held[1]} is no longer a potentially available "
+                "candidate"
+            )
+            print(
+                f"{PROGRAM_NAME}: the approval held in reserve cannot be "
+                f"applied: {detail}. The nearest candidate is proposed "
+                "instead.",
+                file=sys.stderr,
+            )
+        else:
+            proposal = held_proposal
+            state.excluded_providers |= excluded_providers
+            state.excluded_models |= excluded_models
+    if proposal is None:
+        proposal = nearest_fallback(
+            state.configured,
+            reason,
+            excluded_providers=state.excluded_providers,
+            excluded_models=state.excluded_models,
+        )
     if proposal is None:
         print(
             f"{PROGRAM_NAME}: no authenticated or potentially authenticated "
@@ -2313,7 +2468,17 @@ def main(
                     file=sys.stderr,
                 )
                 return 2
-            if invocation.approval is not None:
+            if (
+                invocation.approval is not None
+                and authorising_failure(configured) is None
+            ):
+                # An approval only ever stands in for a failure another
+                # process observed, so with nothing on record it may not
+                # displace the configured role here.
+                stop = unverified_approval(invocation.approval, state)
+                if stop is not None:
+                    return stop
+            elif invocation.approval is not None:
                 (
                     proposal,
                     state.excluded_providers,
@@ -2323,20 +2488,27 @@ def main(
                     invocation.approval,
                 )
                 if proposal is None:
+                    # An approval the allowance rule barred is reported
+                    # as that, not as a candidate the provider withdrew:
+                    # the difference is a setting the user controls.
+                    refusal = delegate_allowance_refusal(
+                        configured, invocation.approval
+                    )
+                    detail = refusal or (
+                        "the approved fallback is no longer a "
+                        "potentially available candidate"
+                    )
                     print(
-                        f"{PROGRAM_NAME}: the approved fallback is no longer "
-                        "a potentially available candidate; no process was "
-                        "started.",
+                        f"{PROGRAM_NAME}: {detail}; no process was started.",
                         file=sys.stderr,
                     )
                     incident_log.record(
-                        "fallback-unavailable",
+                        "fallback-excluded"
+                        if refusal is not None
+                        else "fallback-unavailable",
                         program=PROGRAM_NAME,
                         role=configured,
-                        detail=(
-                            "the approved fallback is no longer a "
-                            "potentially available candidate"
-                        ),
+                        detail=detail,
                         candidate=f"{invocation.approval[0]}:"
                         f"{invocation.approval[1]}",
                     )
@@ -2394,6 +2566,11 @@ def main(
                 adopt_standing_approval(state)
         role_config = state.role
         verbosity = load_verbosity()
+        # Measured against the role that is actually about to run, so a
+        # substitution cannot arrive on a provider whose allowance the
+        # configured role was refused for, and read before any provider
+        # process is started rather than after one has been paid for.
+        allowance_stop = allowance.ceiling_refusal(role_config)
         if role_config.provider == "openai":
             codex_home()
     except RuntimeConfigError as exc:
@@ -2406,6 +2583,20 @@ def main(
             status=2,
         )
         return 2
+
+    if allowance_stop is not None:
+        print(
+            f"{PROGRAM_NAME}: {allowance_stop}; no process was started.",
+            file=sys.stderr,
+        )
+        incident_log.record(
+            "allowance-exhausted",
+            program=PROGRAM_NAME,
+            role=role_config,
+            detail=allowance_stop,
+            status=ALLOWANCE_EXHAUSTED,
+        )
+        return ALLOWANCE_EXHAUSTED
 
     try:
         availability = role_availability(role_config)
@@ -2807,6 +2998,21 @@ def main(
                     **(usage["tokens"] if usage else {}),
                 )
                 return
+            # A receipted run's accounting goes to its attempt files,
+            # which the incident log never sees. Without a marker here,
+            # a dispatch that succeeded under `--receipts` leaves no
+            # trace that can cancel an older failure, so that failure
+            # would keep authorising a pre-emptive substitution for the
+            # rest of its window. Written before `handle_failed_attempt`
+            # records any authorising kind, exactly as `spend` is, so a
+            # failing run still cannot cancel its own failure.
+            incident_log.record(
+                "dispatch-closed",
+                program=PROGRAM_NAME,
+                role=role_config,
+                outcome=outcome,
+                status=status,
+            )
             try:
                 orrery_spend.close_attempt(
                     receipts,

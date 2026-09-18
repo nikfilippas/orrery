@@ -312,12 +312,27 @@ removed by `--revoke-fallbacks`, and is always overridden by
 changed-workspace inspection rule. Use `--no-fallback` when the user
 requires the exact configured provider or model. An approved rerun starts
 the exact candidate directly and must not retry the failed configured
-process first.
+process first, so long as the failure that authorised it is still on
+record. `--approve-fallback` pre-authorises nothing on its own: with no
+recorded failure of the configured provider and model for that role in
+that repository, a read-only role is dispatched on its configured model
+with the approval held in reserve, applied to its first failure without a
+further prompt, and a write-capable role is not started at all, because
+that would begin a process the user never approved over a workspace they
+may have been told to inspect. A standing approval for a delegated
+role is likewise recorded only where a failure authorises it. The
+principal's own standing approvals are not governed by that rule: it
+protects delegated substitution, and the principal is the allowance
+holder rather than a substitute for one.
 
 Candidate distance is based on the failed role, internal model tiers, models
 the user already assigned to comparable roles, live picker-visible catalogues,
-and the nearest supported thinking position. Future picker-visible models are
-ranked automatically. “Potential” is deliberate: login and catalogue checks
+and the nearest supported thinking position. A cross-provider candidate for
+a delegated role is additionally capped at a named ceiling,
+`delegate_fallback_thinking_ceiling`, so a role configured at the top of its
+own provider's scale does not arrive at the top of the substitute's scale by
+construction. The principal's own fallback is not capped. Future
+picker-visible models are ranked automatically. “Potential” is deliberate: login and catalogue checks
 cannot prove remaining credits without running inference. A candidate never
 inherits a failed role's custom endpoint; approving one moves the assignment
 to the proposed provider's own service.
@@ -327,7 +342,16 @@ partial output is failure.
 
 - Authentication, subscription, quota, billing, or entitlement failure: do
   not retry that provider or cycle its models. Propose the nearest candidate on
-  another authenticated provider.
+  another authenticated provider, unless that provider is the principal's own.
+  A delegated role may never be substituted onto the allowance its principal
+  spends from, however the substitution is reached, because a provider outage
+  would otherwise route the whole workload onto the one budget the split exists
+  to protect. `delegate_fallback_scope` sets how much is protected: the
+  principal's provider by default, or only its exact model. Where the rule
+  leaves no candidate, report that fallback is unavailable and stop; do not
+  propose the principal's own model as a substitute. A delegate deliberately
+  *configured* to that provider still runs, since the rule governs substitution
+  rather than configuration.
 - Model-specific unavailability: propose the nearest candidate, preferring the
   same provider when its authentication remains usable.
 - Transient process, network, or service failure: retry once, then propose the

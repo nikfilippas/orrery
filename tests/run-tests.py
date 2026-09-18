@@ -9,6 +9,7 @@ Claude or Codex configuration.
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import dataclasses
@@ -99,6 +100,7 @@ runtime_module = sys.modules["orrery_runtime"]
 fallback_module = sys.modules["orrery_fallback"]
 ledger_module = load_script(LEDGER_SCRIPT, "kit_orrery_ledger")
 task_module = load_script(TASK_SCRIPT, "kit_orrery_task")
+import orrery_allowance as allowance_module  # noqa: E402
 import orrery_findings as findings_module  # noqa: E402
 import orrery_incidents as incidents_module  # noqa: E402
 import orrery_stall as stall_module  # noqa: E402
@@ -228,6 +230,7 @@ def runtime_residue() -> list[str]:
 # run for any test that bypasses finish_review or run_principal.
 STATE_DIRS: list[str] = []
 FAKE_BIN_DIRS: list[str] = []
+HOME_DIRS: list[str] = []
 
 
 @contextlib.contextmanager
@@ -324,6 +327,25 @@ def review_environment(
         standing_state = Path(tempfile.mkdtemp(prefix="kit-standing."))
         STATE_DIRS.append(str(standing_state))
     environment["XDG_STATE_HOME"] = str(standing_state)
+    # Every subprocess started from this environment gets its own HOME.
+    # Without it they run against the developer's real one: a wrapper
+    # test would read and rewrite ~/.claude/settings.json, and anything
+    # resolving KIT_DIR from an installed path would reach the live
+    # manifest. Both were observed: a suite run silently replaced the
+    # configured principal and every delegate role with fixture values,
+    # and repeated runs disagreed with each other because the damage
+    # landed mid-run. The runner's own guard already prescribes this
+    # ("it needs HOME isolation or an explicit --target").
+    home = Path(tempfile.mkdtemp(prefix="kit-home."))
+    HOME_DIRS.append(str(home))
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
+    (home / ".codex").mkdir(parents=True, exist_ok=True)
+    live_settings = Path.home() / ".claude" / "settings.json"
+    if live_settings.exists():
+        # Seeded from the real file so a test that expects a populated
+        # surface still finds one, while writes land on the copy.
+        shutil.copy2(live_settings, home / ".claude" / "settings.json")
+    environment["HOME"] = str(home)
     if not host_enforces_confinement():
         # Only where the guarantee is unavailable, so a host that can
         # enforce still proves the wrapper refuses when it cannot. Tests
@@ -3877,9 +3899,36 @@ def test_fallback_same_provider_ladder() -> None:
     require(
         crossed is not None
         and (crossed.candidate.provider, crossed.candidate.model)
-        == ("anthropic", "fable"),
-        "a two-tier same-provider drop was not outranked by a "
-        f"near-tier cross-provider model: {crossed}",
+        == ("openai", "gpt-5.6-luna"),
+        "a delegate crossed onto the principal's own provider, or did "
+        f"not fall back along its own ladder instead: {crossed}",
+    )
+
+    # D2. This assertion previously expected `anthropic/fable`, a
+    # near-tier cross-provider model outranking a two-tier same-provider
+    # drop. That is the principal's own model and provider, and reaching
+    # it by substitution is the defect D2 closes, so a delegate now
+    # exhausts its own ladder rather than crossing. The tier rule it was
+    # written for is unchanged and is exercised below on the
+    # orchestrator, which D2 does not govern.
+    principal_crossed = fallback_module.nearest_fallback(
+        principal,
+        "test",
+        excluded_models={
+            ("anthropic", "fable"),
+            ("anthropic", "opus"),
+            ("anthropic", "sonnet"),
+            ("anthropic", "haiku"),
+        },
+        assumed_ready={"anthropic", "openai"},
+        discover_live=False,
+    )
+    require(
+        principal_crossed is not None
+        and principal_crossed.candidate.provider == "openai",
+        "the principal, which the allowance rule does not govern, did "
+        f"not cross providers when its own were exhausted: "
+        f"{principal_crossed}",
     )
 
 
@@ -5101,13 +5150,22 @@ def test_failing_run() -> None:
 
 @test("an approved delegated quota fallback crosses providers once")
 def test_delegated_quota_fallback() -> None:
-    with tempfile.TemporaryDirectory() as directory:
+    with tempfile.TemporaryDirectory() as directory, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
         codex_home = Path(directory) / "codex-home"
         claude_home = Path(directory) / "claude-home"
         codex_home.mkdir()
         claude_home.mkdir()
+        # One state home across both runs, as a real rerun has: the
+        # approval is honoured directly only where the first run's
+        # failure is still on record.
+        state_home = Path(directory) / "state"
+        state_home.mkdir(mode=0o700)
         codex_arguments = codex_home / "codex-args"
-        failed_environment = review_environment("success")
+        failed_environment = review_environment(
+            "success", standing_state=state_home
+        )
         failed_environment["CODEX_HOME"] = str(codex_home)
         failed_environment["CODEX_FAKE_MODE"] = "quota"
         failed_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
@@ -5117,6 +5175,7 @@ def test_delegated_quota_fallback() -> None:
             "60",
             "--",
             "prompt",
+            cwd=repository,
         )
         _, failed_stderr = finish_review(failed, failed_environment)
         require(
@@ -5127,7 +5186,9 @@ def test_delegated_quota_fallback() -> None:
         original_arguments = codex_arguments.read_text()
         assert_no_review_residue(f"orrery-review-{failed.pid}-")
 
-        approved_environment = review_environment("success")
+        approved_environment = review_environment(
+            "success", standing_state=state_home
+        )
         approved_environment["CLAUDE_CONFIG_DIR"] = str(claude_home)
         approved_environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
         approved = start_review(
@@ -5138,6 +5199,7 @@ def test_delegated_quota_fallback() -> None:
             "anthropic:fable",
             "--",
             "prompt",
+            cwd=repository,
         )
         stdout, stderr = finish_review(approved, approved_environment)
 
@@ -5146,9 +5208,13 @@ def test_delegated_quota_fallback() -> None:
             f"approved delegated fallback failed: {stderr}",
         )
         require(
-            "Nearest candidate: Anthropic / fable / thinking max" in stderr
+            # D2's named ceiling caps a cross-provider delegate, so an
+            # ultra reviewer arrives at high rather than at the top of
+            # the candidate's scale.
+            "Nearest candidate: Anthropic / fable / thinking high" in stderr
             and "Fallback approved for anthropic:fable" in stderr
-            and "↳ Fallback reviewer · anthropic · fable" in stderr,
+            and "↳ Fallback reviewer · anthropic · fable · thinking high"
+            in stderr,
             f"delegated fallback was not fully announced: {stderr}",
         )
         require(
@@ -5201,8 +5267,12 @@ def test_transient_failure_retries_once() -> None:
 
 @test("a failed writer requires inspection before fallback approval")
 def test_partial_write_blocks_inline_fallback() -> None:
-    with tempfile.TemporaryDirectory() as directory:
+    # The state home is a sibling of the repository, not inside it: an
+    # incident store under the workspace would itself change the
+    # workspace fingerprint this test turns on.
+    with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as state:
         repository = Path(directory)
+        state_home = Path(state)
         subprocess.run(
             ["git", "init", "--quiet", str(repository)],
             stdout=subprocess.DEVNULL,
@@ -5211,8 +5281,16 @@ def test_partial_write_blocks_inline_fallback() -> None:
             timeout=30,
             check=True,
         )
+        # D2 bars a delegate substitution onto the principal's provider,
+        # so a fixture that must reach an Anthropic candidate adopts its
+        # workspace with a principal that is somewhere else.
+        write_json(
+            repository / ".orrery.json", {"orchestrator": OPENAI_PRINCIPAL}
+        )
         partial_edit = repository / "partial.txt"
-        failed_environment = review_environment("transient")
+        failed_environment = review_environment(
+            "transient", standing_state=state_home
+        )
         failed_environment["CODEX_FAKE_WRITE"] = str(partial_edit)
         failed = start_review(
             failed_environment,
@@ -5239,7 +5317,9 @@ def test_partial_write_blocks_inline_fallback() -> None:
         )
         assert_no_review_residue(f"orrery-review-{failed.pid}-")
 
-        approved_environment = review_environment("success")
+        approved_environment = review_environment(
+            "success", standing_state=state_home
+        )
         approved = start_review(
             approved_environment,
             "--timeout",
@@ -5287,24 +5367,31 @@ def test_no_fallback_candidate() -> None:
 
 @test("--no-fallback preserves an explicitly pinned provider")
 def test_no_fallback_option() -> None:
-    environment = review_environment("quota")
-    process = start_review(
-        environment,
-        "--timeout",
-        "60",
-        "--no-fallback",
-        "--",
-        "prompt",
-    )
-    _, stderr = finish_review(process, environment)
+    # D2 excludes a candidate on the principal's provider before any
+    # proposal exists, so the pin is exercised where one is reachable.
+    with d1_repository(OPENAI_PRINCIPAL) as repository:
+        environment = review_environment("quota")
+        process = start_review(
+            environment,
+            "--timeout",
+            "60",
+            "--no-fallback",
+            "--",
+            "prompt",
+            cwd=repository,
+        )
+        _, stderr = finish_review(process, environment)
 
-    require(process.returncode == 7, f"pinned provider status changed: {stderr}")
-    require(
-        "Fallback is disabled for this invocation" in stderr
-        and "no substitution was made" in stderr,
-        f"the explicit provider pin was not honored: {stderr}",
-    )
-    assert_no_review_residue(f"orrery-review-{process.pid}-")
+        require(
+            process.returncode == 7,
+            f"pinned provider status changed: {stderr}",
+        )
+        require(
+            "Fallback is disabled for this invocation" in stderr
+            and "no substitution was made" in stderr,
+            f"the explicit provider pin was not honored: {stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
 
 
 @test("a successful run with no verdict is reported and leaves no residue")
@@ -10628,7 +10715,9 @@ def seed_standing_reviewer(
 
 @test("a standing approval starts the recorded candidate without codex")
 def test_standing_adoption_end_to_end() -> None:
-    with until_store_only() as state_dir:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
         seed_standing_reviewer()
         with tempfile.TemporaryDirectory() as directory:
             codex_arguments = Path(directory) / "codex-args"
@@ -10638,7 +10727,12 @@ def test_standing_adoption_end_to_end() -> None:
             environment["ORRERY_ALLOW_UNCONFINED"] = "1"
             environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
             process = start_review(
-                environment, "--timeout", "60", "--", "prompt"
+                environment,
+                "--timeout",
+                "60",
+                "--",
+                "prompt",
+                cwd=repository,
             )
             stdout, stderr = finish_review(process, environment)
             require(
@@ -10666,7 +10760,9 @@ def test_standing_adoption_end_to_end() -> None:
 
 @test("an explicit approval wins over a conflicting standing record")
 def test_explicit_approval_beats_standing() -> None:
-    with until_store_only() as state_dir:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
         seed_standing_reviewer(candidate_model="opus")
         environment = review_environment("success", standing_state=state_dir)
         environment["CODEX_FAKE_MODE"] = "quota"
@@ -10678,6 +10774,7 @@ def test_explicit_approval_beats_standing() -> None:
             "anthropic:fable",
             "--",
             "prompt",
+            cwd=repository,
         )
         stdout, stderr = finish_review(process, environment)
         require(
@@ -10725,13 +10822,20 @@ def test_no_fallback_ignores_standing() -> None:
 
 @test("a non-interactive until approval is refused, not recorded")
 def test_until_scope_refused_noninteractive() -> None:
-    with until_store_only() as state_dir:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
         failed_environment = review_environment(
             "success", standing_state=state_dir
         )
         failed_environment["CODEX_FAKE_MODE"] = "quota"
         failed = start_review(
-            failed_environment, "--timeout", "60", "--", "prompt"
+            failed_environment,
+            "--timeout",
+            "60",
+            "--",
+            "prompt",
+            cwd=repository,
         )
         _, failed_stderr = finish_review(failed, failed_environment)
         require(
@@ -10757,6 +10861,7 @@ def test_until_scope_refused_noninteractive() -> None:
             "until:2091-08-05T16:49",
             "--",
             "prompt",
+            cwd=repository,
         )
         _stdout, stderr = finish_review(refused, refused_environment)
         require(
@@ -10835,7 +10940,10 @@ def test_revoke_fallbacks_cli() -> None:
 
 @test("adoption validates availability and seeds exclusions")
 def test_adopt_standing_helper() -> None:
-    with standing_stores():
+    # Adopted with an OpenAI principal, because D2 makes a standing
+    # record naming the principal's own provider inert: that refusal is
+    # its own test, and this one is about availability and exclusions.
+    with standing_stores(), d1_repository(OPENAI_PRINCIPAL) as repository:
         configured = seed_standing_reviewer()
         original_status = review_module.provider_status
 
@@ -10861,7 +10969,9 @@ def test_adopt_standing_helper() -> None:
                 configured=configured, role=configured
             )
             errors = io.StringIO()
-            with contextlib.redirect_stderr(errors):
+            with contextlib.redirect_stderr(errors), contextlib.chdir(
+                repository
+            ):
                 adopted = review_module.adopt_standing_approval(state)
             require(
                 adopted is None
@@ -10872,7 +10982,9 @@ def test_adopt_standing_helper() -> None:
             )
 
             review_module.provider_status = ready
-            with contextlib.redirect_stderr(errors):
+            with contextlib.redirect_stderr(errors), contextlib.chdir(
+                repository
+            ):
                 adopted = review_module.adopt_standing_approval(state)
             require(
                 adopted is not None
@@ -11141,9 +11253,25 @@ def test_claude_canary_sweep_end_to_end() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        # D2 bars a delegate substitution onto the principal's provider,
+        # so a fixture that must reach an Anthropic candidate adopts its
+        # workspace with a principal that is somewhere else.
+        write_json(
+            workspace / ".orrery.json", {"orchestrator": OPENAI_PRINCIPAL}
+        )
         exclude = workspace / ".git" / "info" / "exclude"
         prior = exclude.read_bytes() if exclude.exists() else None
-        environment = review_environment("success")
+        state_home = Path(directory) / "state"
+        state_home.mkdir(mode=0o700)
+        # The approval is a fixture here, not the subject, so the
+        # failure that authorises it is seeded rather than provoked.
+        write_incident(
+            state_home,
+            "provider-failure",
+            runtime_module.load_role("implementer"),
+            workdir=workspace,
+        )
+        environment = review_environment("success", standing_state=state_home)
         environment["CLAUDE_FAKE_MODE"] = "fail"
         environment["CLAUDE_FAKE_PLANT"] = "1"
         process = start_review(
@@ -11189,6 +11317,13 @@ def test_read_only_unit_workspace_guard() -> None:
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+            )
+            # D2 bars a delegate substitution onto the principal's provider,
+            # so a fixture that must reach an Anthropic candidate adopts its
+            # workspace with a principal that is somewhere else.
+            write_json(
+                workspace / ".orrery.json",
+                {"orchestrator": OPENAI_PRINCIPAL},
             )
             # Not gated on the host. Either the wrapper holds the
             # guarantee or it says it cannot, and both are asserted
@@ -11242,7 +11377,24 @@ def test_read_only_unit_workspace_guard() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        environment = review_environment("success")
+        # D2 bars a delegate substitution onto the principal's
+        # provider, so this fixture adopts its workspace with a
+        # principal that is somewhere else.
+        write_json(
+            workspace / ".orrery.json",
+            {"orchestrator": OPENAI_PRINCIPAL},
+        )
+        state_home = Path(directory) / "state"
+        state_home.mkdir(mode=0o700)
+        # The approval only gets the writer onto Claude; the failure
+        # that authorises it is a fixture, not the subject.
+        write_incident(
+            state_home,
+            "provider-failure",
+            runtime_module.load_role("implementer"),
+            workdir=workspace,
+        )
+        environment = review_environment("success", standing_state=state_home)
         environment["ORRERY_ALLOW_UNCONFINED"] = "1"
         environment["CLAUDE_FAKE_WRITE"] = str(workspace / "allowed.txt")
         process = start_review(
@@ -12872,6 +13024,1990 @@ def test_incident_reader_validation() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# D1: a substitution requires a verified failure
+# ---------------------------------------------------------------------------
+
+
+def write_incident(
+    state_home: Path,
+    kind: str,
+    role: Any,
+    *,
+    workdir: Path,
+    age_seconds: float = 30.0,
+    **fields: Any,
+) -> None:
+    """Append one raw incident event, shaped as a launcher writes it.
+
+    A doctored store rather than a real failed run: the precondition has
+    to be exercised against records the wrapper cannot be made to write
+    on demand, such as one from another repository or from last week.
+    """
+    store = state_home / "orrery" / "incidents.jsonl"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(store.parent, 0o700)
+    event = {
+        "v": incidents_module.SCHEMA_VERSION,
+        "ts": datetime.fromtimestamp(
+            time.time() - age_seconds, timezone.utc
+        ).isoformat(timespec="milliseconds"),
+        "run": "d1fixture",
+        "pid": os.getpid(),
+        "program": "orrery-agent",
+        "kind": kind,
+        "workdir": str(workdir),
+        "role": role.id,
+        "provider": role.provider,
+        "model": role.model,
+        **({"thinking": role.thinking} if role.thinking else {}),
+        **fields,
+    }
+    with store.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event) + "\n")
+    os.chmod(store, 0o600)
+
+
+# A principal that is not on the provider the delegate roles fall back
+# to, so an Anthropic candidate is something the allowance rule permits
+# rather than the one thing it exists to refuse.
+OPENAI_PRINCIPAL = {
+    "provider": "openai",
+    "model": "gpt-5.6-sol",
+    "thinking": "ultra",
+}
+
+
+@contextlib.contextmanager
+def d1_repository(principal: dict[str, str] | None = None) -> Any:
+    """A git workspace a recorded working directory can be matched to.
+
+    `principal` adopts the workspace with a repository orchestrator
+    override. D2 bars a delegate substitution onto the principal's own
+    provider, so a rerun that is to reach an Anthropic candidate at all
+    must run where the principal is somewhere else; naming that here is
+    what makes these approval fixtures reachable rather than excluded.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "workspace"
+        root.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(root)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if principal is not None:
+            write_json(root / ".orrery.json", {"orchestrator": principal})
+        yield root.resolve()
+
+
+def handle_failed_attempt_kinds() -> tuple[set[str], str | None]:
+    """Every incident kind the delegate failure handler can write."""
+    tree = ast.parse(REVIEW_SCRIPT.read_text())
+    default: str | None = None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "handle_failed_attempt"
+        ):
+            for argument, value in zip(
+                node.args.kwonlyargs, node.args.kw_defaults
+            ):
+                if argument.arg == "kind" and isinstance(value, ast.Constant):
+                    default = value.value
+    kinds: set[str] = set()
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "handle_failed_attempt"
+        ):
+            continue
+        named = [
+            keyword.value.value
+            for keyword in node.keywords
+            if keyword.arg == "kind"
+            and isinstance(keyword.value, ast.Constant)
+        ]
+        if named:
+            kinds.update(named)
+        elif default is not None:
+            kinds.add(default)
+    return kinds, default
+
+
+@test("the authorising failure kinds are exactly what the code can emit")
+def test_d1_authorising_kinds() -> None:
+    kinds, default = handle_failed_attempt_kinds()
+    authorising = fallback_module.AUTHORISING_FAILURE_KINDS
+    require(
+        default == "provider-failure",
+        f"the failure handler's default kind moved: {default!r}",
+    )
+    require(
+        authorising
+        == {
+            "provider-failure",
+            "provider-unavailable",
+            "model-unavailable",
+            "timeout",
+            "stalled-loop",
+            "no-result",
+        },
+        f"the authorising set is not the enumerated one: {authorising}",
+    )
+    # The subset assertion is the drift guard: a kind added to a failure
+    # call site, or one renamed, fails here rather than silently
+    # dropping out of the precondition.
+    require(
+        authorising <= kinds,
+        f"the authorising set names kinds the code cannot emit: "
+        f"{authorising - kinds}",
+    )
+    require(
+        kinds - authorising == {"config-error"},
+        "a failure kind is neither authorising nor deliberately excluded: "
+        f"{kinds - authorising}",
+    )
+    source = REVIEW_SCRIPT.read_text()
+    require(
+        '"interrupted"' in source
+        and '"output-failure"' in source
+        and not ({"interrupted", "output-failure"} & authorising),
+        "interrupted and output-failure are emitted but must not authorise",
+    )
+
+    with standing_stores() as (_runtime, state_dir):
+        reviewer = runtime_module.load_role("reviewer")
+        with d1_repository() as repository:
+            for kind in sorted(authorising):
+                store = state_dir / "orrery" / "incidents.jsonl"
+                store.unlink(missing_ok=True)
+                write_incident(
+                    state_dir, kind, reviewer, workdir=repository
+                )
+                found = fallback_module.authorising_failure(
+                    reviewer, cwd=repository
+                )
+                require(
+                    found is not None and found["kind"] == kind,
+                    f"{kind} did not authorise a substitution",
+                )
+            for kind in ("interrupted", "config-error", "output-failure"):
+                store = state_dir / "orrery" / "incidents.jsonl"
+                store.unlink(missing_ok=True)
+                write_incident(
+                    state_dir, kind, reviewer, workdir=repository
+                )
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is None,
+                    f"{kind} wrongly authorised a substitution",
+                )
+
+
+@test("a failure authorises only as the current state of its own repository")
+def test_d1_failure_is_current_and_local() -> None:
+    with standing_stores() as (_runtime, state_dir):
+        reviewer = runtime_module.load_role("reviewer")
+        store = state_dir / "orrery" / "incidents.jsonl"
+
+        def reset() -> None:
+            store.unlink(missing_ok=True)
+
+        with d1_repository() as repository, d1_repository() as elsewhere:
+            write_incident(
+                state_dir, "provider-failure", reviewer,
+                workdir=repository, age_seconds=60,
+            )
+            # The consent bookkeeping a failure is always followed by is
+            # neutral. A rule stated over the newest event of any kind
+            # would refuse every documented rerun, because the failure
+            # is never the newest event in one.
+            for neutral in (
+                "fallback-approval-required",
+                "fallback-declined",
+                "fallback-unavailable",
+                "standing-recorded",
+            ):
+                write_incident(
+                    state_dir, neutral, reviewer,
+                    workdir=repository, age_seconds=50,
+                )
+            require(
+                fallback_module.authorising_failure(
+                    reviewer, cwd=repository
+                )
+                is not None,
+                "consent bookkeeping cancelled the failure it follows",
+            )
+
+            # dispatch-closed is what a receipted run leaves behind:
+            # its accounting goes to attempt files the incident log
+            # never sees, so without it a receipted success could not
+            # cancel an older failure.
+            for cancelling in ("spend", "transient-retry", "dispatch-closed"):
+                reset()
+                write_incident(
+                    state_dir, "provider-failure", reviewer,
+                    workdir=repository, age_seconds=60,
+                )
+                write_incident(
+                    state_dir, cancelling, reviewer,
+                    workdir=repository, age_seconds=40,
+                )
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is None,
+                    f"a failure closed by {cancelling} still authorised",
+                )
+                # A later failure of the same identity stands again.
+                write_incident(
+                    state_dir, "timeout", reviewer,
+                    workdir=repository, age_seconds=10,
+                )
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is not None,
+                    f"a fresh failure after {cancelling} did not authorise",
+                )
+
+            reset()
+            write_incident(
+                state_dir, "provider-failure", reviewer, workdir=elsewhere
+            )
+            require(
+                fallback_module.authorising_failure(reviewer, cwd=repository)
+                is None,
+                "a failure in another repository authorised this one",
+            )
+
+            # The recorded workdir is the process working directory, not
+            # the repository root, so containment rather than equality.
+            reset()
+            nested = repository / "sub" / "deeper"
+            nested.mkdir(parents=True)
+            write_incident(
+                state_dir, "provider-failure", reviewer, workdir=nested
+            )
+            require(
+                fallback_module.authorising_failure(reviewer, cwd=repository)
+                is not None,
+                "a failure recorded in a subdirectory did not authorise",
+            )
+
+            reset()
+            for other in (
+                dataclasses.replace(reviewer, model="gpt-5.5"),
+                dataclasses.replace(reviewer, provider="anthropic"),
+                dataclasses.replace(reviewer, thinking="high"),
+                dataclasses.replace(reviewer, id="implementer"),
+            ):
+                write_incident(
+                    state_dir, "provider-failure", other, workdir=repository
+                )
+            require(
+                fallback_module.authorising_failure(reviewer, cwd=repository)
+                is None,
+                "a failure of another identity authorised this role",
+            )
+
+
+@test("a failure outside any repository authorises nothing")
+def test_d1_no_repository_fails_closed() -> None:
+    """The containment root must not degrade to the process directory.
+
+    A bare directory as the root matches every incident recorded
+    anywhere beneath it, so a failure in one checkout would authorise a
+    substitution in a sibling whenever the command runs from a parent
+    that is not itself a repository.
+    """
+    with standing_stores() as (_runtime, state_dir):
+        reviewer = runtime_module.load_role("reviewer")
+        with tempfile.TemporaryDirectory() as parent:
+            outer = Path(parent).resolve()
+            inner = outer / "checkout"
+            inner.mkdir()
+            subprocess.run(
+                ["git", "init", "--quiet", str(inner)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            write_incident(
+                state_dir,
+                "provider-failure",
+                reviewer,
+                workdir=inner,
+                age_seconds=60,
+            )
+            require(
+                fallback_module.authorising_failure(reviewer, cwd=inner)
+                is not None,
+                "the failure did not authorise inside its own repository",
+            )
+            require(
+                fallback_module.authorising_failure(reviewer, cwd=outer)
+                is None,
+                "a failure authorised from a non-repository parent",
+            )
+
+
+@test("a failure older than the window or the boot does not authorise")
+def test_d1_failure_recency_window() -> None:
+    saved = fallback_module.seconds_since_boot
+    try:
+        with standing_stores() as (_runtime, state_dir):
+            reviewer = runtime_module.load_role("reviewer")
+            store = state_dir / "orrery" / "incidents.jsonl"
+            with d1_repository() as repository:
+                fallback_module.seconds_since_boot = lambda: 30 * 86400.0
+                write_incident(
+                    state_dir, "provider-failure", reviewer,
+                    workdir=repository,
+                    age_seconds=fallback_module.FAILURE_WINDOW_SECONDS + 600,
+                )
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is None,
+                    "a failure older than the fixed window authorised",
+                )
+
+                store.unlink(missing_ok=True)
+                write_incident(
+                    state_dir, "provider-failure", reviewer,
+                    workdir=repository, age_seconds=600,
+                )
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is not None,
+                    "a failure inside the fixed window did not authorise",
+                )
+
+                # A machine up for three weeks makes the boot bound
+                # useless, so the fixed interval is the other half; a
+                # machine just booted makes the boot bound the tighter
+                # one, and it has to bite.
+                fallback_module.seconds_since_boot = lambda: 60.0
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is None,
+                    "a failure from before this boot authorised",
+                )
+
+                fallback_module.seconds_since_boot = lambda: None
+                require(
+                    fallback_module.authorising_failure(
+                        reviewer, cwd=repository
+                    )
+                    is not None,
+                    "an unreadable boot clock lost the fixed window too",
+                )
+    finally:
+        fallback_module.seconds_since_boot = saved
+
+
+@test("a standing approval is created only where a failure authorises it")
+def test_d1_standing_creation_is_gated() -> None:
+    with standing_stores() as (_runtime, state_dir):
+        reviewer = runtime_module.load_role("reviewer")
+        candidate = standing_candidate(reviewer)
+        decision = fallback_module.ConsentDecision(
+            fallback_module.Consent.APPROVED,
+            "until",
+            time.time() + 3600,
+        )
+        with d1_repository() as repository:
+            saved_cwd = Path.cwd()
+            os.chdir(repository)
+            try:
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    review_module.record_standing(
+                        reviewer,
+                        candidate,
+                        decision,
+                        reason="usage limit reached",
+                        failure_scope="provider",
+                    )
+                require(
+                    standing_module.list_active() == []
+                    and "authorises a standing approval" in errors.getvalue(),
+                    f"an unauthorised standing approval was created: "
+                    f"{errors.getvalue()}",
+                )
+                kinds = [
+                    event["kind"]
+                    for event in incidents_module.read_events()
+                ]
+                require(
+                    "standing-refused" in kinds,
+                    f"the refusal was not recorded: {kinds}",
+                )
+
+                write_incident(
+                    state_dir, "provider-failure", reviewer,
+                    workdir=repository,
+                )
+                with contextlib.redirect_stderr(io.StringIO()):
+                    review_module.record_standing(
+                        reviewer,
+                        candidate,
+                        decision,
+                        reason="usage limit reached",
+                        failure_scope="provider",
+                    )
+                active = standing_module.list_active()
+                require(
+                    len(active) == 1
+                    and active[0]["candidate_model"] == candidate.model,
+                    f"an authorised standing approval was not created: "
+                    f"{active}",
+                )
+            finally:
+                os.chdir(saved_cwd)
+
+        # The read path is deliberately ungated: a live record starts its
+        # recorded candidate on every use, so an emptied incident log
+        # must not silently re-run the provider already known to be
+        # broken.
+        (state_dir / "orrery" / "incidents.jsonl").unlink(missing_ok=True)
+        found = standing_module.match(reviewer)
+        require(
+            found is not None
+            and found["candidate_model"] == candidate.model,
+            f"the read path was gated on the incident log: {found!r}",
+        )
+
+        require(
+            standing_module.FINGERPRINT_VERSION == "v4",
+            "the fingerprint version was not bumped past the ungated "
+            f"records: {standing_module.FINGERPRINT_VERSION}",
+        )
+        store = state_dir / "orrery" / "standing.json"
+        data = read_json(store)
+        data["approvals"][0]["fingerprint"][0] = "v3"
+        write_json(store, data)
+        require(
+            standing_module.match(reviewer) is None,
+            "a record minted before the gate was still honoured",
+        )
+
+
+@test("an approval no failure authorises is held or refused by access")
+def test_d1_unverified_approval_by_access() -> None:
+    mechanic = runtime_module.load_role("mechanic")
+    state = review_module.DelegationState(
+        configured=mechanic, role=mechanic
+    )
+    errors = io.StringIO()
+    with contextlib.redirect_stderr(errors):
+        stop = review_module.unverified_approval(("anthropic", "fable"), state)
+    text = errors.getvalue()
+    require(
+        stop == fallback_module.APPROVAL_REQUIRED
+        and state.held_approval is None
+        and state.role is mechanic,
+        f"a write-capable role was not refused: {stop} {text}",
+    )
+    require(
+        "no recorded failure of openai/gpt-5.6-luna" in text
+        and "anthropic:fable" in text
+        and "ORRERY FALLBACK APPROVAL REQUIRED" in text
+        and "write-capable" in text,
+        f"the refusal did not name the absent record: {text}",
+    )
+
+    reviewer = runtime_module.load_role("reviewer")
+    state = review_module.DelegationState(
+        configured=reviewer, role=reviewer
+    )
+    errors = io.StringIO()
+    with contextlib.redirect_stderr(errors):
+        stop = review_module.unverified_approval(("anthropic", "fable"), state)
+    text = errors.getvalue()
+    require(
+        stop is None
+        and state.held_approval == ("anthropic", "fable")
+        and state.role is reviewer,
+        f"a read-only role did not hold the approval in reserve: {text}",
+    )
+    require(
+        "held in reserve" in text
+        and "ORRERY FALLBACK APPROVAL REQUIRED" not in text,
+        f"the reserve was not disclosed: {text}",
+    )
+
+
+@test("a held approval applies to the first failure without a new prompt")
+def test_d1_held_approval_applies_once() -> None:
+    # Run where the principal is not on Anthropic: D2 bars a delegate
+    # substitution onto the principal's own provider, so this is the
+    # configuration in which an Anthropic candidate is the user's to
+    # approve rather than the allowance rule's to refuse.
+    with standing_stores(), d1_repository(OPENAI_PRINCIPAL) as repository:
+        with contextlib.chdir(repository), provider_binaries_on_path():
+            reviewer = runtime_module.load_role("reviewer")
+            state = review_module.DelegationState(
+                configured=reviewer, role=reviewer
+            )
+            state.held_approval = ("anthropic", "fable")
+            invocation = review_module.Invocation(
+                timeout_seconds=60,
+                output_path=None,
+                prompt="prompt",
+                role_id="reviewer",
+                approval=("anthropic", "fable"),
+                no_fallback=False,
+            )
+            errors = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(errors):
+                    status = review_module.handle_failed_attempt(
+                        invocation,
+                        state,
+                        reason="simulated quota failure",
+                        status=1,
+                        scope=fallback_module.FailureScope.PROVIDER,
+                        context_warning=False,
+                    )
+            except review_module.NextAttempt:
+                status = None
+            text = errors.getvalue()
+            require(
+                status is None
+                and (state.role.provider, state.role.model)
+                == ("anthropic", "fable")
+                and state.is_fallback,
+                f"the held approval did not start its candidate: "
+                f"{status} {text}",
+            )
+            require(
+                "Fallback approved for anthropic:fable" in text
+                and "ORRERY FALLBACK APPROVAL REQUIRED" not in text
+                and "names a different candidate" not in text,
+                f"the held approval asked a second time: {text}",
+            )
+            # The reason names the approval rather than the failure, so
+            # this holds whatever the fresh ranking would have proposed.
+            require(
+                "Reason: the user approved a candidate proposed by an "
+                "earlier failed attempt" in text,
+                f"the candidate was re-ranked rather than resolved from "
+                f"the held approval: {text}",
+            )
+            require(
+                state.held_approval is None,
+                "the held approval was not spent",
+            )
+
+
+@test("a write-capable role with no recorded failure starts nothing")
+def test_d1_write_capable_rerun_stops_and_asks() -> None:
+    with until_store_only() as state_dir, d1_repository() as repository:
+        with tempfile.TemporaryDirectory() as scratch:
+            claude_arguments = Path(scratch) / "claude-args"
+            codex_arguments = Path(scratch) / "codex-args"
+            environment = review_environment(
+                "success", standing_state=state_dir
+            )
+            environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+            environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+            process = start_review(
+                environment,
+                "--role",
+                "mechanic",
+                "--timeout",
+                "60",
+                "--approve-fallback",
+                "anthropic:fable",
+                "--",
+                "prompt",
+                cwd=repository,
+            )
+            _stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 75,
+                f"expected the approval-required status: "
+                f"{process.returncode} {stderr}",
+            )
+            require(
+                "no recorded failure of openai/gpt-5.6-luna" in stderr
+                and "ORRERY FALLBACK APPROVAL REQUIRED" in stderr,
+                f"the refusal did not name the absent record: {stderr}",
+            )
+            require(
+                not claude_arguments.exists()
+                and not codex_arguments.exists(),
+                "a pre-emptive approval started a process anyway",
+            )
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a read-only role runs configured and keeps the approval in reserve")
+def test_d1_read_only_rerun_holds_the_approval() -> None:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
+        with tempfile.TemporaryDirectory() as scratch:
+            claude_arguments = Path(scratch) / "claude-args"
+            environment = review_environment(
+                "success", standing_state=state_dir
+            )
+            environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+            process = start_review(
+                environment,
+                "--timeout",
+                "60",
+                "--approve-fallback",
+                "anthropic:fable",
+                "--",
+                "prompt",
+                cwd=repository,
+            )
+            stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 0 and "# PASS" in stdout,
+                f"the configured reviewer did not run: {stderr}",
+            )
+            require(
+                "held in reserve" in stderr
+                and not claude_arguments.exists(),
+                f"the approval was applied pre-emptively: {stderr}",
+            )
+            # No --receipts, so the completion is recorded as a spend
+            # event in the incident log rather than in an attempt record.
+            kinds = [
+                json.loads(line)["kind"]
+                for line in (
+                    state_dir / "orrery" / "incidents.jsonl"
+                ).read_text().splitlines()
+            ]
+            require(
+                "spend" in kinds,
+                f"a receiptless completion recorded no spend: {kinds}",
+            )
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+        # The same shape, where the configured dispatch then fails. The
+        # reserve applies without a further prompt.
+        (state_dir / "orrery" / "incidents.jsonl").unlink(missing_ok=True)
+        failing = review_environment("success", standing_state=state_dir)
+        failing["CODEX_FAKE_MODE"] = "quota"
+        process = start_review(
+            failing,
+            "--timeout",
+            "60",
+            "--approve-fallback",
+            "anthropic:fable",
+            "--",
+            "prompt",
+            cwd=repository,
+        )
+        stdout, stderr = finish_review(process, failing)
+        require(
+            process.returncode == 0 and "fake Claude verdict" in stdout,
+            f"the reserve did not apply to a real failure: {stderr}",
+        )
+        require(
+            "held in reserve" in stderr
+            and "Fallback approved for anthropic:fable" in stderr
+            and "ORRERY FALLBACK APPROVAL REQUIRED" not in stderr,
+            f"the reserve asked a second time: {stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a recorded failure starts the approved candidate directly")
+def test_d1_recorded_failure_starts_the_candidate() -> None:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
+        with tempfile.TemporaryDirectory() as scratch:
+            codex_arguments = Path(scratch) / "codex-args"
+            write_incident(
+                state_dir,
+                "provider-failure",
+                runtime_module.load_role("reviewer"),
+                workdir=repository,
+            )
+            environment = review_environment(
+                "success", standing_state=state_dir
+            )
+            environment["CODEX_FAKE_ARGS"] = str(codex_arguments)
+            process = start_review(
+                environment,
+                "--timeout",
+                "60",
+                "--approve-fallback",
+                "anthropic:fable",
+                "--",
+                "prompt",
+                cwd=repository,
+            )
+            stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 0 and "fake Claude verdict" in stdout,
+                f"the approved candidate did not start: {stderr}",
+            )
+            require(
+                "Fallback approved for anthropic:fable" in stderr
+                and "held in reserve" not in stderr,
+                f"an authorised approval was not applied directly: {stderr}",
+            )
+            require(
+                not codex_arguments.exists(),
+                "the approved rerun retried the failed configured process",
+            )
+            assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+# ---------------------------------------------------------------------------
+# D2: the principal's own allowance is out of a delegate's reach
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def manifest_settings(**settings: Any) -> Any:
+    """Rank against a doctored copy of the manifest's own settings.
+
+    `global/orchestration.json` is simultaneously the shipped default
+    and the live configuration, so a test that needs a non-default
+    value reads a copy rather than writing the developer's own file.
+    The readers under test are the real ones; only the document they
+    read is substituted.
+    """
+    saved = fallback_module.load_manifest
+    manifest = copy.deepcopy(runtime_module.load_manifest())
+    manifest.update(settings)
+    fallback_module.load_manifest = lambda *_a, **_k: copy.deepcopy(manifest)
+    try:
+        yield manifest
+    finally:
+        fallback_module.load_manifest = saved
+
+
+def standing_record_for(configured: Any, candidate_identity: Any) -> None:
+    """Seed one live standing approval naming an exact candidate."""
+    standing_module.record_approval(
+        configured=configured,
+        candidate=runtime_module.Role(
+            id=configured.id,
+            title=configured.title,
+            provider=candidate_identity[0],
+            model=candidate_identity[1],
+            thinking="max",
+            access=configured.access,
+        ),
+        scope="until",
+        expires_at=time.time() + 3600,
+        reason="usage limit reached",
+        failure_scope="provider",
+    )
+
+
+@test("no delegate substitution reaches the principal's own allowance")
+def test_d2_principal_excluded_from_delegate_rankings() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    reviewer = runtime_module.load_role("reviewer")
+    identity = (principal.provider, principal.model)
+    require(
+        reviewer.provider != principal.provider,
+        "the fixture assumes the delegate and the principal differ in "
+        f"provider: {reviewer.provider} {principal.provider}",
+    )
+
+    # 1. the fresh ranking.
+    proposal = fallback_module.nearest_fallback(
+        reviewer,
+        "test",
+        excluded_providers={reviewer.provider},
+        assumed_ready={principal.provider},
+        discover_live=False,
+    )
+    require(
+        proposal is None,
+        f"a delegate was offered the principal's provider: {proposal}",
+    )
+    # The same ranking still has somewhere to go for the principal
+    # itself, so the refusal above is the rule and not an empty
+    # catalogue.
+    own = fallback_module.nearest_fallback(
+        principal,
+        "test",
+        excluded_providers={reviewer.provider},
+        assumed_ready={principal.provider},
+        discover_live=False,
+    )
+    require(
+        own is not None and own.candidate.provider == principal.provider,
+        f"the principal's own fallback was excluded too: {own}",
+    )
+
+    # 2. the approved-candidate walk.
+    environment = review_environment("success")
+    try:
+        approved, _providers, _models = (
+            fallback_module.proposal_for_approval(
+                reviewer, identity, environment=environment
+            )
+        )
+        require(
+            approved is None,
+            f"an approval resolved onto the principal: {approved}",
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        shutil.rmtree(environment["XDG_STATE_HOME"], ignore_errors=True)
+
+    with standing_stores() as (_runtime, _state_dir):
+        # 3. the standing-approval lookup. A record minted before the
+        # rule goes inert, and says so, rather than starting.
+        standing_record_for(reviewer, identity)
+        state = review_module.DelegationState(
+            configured=reviewer, role=reviewer
+        )
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            adopted = review_module.adopt_standing_approval(state)
+        text = errors.getvalue()
+        require(
+            adopted is None
+            and state.role is reviewer
+            and not state.is_fallback,
+            f"a standing record started the principal's model: {text}",
+        )
+        require(
+            "principal-allowance rule" in text
+            and "configured role will be attempted" in text,
+            f"the inert standing record was not disclosed: {text}",
+        )
+        kinds = [event["kind"] for event in incidents_module.read_events()]
+        require(
+            "standing-excluded" in kinds,
+            f"the exclusion was not recorded: {kinds}",
+        )
+
+        # With nothing left to propose, the run reports that and starts
+        # nothing rather than reaching for the principal.
+        state = review_module.DelegationState(
+            configured=reviewer, role=reviewer
+        )
+        invocation = review_module.Invocation(
+            timeout_seconds=60,
+            output_path=None,
+            prompt="prompt",
+            role_id="reviewer",
+            approval=None,
+            no_fallback=False,
+        )
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            status = review_module.handle_failed_attempt(
+                invocation,
+                state,
+                reason="simulated quota failure",
+                status=1,
+                scope=fallback_module.FailureScope.PROVIDER,
+                context_warning=False,
+            )
+        text = errors.getvalue()
+        require(
+            status == 1
+            and state.role is reviewer
+            and not state.is_fallback,
+            f"a failed delegate was substituted anyway: {status} {text}",
+        )
+        require(
+            "no authenticated or potentially authenticated fallback "
+            "candidate remains" in text,
+            f"the exhausted ranking was not reported: {text}",
+        )
+        kinds = [event["kind"] for event in incidents_module.read_events()]
+        require(
+            "fallback-unavailable" in kinds,
+            f"the exhausted ranking was not recorded: {kinds}",
+        )
+
+
+@test("a cross-provider delegate is capped by name, and the principal is not")
+def test_d2_cross_provider_thinking_cap() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    reviewer = runtime_module.load_role("reviewer")
+    require(
+        reviewer.thinking == "ultra"
+        and "ultra"
+        not in {
+            level
+            for entry in runtime_module.load_catalogue()[principal.provider]
+            for level in entry.get("thinking_levels", [])
+        },
+        "the fixture assumes a configured level the other provider does "
+        "not offer at all",
+    )
+
+    def crossed(**settings: str) -> Any:
+        with manifest_settings(
+            delegate_fallback_scope="principal-model", **settings
+        ):
+            return fallback_module.nearest_fallback(
+                reviewer,
+                "test",
+                excluded_providers={reviewer.provider},
+                assumed_ready={principal.provider},
+                discover_live=False,
+            )
+
+    capped = crossed()
+    require(
+        capped is not None
+        and capped.candidate.provider == principal.provider
+        and capped.candidate.thinking == "high",
+        f"an ultra delegate was not capped at high: {capped}",
+    )
+    raised = crossed(delegate_fallback_thinking_ceiling="max")
+    require(
+        raised is not None and raised.candidate.thinking == "max",
+        f"the raised manifest ceiling did not restore max: {raised}",
+    )
+
+    # A role configured without a thinking level has no name to match,
+    # so the candidate's own default chooses; the ceiling still binds
+    # it, or the cap would be optional for anyone who omits the field.
+    with manifest_settings(delegate_fallback_scope="principal-model"):
+        unset = fallback_module.nearest_fallback(
+            dataclasses.replace(reviewer, thinking=None),
+            "test",
+            excluded_providers={reviewer.provider},
+            assumed_ready={principal.provider},
+            discover_live=False,
+        )
+    require(
+        unset is not None and unset.candidate.thinking == "high",
+        f"an unset level escaped the ceiling: {unset}",
+    )
+
+    # The principal shares `_thinking_for` and is deliberately not
+    # governed: its cost is visible in the session the user is watching.
+    own = fallback_module.nearest_fallback(
+        principal,
+        "test",
+        excluded_providers={principal.provider},
+        assumed_ready={reviewer.provider},
+        discover_live=False,
+    )
+    require(
+        own is not None and own.candidate.thinking == "ultra",
+        f"the cap reached the principal's own fallback: {own}",
+    )
+
+
+@test("an unreadable marker still identifies the principal to exclude")
+def test_d2_principal_identification() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    reviewer = runtime_module.load_role("reviewer")
+    with d1_repository() as repository:
+        marker = repository / ".orrery.json"
+        write_json(
+            marker,
+            {"orchestrator": {"provider": "openai", "model": "gpt-5.5"}},
+        )
+        # The condition measured in the field: a marker left mode 0777,
+        # which makes the trust check refuse and the plain load raise.
+        os.chmod(marker, 0o777)
+        saved_cwd = Path.cwd()
+        os.chdir(repository)
+        try:
+            refused = False
+            try:
+                runtime_module.load_role("orchestrator")
+            except runtime_module.RuntimeConfigError:
+                refused = True
+            require(
+                refused,
+                "the fixture marker did not make the plain load raise",
+            )
+            identified = fallback_module.principal_identity()
+            require(
+                identified is not None
+                and (identified.provider, identified.model)
+                == (principal.provider, principal.model),
+                f"the principal was not identified past the marker: "
+                f"{identified}",
+            )
+            require(
+                fallback_module.principal_exclusions(reviewer)
+                == ({principal.provider}, set()),
+                "the exclusion did not apply normally past the marker",
+            )
+        finally:
+            os.chdir(saved_cwd)
+
+    # Only where even that fails is a candidate refused, and then only
+    # on a provider other than the delegate's own: an openai to openai
+    # substitution cannot touch an allowance that is somewhere else.
+    def unidentifiable(*_arguments: Any, **_keywords: Any) -> Any:
+        raise runtime_module.RuntimeConfigError("simulated manifest failure")
+
+    saved = fallback_module.load_role
+    fallback_module.load_role = unidentifiable
+    try:
+        require(
+            fallback_module.principal_identity() is None,
+            "an unidentifiable principal was identified anyway",
+        )
+        providers, models = fallback_module.principal_exclusions(reviewer)
+        require(
+            providers == set(runtime_module.PROVIDERS) - {reviewer.provider}
+            and not models,
+            f"the refusal was not confined to crossing providers: "
+            f"{providers} {models}",
+        )
+        same = fallback_module.nearest_fallback(
+            reviewer,
+            "test",
+            assumed_ready={reviewer.provider, principal.provider},
+            discover_live=False,
+        )
+        require(
+            same is not None and same.candidate.provider == reviewer.provider,
+            f"a same-provider substitution was refused too: {same}",
+        )
+        refusal = fallback_module.delegate_allowance_refusal(
+            reviewer, (principal.provider, principal.model)
+        )
+        require(
+            refusal is not None and "could not identify" in refusal,
+            f"the unidentified principal was not named: {refusal}",
+        )
+    finally:
+        fallback_module.load_role = saved
+
+
+@test("the delegate exclusion is provider-wide unless scoped to the model")
+def test_d2_delegate_fallback_scope() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    reviewer = runtime_module.load_role("reviewer")
+    require(
+        fallback_module.delegate_fallback_scope() == "principal-provider"
+        and fallback_module.delegate_thinking_ceiling() == "high",
+        "the shipped manifest does not carry the documented defaults",
+    )
+    require(
+        fallback_module.principal_exclusions(reviewer)
+        == ({principal.provider}, set()),
+        "the default scope did not exclude the principal's provider",
+    )
+
+    def nearest() -> Any:
+        return fallback_module.nearest_fallback(
+            reviewer,
+            "test",
+            excluded_providers={reviewer.provider},
+            assumed_ready={principal.provider},
+            discover_live=False,
+        )
+
+    require(
+        nearest() is None,
+        "the default scope offered a candidate on the principal's provider",
+    )
+    with manifest_settings(delegate_fallback_scope="principal-model"):
+        require(
+            fallback_module.principal_exclusions(reviewer)
+            == (set(), {(principal.provider, principal.model)}),
+            "the model scope did not narrow to the principal's identity",
+        )
+        sibling = nearest()
+        require(
+            sibling is not None
+            and sibling.candidate.provider == principal.provider
+            and sibling.candidate.model != principal.model,
+            f"the model scope withheld a sibling allowance: {sibling}",
+        )
+
+    for wrong in ("principal", "", None, True):
+        with manifest_settings(delegate_fallback_scope=wrong):
+            refused = False
+            try:
+                fallback_module.delegate_fallback_scope()
+            except runtime_module.RuntimeConfigError:
+                refused = True
+            require(
+                refused,
+                f"an invalid delegate_fallback_scope was accepted: {wrong!r}",
+            )
+    for wrong in ("higher", 3, None):
+        with manifest_settings(delegate_fallback_thinking_ceiling=wrong):
+            refused = False
+            try:
+                fallback_module.delegate_thinking_ceiling()
+            except runtime_module.RuntimeConfigError:
+                refused = True
+            require(
+                refused,
+                f"an invalid thinking ceiling was accepted: {wrong!r}",
+            )
+
+
+@test("an excluded approval names the rule rather than an absent candidate")
+def test_d2_refusal_names_the_allowance_rule() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    reviewer = runtime_module.load_role("reviewer")
+    identity = (principal.provider, principal.model)
+    refusal = fallback_module.delegate_allowance_refusal(reviewer, identity)
+    require(
+        refusal is not None
+        and "principal-allowance rule" in refusal
+        and "delegate_fallback_scope is principal-provider" in refusal
+        and f"{principal.provider}/{principal.model}" in refusal,
+        f"the refusal did not name the rule and the setting: {refusal}",
+    )
+    require(
+        fallback_module.delegate_allowance_refusal(
+            reviewer, (reviewer.provider, "gpt-5.5")
+        )
+        is None,
+        "a permitted candidate was refused",
+    )
+
+    saved_umask = os.umask(0o077)
+    saved_nesting = review_module.nesting_refusal
+    # The guard is not the subject and refuses inside any delegate unit,
+    # including the one a delegated build of this kit runs in.
+    review_module.nesting_refusal = lambda: None
+    try:
+        with standing_stores() as (_runtime, state_dir):
+            with d1_repository() as repository:
+                saved_cwd = Path.cwd()
+                os.chdir(repository)
+                try:
+                    write_incident(
+                        state_dir,
+                        "provider-failure",
+                        reviewer,
+                        workdir=repository,
+                    )
+                    invocation = review_module.Invocation(
+                        timeout_seconds=60,
+                        output_path=None,
+                        prompt="prompt",
+                        role_id="reviewer",
+                        approval=identity,
+                        no_fallback=False,
+                    )
+                    errors = io.StringIO()
+                    with contextlib.redirect_stderr(errors):
+                        status = review_module.main(invocation)
+                    text = errors.getvalue()
+                    require(
+                        status == fallback_module.APPROVAL_REQUIRED,
+                        f"an excluded approval did not stop the run: "
+                        f"{status} {text}",
+                    )
+                    require(
+                        "principal-allowance rule" in text
+                        and "delegate_fallback_scope" in text
+                        and "no process was started" in text
+                        and "no longer a potentially available candidate"
+                        not in text,
+                        f"the dispatch refusal was misreported: {text}",
+                    )
+                    kinds = [
+                        event["kind"]
+                        for event in incidents_module.read_events()
+                    ]
+                    require(
+                        "fallback-excluded" in kinds,
+                        f"the excluded approval was not recorded: {kinds}",
+                    )
+                finally:
+                    os.chdir(saved_cwd)
+    finally:
+        review_module.nesting_refusal = saved_nesting
+        os.umask(saved_umask)
+
+
+# ---------------------------------------------------------------------------
+# D3: the principal's own spend is accounted for and bounded
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def transcript_roots() -> Any:
+    """Empty Claude and Codex session roots the rollup reads instead.
+
+    The rollup scans the developer's own transcripts by default, which
+    are gigabytes and belong to real work. Pointing both roots at a
+    fixture is what makes a ceiling test a measurement of the fixture
+    rather than of the machine it runs on.
+    """
+    saved = {
+        name: os.environ.get(name)
+        for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")
+    }
+    with tempfile.TemporaryDirectory() as base:
+        claude = Path(base) / "claude"
+        codex = Path(base) / "codex"
+        (claude / "projects" / "fixture").mkdir(parents=True)
+        (codex / "sessions").mkdir(parents=True)
+        os.environ["CLAUDE_CONFIG_DIR"] = str(claude)
+        os.environ["CODEX_HOME"] = str(codex)
+        try:
+            yield claude / "projects" / "fixture", codex / "sessions"
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+
+def transcript_response(
+    identifier: str,
+    request: str,
+    model: str,
+    tokens: int,
+    *,
+    age_seconds: float = 120.0,
+) -> str:
+    """One assistant record, in the shape Claude Code actually writes.
+
+    Four token classes, because the ceiling counts cache reads and a
+    fixture carrying only fresh input would not prove that. The fields
+    are the ones a real transcript carries, so a parser that stopped
+    matching the surface would fail here rather than silently read zero.
+    """
+    quarter = tokens // 4
+    return json.dumps(
+        {
+            "type": "assistant",
+            "uuid": f"uuid-{identifier}",
+            "sessionId": "fixture-session",
+            "requestId": request,
+            "effort": "max",
+            "timestamp": datetime.fromtimestamp(
+                time.time() - age_seconds, timezone.utc
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "message": {
+                "id": identifier,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [{"type": "text", "text": "..."}],
+                "usage": {
+                    "input_tokens": quarter,
+                    "cache_read_input_tokens": quarter,
+                    "cache_creation_input_tokens": quarter,
+                    "output_tokens": tokens - 3 * quarter,
+                    "service_tier": "standard",
+                },
+            },
+        }
+    )
+
+
+def transcript_noise(age_seconds: float = 150.0) -> list[str]:
+    """Records a real transcript carries that must not be counted.
+
+    A user turn, a summary, and the synthetic assistant record that
+    carries no tokens at all. The last one matters most: it is skipped
+    before its identity is taken, so it cannot swallow a counted
+    response's identity.
+    """
+    stamp = (
+        datetime.fromtimestamp(time.time() - age_seconds, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    return [
+        json.dumps({"type": "summary", "summary": "a session"}),
+        json.dumps(
+            {
+                "type": "user",
+                "timestamp": stamp,
+                "message": {"role": "user", "content": "do the thing"},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "timestamp": stamp,
+                "requestId": "",
+                "message": {
+                    "id": "msg_synthetic",
+                    "model": "claude-fable-5-1",
+                    "usage": {
+                        "input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "output_tokens": 0,
+                    },
+                },
+            }
+        ),
+    ]
+
+
+def write_transcript(path: Path, lines: list[str]) -> None:
+    path.write_text("\n".join(lines) + "\n")
+
+
+def codex_rollout(
+    path: Path,
+    model: str,
+    total: int,
+    *,
+    age_seconds: float = 120.0,
+) -> None:
+    """One Codex rollout, in the shape the CLI actually writes.
+
+    A running total for the whole session rather than a record per
+    response, which is why a rollout is counted by its growth.
+    """
+    stamp = (
+        datetime.fromtimestamp(time.time() - age_seconds, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    cached = total // 3
+    path.write_text(
+        "\n".join(
+            json.dumps({"timestamp": stamp, "payload": payload})
+            for payload in (
+                {"type": "session_meta", "model_provider": "openai"},
+                {"type": "turn_context", "model": model},
+                {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": total - 1,
+                            "cached_input_tokens": cached,
+                            "cache_write_input_tokens": 0,
+                            "output_tokens": 1,
+                            "total_tokens": total,
+                        }
+                    },
+                },
+            )
+        )
+        + "\n"
+    )
+
+
+@contextlib.contextmanager
+def manifest_allowances(**allowances: Any) -> Any:
+    """Read allowances from a doctored copy of the live manifest.
+
+    `global/orchestration.json` is the shipped default and the live
+    configuration at once, so a test that needs a configured allowance
+    reads a copy rather than writing the developer's own file.
+    """
+    saved = allowance_module.load_manifest
+    manifest = copy.deepcopy(runtime_module.load_manifest())
+    manifest["allowances"] = {
+        provider: dict(entry) for provider, entry in allowances.items()
+    }
+    allowance_module.load_manifest = lambda *_a, **_k: copy.deepcopy(manifest)
+    try:
+        yield manifest
+    finally:
+        allowance_module.load_manifest = saved
+
+
+@contextlib.contextmanager
+def counted_opens(suffix: str = ".jsonl") -> Any:
+    """Record every session log opened while the block runs."""
+    opened: list[str] = []
+    saved = Path.open
+
+    def spy(self: Path, *arguments: Any, **keywords: Any) -> Any:
+        if str(self).endswith(suffix):
+            opened.append(str(self))
+        return saved(self, *arguments, **keywords)
+
+    Path.open = spy
+    try:
+        yield opened
+    finally:
+        Path.open = saved
+
+
+def anthropic_role(role_id: str = "reviewer", model: str = "opus") -> Any:
+    return runtime_module.Role(
+        id=role_id,
+        title="Fixture role",
+        provider="anthropic",
+        model=model,
+        thinking="high",
+        access="read-only",
+    )
+
+
+@test("the ceiling measures a real transcript and sums a provider's models")
+def test_d3_ceiling_from_a_real_transcript() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [
+                *transcript_noise(),
+                transcript_response("msg_a1", "req_a1", "claude-fable-5-1", 600),
+                transcript_response("msg_a2", "req_a2", "claude-opus-5", 400),
+            ],
+        )
+        role = anthropic_role()
+        with manifest_allowances(
+            anthropic={"tokens": 1000, "window_days": 7}
+        ) as manifest:
+            refusal = allowance_module.ceiling_refusal(role, manifest=manifest)
+        require(
+            refusal is not None
+            and "the anthropic allowance is spent" in refusal
+            and "1,000 tokens" in refusal
+            and "ceiling of 1,000" in refusal
+            and "7 day(s)" in refusal,
+            f"the ceiling did not refuse at its own figure: {refusal}",
+        )
+        # (U2) One bucket for the provider: spend from two Anthropic
+        # models sums, rather than each being measured against the whole.
+        require(
+            "fable 600" in refusal and "opus 400" in refusal,
+            f"the two models did not sum into one bucket: {refusal}",
+        )
+        require(
+            "cache reads" in refusal,
+            f"the refusal did not say what it counts: {refusal}",
+        )
+        with manifest_allowances(
+            anthropic={"tokens": 1001, "window_days": 7}
+        ) as manifest:
+            require(
+                allowance_module.ceiling_refusal(role, manifest=manifest)
+                is None,
+                "a ceiling above the measured spend still refused",
+            )
+        # (R9) The manifest names a provider and the transcript records
+        # an API identifier. Without the mapping the spend reaches no
+        # provider at all and the ceiling silently never fires, which a
+        # doctored store could not have caught.
+        rollup = allowance_module.read_rollup()
+        keys = {
+            key
+            for entry in rollup["hours"].values()
+            for key in entry["spend"]
+        }
+        require(
+            keys == {"anthropic/fable", "anthropic/opus"},
+            f"the transcript models were not mapped onto the manifest: {keys}",
+        )
+        require(
+            allowance_module.window_spend(
+                "openai", 7, rollup=rollup
+            )["total"]
+            == 0,
+            "Anthropic spend was attributed to another provider",
+        )
+
+
+@test("a model only the manifest names still reaches its own provider")
+def test_d3_manifest_named_model_is_attributed() -> None:
+    # Measured rather than imagined: a live gpt-6-astra session, a model
+    # the bundled catalogue has never carried, reached no provider at
+    # all and its spend counted towards no allowance.
+    with standing_stores(), transcript_roots() as (_projects, sessions):
+        codex_rollout(sessions / "rollout-fixture.jsonl", "gpt-6-astra", 900)
+        manifest = copy.deepcopy(runtime_module.load_manifest())
+        manifest["allowances"] = {"openai": {"tokens": 900, "window_days": 7}}
+        manifest["steps"] = [
+            {"id": "plan-reviewer", "provider": "openai", "model": "gpt-6-astra"}
+        ]
+        rollup = allowance_module.refresh(manifest=manifest)
+        spend = allowance_module.window_spend("openai", 7, rollup=rollup)
+        require(
+            spend["total"] == 900 and spend["models"] == {"gpt-6-astra": 900},
+            f"a manifest-named model was not attributed: {spend}",
+        )
+
+        # A role routed at an endpoint names a third-party service, so
+        # its model says nothing about the first-party allowance.
+        routed = copy.deepcopy(manifest)
+        routed["steps"] = [
+            {
+                "id": "plan-reviewer",
+                "provider": "openai",
+                "model": "gpt-6-astra",
+                "endpoint": "somewhere",
+            }
+        ]
+        resolve = allowance_module.model_resolver(routed)
+        require(
+            resolve("gpt-6-astra") == "/gpt-6-astra",
+            f"an endpoint-routed model was claimed for its provider: "
+            f"{resolve('gpt-6-astra')}",
+        )
+        # The catalogue still decides where it can. `load_role` refuses
+        # a manifest that assigns a model to the wrong provider, so this
+        # is the defensive half: even one that got through cannot move
+        # spend onto another provider's allowance.
+        misassigned = allowance_module.model_resolver(
+            {
+                "steps": [
+                    {
+                        "id": "reviewer",
+                        "provider": "openai",
+                        "model": "claude-opus-5",
+                    }
+                ]
+            }
+        )("claude-opus-5")
+        require(
+            misassigned == "anthropic/opus",
+            f"a manifest entry overrode the catalogue's ownership: "
+            f"{misassigned}",
+        )
+
+
+@test("a delegate dispatch onto an exhausted allowance starts nothing")
+def test_d3_dispatch_refusal_starts_nothing() -> None:
+    saved_umask = os.umask(0o077)
+    saved_nesting = review_module.nesting_refusal
+    saved_availability = review_module.role_availability
+    # The guard is not the subject and refuses inside any delegate unit,
+    # including the one a delegated build of this kit runs in.
+    review_module.nesting_refusal = lambda: None
+
+    def refuse_to_probe(_role: Any) -> Any:
+        raise Failure("the refusal reached a provider before stopping")
+
+    review_module.role_availability = refuse_to_probe
+    try:
+        with standing_stores(), transcript_roots() as (projects, _codex):
+            write_transcript(
+                projects / "session.jsonl",
+                [
+                    transcript_response(
+                        "msg_b1", "req_b1", "claude-opus-5", 1_200
+                    )
+                ],
+            )
+            invocation = review_module.Invocation(
+                timeout_seconds=60,
+                output_path=None,
+                prompt="prompt",
+                role_id="reviewer",
+                approval=None,
+                no_fallback=False,
+            )
+            reviewer = runtime_module.load_role("reviewer")
+            state = review_module.DelegationState(
+                configured=reviewer, role=anthropic_role()
+            )
+            with manifest_allowances(anthropic={"tokens": 1_000, "window_days": 7}):
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    status = review_module.main(invocation, state)
+            text = errors.getvalue()
+            require(
+                status == review_module.ALLOWANCE_EXHAUSTED,
+                f"an exhausted allowance did not refuse the dispatch: "
+                f"{status} {text}",
+            )
+            require(
+                "the anthropic allowance is spent" in text
+                and "ceiling of 1,000" in text
+                and "no process was started" in text,
+                f"the dispatch refusal did not name the ceiling: {text}",
+            )
+            kinds = [
+                event["kind"] for event in incidents_module.read_events()
+            ]
+            require(
+                "allowance-exhausted" in kinds,
+                f"the refusal was not recorded: {kinds}",
+            )
+            # The same dispatch under a ceiling the spend is inside runs
+            # on, which is what makes the refusal above a measurement
+            # rather than a blanket stop.
+            with manifest_allowances(
+                anthropic={"tokens": 10_000, "window_days": 7}
+            ):
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    try:
+                        review_module.main(invocation, state)
+                    except Failure:
+                        pass
+                    else:
+                        raise Failure(
+                            "a dispatch inside its allowance was still stopped"
+                        )
+    finally:
+        review_module.role_availability = saved_availability
+        review_module.nesting_refusal = saved_nesting
+        os.umask(saved_umask)
+
+
+@test("the ceiling reads one rollup in the state directory, not the ledger")
+def test_d3_one_accounting_source() -> None:
+    tree = ast.parse((KIT_DIR / "scripts" / "orrery_allowance.py").read_text())
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    require(
+        "orrery_ledger" not in imported,
+        f"the accounting module imports the per-task ledger: {imported}",
+    )
+    with standing_stores() as (_runtime, state_dir), transcript_roots() as (
+        projects,
+        _codex,
+    ):
+        require(
+            allowance_module.rollup_path() == state_dir / "orrery" / "allowance.json",
+            f"the rollup is not in the state directory: "
+            f"{allowance_module.rollup_path()}",
+        )
+        write_transcript(
+            projects / "session.jsonl",
+            [transcript_response("msg_c1", "req_c1", "claude-opus-5", 900)],
+        )
+        # Every entry point into the per-task ledger is made to raise, so
+        # a refusal that still lands cannot have consulted it. The ledger
+        # is a per-repository, per-task store of delegate attempt spend
+        # and holds no principal turn at all.
+        sabotaged: list[tuple[str, Any]] = []
+
+        def refuse(*_a: Any, **_k: Any) -> Any:
+            raise Failure("the ceiling consulted the per-task ledger")
+
+        for name in dir(ledger_module):
+            value = getattr(ledger_module, name)
+            if callable(value) and not name.startswith("__"):
+                sabotaged.append((name, value))
+                setattr(ledger_module, name, refuse)
+        try:
+            with manifest_allowances(
+                anthropic={"tokens": 900, "window_days": 7}
+            ) as manifest:
+                refusal = allowance_module.ceiling_refusal(
+                    anthropic_role(), manifest=manifest
+                )
+        finally:
+            for name, value in sabotaged:
+                setattr(ledger_module, name, value)
+        require(
+            refusal is not None and "900" in refusal,
+            f"the ceiling did not measure without the ledger: {refusal}",
+        )
+        # (R7) Keyed by provider and model, which is what lets one
+        # rollup answer both a provider ceiling and a per-model report.
+        rollup = allowance_module.read_rollup()
+        require(
+            all(
+                allowance_module.split_key(key) == ("anthropic", "opus")
+                for entry in rollup["hours"].values()
+                for key in entry["spend"]
+            )
+            and rollup["hours"],
+            f"the rollup is not keyed by provider and model: {rollup['hours']}",
+        )
+
+
+@test("a resumed transcript is counted once and a shrunken one is rescanned")
+def test_d3_accounting_deduplicates_by_identity() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        first = projects / "first.jsonl"
+        write_transcript(
+            first,
+            [
+                transcript_response("msg_d1", "req_d1", "claude-opus-5", 500),
+                transcript_response("msg_d2", "req_d2", "claude-opus-5", 300),
+            ],
+        )
+        with manifest_allowances() as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+            require(
+                allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+                == 800,
+                "the first transcript was not counted",
+            )
+
+            # A session resumed into a second transcript replays the
+            # responses it already recorded. Offsets alone cannot see
+            # that, and the resulting overcount is what locks a user out.
+            write_transcript(
+                projects / "second.jsonl",
+                [
+                    transcript_response(
+                        "msg_d1", "req_d1", "claude-opus-5", 500
+                    ),
+                    transcript_response(
+                        "msg_d2", "req_d2", "claude-opus-5", 300
+                    ),
+                    transcript_response(
+                        "msg_d3", "req_d3", "claude-opus-5", 100
+                    ),
+                ],
+            )
+            rollup = allowance_module.refresh(manifest=manifest)
+            require(
+                allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+                == 900,
+                "a resumed transcript was counted twice: "
+                f"{allowance_module.window_spend('anthropic', 7, rollup=rollup)}",
+            )
+
+            # A file shorter than its recorded offset was truncated or
+            # replaced under the same name. Reading on from the old
+            # offset would skip everything now in front of it.
+            write_transcript(
+                first,
+                [transcript_response("msg_d4", "req_d4", "claude-opus-5", 7)],
+            )
+            rollup = allowance_module.refresh(manifest=manifest)
+            require(
+                allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+                == 907,
+                "a shrunken transcript was not rescanned: "
+                f"{allowance_module.window_spend('anthropic', 7, rollup=rollup)}",
+            )
+
+
+@test("SessionStart refreshes the rollup, so a killed session still counts")
+def test_d3_session_start_refreshes_the_rollup() -> None:
+    with standing_stores() as (_runtime, state_dir), transcript_roots() as (
+        projects,
+        _codex,
+    ):
+        write_transcript(
+            projects / "killed.jsonl",
+            [transcript_response("msg_e1", "req_e1", "claude-opus-5", 4_242)],
+        )
+        require(
+            not allowance_module.rollup_path().exists(),
+            "the fixture began with a rollup already written",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+            environment = os.environ.copy()
+            # The hook stands aside for a bounded delegate, and this
+            # suite may itself be running as one, so the marker is
+            # cleared for the session being simulated.
+            environment.pop("ORRERY_ROLE", None)
+            result = subprocess.run(
+                [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+                input=json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "source": "startup",
+                        "cwd": str(repository),
+                        "model": "claude-opus-5",
+                    }
+                ),
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        require(
+            result.returncode == 0,
+            f"the SessionStart hook failed: {result.stderr}",
+        )
+        rollup = allowance_module.read_rollup()
+        require(
+            allowance_module.window_spend("anthropic", 7, rollup=rollup)["total"]
+            == 4_242,
+            "SessionStart did not fold the previous session's spend in: "
+            f"{rollup['hours']}",
+        )
+
+
+@test("a rollup read opens only the session logs whose size has changed")
+def test_d3_rollup_opens_only_changed_files() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        quiet = projects / "quiet.jsonl"
+        busy = projects / "busy.jsonl"
+        write_transcript(
+            quiet,
+            [transcript_response("msg_f1", "req_f1", "claude-opus-5", 10)],
+        )
+        write_transcript(
+            busy,
+            [transcript_response("msg_f2", "req_f2", "claude-opus-5", 20)],
+        )
+        with manifest_allowances() as manifest:
+            with counted_opens() as opened:
+                allowance_module.refresh(manifest=manifest)
+            require(
+                sorted(Path(name).name for name in opened)
+                == ["busy.jsonl", "quiet.jsonl"],
+                f"the first read did not open both logs: {opened}",
+            )
+
+            with counted_opens() as opened:
+                allowance_module.refresh(manifest=manifest)
+            require(
+                opened == [],
+                f"an unchanged machine still opened session logs: {opened}",
+            )
+
+            busy.write_text(
+                busy.read_text()
+                + transcript_response("msg_f3", "req_f3", "claude-opus-5", 30)
+                + "\n"
+            )
+            with counted_opens() as opened:
+                rollup = allowance_module.refresh(manifest=manifest)
+            require(
+                [Path(name).name for name in opened] == ["busy.jsonl"],
+                f"the read opened more than the changed log: {opened}",
+            )
+            require(
+                allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+                == 60,
+                "the incremental read lost or repeated spend",
+            )
+
+
+@test("the doctor warns when an adopted repository has no allowance")
+def test_d3_doctor_warns_without_an_allowance() -> None:
+    with standing_stores(), transcript_roots():
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+            write_json(
+                repository / ".orrery.json",
+                {"orchestrator": {"provider": "anthropic", "model": "opus"}},
+            )
+            with manifest_allowances():
+                lines = allowance_module.doctor_report(repository)
+            require(
+                any(
+                    line.startswith("WARN|no allowance is configured for "
+                                    "anthropic")
+                    and "anthropic/opus" in line
+                    and "global/orchestration.json" in line
+                    for line in lines
+                ),
+                f"a missing allowance was not warned about: {lines}",
+            )
+
+            with manifest_allowances(
+                anthropic={"tokens": 1_000, "window_days": 7}
+            ):
+                covered = allowance_module.doctor_report(repository)
+            require(
+                not any(line.startswith("WARN|no allowance") for line in covered)
+                and any(
+                    line.startswith("PASS|anthropic: 0 of 1,000 tokens")
+                    for line in covered
+                ),
+                f"a configured allowance still warned: {covered}",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            plain = Path(directory)
+            subprocess.run(["git", "init", "-q", str(plain)], check=True)
+            with manifest_allowances():
+                unadopted = allowance_module.doctor_report(plain)
+            require(
+                unadopted == [
+                    "SKIP|this repository is not adopted, so no allowance applies"
+                ],
+                f"an un-adopted repository was warned about: {unadopted}",
+            )
+
+
+@test("orrery-doctor reports the missing allowance for this repository")
+def test_d3_doctor_reports_the_missing_allowance() -> None:
+    # The stub providers are lent through PATH rather than through
+    # `review_environment`, whose confinement probe belongs to delegate
+    # dispatch and has nothing to say about a diagnostic that starts no
+    # provider at all.
+    with standing_stores(), provider_binaries_on_path():
+        result = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=os.environ.copy(),
+            cwd=str(KIT_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    principal = runtime_module.load_role("orchestrator", cwd=KIT_DIR)
+    configured = allowance_module.load_allowances()
+    expected = (
+        f"WARN  Allowance: no allowance is configured for {principal.provider}"
+        if principal.provider not in configured
+        else f"PASS  Allowance: {principal.provider}: "
+    )
+    require(
+        expected in result.stdout,
+        f"the doctor did not report the allowance state: "
+        f"{result.stdout[-800:]}",
+    )
+
+
+@test("a configured allowance is validated before it is enforced")
+def test_d3_allowance_validation() -> None:
+    require(
+        allowance_module.load_allowances({}) == {},
+        "an absent allowances block is not empty",
+    )
+    loaded = allowance_module.load_allowances(
+        {"allowances": {"anthropic": {"tokens": 12, "window_days": 7}}}
+    )
+    require(
+        loaded["anthropic"] == allowance_module.Allowance("anthropic", 12, 7),
+        f"a valid allowance did not load: {loaded}",
+    )
+    for wrong in (
+        {"allowances": []},
+        {"allowances": {"acme": {"tokens": 1, "window_days": 1}}},
+        {"allowances": {"anthropic": 1}},
+        {"allowances": {"anthropic": {"tokens": 1}}},
+        {"allowances": {"anthropic": {"tokens": 0, "window_days": 1}}},
+        {"allowances": {"anthropic": {"tokens": True, "window_days": 1}}},
+        {"allowances": {"anthropic": {"tokens": 1, "window_days": 0}}},
+        {"allowances": {"anthropic": {"tokens": 1, "window_days": 400}}},
+        {"allowances": {"anthropic": {"tokens": 1, "window_days": 1, "x": 2}}},
+    ):
+        try:
+            allowance_module.load_allowances(wrong)
+        except runtime_module.RuntimeConfigError:
+            continue
+        raise Failure(f"an invalid allowance was accepted: {wrong}")
+
+
 @test("the verbosity dial validates, defaults terse, and honours the env")
 def test_verbosity_dial() -> None:
     require(
@@ -13065,9 +15201,19 @@ def test_incidents_from_delegated_timeout() -> None:
 
 @test("an approved delegated rerun records its fallback-approved incident")
 def test_incidents_from_approved_rerun() -> None:
-    with tempfile.TemporaryDirectory() as directory:
+    with tempfile.TemporaryDirectory() as directory, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
         state_home = Path(directory) / "state"
         state_home.mkdir(mode=0o700)
+        # The fast path this test is about runs only once a failure has
+        # verified the approval, so the previous run's record is seeded.
+        write_incident(
+            state_home,
+            "provider-failure",
+            runtime_module.load_role("reviewer"),
+            workdir=repository,
+        )
         environment = review_environment(
             "success", standing_state=state_home
         )
@@ -13079,6 +15225,7 @@ def test_incidents_from_approved_rerun() -> None:
             "anthropic:fable",
             "--",
             "prompt",
+            cwd=repository,
         )
         stdout, stderr = finish_review(process, environment)
         require(
@@ -16108,6 +18255,13 @@ def test_read_only_linked_worktree_command_paths() -> None:
             subprocess.run(["git", "-C", str(root), "add", "tracked"], check=True)
             subprocess.run(["git", "-C", str(root), "-c", "user.name=Kit", "-c", "user.email=kit@test", "commit", "-qm", "initial"], check=True)
             subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", str(linked)], check=True)
+            # D2 bars a delegate substitution onto the principal's
+            # provider, so the seeded Anthropic approval is reachable
+            # only where the principal is somewhere else.
+            write_json(
+                linked / ".orrery.json",
+                {"orchestrator": OPENAI_PRINCIPAL},
+            )
             bin_dir = Path(tempfile.mkdtemp(prefix="kit-systemd-capture."))
             capture = bin_dir / "argv.json"
             (bin_dir / "systemctl").write_text(
@@ -22242,7 +24396,7 @@ def main() -> int:
             else:
                 os.environ[name] = value
         shutil.rmtree(suite_state, ignore_errors=True)
-        for leftover in (*STATE_DIRS, *FAKE_BIN_DIRS):
+        for leftover in (*STATE_DIRS, *FAKE_BIN_DIRS, *HOME_DIRS):
             shutil.rmtree(leftover, ignore_errors=True)
         if live_settings_digest() != live_settings_before:
             failures += 1

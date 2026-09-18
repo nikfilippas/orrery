@@ -170,6 +170,90 @@ The manifest's top-level `verbosity` steers how delegated roles write:
 prompts only; principal and direct sessions take the static
 communication-style rule in `global/AGENTS.md`.
 
+## Bound what a provider may spend
+
+### Delegate fallback scope
+
+Two top-level manifest settings govern where a delegated role may be
+substituted when its configured provider fails.
+
+```json
+"delegate_fallback_scope": "principal-provider",
+"delegate_fallback_thinking_ceiling": "high"
+```
+
+`delegate_fallback_scope` bars a delegate substitution from reaching the
+principal's own allowance. The default, `principal-provider`, excludes
+every candidate on the provider the principal runs on; `principal-model`
+excludes only its exact model, at any thinking level. Provider is the
+default because the measured constraint is account-wide, so excluding a
+single model protects nothing: a delegate moved from the principal's
+Fable onto its Opus draws on the same seven-day window.
+
+The rule governs substitution, never configuration. A delegate you
+deliberately assign to the principal's provider still runs there; what it
+may not do is arrive there because something else failed. Where the rule
+leaves no candidate, the run reports that fallback is unavailable and
+stops rather than spending the allowance the split exists to protect.
+
+Two consequences worth knowing before you rely on it. The exclusion
+applies whether or not an `allowance` is configured for that provider, so
+at shipped defaults it restricts every delegate's ladder to protect a
+budget you have not yet declared. And where a delegate shares the
+principal's provider, it loses its same-provider ladder entirely and can
+only ever be substituted across providers.
+
+`delegate_fallback_thinking_ceiling` caps a cross-provider delegate
+candidate by name, defaulting to `high`. Without it, a role configured at
+the top of its own provider's scale maps onto the top of the substitute's
+scale, which is the most expensive setting available and is rarely what
+was intended. The principal's own fallback is not capped: it is an
+interactive session whose cost you can see and interrupt.
+
+The manifest's top-level `allowances` names a token ceiling per provider
+over a rolling window. It ships empty, and `orrery-doctor` warns while an
+adopted repository's principal runs on a provider with no allowance,
+because nothing then bounds what that session spends.
+
+```json
+"allowances": {
+  "anthropic": { "tokens": 1200000000, "window_days": 7 }
+}
+```
+
+**The ceiling counts cache reads.** It sums the same four token classes
+`orrery-usage` reports: fresh input, cache read, cache write and output.
+Cache reads dominate real figures by an order of magnitude, so a number
+copied from a provider's own headline usage figure will mean something
+quite different from this one. Set it from `orrery-usage` instead, which
+is the same measurement for Anthropic.
+
+For OpenAI it is not, and the difference is worth knowing before you set
+a number from it. A Codex rollout records a cumulative session total and
+no per-response timestamp, so the ceiling cannot tell when any of it was
+spent. It therefore records a baseline the first time it sees a rollout
+and counts only growth after that, while `orrery-usage` counts the whole
+file. The ceiling will read lower than `orrery-usage` for OpenAI by
+whatever those sessions had already spent when the rollup was first
+built, and the two converge as new work accumulates.
+
+Keyed by provider rather than by model, because the measured constraint
+is account-wide: Anthropic reports one five-hour and one seven-day window
+for the whole account with no per-model breakdown, so every Anthropic
+model's spend sums into the one bucket.
+
+Spend is measured from the local session logs, the Claude transcripts and
+Codex rollout files this machine has written, and folded into one rollup
+beside the incident store. Delegated runs keep no session file at all, so
+they are absent by construction and are accounted for by the task ledger
+instead. The figure is therefore a local estimate of interactive spend and
+not the provider's billing.
+
+Once a provider's window spend reaches its ceiling, `orrery-agent` refuses
+to start any role on that provider and exits 78, naming the measured
+spend, the ceiling and the window. Raise the ceiling, route the role at
+another provider, or wait for the window to pass.
+
 ## Watch and capture a delegated run
 
 ```bash
@@ -1005,6 +1089,8 @@ The maintained artefacts are:
   entry point.
 - `scripts/orrery_incidents.py` and `scripts/orrery-incidents` — the
   incident log writer/reader module and its reporting command.
+- `scripts/orrery_allowance.py` — the per-provider token ceiling and the
+  rollup of local session spend it is measured against.
 - `scripts/orrery_ledger.py` and `scripts/orrery-task` — the durable task
   ledger, contracts, and state machine, and the task command surface
   (Phase 1 control plane).

@@ -44,7 +44,11 @@ STORE_NAME = "standing.json"
 LOCK_NAME = "standing.lock"
 GLOBAL_LOCK_NAME = "standing-all.lock"
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
-FINGERPRINT_VERSION = "v3"
+# v4 invalidates every record minted before a standing approval required
+# a verified failure to create it. `_valid_record` rejects an older
+# version outright, so the ungated records are retired in one line
+# rather than being honoured for the rest of their scope.
+FINGERPRINT_VERSION = "v4"
 _FAILURE_SCOPES = frozenset({"provider", "model", "transient"})
 
 

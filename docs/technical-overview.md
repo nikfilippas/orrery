@@ -1251,6 +1251,7 @@ number on this page should be read as one.
 | `scripts/orrery-review` | contained generic role runner; compatibility filename |
 | `scripts/orrery_incidents.py` | best-effort incident log writer and validated reader |
 | `scripts/orrery-incidents` | incident aggregation and reporting command |
+| `scripts/orrery_allowance.py` | per-provider token ceiling and the session-spend rollup it reads |
 | `scripts/orrery-config` | atomic visual configuration surface |
 | `scripts/orrery-usage` | local token-usage accounting from provider session logs |
 | `scripts/orrery-task` | task contracts, parallel dispatch, verification, review queue, and the evidence-gated merge |

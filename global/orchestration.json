@@ -1,6 +1,9 @@
 {
   "verbosity": 1,
   "max_concurrent_tasks": 2,
+  "delegate_fallback_scope": "principal-provider",
+  "delegate_fallback_thinking_ceiling": "high",
+  "allowances": {},
   "prices": {
     "as_of": null,
     "currency": "USD",

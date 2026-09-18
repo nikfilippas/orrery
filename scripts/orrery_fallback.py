@@ -21,7 +21,7 @@ import subprocess
 import sys
 from hashlib import sha256
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import IO, Any, Callable, Iterable
@@ -29,6 +29,7 @@ from typing import IO, Any, Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from orrery_incidents import read_events  # noqa: E402
 from orrery_model_catalogue import (  # noqa: E402
     CatalogueDiscoveryError,
     discover_claude_models,
@@ -39,8 +40,10 @@ from orrery_runtime import (  # noqa: E402
     PROVIDERS,
     Role,
     RuntimeConfigError,
+    _git_root,
     load_catalogue,
     load_manifest,
+    load_role,
 )
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
@@ -53,6 +56,42 @@ from orrery_standing import (  # noqa: E402
 APPROVAL_REQUIRED = 75
 AUTH_TIMEOUT_SECONDS = 8.0
 DISCOVERY_TIMEOUT_SECONDS = 12.0
+
+# A substitution may be authorised only by a failure the incident log
+# actually recorded. These are the kinds handle_failed_attempt writes,
+# minus `config-error`: a broken configuration must be repaired rather
+# than routed around, and it reaches that handler like the rest. Two
+# failures recorded elsewhere are excluded too: `interrupted`, because
+# a run the user stopped says nothing about the provider, and
+# `output-failure`, which follows a run that completed and so is not a
+# provider failure at all.
+AUTHORISING_FAILURE_KINDS = frozenset(
+    {
+        "provider-failure",
+        "provider-unavailable",
+        "model-unavailable",
+        "timeout",
+        "stalled-loop",
+        "no-result",
+    }
+)
+
+# What closes a standing failure. A run that succeeded writes `spend`
+# when it carries no receipts, and a transient failure that was retried
+# and then succeeded leaves only `transient-retry`, because a receipted
+# completion writes nothing to this log at all. The consent bookkeeping
+# kinds a failure is always followed by are neither: they are neutral,
+# so a rerun after a documented consent stop still finds its failure.
+CANCELLING_INCIDENT_KINDS = frozenset(
+    {"spend", "transient-retry", "dispatch-closed"}
+)
+
+# How long a recorded failure keeps authorising. Bounded again by the
+# time since boot, so a machine left up for weeks cannot let last
+# week's failure authorise today's substitution. Hours, not days: the
+# window only has to cover a consent stop and the user's rerun.
+FAILURE_WINDOW_SECONDS = 6 * 3600.0
+UPTIME_PATH = Path("/proc/uptime")
 
 # These numbers are internal distance anchors, never picker labels. A model
 # discovered in the future gets a tier from its configured role or provider
@@ -71,6 +110,31 @@ ROLE_TIER = {
 # other provider is the better substitute. On the 1-3 tier scale this
 # means one step down keeps the provider and two steps crosses.
 LARGE_TIER_GAP = 2
+
+# What a delegate substitution may not reach. The ranking had no cost or
+# allowance term at all, so every delegate's nearest candidate when its
+# own provider was down was whatever the principal runs, and a worker
+# outage converted itself into consumption of the one allowance the
+# split exists to protect.
+#
+# The default is provider-scoped because the measured constraint is
+# account-wide: Anthropic's rate-limit telemetry reports one five-hour
+# and one seven-day window for the account, with no per-model breakdown,
+# so excluding the principal's model alone would protect nothing.
+# `principal-model` stays available for a user with evidence of
+# genuinely separate per-model budgets.
+PRINCIPAL_MODEL_SCOPE = "principal-model"
+PRINCIPAL_PROVIDER_SCOPE = "principal-provider"
+DELEGATE_FALLBACK_SCOPES = (PRINCIPAL_PROVIDER_SCOPE, PRINCIPAL_MODEL_SCOPE)
+DEFAULT_DELEGATE_FALLBACK_SCOPE = PRINCIPAL_PROVIDER_SCOPE
+
+# The named thinking scale, cheapest first. The cross-provider cap is
+# stated over these names rather than over scale positions: `ultra` sits
+# at the top of the OpenAI scale and a positional rule maps it onto the
+# top of the Anthropic one, which is exactly the substitution the cap
+# exists to prevent.
+THINKING_ORDER = ("low", "medium", "high", "xhigh", "max", "ultra")
+DEFAULT_DELEGATE_THINKING_CEILING = "high"
 
 
 class Availability(str, Enum):
@@ -224,6 +288,111 @@ def configured_model_tiers() -> dict[tuple[str, str], int]:
             identity = (provider, model)
             tiers[identity] = max(tiers.get(identity, 0), ROLE_TIER[role_id])
     return tiers
+
+
+def delegate_fallback_scope(manifest: dict[str, Any] | None = None) -> str:
+    """How much of the principal a delegate substitution may not reach."""
+    if manifest is None:
+        manifest = load_manifest()
+    value = manifest.get(
+        "delegate_fallback_scope", DEFAULT_DELEGATE_FALLBACK_SCOPE
+    )
+    if value not in DELEGATE_FALLBACK_SCOPES:
+        raise RuntimeConfigError(
+            "the manifest delegate_fallback_scope must be "
+            f"{' or '.join(DELEGATE_FALLBACK_SCOPES)}"
+        )
+    return str(value)
+
+
+def delegate_thinking_ceiling(manifest: dict[str, Any] | None = None) -> str:
+    """The highest thinking level a cross-provider delegate may be given."""
+    if manifest is None:
+        manifest = load_manifest()
+    value = manifest.get(
+        "delegate_fallback_thinking_ceiling",
+        DEFAULT_DELEGATE_THINKING_CEILING,
+    )
+    if value not in THINKING_ORDER:
+        raise RuntimeConfigError(
+            "the manifest delegate_fallback_thinking_ceiling must be one of "
+            f"{', '.join(THINKING_ORDER)}"
+        )
+    return str(value)
+
+
+def principal_identity() -> Role | None:
+    """The configured principal, or None where it cannot be identified.
+
+    By ranking time the manifest is known good: the caller has already
+    loaded its own role or exited. Every remaining raiser is the
+    adoption marker, the trust store, or the repository override, and
+    `apply_override=False` bypasses all three. It is safe to fall back
+    on: where the override cannot be read the repository is not adopted,
+    so the global principal is the one that would have applied anyway.
+    """
+    for apply_override in (True, False):
+        try:
+            return load_role("orchestrator", apply_override=apply_override)
+        except RuntimeConfigError:
+            continue
+    return None
+
+
+def principal_exclusions(role: Role) -> tuple[set[str], set[tuple[str, str]]]:
+    """What a substitution for this role may not reach, as exclusions.
+
+    The principal itself is not governed: it is the allowance holder,
+    and an interactive session whose cost the user can see. A delegate
+    loses the principal's provider, or under `principal-model` only the
+    principal's exact identity at any thinking level.
+
+    Where the principal cannot be identified at all, no provider has
+    been named, so the refusal is confined to crossing providers: an
+    openai to openai substitution cannot touch an allowance that is by
+    construction somewhere else.
+    """
+    if role.id == "orchestrator":
+        return set(), set()
+    principal = principal_identity()
+    if principal is None:
+        return {
+            provider for provider in PROVIDERS if provider != role.provider
+        }, set()
+    if delegate_fallback_scope() == PRINCIPAL_MODEL_SCOPE:
+        return set(), {(principal.provider, principal.model)}
+    return {principal.provider}, set()
+
+
+def delegate_allowance_refusal(
+    role: Role,
+    identity: tuple[str, str],
+) -> str | None:
+    """Why the principal-allowance rule bars this candidate, or None.
+
+    A named candidate that the rule excluded must not be reported as no
+    longer potentially available, which is true but says nothing about
+    why, and sends the user looking at their provider rather than at the
+    setting that decided it. Returned unpunctuated, so each caller can
+    compose it into its own sentence.
+    """
+    providers, models = principal_exclusions(role)
+    if identity[0] not in providers and identity not in models:
+        return None
+    principal = principal_identity()
+    if principal is None:
+        return (
+            f"{identity[0]}/{identity[1]} would cross providers for "
+            f"{role.id}, and Orrery could not identify the configured "
+            "principal, so it cannot show that the substitution stays "
+            "clear of the principal's allowance"
+        )
+    return (
+        f"{identity[0]}/{identity[1]} is excluded for {role.id} by the "
+        f"principal-allowance rule: the principal runs "
+        f"{principal.provider}/{principal.model}, and "
+        f"delegate_fallback_scope is {delegate_fallback_scope()}"
+    )
 
 
 def _picker_tier(index: int, count: int) -> int:
@@ -452,6 +621,62 @@ def _thinking_for(
     return str(levels[0])
 
 
+def _thinking_rank(level: Any) -> int | None:
+    return THINKING_ORDER.index(level) if level in THINKING_ORDER else None
+
+
+def _capped_thinking(
+    original: Role,
+    candidate: dict[str, Any],
+    source_entries: Iterable[dict[str, Any]],
+    *,
+    ceiling: str,
+) -> str | None:
+    """A cross-provider delegate's level: the configured name, capped.
+
+    The candidate is given the configured level's own name where it
+    offers one, and otherwise the nearest lower name it does offer,
+    never above the ceiling. Positional mapping is what put an `ultra`
+    reviewer on Anthropic's `max`, since `ultra` is the top of its own
+    scale and `max` the top of the other; by name, `ultra` is not
+    offered at all and the ceiling decides.
+
+    This governs delegates only. The principal keeps `_thinking_for`:
+    its cost is visible in the session the user is watching, and
+    quietly substituting it down would change the quality of the work
+    in front of them.
+    """
+    levels = candidate.get("thinking_levels")
+    if not isinstance(levels, list) or not levels:
+        return None
+    ranked = sorted(
+        (rank, level)
+        for rank, level in (
+            (_thinking_rank(level), level) for level in levels
+        )
+        if rank is not None
+    )
+    limit = _thinking_rank(ceiling)
+    if not ranked or limit is None:
+        # A level this catalogue cannot place on the named scale cannot
+        # be capped by name either, so the positional mapping stands
+        # rather than a guess being made about where it sits.
+        return _thinking_for(original, candidate, source_entries)
+    wanted = _thinking_rank(original.thinking)
+    if wanted is None:
+        # No configured name to match against this candidate's own, so
+        # the positional mapping still chooses; the ceiling still binds
+        # what it returns.
+        positional = _thinking_for(original, candidate, source_entries)
+        wanted = _thinking_rank(positional)
+        if wanted is None:
+            return positional
+    allowed = [level for rank, level in ranked if rank <= min(wanted, limit)]
+    # Nothing at or below the cap leaves the cheapest the candidate
+    # offers: exceeding the ceiling is the one outcome this prevents.
+    return allowed[-1] if allowed else ranked[0][1]
+
+
 def _ranked_candidates(
     original: Role,
     *,
@@ -470,6 +695,13 @@ def _ranked_candidates(
     assumed = set(assumed_ready)
     supplied_statuses = {} if statuses is None else dict(statuses)
     additions = {} if additional_models is None else additional_models
+    # Read once, and only for a delegate: an invalid ceiling must not
+    # fail the principal's own fallback, which the cap never governs.
+    ceiling = (
+        None
+        if original.id == "orchestrator"
+        else delegate_thinking_ceiling()
+    )
     configured_tiers = configured_model_tiers()
     bundled = load_catalogue()
     source_entries = bundled.get(original.provider, [])
@@ -556,7 +788,13 @@ def _ranked_candidates(
                     identity,
                     _picker_tier(index, len(ordered)),
                 )
-            thinking = _thinking_for(original, entry, source_entries)
+            thinking = (
+                _capped_thinking(
+                    original, entry, source_entries, ceiling=ceiling
+                )
+                if ceiling is not None and provider != original.provider
+                else _thinking_for(original, entry, source_entries)
+            )
             candidate = replace(
                 original,
                 provider=provider,
@@ -608,10 +846,11 @@ def nearest_fallback(
     discover_live: bool = True,
 ) -> FallbackProposal | None:
     """Return the closest potentially usable role without authorising it."""
+    principal_providers, principal_models = principal_exclusions(original)
     ranked = _ranked_candidates(
         original,
-        excluded_providers=excluded_providers,
-        excluded_models=excluded_models,
+        excluded_providers=set(excluded_providers) | principal_providers,
+        excluded_models=set(excluded_models) | principal_models,
         environment=environment,
         statuses=statuses,
         assumed_ready=assumed_ready,
@@ -677,6 +916,90 @@ def same_provider_ladder(role: Role, *, limit: int = 2) -> list[str]:
     return [model for _distance, _index, model in ranked][:limit]
 
 
+def seconds_since_boot() -> float | None:
+    """Seconds since this boot, or None where the clock cannot be read."""
+    try:
+        return float(UPTIME_PATH.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _same_identity(event: dict[str, Any], role: Role) -> bool:
+    """Whether one incident event was written against this exact role.
+
+    Deliberately four fields: role id, provider, model and thinking. An
+    incident carries less than the standing store's ten-field
+    fingerprint, and the endpoint id it does carry is not compared,
+    because a substitution candidate never inherits one.
+    """
+    return (
+        event.get("role") == role.id
+        and event.get("provider") == role.provider
+        and event.get("model") == role.model
+        and event.get("thinking") == (role.thinking or None)
+    )
+
+
+def _within_repository(root: Path, workdir: Any) -> bool:
+    """Whether a recorded working directory lies inside this repository.
+
+    Containment rather than equality: the log records the process
+    working directory, so a run started from a subdirectory would never
+    match its own repository root.
+    """
+    if not isinstance(workdir, str) or not workdir:
+        return False
+    try:
+        recorded = Path(workdir).resolve(strict=False)
+    except (OSError, ValueError):
+        return False
+    return recorded == root or root in recorded.parents
+
+
+def authorising_failure(
+    role: Role,
+    *,
+    cwd: Path | None = None,
+) -> dict[str, Any] | None:
+    """The recorded failure that authorises a substitution, or None.
+
+    The precondition is the newest authorising failure for this exact
+    identity in this repository, not followed by a cancelling event. It
+    is stated over failures rather than over all events on purpose: the
+    documented rerun flow always writes consent bookkeeping after the
+    failure, so a rule over the newest event of any kind would refuse
+    every rerun it exists to permit.
+    """
+    window = FAILURE_WINDOW_SECONDS
+    since_boot = seconds_since_boot()
+    if since_boot is not None:
+        window = min(window, since_boot)
+    working = Path.cwd() if cwd is None else Path(cwd)
+    root = _git_root(working)
+    if root is None:
+        # Fail closed rather than degrade to the process directory. A
+        # bare directory as the containment root matches every incident
+        # recorded anywhere beneath it, so a failure in one repository
+        # would authorise a substitution in a sibling whenever the
+        # command is run from a parent that is not itself a checkout.
+        # Refusing costs only a run started outside any repository.
+        return None
+    since = datetime.now(timezone.utc) - timedelta(seconds=window)
+
+    found: dict[str, Any] | None = None
+    for event in read_events(since=since):
+        if not _same_identity(event, role):
+            continue
+        if not _within_repository(root, event.get("workdir")):
+            continue
+        kind = event.get("kind")
+        if kind in AUTHORISING_FAILURE_KINDS:
+            found = event
+        elif kind in CANCELLING_INCIDENT_KINDS:
+            found = None
+    return found
+
+
 def proposal_for_approval(
     original: Role,
     approval: tuple[str, str],
@@ -687,7 +1010,9 @@ def proposal_for_approval(
 
     A cross-provider approval means the configured provider already
     failed; a same-provider approval means at least the configured
-    model failed. The approved identity may sit deeper than the
+    model failed. That premise is not assumed here: `authorising_failure`
+    proves it against the incident log before a caller resolves an
+    approval. The approved identity may sit deeper than the
     freshly ranked nearest candidate: the exclusions a failing
     invocation accumulates while walking the ladder do not survive its
     exit, so a rerun cannot rebuild them. An explicitly named identity
@@ -695,9 +1020,13 @@ def proposal_for_approval(
     every candidate ranking nearer is excluded as already ruled out,
     so a later failure of the approved candidate proposes a strictly
     deeper rung instead of walking back up the ladder.
+
+    A delegate's ranking starts from the principal-allowance exclusions,
+    so an approval naming a candidate that rule bars resolves to no
+    proposal. Callers report that with `delegate_allowance_refusal`,
+    which says which rule decided it.
     """
-    excluded_providers: set[str] = set()
-    excluded_models: set[tuple[str, str]] = set()
+    excluded_providers, excluded_models = principal_exclusions(original)
     if approval[0] == original.provider:
         excluded_models.add((original.provider, original.model))
     else:

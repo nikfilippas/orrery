@@ -996,6 +996,31 @@ else
     fail "The standing-approval store could not be read"
 fi
 
+printf '\n=== Allowances ===\n'
+if ALLOWANCE_REPORT="$(
+    python3 - "$KIT_DIR" "$PWD" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_allowance import doctor_report
+
+for line in doctor_report(Path(sys.argv[2])):
+    print(line)
+PY
+)"; then
+    while IFS='|' read -r verdict message; do
+        [ -n "$message" ] || continue
+        case "$verdict" in
+            PASS) pass "Allowance: $message" ;;
+            SKIP) skip "Allowance: $message" ;;
+            *) warn "Allowance: $message" ;;
+        esac
+    done <<< "$ALLOWANCE_REPORT"
+else
+    warn "The configured allowances could not be inspected"
+fi
+
 printf '\n=== Parked work ===\n'
 if PICKUP_REPORT="$(
     python3 - "$KIT_DIR" <<'PY'

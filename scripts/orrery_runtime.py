@@ -102,6 +102,34 @@ class Role:
         return self.access == "read-only"
 
 
+def same_model(provider: str, configured: str, active: str) -> bool:
+    """Whether a live model identifier is the configured one.
+
+    The manifest names a model the way a picker does, `fable` or
+    `opus`, while a running session reports an API identifier such as
+    `claude-fable-5-1`, or a settings value such as `opus[1m]`. Only
+    Anthropic needs the family match: Codex reports the configured name
+    verbatim, so equality is the whole test there and a looser rule
+    would let one OpenAI model answer for another.
+
+    Shared rather than duplicated: the principal check compares a
+    session's model with the configured one, and the allowance rollup
+    maps a transcript's model onto the catalogue entry that says which
+    provider owns it. A second copy would let those two disagree.
+    """
+    if configured == active:
+        return True
+    if provider != "anthropic":
+        return False
+    family = configured.lower()
+    if family not in {"fable", "opus", "sonnet", "haiku"}:
+        return False
+    return re.search(
+        rf"(?:^|[-_/]){re.escape(family)}(?:[-_/\[\]]|$)",
+        active.lower(),
+    ) is not None
+
+
 def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
     try:
         manifest = json.loads(path.read_text())

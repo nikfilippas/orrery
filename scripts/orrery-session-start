@@ -25,7 +25,9 @@ from orrery_runtime import (  # noqa: E402
     adopted_root,
     codex_home,
     load_role,
+    same_model,
 )
+import orrery_allowance as allowance  # noqa: E402
 import orrery_incidents as incident_log  # noqa: E402
 
 
@@ -89,20 +91,6 @@ def environment_effort() -> str | None:
         if value and THINKING_LEVEL.fullmatch(value):
             return value
     return None
-
-
-def same_model(provider: str, configured: str, active: str) -> bool:
-    if configured == active:
-        return True
-    if provider != "anthropic":
-        return False
-    family = configured.lower()
-    if family not in {"fable", "opus", "sonnet", "haiku"}:
-        return False
-    return re.search(
-        rf"(?:^|[-_/]){re.escape(family)}(?:[-_/\[\]]|$)",
-        active.lower(),
-    ) is not None
 
 
 def parked_announcement() -> str:
@@ -196,6 +184,23 @@ def main() -> int:
             )
         )
         return 0
+    # Fold whatever the last session spent into the rollup before this
+    # one starts. A session killed abnormally never reaches an orderly
+    # end, and the longest sessions are the likeliest to die that way,
+    # so the start of the next one is where their spend is recovered.
+    # Best-effort in the strictest sense: this is an estimate, and no
+    # fault in it may cost the user a session.
+    try:
+        # Unconditional on purpose. Skipping this where no allowance is
+        # configured would save a measured 0.076s on a warm rollup, and
+        # 0.76s on the first build, against a 15s hook budget; it would
+        # cost the guarantee above, that a session killed before it
+        # could be accounted for is recovered when the next one starts.
+        # A user who configures a ceiling later would then begin from a
+        # rollup that had been deliberately left empty.
+        allowance.refresh()
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        pass
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
