@@ -24,6 +24,8 @@ from orrery_runtime import (  # noqa: E402
     RuntimeConfigError,
     adopted_root,
     codex_home,
+    load_catalogue,
+    load_manifest,
     load_role,
     same_model,
 )
@@ -138,12 +140,130 @@ def parked_announcement() -> str:
     return ""
 
 
-def hook_output(system_message: str, context: str) -> dict[str, Any]:
+ROLE_SQUARE = {
+    # The squares carry the legend's own colours so the table and the
+    # configuration page can be scanned against each other. The mechanic
+    # is the one compromise: its colour is a muted slate and the emoji
+    # set has no grey square, so a white one stands in.
+    "orchestrator": "\U0001F7E6",
+    "mechanic": "\u2B1C",
+    "implementer": "\U0001F7E9",
+    "plan-reviewer": "\U0001F7EA",
+    "reviewer": "\U0001F7E8",
+}
+ROLE_LABEL = {
+    "orchestrator": "principal",
+    "mechanic": "mechanic",
+    "implementer": "implementer",
+    "plan-reviewer": "plan reviewer",
+    "reviewer": "final reviewer",
+}
+
+
+def resolved_models() -> dict[tuple[str, str], str]:
+    """Each configured alias against the version it currently resolves to.
+
+    Live discovery, because an alias moves without the manifest
+    changing and a table that says `opus` tells the reader less than one
+    that says which Opus. Measured at about a second against both
+    installed CLIs, inside a fifteen second hook budget, and every
+    failure degrades to the alias rather than costing the session its
+    framing.
+    """
+    try:
+        from orrery_model_catalogue import discover_catalogue
+
+        discovered = discover_catalogue(load_catalogue())
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        return {}
+    found: dict[tuple[str, str], str] = {}
+    for provider, entries in discovered.providers.items():
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get("id"):
+                found[(provider, entry["id"])] = (
+                    entry.get("resolved") or entry["id"]
+                )
+    return found
+
+
+def pretty_model(provider: str, alias: str, resolved: dict) -> str:
+    """The version a reader recognises, or the alias where none is known."""
+    api = resolved.get((provider, alias), alias)
+    if provider == "anthropic" and api.startswith("claude-"):
+        parts = api[len("claude-"):].split("-")
+        numbers = [p for p in parts[1:] if p.isdigit() and len(p) <= 2]
+        name = parts[0].capitalize()
+        return f"{name} {'.'.join(numbers)}" if numbers else name
+    match = re.fullmatch(r"gpt-([0-9.]+)-([a-z]+)", api)
+    if match:
+        return f"GPT-{match.group(1)} {match.group(2).capitalize()}"
+    return api
+
+
+def role_table() -> str:
+    """Every configured role, for the top of a session.
+
+    On systemMessage rather than in context: a line the model is asked
+    to repeat appears only when it complies, which is not the same as
+    being shown. The principal's own row is what the single line this
+    replaces used to say.
+    """
+    try:
+        manifest = load_manifest()
+        steps = [
+            s for s in manifest.get("steps", [])
+            if isinstance(s, dict) and s.get("provider") and s.get("model")
+        ]
+        if not steps:
+            return ""
+        resolved = resolved_models()
+        rows = [
+            (
+                ROLE_SQUARE.get(s["id"], "\u2B1C"),
+                ROLE_LABEL.get(s["id"], s["id"]),
+                s["provider"],
+                pretty_model(s["provider"], s["model"], resolved),
+                s.get("thinking") or "-",
+            )
+            for s in steps
+        ]
+        widths = [max(len(r[i]) for r in rows) for i in (1, 2, 3)]
+        lines = [
+            f"  {sq} {role:<{widths[0]}}  {prov:<{widths[1]}}  "
+            f"{model:<{widths[2]}}  {think}"
+            for sq, role, prov, model, think in rows
+        ]
+        rounds = manifest.get("settings", {}).get("plan_review_rounds", {})
+        value = rounds.get("value") if isinstance(rounds, dict) else None
+        if isinstance(value, int):
+            plural = "" if value == 1 else "s"
+            marker = "\u2B1B"
+            label = "plan review"
+            lines.append(
+                f"  {marker} {label:<{widths[0]}}  "
+                f"{value} round{plural} at most"
+            )
+        return "\n".join(lines)
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        return ""
+
+
+def with_role_table(system_message: str) -> str:
+    """The status line the caller wrote, then the configured roles."""
+    table = role_table()
+    return f"{system_message}\n{table}" if table else system_message
+
+
+def hook_output(
+    system_message: str, context: str, *, roles: bool = True
+) -> dict[str, Any]:
     parked = parked_announcement()
     if parked:
         context = f"{context}\n{parked}" if context else parked
     return {
-        "systemMessage": system_message,
+        "systemMessage": (
+            with_role_table(system_message) if roles else system_message
+        ),
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": context,
@@ -180,6 +300,7 @@ def main() -> int:
                     "adopt principal duties, open replies with a principal "
                     "header, or treat principal-surface guidance as "
                     "applying here.",
+                    roles=False,
                 )
             )
         )
@@ -236,6 +357,7 @@ def main() -> int:
                         "delegate to orrery-agent, run plan-review loops, "
                         "apply the fallback protocol, or require "
                         "principal approval.",
+                        roles=False,
                     )
                 )
             )

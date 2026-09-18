@@ -172,6 +172,40 @@ communication-style rule in `global/AGENTS.md`.
 
 ## Bound what a provider may spend
 
+### What a new session shows you
+
+Orrery's SessionStart hook prints the configured roles at the top of
+every session in an adopted repository, on the channel the surface
+renders itself rather than as a request the model may or may not honour:
+
+```
+Orrery principal mismatch: configured Anthropic / fable / thinking max; ...
+  🟦 principal       anthropic  Fable 5.1  max
+  ⬜ mechanic        anthropic  Opus 5     medium
+  🟩 implementer     anthropic  Opus 5     high
+  🟪 plan reviewer   anthropic  Opus 5     max
+  🟨 final reviewer  anthropic  Opus 5     max
+  ⬛ plan review     2 rounds at most
+```
+
+The first line is the status: whether this session matches the
+configured principal, or why that could not be determined. The table
+below it is the roster.
+
+The squares carry the configuration page's own role colours, so the two
+can be scanned against each other. The mechanic is the one compromise:
+its colour is a muted slate and the emoji set has no grey square.
+
+The model column shows the version an alias currently resolves to, from
+the same live discovery `orrery-doctor` uses, so `fable` reads as
+`Fable 5.1` and would change by itself if a provider moved the alias.
+Where discovery is unavailable the alias is shown unchanged; the table
+never fails a session to report a version.
+
+It is deliberately absent in two cases. An un-adopted repository is an
+ordinary single-provider session and Orrery's roles do not apply to it.
+A bounded delegate gets its assignment, not the principal's roster.
+
 ### Delegate fallback scope
 
 Two top-level manifest settings govern where a delegated role may be

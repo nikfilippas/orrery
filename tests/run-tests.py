@@ -15151,6 +15151,78 @@ def hook_report(result: Any) -> dict[str, Any]:
         ) from exc
 
 
+@test("a new session is shown every configured role, and only where they apply")
+def test_session_start_role_table() -> None:
+    """The roster goes on the channel the surface renders itself.
+
+    A line the model is asked to repeat appears only when it complies,
+    which is not the same as being shown, so the table is emitted on
+    systemMessage rather than left to context.
+    """
+    module = load_script(SESSION_START_SCRIPT, f"kit_roles_{time.time_ns()}")
+    table = module.role_table()
+    require(table, "the role table was empty for a valid manifest")
+    lines = table.splitlines()
+    configured = [
+        step for step in runtime_module.load_manifest()["steps"]
+        if isinstance(step, dict) and step.get("provider")
+    ]
+    require(
+        len(lines) == len(configured) + 1,
+        f"expected one line per role plus the review rounds: {table}",
+    )
+    require(
+        all(line.startswith("  ") for line in lines),
+        f"a table line was not indented under the status line: {table}",
+    )
+    # Every role's own square, so the table and the configuration page
+    # can be scanned against each other.
+    squares = {line.strip().split()[0] for line in lines}
+    require(
+        len(squares) == len(lines),
+        f"two rows share a square, so colour cannot distinguish them: {table}",
+    )
+
+    with tempfile.TemporaryDirectory() as directory:
+        repository = adopted_repository(directory)
+        environment = os.environ.copy()
+        environment.pop("ORRERY_ROLE", None)
+
+        def emitted(cwd: str, env: dict[str, str]) -> dict:
+            result = subprocess.run(
+                [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+                input=json.dumps({
+                    "hook_event_name": "SessionStart",
+                    "source": "startup",
+                    "cwd": cwd,
+                }),
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=120, check=False,
+            )
+            return json.loads(result.stdout)
+
+        adopted = emitted(str(repository), environment)
+        require(
+            len(adopted["systemMessage"].splitlines()) > 1,
+            f"an adopted session was shown no roles: {adopted}",
+        )
+
+        # Orrery's roles do not apply to a repository it has not adopted.
+        plain = emitted(directory, environment)
+        require(
+            len(plain["systemMessage"].splitlines()) == 1,
+            f"an un-adopted session was shown the roster: {plain}",
+        )
+
+        # A bounded delegate gets its assignment, not the roster.
+        delegate = dict(environment, ORRERY_ROLE="implementer")
+        bounded = emitted(str(repository), delegate)
+        require(
+            len(bounded["systemMessage"].splitlines()) == 1,
+            f"a delegate was shown the principal's roster: {bounded}",
+        )
+
+
 @test("a crossed allowance warns on every principal turn without stopping it")
 def test_d3_prompt_warning_is_visible_and_per_turn() -> None:
     with prompt_hook_kit(
