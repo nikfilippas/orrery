@@ -327,16 +327,28 @@ def review_environment(
         standing_state = Path(tempfile.mkdtemp(prefix="kit-standing."))
         STATE_DIRS.append(str(standing_state))
     environment["XDG_STATE_HOME"] = str(standing_state)
-    # Every subprocess started from this environment gets its own HOME.
-    # Without it they run against the developer's real one: a wrapper
-    # test would read and rewrite ~/.claude/settings.json, and anything
-    # resolving KIT_DIR from an installed path would reach the live
-    # manifest. Both were observed: a suite run silently replaced the
-    # configured principal and every delegate role with fixture values,
-    # and repeated runs disagreed with each other because the damage
-    # landed mid-run. The runner's own guard already prescribes this
-    # ("it needs HOME isolation or an explicit --target").
-    home = Path(tempfile.mkdtemp(prefix="kit-home."))
+    # Every subprocess started from this environment gets its own HOME,
+    # so a wrapper test cannot read or rewrite the developer's real
+    # ~/.claude/settings.json. The runner's own guard prescribes exactly
+    # this ("it needs HOME isolation or an explicit --target").
+    #
+    # It does NOT protect global/orchestration.json, and an earlier
+    # version of this comment wrongly said it did. MANIFEST_PATH derives
+    # from KIT_DIR, the script's own location, which HOME does not
+    # affect. The manifest's only writer in the kit is orrery-config's
+    # apply endpoint, and every test driving apply runs against a
+    # copytree, so no test reaches the live file. Drift observed in it
+    # came from elsewhere: this manifest is shared mutable state across
+    # concurrent sessions on one machine.
+    # Under the runner's real home, never the ordinary temporary
+    # directory, for the reason `confinable_scratch` gives above: the
+    # runner grants /tmp and /var/tmp, and the wrapper's confinement
+    # probe writes its negative target at `Path.home()`. A HOME under
+    # /tmp would put that target inside a deliberate grant, the probe
+    # would succeed where it must fail, and every dispatch test would
+    # refuse on a host whose confinement is intact. `run-like-ci.sh`
+    # exports TMPDIR=/tmp, so that is the CI shape, not a corner case.
+    home = Path(tempfile.mkdtemp(prefix="kit-home.", dir=Path.home()))
     HOME_DIRS.append(str(home))
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
@@ -3918,7 +3930,6 @@ def test_fallback_same_provider_ladder() -> None:
             ("anthropic", "fable"),
             ("anthropic", "opus"),
             ("anthropic", "sonnet"),
-            ("anthropic", "haiku"),
         },
         assumed_ready={"anthropic", "openai"},
         discover_live=False,
@@ -3926,9 +3937,20 @@ def test_fallback_same_provider_ladder() -> None:
     require(
         principal_crossed is not None
         and principal_crossed.candidate.provider == "openai",
-        "the principal, which the allowance rule does not govern, did "
-        f"not cross providers when its own were exhausted: "
-        f"{principal_crossed}",
+        # haiku is left available on purpose: it is a two-tier drop on
+        # the principal's own provider, so this is the case where the
+        # large-tier-gap term actually decides. Excluding it too, as an
+        # earlier version of this test did, left no same-provider
+        # candidate at all and the term never fired, which made the
+        # assertion pass with the rule ablated. Measured: with the term
+        # in force this crosses to OpenAI; with LARGE_TIER_GAP raised to
+        # 99 it returns anthropic/haiku.
+        #
+        # The provider is asserted rather than the model, because which
+        # OpenAI model wins depends on the roles configured in the live
+        # manifest, and this suite reads that file.
+        "a two-tier same-provider drop was not outranked by a near-tier "
+        f"cross-provider model: {principal_crossed}",
     )
 
 
@@ -24346,12 +24368,22 @@ def main() -> int:
     # than assumed. HOME is deliberately not overridden globally:
     # doctor tests legitimately inspect the real installation.
     def live_settings_digest() -> str | None:
-        try:
-            return hashlib.sha256(
-                (Path.home() / ".claude" / "settings.json").read_bytes()
-            ).hexdigest()
-        except OSError:
-            return None
+        # Both files a test has been observed to disturb, digested
+        # together so a single comparison names the offending test.
+        # The manifest is here because a claim that no test can reach
+        # it should be a measurement rather than an argument: it is
+        # also shared mutable state between concurrent sessions on one
+        # machine, so drift in it is worth catching whatever the cause.
+        digest = hashlib.sha256()
+        for path in (
+            Path.home() / ".claude" / "settings.json",
+            KIT_DIR / "global" / "orchestration.json",
+        ):
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"\0")
+        return digest.hexdigest()
 
     live_settings_before = live_settings_digest()
 
@@ -24386,8 +24418,9 @@ def main() -> int:
                 failures += 1
                 print(
                     f"FAIL  {name}\n      this test wrote the live "
-                    "~/.claude/settings.json; it needs HOME isolation or "
-                    "an explicit --target"
+                    "~/.claude/settings.json or global/orchestration.json; "
+                    "it needs HOME isolation, a copied kit, or an "
+                    "explicit --target"
                 )
     finally:
         for name, value in saved_environment.items():
@@ -24402,8 +24435,9 @@ def main() -> int:
             failures += 1
             print(
                 "FAIL  the suite modified the developer's own "
-                "~/.claude/settings.json\n      a test is missing HOME "
-                "isolation or an explicit --target"
+                "~/.claude/settings.json or global/orchestration.json\n"
+                "      a test is missing HOME isolation or a copied kit, "
+                "or another session changed the manifest while this ran"
             )
         # The pickup feature arms real transient timers when a test lets
         # it; a unit left loaded would fire real work on the developer's

@@ -1627,11 +1627,23 @@ function render() {
   fitHeaderNote(canvas);
   fitCanvas();
   let pending = false;
-  window.addEventListener("resize", () => {
+  const refit = () => {
     if (pending) return;
     pending = true;
     requestAnimationFrame(() => { pending = false; fitCanvas(); });
-  });
+  };
+  window.addEventListener("resize", refit);
+  // The chart's room also changes without the window moving: the result
+  // panel grows when a preview is rendered, and the column layout takes
+  // that room from the drawing. Refitting only on resize left the scale
+  // stale, so the canvas overflowed upward and carried the action bar
+  // with it: the bar is placed in chart coordinates, so it ended up
+  // above the top of the window, and `body { overflow: hidden }` meant
+  // there was no scrolling back to it. Apply became unreachable the
+  // moment it was enabled. Observing the host covers every cause.
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(refit).observe(host);
+  }
 }
 
 // The drawing takes whatever room the tab has left once the page's own
