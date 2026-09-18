@@ -15161,11 +15161,13 @@ def hook_report(result: Any) -> dict[str, Any]:
 
 @test("a new session is shown every configured role, and only where they apply")
 def test_session_start_role_table() -> None:
-    """The roster goes on the channel the surface renders itself.
+    """The roster goes on the channel that reaches every surface.
 
-    A line the model is asked to repeat appears only when it complies,
-    which is not the same as being shown, so the table is emitted on
-    systemMessage rather than left to context.
+    systemMessage looks like the display channel and is not one: the
+    VS Code extension renders no SessionStart systemMessage, so a
+    roster emitted there reaches the transcript and no reader. It is
+    delivered as context with an instruction to reproduce it, and this
+    asserts the channel, not merely the text.
     """
     module = load_script(SESSION_START_SCRIPT, f"kit_roles_{time.time_ns()}")
     table = module.role_table()
@@ -15175,20 +15177,25 @@ def test_session_start_role_table() -> None:
         step for step in runtime_module.load_manifest()["steps"]
         if isinstance(step, dict) and step.get("provider")
     ]
+    # Every role, then the review round cap, two cells to a line.
+    cells = len(configured) + 1
     require(
-        len(lines) == len(configured) + 1,
-        f"expected one line per role plus the review rounds: {table}",
+        len(lines) == (cells + 1) // 2,
+        f"expected {cells} cells laid out two to a line: {table}",
     )
     require(
         all(line.startswith("  ") for line in lines),
         f"a table line was not indented under the status line: {table}",
     )
-    # Every role's own square, so the table and the configuration page
+    # Every cell's own square, so the table and the configuration page
     # can be scanned against each other.
-    squares = {line.strip().split()[0] for line in lines}
+    known = set(module.ROLE_SQUARE.values()) | {"\u2B1B"}
+    squares = [
+        token for line in lines for token in line.split() if token in known
+    ]
     require(
-        len(squares) == len(lines),
-        f"two rows share a square, so colour cannot distinguish them: {table}",
+        len(squares) == cells and len(set(squares)) == cells,
+        f"two cells share a square, so colour cannot distinguish them: {table}",
     )
 
     with tempfile.TemporaryDirectory() as directory:
@@ -15209,25 +15216,49 @@ def test_session_start_role_table() -> None:
             )
             return json.loads(result.stdout)
 
+        def roster(report: dict) -> str:
+            return report.get("hookSpecificOutput", {}).get(
+                "additionalContext", ""
+            )
+
         adopted = emitted(str(repository), environment)
+        context = roster(adopted)
         require(
-            len(adopted["systemMessage"].splitlines()) > 1,
-            f"an adopted session was shown no roles: {adopted}",
+            all(line in context for line in lines),
+            f"an adopted session was not given the roles: {adopted}",
+        )
+        # Delivery is not display. Nothing renders this channel, so the
+        # context carries the instruction that makes it visible.
+        require(
+            module.ROLE_TABLE_PREFACE in context,
+            f"the roster arrived with no instruction to show it: {adopted}",
+        )
+        # Fenced, or a surface that sets prose in a proportional font
+        # shows the columns unaligned, which is what 2026-09-19 showed.
+        require(
+            f"```\n{table}\n```" in context,
+            f"the roster was delivered without its fences: {adopted}",
+        )
+        # The roster must not also sit on a channel this surface drops,
+        # or it is shown twice wherever systemMessage does render.
+        require(
+            len(adopted["systemMessage"].splitlines()) == 1,
+            f"the roster was duplicated onto systemMessage: {adopted}",
         )
 
         # Orrery's roles do not apply to a repository it has not adopted.
         plain = emitted(directory, environment)
         require(
-            len(plain["systemMessage"].splitlines()) == 1,
-            f"an un-adopted session was shown the roster: {plain}",
+            module.ROLE_TABLE_PREFACE not in roster(plain),
+            f"an un-adopted session was given the roster: {plain}",
         )
 
         # A bounded delegate gets its assignment, not the roster.
         delegate = dict(environment, ORRERY_ROLE="implementer")
         bounded = emitted(str(repository), delegate)
         require(
-            len(bounded["systemMessage"].splitlines()) == 1,
-            f"a delegate was shown the principal's roster: {bounded}",
+            module.ROLE_TABLE_PREFACE not in roster(bounded),
+            f"a delegate was given the principal's roster: {bounded}",
         )
 
 

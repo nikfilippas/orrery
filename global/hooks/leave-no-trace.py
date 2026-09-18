@@ -1259,12 +1259,14 @@ def hook_start() -> int:
                         "Leave No Trace automation is active. Use claude-lnt-start for any "
                         "process that must span tool calls and claude-lnt-register before "
                         "an external mutation that needs a custom rollback. "
-                        "Orrery's SessionStart hook already lists the configured "
-                        "roles, so do not repeat them. Open the first reply with one "
-                        "discreet line naming the model actually running, in the form: "
-                        "↳ Principal orchestrator · <model>: the table states "
-                        "what is configured, this states what is running, and surfaces "
-                        "such as the VS Code extension show no model header of their own. "
+                        "Where Orrery's SessionStart hook supplies the configured "
+                        "roles, reproduce that block verbatim: it is delivered to you "
+                        "because not every surface renders it itself. Open the first reply with "
+                        "one discreet line naming the model actually running, in the "
+                        "form: ↳ Principal orchestrator · <model>, then that block: the "
+                        "table states what is configured, the line states what is "
+                        "running, and surfaces such as the VS Code extension show no "
+                        "model header of their own. "
                         + plan_context
                     ),
                 }

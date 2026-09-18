@@ -174,18 +174,20 @@ communication-style rule in `global/AGENTS.md`.
 
 ### What a new session shows you
 
-Orrery's SessionStart hook prints the configured roles at the top of
-every session in an adopted repository, on the channel the surface
-renders itself rather than as a request the model may or may not honour:
+Orrery's SessionStart hook opens every session in an adopted repository
+with the configured roles. They are delivered to the session's context
+with an instruction to reproduce them, rather than on a SessionStart
+`systemMessage`, which is not a display channel everywhere: the VS Code
+extension renders none, so a roster emitted there reached the transcript
+and no reader. The roster is delivered fenced, because that same surface
+sets prose in a proportional font and aligns the columns only inside a
+code block. What a session opens with:
 
 ```
-Orrery principal: Anthropic / fable / thinking max, matched by this session.
-  🟦 principal       anthropic  Fable 5.1  max
-  ⬜ mechanic        anthropic  Fable 5.1  low
-  🟩 implementer     openai     Terra      high
-  🟪 plan reviewer   openai     Astra      ultra
-  🟨 final reviewer  openai     Astra      ultra
-  ⬛ plan review     2 rounds at most
+↳ Principal orchestrator · Fable 5.1
+  🟦 principal       anthropic  Fable 5.1  max     ⬜ mechanic       anthropic  Fable 5.1  low
+  🟩 implementer     openai     Terra      high    🟪 plan reviewer  openai     Astra      ultra
+  🟨 final reviewer  openai     Astra      ultra   ⬛ plan review    2 rounds at most
 ```
 
 That spread is worth reading as a worked example rather than a sample.

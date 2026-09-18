@@ -200,13 +200,36 @@ def pretty_model(provider: str, alias: str, resolved: dict) -> str:
     return api
 
 
+def _column(cells: list[tuple[str, ...]]) -> list[str]:
+    """One grid column, each field padded to the widest in that column.
+
+    A five-field cell is a role; a three-field cell is the review round
+    cap, whose last field spans the provider, model and level.
+    """
+    label = max(len(cell[1]) for cell in cells)
+    roles = [cell for cell in cells if len(cell) == 5]
+    provider = max((len(cell[2]) for cell in roles), default=0)
+    model = max((len(cell[3]) for cell in roles), default=0)
+    rendered = []
+    for cell in cells:
+        if len(cell) == 5:
+            rendered.append(
+                f"{cell[0]} {cell[1]:<{label}}  {cell[2]:<{provider}}  "
+                f"{cell[3]:<{model}}  {cell[4]}"
+            )
+        else:
+            rendered.append(f"{cell[0]} {cell[1]:<{label}}  {cell[2]}")
+    return rendered
+
+
 def role_table() -> str:
     """Every configured role, for the top of a session.
 
-    On systemMessage rather than in context: a line the model is asked
-    to repeat appears only when it complies, which is not the same as
-    being shown. The principal's own row is what the single line this
-    replaces used to say.
+    Two cells to a line, so the roster opens a conversation in three
+    lines rather than six. Every cell starts with one square, so
+    padding by character count still aligns the columns wherever the
+    squares are all the same width. The principal's own cell is what
+    the single line this replaces used to say.
     """
     try:
         manifest = load_manifest()
@@ -217,7 +240,7 @@ def role_table() -> str:
         if not steps:
             return ""
         resolved = resolved_models()
-        rows = [
+        cells: list[tuple[str, ...]] = [
             (
                 ROLE_SQUARE.get(s["id"], "\u2B1C"),
                 ROLE_LABEL.get(s["id"], s["id"]),
@@ -227,31 +250,57 @@ def role_table() -> str:
             )
             for s in steps
         ]
-        widths = [max(len(r[i]) for r in rows) for i in (1, 2, 3)]
-        lines = [
-            f"  {sq} {role:<{widths[0]}}  {prov:<{widths[1]}}  "
-            f"{model:<{widths[2]}}  {think}"
-            for sq, role, prov, model, think in rows
-        ]
         rounds = manifest.get("settings", {}).get("plan_review_rounds", {})
         value = rounds.get("value") if isinstance(rounds, dict) else None
         if isinstance(value, int):
             plural = "" if value == 1 else "s"
             marker = "\u2B1B"
-            label = "plan review"
+            cells.append(
+                (marker, "plan review", f"{value} round{plural} at most")
+            )
+        left = _column(cells[0::2])
+        right = _column(cells[1::2]) if cells[1::2] else []
+        width = max(len(cell) for cell in left)
+        lines = []
+        for index, cell in enumerate(left):
+            partner = right[index] if index < len(right) else ""
             lines.append(
-                f"  {marker} {label:<{widths[0]}}  "
-                f"{value} round{plural} at most"
+                f"  {cell:<{width}}   {partner}" if partner else f"  {cell}"
             )
         return "\n".join(lines)
     except Exception:  # noqa: BLE001 - a hook must never fail a session
         return ""
 
 
-def with_role_table(system_message: str) -> str:
-    """The status line the caller wrote, then the configured roles."""
+ROLE_TABLE_PREFACE = (
+    "At the top of the first reply, reproduce the configured roles below "
+    "verbatim, fences included, directly after any line naming the "
+    "running model. The fences are not decoration: a surface that sets "
+    "prose in a proportional font aligns the columns only inside them. "
+    "They state what is configured; that line states what is running."
+)
+
+
+def with_role_table(context: str) -> str:
+    """The roster, on the channel a surface actually renders.
+
+    It was first emitted on systemMessage, reasoning that a line the
+    model is asked to repeat appears only when it complies, which is
+    not the same as being shown. That reasoning is sound and the
+    channel was still wrong: the VS Code extension renders no
+    SessionStart systemMessage at all, so on 2026-09-19 the table
+    reached the transcript as a hook_system_message attachment and
+    reached the user nowhere. Context plus an instruction is the only
+    route that arrives on every surface, since a surface that does
+    render systemMessage is not one that can be relied on.
+    """
     table = role_table()
-    return f"{system_message}\n{table}" if table else system_message
+    if not table:
+        return context
+    block = f"{ROLE_TABLE_PREFACE}\n```\n{table}\n```"
+    return f"{context}\n{block}" if context else block
+
+
 
 
 def hook_output(
@@ -260,10 +309,10 @@ def hook_output(
     parked = parked_announcement()
     if parked:
         context = f"{context}\n{parked}" if context else parked
+    if roles:
+        context = with_role_table(context)
     return {
-        "systemMessage": (
-            with_role_table(system_message) if roles else system_message
-        ),
+        "systemMessage": system_message,
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": context,
