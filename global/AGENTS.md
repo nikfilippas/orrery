@@ -201,18 +201,32 @@ the smallest relevant verification.
 
 #### Standard
 
-Make a concise plan. Delegate a bounded implementation to
-`orrery-agent --role implementer` when useful. Inspect the actual diff, correct
+Make a concise plan. Delegate the bounded implementation to
+`orrery-agent --role implementer`. Inspect the actual diff, correct
 small integration issues, and run relevant tests, lint, types, and builds.
 Request a fresh final review when meaningful logic or regression risk warrants
 it.
+
+The principal plans, inspects every diff, runs verification and owns the
+outcome; it does not write the implementation itself. That is not a
+preference about tidiness. Measured in one repository over eleven days:
+1.87 billion principal tokens, 858 million of them in a single day across
+1,626 turns at the highest thinking level, on a day with no delegated
+dispatch at all. A worker provider being unavailable is the case this
+rule exists for, not an exception to it: where no implementer-capable
+role can run, stop and ask rather than absorbing the work, because the
+principal's own allowance is the one the role split exists to protect.
+A role deliberately configured onto the principal's provider still runs,
+since that is a recorded decision rather than a silent diversion.
 
 #### Complex or high-risk
 
 Investigate first and produce an explicit plan with acceptance criteria. Run
 the bounded plan review, delegate implementation in coherent batches, inspect
 every batch and its real diff, run the complete relevant verification suite,
-and use a fresh final-review session. Verify every finding before changing
+and use a fresh final-review session. The standard route's rule on not
+writing the implementation applies here too, and more strongly: a batch
+the principal wrote is a batch no independent context ever read. Verify every finding before changing
 code, then rerun affected checks.
 
 ##### Bounded plan review
@@ -377,13 +391,28 @@ not migrate.
 ### Efficiency and prompt caching
 
 Honor each configured role's provider, model, and thinking level. Do not
-silently substitute a cheaper or more expensive level.
+silently substitute a cheaper or more expensive level for a delegated role, and
+do not switch a delegate's model or level mid-run: Orrery sets both when it
+starts that process, which is where it does control them.
 
 Both provider CLIs manage prompt caching automatically. Keep this shared
-instruction prefix stable, put task-specific context after it, choose the model
-and thinking level before a session starts, and avoid switching either during
-the task. Reviews stay fresh. Reuse only a coherent implementation session
-when the runtime supports exact-session continuation.
+instruction prefix stable, put task-specific context after it, and choose the
+principal's model before a session starts. Reviews stay fresh. Reuse only a
+coherent implementation session when the runtime supports exact-session
+continuation.
+
+The principal's own thinking level may be lowered within a session for a cheap
+route. Orrery cannot lower it: `--effort` is start-time and a hook cannot issue
+a slash command, so the only lever is the user's own `/effort`. What this asks
+for is one line, not an action. Where the classified route's recommended level
+is below the level the session is running at, say so once and name the level,
+and never state that the level changed. The recommended levels are
+investigation `medium`, trivial `low`, mechanical `low`, standard `high`, and
+complex `max`, unless `route_effort` in `global/orchestration.json` names
+others. They are provisional until it is measured whether changing the level
+inside a session costs a cache re-read; if it does, staying put is cheaper than
+switching. `orrery-doctor` reports the level the newest transcript for a
+repository recorded, and says so rather than naming a level it did not read.
 
 Do not delegate trivial work, require plan review for straightforward work, or
 repeat context that the role can read from the repository.

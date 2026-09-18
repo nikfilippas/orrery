@@ -661,6 +661,9 @@ check_link \
 check_link \
     "$CODEX_HOME/hooks/orrery-session-start.py" \
     "$KIT_DIR/scripts/orrery-session-start"
+check_link \
+    "$HOME/.claude/hooks/orrery-prompt-submit.py" \
+    "$KIT_DIR/scripts/orrery-prompt-submit"
 
 if [ "$(tr -d '\r' < "$KIT_DIR/global/CLAUDE.md")" = "@AGENTS.md" ] &&
    [ "$(tr -d '\r' < "$KIT_DIR/project-template/CLAUDE.md")" = "@AGENTS.md" ]
@@ -706,6 +709,8 @@ for script in \
     "$KIT_DIR/scripts/orrery" \
     "$KIT_DIR/scripts/orrery_fallback.py" \
     "$KIT_DIR/scripts/orrery-session-start" \
+    "$KIT_DIR/scripts/orrery-prompt-submit" \
+    "$KIT_DIR/scripts/orrery_effort.py" \
     "$KIT_DIR/scripts/orrery_model_catalogue.py" \
     "$KIT_DIR/scripts/orrery_runtime.py" \
     "$KIT_DIR/scripts/orrery-review" \
@@ -1019,6 +1024,31 @@ PY
     done <<< "$ALLOWANCE_REPORT"
 else
     warn "The configured allowances could not be inspected"
+fi
+
+printf '\n=== Thinking level ===\n'
+if EFFORT_REPORT="$(
+    python3 - "$KIT_DIR" "$PWD" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_effort import doctor_report
+
+for line in doctor_report(Path(sys.argv[2])):
+    print(line)
+PY
+)"; then
+    while IFS='|' read -r verdict message; do
+        [ -n "$message" ] || continue
+        case "$verdict" in
+            PASS) pass "Effort: $message" ;;
+            SKIP) skip "Effort: $message" ;;
+            *) warn "Effort: $message" ;;
+        esac
+    done <<< "$EFFORT_REPORT"
+else
+    warn "The session's thinking level could not be inspected"
 fi
 
 printf '\n=== Parked work ===\n'

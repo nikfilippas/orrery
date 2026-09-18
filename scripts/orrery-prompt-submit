@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""Warn, or stop, when a principal turn crosses its provider's allowance.
+
+Two earlier decisions closed the paths by which a delegated run could be
+substituted onto the allowance its principal spends from. Neither
+touches the case that actually spent one: the principal doing the work
+itself. The measured day spent 858 million tokens across 1,626 principal
+turns with no delegate dispatch at all, every turn at the most expensive
+thinking level, and nothing in the kit bounded it.
+
+This is the half that answers that. On every prompt submission it
+measures what the model actually running has spent over its provider's
+window and, once that crosses the configured allowance, says so in the
+channel the user can see. `systemMessage` rather than context alone:
+whether a line delivered only to the model is ever repeated to the user
+depends on the model choosing to repeat it, and a warning the user
+cannot see is not a warning.
+
+It warns by default and stops a turn only under `on_exceeded: block`,
+because the accounting can overcount on resume and an overcount in warn
+mode costs a sentence rather than a session.
+
+Four rules decide what it may do.
+
+A delegate is exempt. Delegated Claude runs carry ORRERY_ROLE and run
+`claude --print`, which fires this hook too, and a stopped delegate turn
+returns no result, which is recorded as an authorising failure and would
+manufacture exactly the substitutions the fallback precondition exists
+to prevent.
+
+It is conditioned on the model actually running, read from the
+transcript tail, so a session is never stopped by a ceiling on a
+provider it is not spending.
+
+Every read, parse, lock and configuration error permits the turn, and
+that includes RuntimeConfigError from the adoption check. It exits 2
+only on a crossing it measured, never on an exception, and slash command
+input is never stopped, or `/effort` would be unreachable at exactly the
+moment it is wanted. The manifest is re-read every turn, so raising the
+ceiling elsewhere takes effect without restarting the session, which is
+the only escape an already-stopped session has.
+
+The user-visible warning goes on every crossing turn. The incident
+behind it is written once per session and again only when the value
+changes: the incident store rotates at 1 MiB keeping one previous file,
+and the failure records the fallback precondition reads live there.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from orrery_runtime import (  # noqa: E402
+    MANIFEST_PATH,
+    Role,
+    RuntimeConfigError,
+    adopted_root,
+    load_manifest,
+    load_role,
+)
+import orrery_allowance as allowance  # noqa: E402
+import orrery_effort as effort  # noqa: E402
+import orrery_incidents as incident_log  # noqa: E402
+
+
+MAX_INPUT_BYTES = 1024 * 1024
+PROGRAM = "orrery-prompt-submit"
+OVERRIDE = "ORRERY_ALLOWANCE_OVERRIDE"
+# The one exit code that stops a turn. Everything else, including every
+# failure of this hook's own, permits it.
+STOP_TURN = 2
+
+
+def hook_output(system_message: str, context: str) -> dict[str, Any]:
+    return {
+        "systemMessage": system_message,
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": context,
+        },
+    }
+
+
+def configured_principal(cwd: Path) -> Role | None:
+    """The principal this repository runs under, or None.
+
+    `apply_override=False` is tried second for the reason the ranking
+    already uses it: every remaining raiser is the adoption marker, the
+    trust store or the repository override, and if the override cannot
+    be read the repository is not adopted, so the global principal is
+    the one that would have applied anyway.
+    """
+    for apply_override in (True, False):
+        try:
+            return load_role(
+                "orchestrator", cwd=cwd, apply_override=apply_override
+            )
+        except RuntimeConfigError:
+            continue
+    return None
+
+
+def record_drift(
+    session: str,
+    seen: effort.Observation,
+    principal: Role | None,
+) -> None:
+    """One incident when the level running is not the level configured.
+
+    Compared against the configured principal thinking level and nothing
+    else. The classified route exists only in the principal's own
+    reasoning and is written to no file this hook could read, so
+    recommending per route is the principal's job; observing what is
+    running is this one's.
+    """
+    if seen.effort is None or principal is None:
+        return
+    if principal.provider != "anthropic" or principal.thinking is None:
+        # The level is a Claude notion, so an OpenAI scale's wording is
+        # not comparable with it, and a role configured without one
+        # states no level to differ from.
+        return
+    if not effort.changed_for_session(session, "effort", seen.effort):
+        return
+    if seen.effort == principal.thinking:
+        return
+    incident_log.record(
+        "effort-drift",
+        program=PROGRAM,
+        role=principal,
+        detail=(
+            f"the session is running at thinking {seen.effort}, not the "
+            f"configured {principal.thinking}"
+        ),
+        session_thinking=seen.effort,
+        active_model=seen.model,
+    )
+
+
+def measured(crossing: allowance.Crossing) -> str:
+    """The measurement itself, in the units orrery-usage reports."""
+    return (
+        f"the {crossing.provider} allowance is spent: {crossing.total:,} "
+        f"tokens measured over the last {crossing.window_days} day(s) "
+        f"against a ceiling of {crossing.tokens:,}"
+        + (f" ({crossing.breakdown})" if crossing.breakdown else "")
+        + ". The count includes cache reads, as orrery-usage does."
+    )
+
+
+def way_out(crossing: allowance.Crossing) -> str:
+    """How to proceed, from outside a session that cannot be typed in."""
+    return (
+        f"From another terminal, raise allowances.{crossing.provider} or "
+        f"set on_exceeded to warn in {MANIFEST_PATH}; it is re-read on "
+        f"every turn, so no restart is needed. A new session started with "
+        f"{OVERRIDE}=1 proceeds without stopping."
+    )
+
+
+def run() -> int:
+    if os.environ.get("ORRERY_ROLE", "").strip():
+        # A bounded delegate is exempt: stopping its turn would produce
+        # no result, which is itself an authorising failure.
+        return 0
+    raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        return 0
+    payload = json.loads(raw or b"{}")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("hook_event_name") != "UserPromptSubmit"
+    ):
+        return 0
+    cwd = payload.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        cwd = str(Path.cwd())
+    if (
+        adopted_root(Path(cwd)) is None
+        and os.environ.get("ORRERY_SESSION") != "principal"
+    ):
+        return 0
+
+    manifest = load_manifest()
+    transcript = payload.get("transcript_path")
+    seen = effort.observe(transcript)
+    session = payload.get("session_id") or transcript or ""
+    if not isinstance(session, str):
+        session = ""
+    principal = configured_principal(Path(cwd))
+    record_drift(session, seen, principal)
+
+    crossing = allowance.principal_crossing(seen.model, manifest=manifest)
+    mode = allowance.on_exceeded(manifest)
+    signature = "" if crossing is None else f"{crossing.provider}:{mode}"
+    # Stored even when there is nothing to record, so that a ceiling
+    # crossed again after being raised is reported again.
+    changed = effort.changed_for_session(session, "ceiling", signature)
+    if crossing is None:
+        return 0
+    if changed:
+        incident_log.record(
+            "allowance-exceeded",
+            program=PROGRAM,
+            role=principal,
+            detail=measured(crossing),
+            mode=mode,
+            spend=crossing.total,
+            ceiling=crossing.tokens,
+            window_days=crossing.window_days,
+            active_model=seen.model,
+        )
+
+    prompt = payload.get("prompt")
+    slash = isinstance(prompt, str) and prompt.lstrip().startswith("/")
+    overridden = os.environ.get(OVERRIDE) == "1"
+    if mode == "block" and not slash and not overridden:
+        print(
+            f"orrery: {measured(crossing)} This turn was stopped because "
+            f"on_exceeded is block. {way_out(crossing)}",
+            file=sys.stderr,
+        )
+        return STOP_TURN
+
+    if mode == "block" and slash:
+        permitted = " A slash command is never stopped, so this turn ran."
+    elif mode == "block" and overridden:
+        permitted = f" {OVERRIDE}=1 is set, so this turn was not stopped."
+    else:
+        permitted = " Nothing was stopped."
+    print(
+        json.dumps(
+            hook_output(
+                f"Orrery: {measured(crossing)}{permitted}",
+                "ORRERY ALLOWANCE WARNING\n"
+                f"{measured(crossing)}{permitted} Tell the user in one "
+                "short line that the allowance is spent and by how much, "
+                "and do not say the session was stopped when it was not.",
+            )
+        )
+    )
+    return 0
+
+
+def main() -> int:
+    try:
+        return run()
+    except Exception:  # noqa: BLE001 - a hook must never fail a turn
+        # Deliberately silent and deliberately zero. Anything this hook
+        # cannot measure, it has no business stopping a turn over.
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

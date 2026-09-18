@@ -254,6 +254,84 @@ to start any role on that provider and exits 78, naming the measured
 spend, the ceiling and the window. Raise the ceiling, route the role at
 another provider, or wait for the window to pass.
 
+### What a crossing does to the session itself
+
+That refusal governs delegate dispatches. The day this was built around spent
+858 million tokens across 1,626 principal turns and made no delegate dispatch
+at all, so it would not have fired once. The principal's own turns are answered
+by a `UserPromptSubmit` hook, `scripts/orrery-prompt-submit`, installed for
+Claude alone because Codex publishes neither the running model nor the thinking
+level to a prompt hook.
+
+```json
+"on_exceeded": "warn"
+```
+
+Once the window spend for the model **actually running** crosses that
+provider's allowance, every turn carries one line naming the measured spend,
+the ceiling and the window. It is sent to `systemMessage`, the channel you see,
+and not to the model's context alone: whether a line delivered only to the
+model is ever repeated to you depends on the model choosing to repeat it.
+`on_exceeded: block` stops the crossing turn instead. Blocking is opt-in
+because the accounting can overcount on a resumed session, and an overcount in
+warn mode costs a sentence rather than a session.
+
+The running model is read from the transcript, so a ceiling on one provider
+never stops a session spending another's. Four things are never stopped: a
+session carrying `ORRERY_ROLE`, because a stopped delegate turn returns no
+result and that is itself recorded as an authorising failure; slash-command
+input, so `/effort` stays reachable exactly when it is wanted; a session
+started with `ORRERY_ALLOWANCE_OVERRIDE=1`; and anything the hook could not
+measure, which includes an absent allowance, an unreadable rollup or
+transcript, an adoption check that raised, and any unexpected error. The hook
+exits 2 only on a crossing it measured.
+
+A stopped session cannot set an environment variable for itself, so the message
+names what to change from another terminal. The manifest is re-read on every
+turn: raising `allowances.<provider>`, or setting `on_exceeded` back to `warn`,
+takes effect on the next prompt without restarting the session.
+
+The warning is repeated on every crossing turn by design. The incident behind
+it is not: it is written once per session and again only when the value
+changes, because the incident store rotates at 1 MiB keeping one previous file
+and the fallback precondition reads the failure records it would otherwise
+flush.
+
+## Recommend a thinking level, and see the one in use
+
+Orrery cannot set a thinking level inside a running session. `--effort` is
+start-time, a provider's settings are read at start, and a hook cannot issue a
+slash command. Only your own `/effort` can, so the manifest's `route_effort` is
+a recommendation table that the principal states in one line, never an action
+it takes.
+
+```json
+"route_effort": {
+  "investigation": "medium",
+  "trivial": "low",
+  "mechanical": "low",
+  "standard": "high",
+  "complex": "max"
+}
+```
+
+Those are the defaults, and the block may be omitted entirely or name only the
+routes you want to move. They are provisional: whether changing the level
+inside a session costs a cache re-read has not been measured, and if it does,
+staying put is cheaper than switching.
+
+What is observable is the level actually running. The same prompt hook reads it
+from the transcript tail and records an `effort-drift` incident when it differs
+from the configured principal level, under the same one-per-changed-value
+bound; an absent level is unobserved and never counted as a difference.
+`orrery-doctor` reports the level the newest transcript for the repository
+recorded, and names that file. Where it cannot read one it says the level is
+unknown rather than naming the configured one, which nobody observed.
+
+`orrery-session-start` already reads `CLAUDE_CODE_EFFORT_LEVEL` and
+`CLAUDE_EFFORT` at session start, so the only blind spot the hook closes is an
+in-session `/effort` change after start.
+
 ## Watch and capture a delegated run
 
 ```bash
@@ -1091,6 +1169,15 @@ The maintained artefacts are:
   incident log writer/reader module and its reporting command.
 - `scripts/orrery_allowance.py` — the per-provider token ceiling and the
   rollup of local session spend it is measured against.
+- `scripts/orrery-prompt-submit` — the `UserPromptSubmit` hook that warns,
+  or stops the turn, once the model actually running has crossed its
+  provider's allowance. A bounded delegate is exempt, every read and
+  configuration error permits the turn, and slash-command input is never
+  stopped.
+- `scripts/orrery_effort.py` — the thinking level a session is actually
+  running at, read from its transcript, the route-to-effort
+  recommendation table, and the per-session bookkeeping that keeps the
+  prompt hook's incidents to one per changed value.
 - `scripts/orrery_ledger.py` and `scripts/orrery-task` — the durable task
   ledger, contracts, and state machine, and the task command surface
   (Phase 1 control plane).

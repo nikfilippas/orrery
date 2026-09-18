@@ -101,6 +101,10 @@ TOKEN_FIELDS = (
 DEFAULT_RETENTION_DAYS = 8
 MAX_WINDOW_DAYS = 90
 
+# What a crossing does to the principal's own turn. The first is the
+# default, and the enforcing one is opt-in.
+ON_EXCEEDED_MODES = ("warn", "block")
+
 # Enough of a digest that a collision is not a practical concern at any
 # plausible response count, and short enough that a busy week of
 # identities stays a few hundred kilobytes.
@@ -170,6 +174,27 @@ def load_allowances(manifest: dict[str, Any] | None = None) -> dict[str, Allowan
             )
         allowances[provider] = Allowance(provider, tokens, window_days)
     return allowances
+
+
+def on_exceeded(manifest: dict[str, Any] | None = None) -> str:
+    """What a crossing does to a principal turn: warn, or block.
+
+    Warning is the default because the accounting can overcount. A
+    session resumed into a second transcript replays responses the first
+    one recorded, and while identity deduplication is what stops that
+    becoming spend, an overcount is the direction that refuses work the
+    allowance would have covered. In warn mode that costs a sentence; in
+    block mode it costs the session.
+    """
+    if manifest is None:
+        manifest = load_manifest()
+    value = manifest.get("on_exceeded", ON_EXCEEDED_MODES[0])
+    if value not in ON_EXCEEDED_MODES:
+        raise RuntimeConfigError(
+            "the manifest on_exceeded must be "
+            f"{' or '.join(ON_EXCEEDED_MODES)}"
+        )
+    return str(value)
 
 
 def retention_seconds(allowances: dict[str, Allowance]) -> float:
@@ -778,6 +803,60 @@ def ceiling_refusal(
     )
 
 
+@dataclass(frozen=True)
+class Crossing:
+    """A measured window spend that has reached its provider's ceiling."""
+
+    provider: str
+    total: int
+    tokens: int
+    window_days: int
+    breakdown: str
+
+
+def principal_crossing(
+    model: Any,
+    *,
+    now: float | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> Crossing | None:
+    """The allowance the model already running has crossed, or None.
+
+    The dispatch refusal measures the role about to start; this measures
+    what is running, which its caller reads from the transcript rather
+    than from the configuration. The provider follows the model for the
+    same reason: a session on one provider must not be stopped by
+    another provider's ceiling, nor by a ceiling on a model it is not
+    running.
+    """
+    if not isinstance(model, str) or not model:
+        return None
+    if manifest is None:
+        manifest = load_manifest()
+    allowances = load_allowances(manifest)
+    if not allowances:
+        return None
+    provider, _name = split_key(model_resolver(manifest)(model))
+    allowance = allowances.get(provider)
+    if allowance is None:
+        return None
+    spend = window_spend(
+        provider,
+        allowance.window_days,
+        rollup=refresh(now=now, manifest=manifest),
+        now=now,
+    )
+    if spend["total"] < allowance.tokens:
+        return None
+    return Crossing(
+        provider,
+        spend["total"],
+        allowance.tokens,
+        allowance.window_days,
+        describe_models(spend["models"]),
+    )
+
+
 def _age_phrase(seconds: float) -> str:
     """How stale a stored measurement is, in the coarsest useful unit."""
     if seconds < 90:
@@ -814,6 +893,14 @@ def doctor_report(cwd: Path | None = None) -> list[str]:
         return [f"WARN|the configured principal could not be read: {exc}"]
 
     lines: list[str] = []
+    try:
+        on_exceeded()
+    except RuntimeConfigError as exc:
+        # Reported only when it is wrong, because the hook reading it
+        # permits the turn on any configuration error: a misspelt value
+        # would otherwise leave a ceiling that neither warns nor blocks
+        # and says nothing about why.
+        lines.append(f"WARN|{exc}, so a crossing would do neither")
     if principal.provider not in allowances:
         lines.append(
             f"WARN|no allowance is configured for {principal.provider}, the "

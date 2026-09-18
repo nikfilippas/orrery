@@ -139,6 +139,13 @@ link_file \
     "$KIT_DIR/scripts/orrery-session-start" \
     "$CODEX_HOME/hooks/orrery-session-start.py"
 
+# The allowance warning is a Claude hook only: it reads the thinking
+# level and the running model from a Claude transcript, and Codex
+# publishes neither to a prompt hook.
+link_file \
+    "$KIT_DIR/scripts/orrery-prompt-submit" \
+    "$HOME/.claude/hooks/orrery-prompt-submit.py"
+
 # Role assignments now come from one provider-neutral manifest. Remove only
 # obsolete profile links installed by this checkout; user-owned profiles stay.
 for stale in mechanic implementer plan-reviewer reviewer luna terra vesta sol; do

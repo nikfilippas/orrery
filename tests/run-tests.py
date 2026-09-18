@@ -48,6 +48,7 @@ PRINCIPAL_SCRIPT = KIT_DIR / "scripts" / "orrery"
 RUNTIME_SCRIPT = KIT_DIR / "scripts" / "orrery_runtime.py"
 FALLBACK_SCRIPT = KIT_DIR / "scripts" / "orrery_fallback.py"
 SESSION_START_SCRIPT = KIT_DIR / "scripts" / "orrery-session-start"
+PROMPT_SUBMIT_SCRIPT = KIT_DIR / "scripts" / "orrery-prompt-submit"
 CONFIG_SCRIPT = KIT_DIR / "scripts" / "orrery-config"
 INSTALL_SCRIPT = KIT_DIR / "scripts" / "install.sh"
 DOCTOR_SCRIPT = KIT_DIR / "scripts" / "doctor.sh"
@@ -101,6 +102,7 @@ fallback_module = sys.modules["orrery_fallback"]
 ledger_module = load_script(LEDGER_SCRIPT, "kit_orrery_ledger")
 task_module = load_script(TASK_SCRIPT, "kit_orrery_task")
 import orrery_allowance as allowance_module  # noqa: E402
+import orrery_effort as effort_module  # noqa: E402
 import orrery_findings as findings_module  # noqa: E402
 import orrery_incidents as incidents_module  # noqa: E402
 import orrery_stall as stall_module  # noqa: E402
@@ -15028,6 +15030,650 @@ def test_d3_allowance_validation() -> None:
         except runtime_module.RuntimeConfigError:
             continue
         raise Failure(f"an invalid allowance was accepted: {wrong}")
+
+
+# ---------------------------------------------------------------------------
+# D3 enforcement and D4: what the running session spends, and at what level
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def prompt_hook_kit(**settings: Any) -> Any:
+    """A copied kit, an adopted repository, and empty transcript roots.
+
+    The hook runs as a subprocess, so the manifest it reads has to be a
+    real file: `manifest_allowances` doctors an import and cannot reach
+    another process. The copy is also what keeps the developer's own
+    manifest, which is simultaneously the shipped default, out of every
+    assertion here, and lets the principal be pinned rather than
+    inherited from whatever this machine is configured for.
+    """
+    with standing_stores(), transcript_roots() as (projects, sessions):
+        with tempfile.TemporaryDirectory() as directory:
+            kit = Path(directory) / "kit"
+            shutil.copytree(
+                KIT_DIR,
+                kit,
+                ignore=shutil.ignore_patterns(".git", "__pycache__"),
+            )
+            manifest_path = kit / "global" / "orchestration.json"
+            manifest = read_json(manifest_path)
+            principal = next(
+                step
+                for step in manifest["steps"]
+                if step["id"] == "orchestrator"
+            )
+            principal.update(
+                {"provider": "anthropic", "model": "opus", "thinking": "high"}
+            )
+            manifest["allowances"] = settings.pop("allowances", {})
+            manifest.update(settings)
+            write_json(manifest_path, manifest)
+            yield kit, adopted_repository(directory), projects, sessions
+
+
+def run_prompt_hook(
+    kit: Path,
+    repository: Path,
+    *,
+    transcript: Path | None = None,
+    session: str = "fixture-session",
+    prompt: str = "do the thing",
+    role: str | None = None,
+    override: str | None = None,
+    event: str = "UserPromptSubmit",
+) -> Any:
+    """One prompt submission through the hook, as the surface runs it."""
+    environment = os.environ.copy()
+    # The suite may itself be running as a bounded delegate, and the
+    # hook stands aside for one, so the marker is cleared unless the
+    # test is about the exemption.
+    environment.pop("ORRERY_ROLE", None)
+    environment.pop("ORRERY_ALLOWANCE_OVERRIDE", None)
+    if role is not None:
+        environment["ORRERY_ROLE"] = role
+    if override is not None:
+        environment["ORRERY_ALLOWANCE_OVERRIDE"] = override
+    return subprocess.run(
+        [sys.executable, str(kit / "scripts" / "orrery-prompt-submit")],
+        input=json.dumps(
+            {
+                "hook_event_name": event,
+                "session_id": session,
+                "transcript_path": "" if transcript is None else str(transcript),
+                "cwd": str(repository),
+                "prompt": prompt,
+            }
+        ),
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+def transcript_with_effort(
+    path: Path,
+    model: str,
+    tokens: int,
+    level: str | None,
+    *,
+    identifier: str = "msg_p1",
+) -> None:
+    """A transcript whose newest assistant record carries `level`.
+
+    `None` writes a record with no `effort` field at all, which is the
+    case that must read as unobserved rather than as a difference.
+    """
+    record = json.loads(
+        transcript_response(identifier, f"req_{identifier}", model, tokens)
+    )
+    if level is None:
+        record.pop("effort", None)
+    else:
+        record["effort"] = level
+    write_transcript(path, [*transcript_noise(), json.dumps(record)])
+
+
+def hook_report(result: Any) -> dict[str, Any]:
+    require(
+        result.returncode == 0,
+        f"the hook did not permit the turn: {result.returncode} "
+        f"{result.stderr}",
+    )
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise Failure(
+            f"the hook emitted no usable report: {result.stdout!r} {exc}"
+        ) from exc
+
+
+@test("a crossed allowance warns on every principal turn without stopping it")
+def test_d3_prompt_warning_is_visible_and_per_turn() -> None:
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}}
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+
+        for turn in (1, 2):
+            result = run_prompt_hook(
+                kit, repository, transcript=transcript, session="turn-fixture"
+            )
+            report = hook_report(result)
+            # (A10) The user-visible channel, not context alone. Whether
+            # a line delivered only to the model is ever repeated to the
+            # user depends on the model choosing to repeat it, which is
+            # the dependence on prose that warn mode was chosen against.
+            message = report.get("systemMessage", "")
+            context = report.get("hookSpecificOutput", {}).get(
+                "additionalContext", ""
+            )
+            for channel, text in (("systemMessage", message), ("context", context)):
+                require(
+                    "the anthropic allowance is spent" in text
+                    and "1,200 tokens" in text
+                    and "ceiling of 1,000" in text
+                    and "7 day(s)" in text,
+                    f"turn {turn} did not name spend, ceiling and window in "
+                    f"{channel}: {text!r}",
+                )
+            require(
+                report["hookSpecificOutput"]["hookEventName"]
+                == "UserPromptSubmit",
+                f"the hook named the wrong event: {report}",
+            )
+            require(
+                "Nothing was stopped" in message,
+                f"warn mode did not say the turn ran: {message!r}",
+            )
+
+        # The measurement is what decides, so a ceiling the spend is
+        # inside says nothing at all.
+        with prompt_hook_kit(
+            allowances={"anthropic": {"tokens": 10_000, "window_days": 7}}
+        ) as (covered, inside, roomy, _codex):
+            quiet = roomy / "session.jsonl"
+            transcript_with_effort(quiet, "claude-opus-5", 1_200, "high")
+            result = run_prompt_hook(covered, inside, transcript=quiet)
+            require(
+                result.returncode == 0 and not result.stdout.strip(),
+                f"a session inside its allowance was warned: {result.stdout!r}",
+            )
+
+
+@test("on_exceeded block stops the crossing turn and names a way out")
+def test_d3_prompt_block_mode() -> None:
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        result = run_prompt_hook(kit, repository, transcript=transcript)
+        require(
+            result.returncode == 2,
+            f"block mode did not stop the turn: {result.returncode} "
+            f"{result.stdout!r}",
+        )
+        require(
+            "the anthropic allowance is spent" in result.stderr
+            and "ceiling of 1,000" in result.stderr,
+            f"the stop did not name the measurement: {result.stderr!r}",
+        )
+        # (A20) An environment variable cannot be set from inside a
+        # stopped session, so the message has to name something that can
+        # be changed from outside it, and say that it takes effect
+        # without a restart.
+        require(
+            "orchestration.json" in result.stderr
+            and "on_exceeded" in result.stderr
+            and "re-read on every turn" in result.stderr
+            and "ORRERY_ALLOWANCE_OVERRIDE=1" in result.stderr,
+            f"the stop named no way out: {result.stderr!r}",
+        )
+        require(
+            not result.stdout.strip(),
+            f"a stopped turn still emitted a report: {result.stdout!r}",
+        )
+
+
+@test("a delegate turn and another provider's ceiling never stop a session")
+def test_d3_prompt_exempts_delegates_and_follows_the_model() -> None:
+    # (R10) A stopped delegate turn produces no final result, which is
+    # recorded as `no-result` and authorises a substitution, so a hook
+    # that stopped one would manufacture the diversions the precondition
+    # exists to prevent.
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        delegated = run_prompt_hook(
+            kit, repository, transcript=transcript, role="implementer"
+        )
+        require(
+            delegated.returncode == 0
+            and not delegated.stdout.strip()
+            and not delegated.stderr.strip(),
+            f"a bounded delegate was not exempt: {delegated.returncode} "
+            f"{delegated.stdout!r} {delegated.stderr!r}",
+        )
+
+    # (R10) Conditioned on the model actually running: an exhausted
+    # allowance on the provider this session is not spending must not
+    # reach it.
+    with prompt_hook_kit(
+        allowances={"openai": {"tokens": 100, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, sessions):
+        codex_rollout(sessions / "rollout-fixture.jsonl", "gpt-5.6-sol", 900)
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        elsewhere = run_prompt_hook(kit, repository, transcript=transcript)
+        require(
+            elsewhere.returncode == 0 and not elsewhere.stdout.strip(),
+            "a Claude session was stopped by the OpenAI ceiling: "
+            f"{elsewhere.returncode} {elsewhere.stdout!r} {elsewhere.stderr!r}",
+        )
+
+
+@test("the prompt hook permits the turn on everything it cannot measure")
+def test_d3_prompt_fails_open() -> None:
+    # No allowance block at all.
+    with prompt_hook_kit(on_exceeded="block") as (
+        kit,
+        repository,
+        projects,
+        _sessions,
+    ):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        result = run_prompt_hook(kit, repository, transcript=transcript)
+        require(
+            result.returncode == 0 and not result.stdout.strip(),
+            f"an unconfigured allowance stopped a turn: {result.returncode}",
+        )
+
+        # (A20) `adopted_root` raises on a group- or world-writable
+        # marker rather than returning None, and that is a configuration
+        # fault in the repository, not a crossing.
+        (repository / ".orrery.json").chmod(0o666)
+        try:
+            unreadable = run_prompt_hook(
+                kit, repository, transcript=transcript
+            )
+        finally:
+            (repository / ".orrery.json").chmod(0o600)
+        require(
+            unreadable.returncode == 0 and not unreadable.stdout.strip(),
+            f"an unreadable adoption marker stopped a turn: "
+            f"{unreadable.returncode} {unreadable.stderr!r}",
+        )
+
+    # A state directory that cannot be written: the rollup, the incident
+    # store and this hook's own bookkeeping all live under it.
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        saved_state = os.environ["XDG_STATE_HOME"]
+        locked = Path(saved_state) / "locked"
+        locked.mkdir()
+        locked.chmod(0o500)
+        os.environ["XDG_STATE_HOME"] = str(locked / "state")
+        try:
+            result = run_prompt_hook(kit, repository, transcript=transcript)
+        finally:
+            os.environ["XDG_STATE_HOME"] = saved_state
+            locked.chmod(0o700)
+        require(
+            result.returncode == 0 and not result.stdout.strip(),
+            f"an unwritable state directory stopped a turn: "
+            f"{result.returncode} {result.stderr!r}",
+        )
+
+    # An unexpected exception, which no fail-open list can enumerate.
+    # Driven in process because that is the only place one can be
+    # injected at all.
+    hook = load_script(PROMPT_SUBMIT_SCRIPT, "kit_orrery_prompt_submit")
+
+    class Stdin:
+        def __init__(self, data: bytes) -> None:
+            self.buffer = io.BytesIO(data)
+
+    def explode(*_a: Any, **_k: Any) -> Any:
+        raise ZeroDivisionError("an error the hook never anticipated")
+
+    with standing_stores(), transcript_roots():
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+            saved_crossing = hook.allowance.principal_crossing
+            saved_stdin = sys.stdin
+            hook.allowance.principal_crossing = explode
+            spoken = io.StringIO()
+            try:
+                sys.stdin = Stdin(
+                    json.dumps(
+                        {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": "exception-fixture",
+                            "cwd": str(repository),
+                            "prompt": "do the thing",
+                        }
+                    ).encode()
+                )
+                with contextlib.redirect_stdout(spoken):
+                    status = hook.main()
+            finally:
+                sys.stdin = saved_stdin
+                hook.allowance.principal_crossing = saved_crossing
+    require(
+        status == 0 and not spoken.getvalue().strip(),
+        f"an unexpected exception did not permit the turn: {status} "
+        f"{spoken.getvalue()!r}",
+    )
+
+
+@test("an override and a slash command are never stopped by the ceiling")
+def test_d3_prompt_escape_hatches() -> None:
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+
+        # (A20) `/effort` is the command D4 asks for, and it would be
+        # unreachable at exactly the moment it is wanted.
+        slash = run_prompt_hook(
+            kit, repository, transcript=transcript, prompt="  /effort medium"
+        )
+        require(
+            slash.returncode == 0,
+            f"a slash command was stopped: {slash.returncode} {slash.stderr!r}",
+        )
+        require(
+            "slash command is never stopped"
+            in hook_report(slash).get("systemMessage", ""),
+            f"the slash exemption was not disclosed: {slash.stdout!r}",
+        )
+
+        overridden = run_prompt_hook(
+            kit, repository, transcript=transcript, override="1"
+        )
+        require(
+            overridden.returncode == 0,
+            f"the override did not permit the turn: {overridden.returncode} "
+            f"{overridden.stderr!r}",
+        )
+        require(
+            "ORRERY_ALLOWANCE_OVERRIDE=1 is set"
+            in hook_report(overridden).get("systemMessage", ""),
+            f"the override was not disclosed: {overridden.stdout!r}",
+        )
+
+
+@test("the ceiling and effort incidents are bounded to one per changed value")
+def test_d4_incidents_are_rate_bounded() -> None:
+    # (A19) The incident store rotates at 1 MiB keeping one previous
+    # file and the fallback precondition reads it for control flow, so
+    # an event per prompt submission would flush the failure records it
+    # depends on within days at the rate this plan measured.
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}}
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "max")
+
+        def kinds() -> list[str]:
+            return [
+                event["kind"]
+                for event in incidents_module.read_events()
+                if event["program"] == "orrery-prompt-submit"
+            ]
+
+        for _turn in range(3):
+            result = run_prompt_hook(
+                kit, repository, transcript=transcript, session="one-session"
+            )
+            require(
+                "the anthropic allowance is spent"
+                in hook_report(result).get("systemMessage", ""),
+                "the warning is per turn by design and one turn lost it: "
+                f"{result.stdout!r}",
+            )
+        require(
+            kinds() == ["effort-drift", "allowance-exceeded"],
+            f"three turns did not write exactly one of each: {kinds()}",
+        )
+
+        # A changed value is a new fact and is recorded again.
+        transcript_with_effort(
+            transcript,
+            "claude-opus-5",
+            1_200,
+            "medium",
+            identifier="msg_p2",
+        )
+        run_prompt_hook(
+            kit, repository, transcript=transcript, session="one-session"
+        )
+        require(
+            kinds().count("effort-drift") == 2,
+            f"a changed level was not recorded again: {kinds()}",
+        )
+
+        # Another session is another fact.
+        run_prompt_hook(
+            kit, repository, transcript=transcript, session="other-session"
+        )
+        require(
+            kinds().count("effort-drift") == 3
+            and kinds().count("allowance-exceeded") == 2,
+            f"a second session was silently folded into the first: {kinds()}",
+        )
+
+
+@test("the hook records the level a session runs at, and nothing it cannot read")
+def test_d4_effort_drift_is_observed_not_assumed() -> None:
+    with prompt_hook_kit() as (kit, repository, projects, _sessions):
+        def drift() -> list[dict[str, Any]]:
+            return [
+                event
+                for event in incidents_module.read_events()
+                if event["kind"] == "effort-drift"
+            ]
+
+        # The fixture pins the principal at thinking high.
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 10, "max")
+        run_prompt_hook(
+            kit, repository, transcript=transcript, session="drifting"
+        )
+        events = drift()
+        require(
+            len(events) == 1
+            and events[0]["session_thinking"] == "max"
+            and events[0]["thinking"] == "high"
+            and "not the configured high" in events[0]["detail"],
+            f"the drift was not recorded against the configured level: {events}",
+        )
+
+        # (A19, A24) An absent field is unobserved, never a difference.
+        # Deliberately the same session, which is where the distinction
+        # bites: a level was observed a moment ago, and the absence of
+        # one now is not a change away from it.
+        transcript_with_effort(
+            transcript, "claude-opus-5", 10, None, identifier="msg_q1"
+        )
+        run_prompt_hook(
+            kit, repository, transcript=transcript, session="drifting"
+        )
+        require(
+            len(drift()) == 1,
+            f"a transcript with no level was read as drift: {drift()}",
+        )
+
+        # An unreadable transcript records nothing at all.
+        run_prompt_hook(
+            kit,
+            repository,
+            transcript=projects / "absent.jsonl",
+            session="drifting",
+        )
+        require(
+            len(drift()) == 1,
+            f"an unreadable transcript was read as drift: {drift()}",
+        )
+
+        # The level the principal is configured for is not drift.
+        transcript_with_effort(
+            transcript, "claude-opus-5", 10, "high", identifier="msg_q2"
+        )
+        run_prompt_hook(
+            kit, repository, transcript=transcript, session="drifting"
+        )
+        require(
+            len(drift()) == 1,
+            f"the configured level was recorded as drift: {drift()}",
+        )
+
+
+@test("the route effort map defaults, and the manifest may override it")
+def test_d4_route_effort_map() -> None:
+    require(
+        effort_module.route_effort({})
+        == {
+            "investigation": "medium",
+            "trivial": "low",
+            "mechanical": "low",
+            "standard": "high",
+            "complex": "max",
+        },
+        f"the defaults moved: {effort_module.route_effort({})}",
+    )
+    mapped = effort_module.route_effort({"route_effort": {"standard": "max"}})
+    require(
+        mapped["standard"] == "max" and mapped["trivial"] == "low",
+        f"a partial map did not merge over the defaults: {mapped}",
+    )
+    for wrong in (
+        {"route_effort": []},
+        {"route_effort": {"refactor": "low"}},
+        {"route_effort": {"standard": "HIGH"}},
+        {"route_effort": {"standard": 2}},
+    ):
+        try:
+            effort_module.route_effort(wrong)
+        except runtime_module.RuntimeConfigError:
+            continue
+        raise Failure(f"an invalid route effort map was accepted: {wrong}")
+
+
+@test("the doctor reports the level it read and never one it did not")
+def test_d4_doctor_reports_the_observed_level() -> None:
+    levels = ("low", "medium", "high", "xhigh", "max")
+    with standing_stores(), transcript_roots():
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+
+            # Nothing to read: the doctor says so rather than naming the
+            # configured level, which nobody observed.
+            silent = [
+                line
+                for line in effort_module.doctor_report(repository)
+                if not line.startswith("PASS|recommended")
+            ]
+            require(
+                len(silent) == 1
+                and silent[0].startswith("SKIP|")
+                and "unknown" in silent[0]
+                and not any(level in silent[0] for level in levels),
+                f"an unread level was still asserted: {silent}",
+            )
+
+            principal = runtime_module.load_role(
+                "orchestrator", cwd=repository
+            )
+            observed = "low" if principal.thinking != "low" else "high"
+            projects = allowance_module.claude_projects_root()
+            directory_name = effort_module.project_directory(repository)
+            (projects / directory_name).mkdir(parents=True)
+            transcript = projects / directory_name / "session.jsonl"
+            transcript_with_effort(
+                transcript, "claude-opus-5", 10, observed
+            )
+            lines = effort_module.doctor_report(repository)
+            named = [line for line in lines if str(transcript) in line]
+            require(
+                len(named) == 1
+                and f"last recorded thinking {observed}" in named[0],
+                f"the doctor did not report what it read: {lines}",
+            )
+            if principal.provider == "anthropic":
+                require(
+                    named[0].startswith("WARN|")
+                    and f"level {principal.thinking}" in named[0],
+                    f"a level below the configured one did not warn: {named}",
+                )
+            require(
+                any(
+                    line.startswith("PASS|recommended thinking by route: ")
+                    and "standard high" in line
+                    and "complex max" in line
+                    for line in lines
+                ),
+                f"the route map was not reported: {lines}",
+            )
+
+    doctor = DOCTOR_SCRIPT.read_text()
+    require(
+        "from orrery_effort import doctor_report" in doctor
+        and "Thinking level ===" in doctor,
+        "the doctor does not run the thinking-level report",
+    )
+
+
+@test("the prompt hook is installed wherever the kit installs its hooks")
+def test_d3_prompt_hook_is_installed() -> None:
+    canonical = read_json(KIT_DIR / "global" / "claude-settings.json")
+    handlers = [
+        entry
+        for group in canonical.get("hooks", {}).get("UserPromptSubmit", [])
+        for entry in group.get("hooks", [])
+    ]
+    require(
+        len(handlers) == 1
+        and handlers[0]["command"]
+        == 'python3 "$HOME/.claude/hooks/orrery-prompt-submit.py"'
+        and handlers[0]["timeout"] == 15,
+        f"the canonical settings do not run the prompt hook: {handlers}",
+    )
+    installer = INSTALL_SCRIPT.read_text()
+    require(
+        '"$KIT_DIR/scripts/orrery-prompt-submit" \\\n'
+        '    "$HOME/.claude/hooks/orrery-prompt-submit.py"' in installer,
+        "the installer does not link the prompt hook",
+    )
+    # Codex publishes neither the running model nor the thinking level
+    # to a prompt hook, so it is deliberately a Claude hook only.
+    codex = read_json(KIT_DIR / "global" / "codex-hooks.json")
+    require(
+        "UserPromptSubmit" not in codex.get("hooks", {}),
+        "the prompt hook was installed on a surface that cannot feed it",
+    )
+    doctor = DOCTOR_SCRIPT.read_text()
+    require(
+        '"$HOME/.claude/hooks/orrery-prompt-submit.py" \\' in doctor,
+        "the doctor does not check the prompt hook's link",
+    )
 
 
 @test("the verbosity dial validates, defaults terse, and honours the env")

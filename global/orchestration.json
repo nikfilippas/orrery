@@ -4,6 +4,14 @@
   "delegate_fallback_scope": "principal-provider",
   "delegate_fallback_thinking_ceiling": "high",
   "allowances": {},
+  "on_exceeded": "warn",
+  "route_effort": {
+    "investigation": "medium",
+    "trivial": "low",
+    "mechanical": "low",
+    "standard": "high",
+    "complex": "max"
+  },
   "prices": {
     "as_of": null,
     "currency": "USD",
