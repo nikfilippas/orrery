@@ -975,7 +975,7 @@ stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   }
   .cardctl.on-light .ctl::placeholder { color: rgba(0,0,0,.42); }
   .cardctl.on-light select.ctl option { background: #ffffff; color: #10161a; }
-  /* The buttons live in the drawing's clear top-right band. */
+  /* The buttons sit beside the legend, on the drawing's clear ground. */
   .actions { display: none; }
   .actionbar {
     position: absolute; z-index: 30; display: flex; align-items: center;
@@ -1203,10 +1203,10 @@ function header() {
 // left of them however wide their labels turn out to be.
 function fitHeaderNote(canvas) {
   const note = canvas.querySelector("text.scopeline");
-  const bar = canvas.querySelector(".actionbar");
-  if (!note || !bar) return;
-  const taken = bar.getBoundingClientRect().width / S;
-  const room = CHART.actions.x - taken - CHART.header.x - 14;
+  if (!note) return;
+  // The header band is the note's alone now that the buttons sit beside
+  // the legend; the actions box's right edge is still the band's margin.
+  const room = CHART.actions.x - CHART.header.x;
   note.removeAttribute("textLength");
   if (note.getComputedTextLength() > room) {
     note.setAttribute("textLength", room);
@@ -1648,9 +1648,18 @@ function render() {
 
   const bar = document.createElement("div");
   bar.className = "actionbar";
+  // Beside the legend, where the controls are, rather than in the
+  // drawing's top-right band: a user who has just changed a model in a
+  // card should not have to look to the other corner of the page to
+  // find out what happens next. The ground left of the legend is the
+  // drawing's only clear space at that height, so the bar sits there
+  // with its bottom on the bottom row of cards. Only the bar's height
+  // still comes from the chart's actions box; its corner is derived.
   const box = CHART.actions;
+  const right = boxLeft(legend.frame) - 12;
+  const bottom = boxTop(legend.frame) + legend.frame.h - 8;
   bar.style.cssText =
-    `right:${(CHART.width - box.x) * S}px;top:${box.y * S}px;` +
+    `right:${(CHART.width - right) * S}px;top:${(bottom - box.h) * S}px;` +
     `height:${box.h * S}px;font-size:${box.h * 0.44 * S}px`;
   for (const button of [...document.querySelectorAll(".actions .btn")]) {
     bar.appendChild(button);
@@ -2112,14 +2121,14 @@ document.addEventListener("change", event => {
     );
   }
   applyButton.disabled = true;
-  // The control that was just changed is in the legend, and the buttons
-  // are in the bar at the top of the page, so a user who changes a model
-  // and looks for a way to save it may never see them. Say what happens
-  // next, where they are already looking.
+  // The control that was just changed is in the legend and the buttons
+  // sit just left of it, but a user who changes a model and looks for a
+  // way to save it may still not see them. Say what happens next, where
+  // they are already looking.
   if (!result.innerHTML) {
     result.innerHTML =
-      "<p>Changed. Choose <strong>Preview changes</strong> at the top of " +
-      "the page to see exactly which lines would change; " +
+      "<p>Changed. Choose <strong>Preview changes</strong>, just left of " +
+      "the legend, to see exactly which lines would change; " +
       "<strong>Apply</strong> turns on once you have seen them.</p>";
   }
 });
