@@ -2,13 +2,15 @@
 # Run the suite against an isolated copy of this checkout, pinned to the
 # committed manifest and provisioned like a CI runner.
 #
-# On a configured machine `tests/run-tests.py` reads the live
-# global/orchestration.json, which holds that machine's own role choices,
-# while many tests assume the shipped ones. The result then depends on
-# what that file says when the run starts, and on whether another session
-# edits it mid-run: the same unchanged suite returned 4, 81, 43, 23, 56 and
-# 57 failures in one day. This runner removes that dependence. Five things
-# have to be right or it measures the harness rather than the kit:
+# A machine's own role choices now live in ~/.config/orrery/config.json,
+# which the suite gives itself an isolated copy of, so `tests/run-tests.py`
+# measures the kit and not the machine. What it still reads in place is the
+# tracked global/orchestration.json, and a checkout whose manifest carries
+# configuration, as every install did before `orrery-config --import`
+# existed, still steers the run: that is what made the same unchanged suite
+# return 4, 81, 43, 23, 56 and 57 failures in one day. This runner removes
+# the remaining dependence by pinning that file to a committed ref. Five
+# things have to be right or it measures the harness rather than the kit:
 #   - the copy's manifest is the committed one, `git show REF:...`;
 #   - .git is kept, or `git ls-files` fails and inventory tests error;
 #   - the isolated HOME carries a git identity, or commits fail with
