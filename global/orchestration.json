@@ -3,7 +3,10 @@
   "max_concurrent_tasks": 2,
   "delegate_fallback_scope": "principal-provider",
   "delegate_fallback_thinking_ceiling": "high",
-  "allowances": {},
+  "allowances": {
+    "anthropic": {"tokens": 100000000000, "window_days": 7}
+  },
+  "on_exceeded": "warn",
   "on_exceeded": "warn",
   "route_effort": {
     "investigation": "medium",

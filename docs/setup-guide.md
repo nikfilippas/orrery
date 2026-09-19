@@ -258,9 +258,13 @@ was intended. The principal's own fallback is not capped: it is an
 interactive session whose cost you can see and interrupt.
 
 The manifest's top-level `allowances` names a token ceiling per provider
-over a rolling window. It ships empty, and `orrery-doctor` warns while an
-adopted repository's principal runs on a provider with no allowance,
-because nothing then bounds what that session spends.
+over a rolling window. It ships at 100 billion tokens over seven days for
+Anthropic, which is above any weekly window and so never fires until it
+is lowered: the shipped value is a placeholder that keeps the warning
+quiet, not a measurement. `orrery-doctor` warns only while an adopted
+repository's principal runs on a provider with no allowance at all,
+because nothing then bounds what that session spends. A ceiling set from
+a real figure looks like this:
 
 ```json
 "allowances": {
