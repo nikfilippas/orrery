@@ -31,9 +31,7 @@ LNT_MARKER = "claude-lnt"
 DEFAULT_PLAN_REVIEW_ROUNDS = 2
 MIN_PLAN_REVIEW_ROUNDS = 1
 MAX_PLAN_REVIEW_ROUNDS = 4
-ORCHESTRATION_MANIFEST = (
-    Path(__file__).resolve().parents[2] / "global" / "orchestration.json"
-)
+KIT_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 
 # Ephemeral profile directories created by browser automation. These are the
 # exact prefixes the drivers use, not a wildcard over the tool name: a glob
@@ -240,15 +238,31 @@ def current_session(data: dict[str, Any] | None = None) -> str:
 def configured_plan_review_rounds() -> int:
     """Read the plan-review cap without making SessionStart depend on it.
 
-    The doctor and configurator reject malformed values. The lifecycle hook
-    still has to initialise Leave No Trace when the manifest is missing or
-    being edited, so an invalid value falls back to the safe default rather
-    than aborting the whole SessionStart hook.
+    The cap is the effective one, the shipped default under this
+    machine's user configuration, so a session is told the number that
+    actually governs it. The runtime is imported here rather than at
+    module level, and only this function needs it: hook-guard runs on
+    every Bash call under a five-second timeout and hook-sweep runs on
+    every stop, and neither may pay for an import it never uses.
+
+    The two steps are nested deliberately. `RuntimeConfigError` is a
+    name the failed import would not have bound, so naming it in an
+    except clause after one would raise NameError instead of falling
+    back. Both steps fall back to the safe default: the doctor and the
+    configuration page reject malformed values, but SessionStart still
+    has to initialise Leave No Trace while the configuration is missing
+    or being edited, and it runs for every Claude session on the
+    machine.
     """
     try:
-        manifest = json.loads(ORCHESTRATION_MANIFEST.read_text())
-        value = manifest["settings"]["plan_review_rounds"]["value"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+        if str(KIT_SCRIPTS) not in sys.path:
+            sys.path.insert(0, str(KIT_SCRIPTS))
+        from orrery_runtime import effective_manifest
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        return DEFAULT_PLAN_REVIEW_ROUNDS
+    try:
+        value = effective_manifest()["settings"]["plan_review_rounds"]["value"]
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
         return DEFAULT_PLAN_REVIEW_ROUNDS
     if (
         isinstance(value, bool)

@@ -25,6 +25,8 @@ from orrery_runtime import (  # noqa: E402
     claude_sandbox_settings,
     codex_home,
     delegated_command,
+    config_home,
+    effective_manifest,
     load_role,
     load_verbosity,
     provider_environment,
@@ -1477,6 +1479,7 @@ def write_service_launcher(
     role_id: str = "",
     endpoint: Any = None,
     receipts: Path | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     environment_path = run_dir / "service-environment.json"
     environment_fd = os.open(
@@ -1486,7 +1489,7 @@ def write_service_launcher(
     )
     with os.fdopen(environment_fd, "w", encoding="utf-8") as handle:
         json.dump(
-            provider_environment(provider, tmp_dir, role_id, endpoint),
+            provider_environment(provider, tmp_dir, role_id, endpoint, manifest),
             handle,
             ensure_ascii=False,
         )
@@ -2031,7 +2034,10 @@ def record_standing(
     )
 
 
-def adopt_standing_approval(state: DelegationState) -> dict | None:
+def adopt_standing_approval(
+    state: DelegationState,
+    manifest: dict[str, Any] | None = None,
+) -> dict | None:
     """Adopt a live standing approval, or leave the state untouched.
 
     The recorded candidate is started exactly as approved, never
@@ -2046,7 +2052,7 @@ def adopt_standing_approval(state: DelegationState) -> dict | None:
     # principal moved, goes inert rather than silently: the run says the
     # candidate was excluded and dispatches the configured role.
     refusal = delegate_allowance_refusal(
-        state.configured, (candidate.provider, candidate.model)
+        state.configured, (candidate.provider, candidate.model), manifest
     )
     if refusal is not None:
         print(
@@ -2180,6 +2186,7 @@ def handle_failed_attempt(
     diagnostics: str = "",
     kind: str = "provider-failure",
     incident_fields: dict[str, Any] | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> int:
     """Retry one transient failure or request exact fallback consent."""
     failed = state.role
@@ -2256,10 +2263,12 @@ def handle_failed_attempt(
         # candidate, which request_fallback_decision would reject as
         # naming a different candidate.
         held_proposal, excluded_providers, excluded_models = (
-            proposal_for_approval(state.configured, held)
+            proposal_for_approval(state.configured, held, manifest=manifest)
         )
         if held_proposal is None:
-            refusal = delegate_allowance_refusal(state.configured, held)
+            refusal = delegate_allowance_refusal(
+                state.configured, held, manifest
+            )
             detail = refusal or (
                 f"{held[0]}:{held[1]} is no longer a potentially available "
                 "candidate"
@@ -2280,6 +2289,7 @@ def handle_failed_attempt(
             reason,
             excluded_providers=state.excluded_providers,
             excluded_models=state.excluded_models,
+            manifest=manifest,
         )
     if proposal is None:
         print(
@@ -2299,7 +2309,7 @@ def handle_failed_attempt(
     disclosures: tuple[str, ...] = ()
     if state.configured.read_only:
         try:
-            principal = load_role("orchestrator")
+            principal = load_role("orchestrator", manifest=manifest)
         except RuntimeConfigError:
             principal = None
         if principal is not None and (
@@ -2451,8 +2461,16 @@ def main(
         return 0
 
     try:
+        # One read for the whole dispatch. The document that names which
+        # endpoint credentials are stripped from the delegate's
+        # environment has to be the one this command was validated
+        # against, not a second read taken after the role was loaded.
+        manifest = effective_manifest()
+        # Resolved once, beside the read it governs, for the grant check
+        # below: this is the directory whose document chose the role.
+        configuration_home = config_home().resolve(strict=False)
         if state is None:
-            configured = load_role(invocation.role_id)
+            configured = load_role(invocation.role_id, manifest=manifest)
             state = DelegationState(configured=configured, role=configured)
             # Budgets are validated before any consent handling or
             # provider preflight, so an invalid pair can never trigger
@@ -2486,13 +2504,14 @@ def main(
                 ) = proposal_for_approval(
                     configured,
                     invocation.approval,
+                    manifest=manifest,
                 )
                 if proposal is None:
                     # An approval the allowance rule barred is reported
                     # as that, not as a candidate the provider withdrew:
                     # the difference is a setting the user controls.
                     refusal = delegate_allowance_refusal(
-                        configured, invocation.approval
+                        configured, invocation.approval, manifest
                     )
                     detail = refusal or (
                         "the approved fallback is no longer a "
@@ -2563,14 +2582,16 @@ def main(
                         file=sys.stderr,
                     )
             else:
-                adopt_standing_approval(state)
+                adopt_standing_approval(state, manifest)
         role_config = state.role
-        verbosity = load_verbosity()
+        verbosity = load_verbosity(manifest)
         # Measured against the role that is actually about to run, so a
         # substitution cannot arrive on a provider whose allowance the
         # configured role was refused for, and read before any provider
         # process is started rather than after one has been paid for.
-        allowance_stop = allowance.ceiling_refusal(role_config)
+        allowance_stop = allowance.ceiling_refusal(
+            role_config, manifest=manifest
+        )
         if role_config.provider == "openai":
             codex_home()
     except RuntimeConfigError as exc:
@@ -2613,6 +2634,7 @@ def main(
             context_warning=False,
             approval_required_status=APPROVAL_REQUIRED,
             kind="provider-unavailable",
+            manifest=manifest,
         )
     if availability.state is Availability.UNKNOWN:
         print(
@@ -2638,6 +2660,7 @@ def main(
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
                 kind="model-unavailable",
+                manifest=manifest,
             )
 
     timeout_seconds, hard_timeout_seconds = effective_budgets(
@@ -2789,6 +2812,42 @@ def main(
         writable_paths.extend(
             path for path in (Path("/tmp"), Path("/var/tmp")) if path.is_dir()
         )
+        # This machine's configuration chooses the next delegate's
+        # provider, model and endpoint credential. Under the home it is
+        # read-only to the unit, but under any path granted above it
+        # would be writable, and a read-only mapping there would be
+        # defeated by renaming its parent, the measured limit
+        # repository_read_only_paths describes. So a config home inside
+        # a grant refuses the dispatch instead of being mapped.
+        configuration_grant = next(
+            (
+                grant
+                for grant in writable_paths
+                if configuration_home == grant.resolve(strict=False)
+                or grant.resolve(strict=False) in configuration_home.parents
+            ),
+            None,
+        )
+        if configuration_grant is not None:
+            detail = (
+                f"the user configuration {configuration_home} lies under "
+                f"{configuration_grant}, which this run grants write access "
+                "to; a delegate there could rewrite the document that "
+                "chooses its own provider, model and endpoint credential. "
+                "Move it outside that path"
+            )
+            print(
+                f"{PROGRAM_NAME}: {detail}; no process was started.",
+                file=sys.stderr,
+            )
+            incident_log.record(
+                "config-error",
+                program=PROGRAM_NAME,
+                role=role_config,
+                detail=detail,
+                status=2,
+            )
+            return 2
         # A read-only role's guarantee is that its workspace cannot be
         # written. Leaving the workspace out of the allowlist does not
         # give that, because /tmp, /var/tmp and the provider's own
@@ -3060,6 +3119,7 @@ def main(
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
                 kind="config-error",
+                manifest=manifest,
             )
 
         if use_systemd:
@@ -3070,6 +3130,7 @@ def main(
                 role_config.id,
                 role_config.endpoint,
                 receipts,
+                manifest,
             )
             command = [
                 systemd_run_path(),
@@ -3111,6 +3172,7 @@ def main(
                     role_config.id,
                     role_config.endpoint,
                     receipts,
+                    manifest,
                 )
                 command = [
                     sys.executable,
@@ -3225,6 +3287,7 @@ def main(
                                 tmp_dir,
                                 role_config.id,
                                 role_config.endpoint,
+                                manifest,
                             )
                         ),
                     )
@@ -3425,6 +3488,7 @@ def main(
                         "hard_timeout_seconds": hard_timeout_seconds,
                         "stalled_seconds": stalled_seconds,
                     },
+                    manifest=manifest,
                 )
 
             if stalled_verdict is not None:
@@ -3471,6 +3535,7 @@ def main(
                     approval_required_status=114,
                     kind="stalled-loop",
                     incident_fields={"rule": rule, "counts": counts},
+                    manifest=manifest,
                 )
 
         if return_code != 0:
@@ -3501,6 +3566,7 @@ def main(
                     workspace_requires_inspection()
                 ),
                 approval_required_status=return_code,
+                manifest=manifest,
             )
 
         if role_config.provider == "anthropic":
@@ -3538,6 +3604,7 @@ def main(
                     ),
                     approval_required_status=1,
                     kind="no-result",
+                    manifest=manifest,
                 )
 
         if (
@@ -3572,6 +3639,7 @@ def main(
                 ),
                 approval_required_status=1,
                 kind="no-result",
+                manifest=manifest,
             )
 
         close_run("completed", return_code)

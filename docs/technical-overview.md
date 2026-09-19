@@ -326,10 +326,14 @@ so a delegate cannot spawn further agents, and no chain of delegations
 can hold authority the principal never granted. Instructions alone do
 not hold such a boundary; the process composition does.
 
-`global/orchestration.json` is the only role-assignment source. Every
-row may be changed to either provider. For example, Sol may be the
+Role assignment comes from three documents, merged on every read. The
+tracked `global/orchestration.json` is the shipped default and is never
+written by configuration; `~/.config/orrery/config.json` is the machine's
+own sparse layer, holding only the values that differ; a repository's
+`.orrery.json` principal override wins over both for that directory.
+Every role may be moved to either provider. For example, Sol may be the
 principal while Fable or Opus reviews it, or all five roles may use
-Anthropic.
+Anthropic. The setup guide describes the layers and their trust rules.
 
 Each worker or reviewer is an independent CLI process and model
 context, not necessarily a separate terminal window. Fresh context plus
@@ -859,7 +863,8 @@ preview and apply inert, so it can be tried without installing
 anything:
 **[the configuration page](https://nikfilippas.github.io/orrery/config-demo.html)**.
 
-The localhost-only page is generated from the canonical manifest. On
+The localhost-only page is generated from the effective configuration,
+the shipped manifest under this machine's own layer. On
 launch it discovers picker-visible models and each model's exact
 thinking levels from the installed Claude and Codex CLIs, without
 running a model. Discovery is concurrent and provider-independent: if
@@ -898,10 +903,14 @@ manifest itself, and a missing one stops the run rather than falling
 back to a first-party account. See [the setup guide](setup-guide.md)
 for the wire-protocol limits.
 
-Preview shows one atomic `global/orchestration.json` diff. Apply writes
-exactly that preview and runs the doctor. Running sessions are never
-mutated. A repository-local `.orrery.json` principal override, created
-by `orrery-init`, wins over the global principal for that repository.
+Preview shows one diff of `~/.config/orrery/config.json`, the machine's
+own sparse layer, which is small enough to read; the shipped manifest is
+never written, and a role set back to its shipped value leaves the file
+rather than being restated in it. Apply writes exactly that preview
+through a locked compare-and-swap, then runs `orrery-sync` and the
+doctor. Running sessions are never mutated. A repository-local
+`.orrery.json` principal override, created by `orrery-init`, wins over
+the global principal for that repository.
 
 The same live catalogues support fallback ranking. Orrery first
 preserves the provider for a model-only failure, then minimizes
@@ -1247,7 +1256,8 @@ number on this page should be read as one.
 | --- | --- |
 | `global/AGENTS.md` | canonical provider-neutral development policy |
 | `global/CLAUDE.md` | one-line Claude import of `AGENTS.md` |
-| `global/orchestration.json` | role assignments, workflow settings, and configuration-chart geometry |
+| `global/orchestration.json` | the shipped default: role assignments, workflow settings, and configuration-chart geometry |
+| `~/.config/orrery/config.json` | this machine's own configuration, untracked and sparse: only what was changed |
 | `global/model-catalogue.json` | provider fallback choices and Orrery-specific thinking defaults |
 | `global/endpoints.json` | offered third-party and local endpoint presets |
 | `global/claude-settings.json` | Claude-specific hooks and permissions, not role selection |

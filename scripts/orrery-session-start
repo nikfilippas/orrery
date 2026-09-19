@@ -24,8 +24,8 @@ from orrery_runtime import (  # noqa: E402
     RuntimeConfigError,
     adopted_root,
     codex_home,
+    effective_manifest,
     load_catalogue,
-    load_manifest,
     load_role,
     same_model,
 )
@@ -222,7 +222,7 @@ def _column(cells: list[tuple[str, ...]]) -> list[str]:
     return rendered
 
 
-def role_table() -> str:
+def role_table(manifest: dict[str, Any] | None = None) -> str:
     """Every configured role, for the top of a session.
 
     Two cells to a line, so the roster opens a conversation in three
@@ -230,9 +230,14 @@ def role_table() -> str:
     padding by character count still aligns the columns wherever the
     squares are all the same width. The principal's own cell is what
     the single line this replaces used to say.
+
+    `manifest` is the document this run already read; the early paths
+    that answer before that read take their own, inside the guard
+    below, because a roster is never worth failing a session over.
     """
     try:
-        manifest = load_manifest()
+        if manifest is None:
+            manifest = effective_manifest()
         steps = [
             s for s in manifest.get("steps", [])
             if isinstance(s, dict) and s.get("provider") and s.get("model")
@@ -281,7 +286,9 @@ ROLE_TABLE_PREFACE = (
 )
 
 
-def with_role_table(context: str) -> str:
+def with_role_table(
+    context: str, manifest: dict[str, Any] | None = None
+) -> str:
     """The roster, on the channel a surface actually renders.
 
     It was first emitted on systemMessage, reasoning that a line the
@@ -294,7 +301,7 @@ def with_role_table(context: str) -> str:
     route that arrives on every surface, since a surface that does
     render systemMessage is not one that can be relied on.
     """
-    table = role_table()
+    table = role_table(manifest)
     if not table:
         return context
     block = f"{ROLE_TABLE_PREFACE}\n```\n{table}\n```"
@@ -304,13 +311,17 @@ def with_role_table(context: str) -> str:
 
 
 def hook_output(
-    system_message: str, context: str, *, roles: bool = True
+    system_message: str,
+    context: str,
+    *,
+    roles: bool = True,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parked = parked_announcement()
     if parked:
         context = f"{context}\n{parked}" if context else parked
     if roles:
-        context = with_role_table(context)
+        context = with_role_table(context, manifest)
     return {
         "systemMessage": system_message,
         "hookSpecificOutput": {
@@ -371,6 +382,9 @@ def main() -> int:
         allowance.refresh()
     except Exception:  # noqa: BLE001 - a hook must never fail a session
         pass
+    # Bound before the read that fills it, so the handler below can pass
+    # it on whether or not that read got as far as returning a document.
+    manifest: dict[str, Any] | None = None
     try:
         raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
         if len(raw) > MAX_INPUT_BYTES:
@@ -411,7 +425,13 @@ def main() -> int:
                 )
             )
             return 0
-        configured = load_role("orchestrator", cwd=Path(cwd))
+        # One read for this hook, threaded from here on. A refusal
+        # lands in the handler below, which already reports that the
+        # principal could not be verified and carries the path.
+        manifest = effective_manifest()
+        configured = load_role(
+            "orchestrator", manifest=manifest, cwd=Path(cwd)
+        )
     except (OSError, ValueError, json.JSONDecodeError, RuntimeConfigError) as exc:
         detail = re.sub(r"[\r\n]+", " ", str(exc))[:300]
         print(
@@ -423,6 +443,7 @@ def main() -> int:
                     "comparison. Say so in one short line in your first "
                     "reply; do not claim the configured principal or a "
                     "fallback was verified.",
+                    manifest=manifest,
                 )
             )
         )
@@ -481,6 +502,7 @@ def main() -> int:
                         "the one running, and if the interface shows a "
                         "different model, report that instead. This is a "
                         "property of the surface, not an error.",
+                        manifest=manifest,
                     )
                 )
             )
@@ -532,6 +554,7 @@ def main() -> int:
                     "Never state that the configured model is the one "
                     "running, and if the interface shows a different "
                     "model, report that instead.",
+                    manifest=manifest,
                 )
             )
         )
@@ -567,6 +590,7 @@ def main() -> int:
         assumed_ready={active_provider},
         additional_models={active_provider: [active_model]},
         discover_live=False,
+        manifest=manifest,
     )
     recommended = proposal.candidate if proposal is not None else None
     active_label = (
@@ -639,7 +663,9 @@ def main() -> int:
         "them to `orrery` or a model switch. If they approve, continue "
         "here and report the fallback honestly and briefly."
     )
-    print(json.dumps(hook_output(system_message, context)))
+    print(
+        json.dumps(hook_output(system_message, context, manifest=manifest))
+    )
     incident_log.record(
         "principal-mismatch",
         program=PROGRAM,

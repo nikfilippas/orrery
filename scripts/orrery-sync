@@ -39,7 +39,7 @@ from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
     codex_home,
-    load_manifest,
+    effective_manifest,
     load_role,
 )
 
@@ -448,8 +448,10 @@ def main() -> int:
         # Global manifest only: a repository's .orrery.json principal is
         # correct for that directory, and projecting it would change
         # every other repository's default.
-        role = load_role("orchestrator", apply_override=False)
-        manifest = load_manifest()
+        manifest = effective_manifest()
+        role = load_role(
+            "orchestrator", manifest=manifest, apply_override=False
+        )
     except RuntimeConfigError as exc:
         print(f"{PROGRAM}: {exc}", file=sys.stderr)
         return 2

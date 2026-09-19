@@ -41,8 +41,8 @@ from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
     _git_root,
+    effective_manifest,
     load_catalogue,
-    load_manifest,
     load_role,
 )
 from orrery_standing import (  # noqa: E402
@@ -272,9 +272,13 @@ def provider_status(
     )
 
 
-def configured_model_tiers() -> dict[tuple[str, str], int]:
+def configured_model_tiers(
+    manifest: dict[str, Any] | None = None,
+) -> dict[tuple[str, str], int]:
+    if manifest is None:
+        manifest = effective_manifest()
     tiers: dict[tuple[str, str], int] = {}
-    for step in load_manifest().get("steps", []):
+    for step in manifest.get("steps", []):
         if not isinstance(step, dict):
             continue
         provider = step.get("provider")
@@ -293,7 +297,7 @@ def configured_model_tiers() -> dict[tuple[str, str], int]:
 def delegate_fallback_scope(manifest: dict[str, Any] | None = None) -> str:
     """How much of the principal a delegate substitution may not reach."""
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     value = manifest.get(
         "delegate_fallback_scope", DEFAULT_DELEGATE_FALLBACK_SCOPE
     )
@@ -308,7 +312,7 @@ def delegate_fallback_scope(manifest: dict[str, Any] | None = None) -> str:
 def delegate_thinking_ceiling(manifest: dict[str, Any] | None = None) -> str:
     """The highest thinking level a cross-provider delegate may be given."""
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     value = manifest.get(
         "delegate_fallback_thinking_ceiling",
         DEFAULT_DELEGATE_THINKING_CEILING,
@@ -321,25 +325,35 @@ def delegate_thinking_ceiling(manifest: dict[str, Any] | None = None) -> str:
     return str(value)
 
 
-def principal_identity() -> Role | None:
+def principal_identity(
+    manifest: dict[str, Any] | None = None,
+) -> Role | None:
     """The configured principal, or None where it cannot be identified.
 
-    By ranking time the manifest is known good: the caller has already
-    loaded its own role or exited. Every remaining raiser is the
-    adoption marker, the trust store, or the repository override, and
+    `manifest` is the document the command read when it loaded its own
+    role or exited, so with it in hand no configuration is read here and
+    nothing that read could raise. What is left to raise is the adoption
+    marker, the trust store, or the repository override, and
     `apply_override=False` bypasses all three. It is safe to fall back
     on: where the override cannot be read the repository is not adopted,
     so the global principal is the one that would have applied anyway.
     """
     for apply_override in (True, False):
         try:
-            return load_role("orchestrator", apply_override=apply_override)
+            return load_role(
+                "orchestrator",
+                manifest=manifest,
+                apply_override=apply_override,
+            )
         except RuntimeConfigError:
             continue
     return None
 
 
-def principal_exclusions(role: Role) -> tuple[set[str], set[tuple[str, str]]]:
+def principal_exclusions(
+    role: Role,
+    manifest: dict[str, Any] | None = None,
+) -> tuple[set[str], set[tuple[str, str]]]:
     """What a substitution for this role may not reach, as exclusions.
 
     The principal itself is not governed: it is the allowance holder,
@@ -354,12 +368,12 @@ def principal_exclusions(role: Role) -> tuple[set[str], set[tuple[str, str]]]:
     """
     if role.id == "orchestrator":
         return set(), set()
-    principal = principal_identity()
+    principal = principal_identity(manifest)
     if principal is None:
         return {
             provider for provider in PROVIDERS if provider != role.provider
         }, set()
-    if delegate_fallback_scope() == PRINCIPAL_MODEL_SCOPE:
+    if delegate_fallback_scope(manifest) == PRINCIPAL_MODEL_SCOPE:
         return set(), {(principal.provider, principal.model)}
     return {principal.provider}, set()
 
@@ -367,6 +381,7 @@ def principal_exclusions(role: Role) -> tuple[set[str], set[tuple[str, str]]]:
 def delegate_allowance_refusal(
     role: Role,
     identity: tuple[str, str],
+    manifest: dict[str, Any] | None = None,
 ) -> str | None:
     """Why the principal-allowance rule bars this candidate, or None.
 
@@ -376,10 +391,10 @@ def delegate_allowance_refusal(
     setting that decided it. Returned unpunctuated, so each caller can
     compose it into its own sentence.
     """
-    providers, models = principal_exclusions(role)
+    providers, models = principal_exclusions(role, manifest)
     if identity[0] not in providers and identity not in models:
         return None
-    principal = principal_identity()
+    principal = principal_identity(manifest)
     if principal is None:
         return (
             f"{identity[0]}/{identity[1]} would cross providers for "
@@ -391,7 +406,7 @@ def delegate_allowance_refusal(
         f"{identity[0]}/{identity[1]} is excluded for {role.id} by the "
         f"principal-allowance rule: the principal runs "
         f"{principal.provider}/{principal.model}, and "
-        f"delegate_fallback_scope is {delegate_fallback_scope()}"
+        f"delegate_fallback_scope is {delegate_fallback_scope(manifest)}"
     )
 
 
@@ -687,6 +702,7 @@ def _ranked_candidates(
     assumed_ready: Iterable[str] = (),
     additional_models: dict[str, list[str]] | None = None,
     discover_live: bool = True,
+    manifest: dict[str, Any] | None = None,
 ) -> list[tuple[tuple[int, int, int, int, int, str, str], Role, str]]:
     """Every potentially usable candidate, nearest first."""
     env = dict(os.environ if environment is None else environment)
@@ -700,9 +716,9 @@ def _ranked_candidates(
     ceiling = (
         None
         if original.id == "orchestrator"
-        else delegate_thinking_ceiling()
+        else delegate_thinking_ceiling(manifest)
     )
-    configured_tiers = configured_model_tiers()
+    configured_tiers = configured_model_tiers(manifest)
     bundled = load_catalogue()
     source_entries = bundled.get(original.provider, [])
     source_seed = next(
@@ -844,9 +860,12 @@ def nearest_fallback(
     assumed_ready: Iterable[str] = (),
     additional_models: dict[str, list[str]] | None = None,
     discover_live: bool = True,
+    manifest: dict[str, Any] | None = None,
 ) -> FallbackProposal | None:
     """Return the closest potentially usable role without authorising it."""
-    principal_providers, principal_models = principal_exclusions(original)
+    principal_providers, principal_models = principal_exclusions(
+        original, manifest
+    )
     ranked = _ranked_candidates(
         original,
         excluded_providers=set(excluded_providers) | principal_providers,
@@ -856,6 +875,7 @@ def nearest_fallback(
         assumed_ready=assumed_ready,
         additional_models=additional_models,
         discover_live=discover_live,
+        manifest=manifest,
     )
     if not ranked:
         return None
@@ -1005,6 +1025,7 @@ def proposal_for_approval(
     approval: tuple[str, str],
     *,
     environment: dict[str, str] | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[FallbackProposal | None, set[str], set[tuple[str, str]]]:
     """Resolve an approval from a previous failed invocation.
 
@@ -1026,7 +1047,9 @@ def proposal_for_approval(
     proposal. Callers report that with `delegate_allowance_refusal`,
     which says which rule decided it.
     """
-    excluded_providers, excluded_models = principal_exclusions(original)
+    excluded_providers, excluded_models = principal_exclusions(
+        original, manifest
+    )
     if approval[0] == original.provider:
         excluded_models.add((original.provider, original.model))
     else:
@@ -1037,6 +1060,7 @@ def proposal_for_approval(
         excluded_providers=excluded_providers,
         excluded_models=excluded_models,
         environment=environment,
+        manifest=manifest,
     )
     for _score, candidate, catalogue_source in ranked:
         identity = (candidate.provider, candidate.model)

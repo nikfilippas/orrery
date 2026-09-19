@@ -20,6 +20,12 @@ from typing import Any
 
 import fcntl
 
+# The only intra-kit import the runtime makes. Sharing the grant rule
+# rather than restating it keeps one answer to "which directories is
+# every contained run handed", which is the whole reason a configuration
+# under one of them is refused.
+from orrery_verify import under_broad_grant
+
 
 KIT_DIR = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = KIT_DIR / "global" / "orchestration.json"
@@ -60,6 +66,40 @@ GIT_TRUST_ENV = frozenset(
         "GIT_CEILING_DIRECTORIES",
     }
 )
+
+# What the machine-wide user configuration may carry. An allow-list in
+# code rather than a shape derived from the shipped document: optional
+# keys such as `endpoints` and `principal_auto_fallback` are expressible
+# here while absent from the default, and a key nobody recognises has to
+# be refused rather than ignored, because an ignored one reads as
+# configured while the shipped value goes on applying.
+USER_ROLE_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "thinking",
+        "endpoint",
+        "timeout_seconds",
+        "hard_timeout_seconds",
+        "stall_detection",
+    }
+)
+USER_SCALAR_KEYS = frozenset(
+    {
+        "verbosity",
+        "max_concurrent_tasks",
+        "delegate_fallback_scope",
+        "delegate_fallback_thinking_ceiling",
+        "on_exceeded",
+        "principal_auto_fallback",
+    }
+)
+USER_MAPPING_KEYS = frozenset(
+    {"roles", "endpoints", "settings", "route_effort", "allowances", "prices"}
+)
+USER_CONFIG_KEYS = USER_SCALAR_KEYS | USER_MAPPING_KEYS | {"version"}
+USER_PRICE_KEYS = frozenset({"as_of", "currency", "source", "max_age_days", "models"})
+USER_CONFIG_VERSION = 1
 
 
 class RuntimeConfigError(Exception):
@@ -131,7 +171,13 @@ def same_model(provider: str, configured: str, active: str) -> bool:
     ) is not None
 
 
-def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
+def load_manifest(path: Path) -> dict[str, Any]:
+    """One document, read and shape-checked, with no layers over it.
+
+    `path` is required so that a reader wanting the effective
+    configuration has to say so: `effective_manifest()` is the layered
+    read, and this is the shipped default or a fixture on its own.
+    """
     try:
         manifest = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
@@ -533,23 +579,434 @@ def project_override(cwd: Path) -> dict[str, Any] | None:
     return override
 
 
-def load_role(
-    role_id: str,
-    path: Path = MANIFEST_PATH,
-    *,
-    cwd: Path | None = None,
-    apply_override: bool = True,
-) -> Role:
-    """The validated role, optionally ignoring repository overrides.
+def config_home() -> Path:
+    """The validated directory holding this machine's configuration.
 
-    `apply_override=False` is for callers that write global state: a
-    repository's `.orrery.json` principal is correct for that
-    directory only, so projecting it into a machine-wide setting would
-    silently change every other repository's default.
+    Trusted like the adoption store, because the file inside it can name
+    an endpoint's base URL and the variable holding its key: a forged
+    one would redirect a role's traffic and its credential.
+
+    Ancestors are deliberately not walked for symlinks, unlike the trust
+    store. `~/.config` is commonly a symlink into a dotfiles repository,
+    and refusing that would make the kit unusable for those users; the
+    resolved location is what the grant check inspects instead.
+    """
+    raw = os.environ.get("XDG_CONFIG_HOME")
+    if raw is not None:
+        if not raw or not Path(raw).is_absolute():
+            raise RuntimeConfigError(
+                "refusing relative or empty XDG_CONFIG_HOME for the user "
+                f"configuration: {raw!r}"
+            )
+        base = Path(raw)
+    else:
+        base = Path.home() / ".config"
+    home = base / "orrery"
+    grant = under_broad_grant(home)
+    if grant and os.environ.get("ORRERY_ALLOW_TMP_REPOSITORY") != "1":
+        raise RuntimeConfigError(
+            f"refusing user configuration {home} under {grant}, which every "
+            "contained run is granted so the provider CLIs can build their "
+            "sandbox mount points. A delegate could forge the document that "
+            "chooses its own provider, model and endpoint credential. Move "
+            "it outside " + grant + ", or set ORRERY_ALLOW_TMP_REPOSITORY=1 "
+            "to accept that."
+        )
+    if home.resolve(strict=False).is_relative_to(KIT_DIR.resolve(strict=False)):
+        raise RuntimeConfigError(
+            f"refusing user configuration {home} inside the kit checkout "
+            f"{KIT_DIR}: the machine's configuration must not be a tracked "
+            "file that a pull can overwrite"
+        )
+    if os.path.lexists(home):
+        _secure(home, "user configuration directory")
+    return home
+
+
+def user_config_path() -> Path:
+    return config_home() / "config.json"
+
+
+def load_user_config(path: Path | None = None) -> dict[str, Any]:
+    """This machine's sparse overrides, or {} when none are configured.
+
+    An absent file is the fresh-install state. A present but unsafe or
+    malformed one is fatal rather than ignored: falling back to the
+    shipped defaults would move a delegate onto a provider, a model and
+    an allowance the user did not choose, silently.
+    """
+    if path is None:
+        path = user_config_path()
+    if not os.path.lexists(path):
+        return {}
+    _secure(path, "user configuration", regular=True)
+    try:
+        document = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeConfigError(
+            f"the user configuration {path} is unreadable: {exc}"
+        ) from exc
+    if not isinstance(document, dict):
+        raise RuntimeConfigError(
+            f"the user configuration {path} must be a JSON object"
+        )
+    return document
+
+
+def _merge_roles(
+    merged: dict[str, Any],
+    shipped: dict[str, Any],
+    roles: Any,
+    sources: dict[str, str] | None,
+) -> None:
+    if not isinstance(roles, dict):
+        raise RuntimeConfigError("'roles' must be an object")
+    steps = shipped.get("steps")
+    if not isinstance(steps, list):
+        raise RuntimeConfigError("the shipped manifest has no role list")
+    patched = [dict(step) if isinstance(step, dict) else step for step in steps]
+    for role_id, fields in roles.items():
+        if role_id not in ROLE_IDS:
+            raise RuntimeConfigError(f"unknown role 'roles.{role_id}'")
+        if not isinstance(fields, dict):
+            raise RuntimeConfigError(f"'roles.{role_id}' must be an object")
+        unknown = set(fields) - USER_ROLE_FIELDS
+        if unknown:
+            raise RuntimeConfigError(
+                f"'roles.{role_id}' cannot set "
+                + ", ".join(f"'{name}'" for name in sorted(unknown))
+            )
+        matches = [
+            step
+            for step in patched
+            if isinstance(step, dict) and step.get("id") == role_id
+        ]
+        if len(matches) != 1:
+            raise RuntimeConfigError(
+                f"the shipped manifest must define {role_id} exactly once"
+            )
+        # dict.update semantics, exactly as the repository override is
+        # applied, so a stored null is a deliberate "unset this field".
+        matches[0].update(fields)
+        if sources is not None:
+            for name in fields:
+                sources[f"roles.{role_id}.{name}"] = "user"
+    merged["steps"] = patched
+
+
+def _merge_settings(
+    merged: dict[str, Any],
+    shipped: dict[str, Any],
+    settings: Any,
+    sources: dict[str, str] | None,
+) -> None:
+    if not isinstance(settings, dict):
+        raise RuntimeConfigError("'settings' must be an object")
+    shipped_settings = shipped.get("settings")
+    if not isinstance(shipped_settings, dict):
+        raise RuntimeConfigError("the shipped manifest has no settings")
+    patched = {
+        name: dict(entry) if isinstance(entry, dict) else entry
+        for name, entry in shipped_settings.items()
+    }
+    for name, value in settings.items():
+        entry = patched.get(name)
+        if not isinstance(entry, dict):
+            raise RuntimeConfigError(f"unknown setting 'settings.{name}'")
+        if isinstance(value, (dict, list)):
+            # Only the value is configurable; the label, description and
+            # bounds are shipped metadata the page renders.
+            raise RuntimeConfigError(f"'settings.{name}' must be a scalar")
+        minimum = entry.get("minimum")
+        maximum = entry.get("maximum")
+        if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise RuntimeConfigError(f"'settings.{name}' must be a number")
+            if value < minimum:
+                raise RuntimeConfigError(
+                    f"'settings.{name}' is below its shipped minimum {minimum}"
+                )
+        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise RuntimeConfigError(f"'settings.{name}' must be a number")
+            if value > maximum:
+                raise RuntimeConfigError(
+                    f"'settings.{name}' is above its shipped maximum {maximum}"
+                )
+        entry["value"] = value
+        if sources is not None:
+            sources[f"settings.{name}"] = "user"
+    merged["settings"] = patched
+
+
+def _merge_prices(
+    merged: dict[str, Any],
+    shipped: dict[str, Any],
+    prices: Any,
+    sources: dict[str, str] | None,
+) -> None:
+    if not isinstance(prices, dict):
+        raise RuntimeConfigError("'prices' must be an object")
+    unknown = set(prices) - USER_PRICE_KEYS
+    if unknown:
+        raise RuntimeConfigError(
+            "'prices' cannot set " + ", ".join(f"'{name}'" for name in sorted(unknown))
+        )
+    shipped_prices = shipped.get("prices")
+    patched = dict(shipped_prices) if isinstance(shipped_prices, dict) else {}
+    for name, value in prices.items():
+        if name != "models":
+            patched[name] = value
+            if sources is not None:
+                sources[f"prices.{name}"] = "user"
+            continue
+        if not isinstance(value, dict):
+            raise RuntimeConfigError("'prices.models' must be an object")
+        shipped_models = patched.get("models")
+        models = dict(shipped_models) if isinstance(shipped_models, dict) else {}
+        # Per model id, so naming one price does not delete the rest.
+        models.update(value)
+        patched["models"] = models
+        if sources is not None:
+            for model_id in value:
+                sources[f"prices.models.{model_id}"] = "user"
+    merged["prices"] = patched
+
+
+def merge_user_config(
+    shipped: dict[str, Any],
+    user: dict[str, Any],
+    sources: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """The shipped default with the user's sparse overrides folded in.
+
+    Pure: no I/O and no cache, so the configuration page can validate a
+    candidate document with exactly the rules every reader applies, and
+    a change lands on the next command rather than after a restart.
+    Refusals name the offending key; the caller that read the file adds
+    its path.
+
+    When `sources` is given, every overridden key is recorded in it as
+    "roles.reviewer.model": "user", which is what lets the page say
+    where each row it shows came from. A key absent from it is shipped.
+    """
+    # A shallow top-level copy, with deep copies only of the sub-trees an
+    # overlay actually reaches: the shipped chart is 40 KB of nested
+    # objects that no user key can touch, and copying it on every read
+    # would be paid for nothing.
+    merged = dict(shipped)
+    version = user.get("version", USER_CONFIG_VERSION)
+    if version != USER_CONFIG_VERSION:
+        raise RuntimeConfigError(f"unsupported 'version': {version!r}")
+    unknown = set(user) - USER_CONFIG_KEYS
+    if unknown:
+        raise RuntimeConfigError(
+            "unknown key " + ", ".join(f"'{name}'" for name in sorted(unknown))
+        )
+    for key, value in user.items():
+        if key == "version":
+            continue
+        if key in USER_SCALAR_KEYS:
+            merged[key] = value
+            if sources is not None:
+                sources[key] = "user"
+        elif key == "roles":
+            _merge_roles(merged, shipped, value, sources)
+        elif key == "settings":
+            _merge_settings(merged, shipped, value, sources)
+        elif key == "prices":
+            _merge_prices(merged, shipped, value, sources)
+        else:
+            # endpoints, route_effort and allowances: merged one entry
+            # deep, each entry replaced whole. An endpoint's registry
+            # record and a provider's allowance are single objects whose
+            # fields only make sense together.
+            if not isinstance(value, dict):
+                raise RuntimeConfigError(f"'{key}' must be an object")
+            base = shipped.get(key)
+            patched = dict(base) if isinstance(base, dict) else {}
+            patched.update(value)
+            merged[key] = patched
+            if sources is not None:
+                for name in value:
+                    sources[f"{key}.{name}"] = "user"
+    return merged
+
+
+def effective_manifest(sources: dict[str, str] | None = None) -> dict[str, Any]:
+    """The shipped default under this machine's user configuration."""
+    path = user_config_path()
+    user = load_user_config(path)
+    # Read outside the handler below, which names the user configuration:
+    # a fault in the shipped file must be reported as its own.
+    shipped = load_manifest(MANIFEST_PATH)
+    try:
+        return merge_user_config(shipped, user, sources)
+    except RuntimeConfigError as exc:
+        raise RuntimeConfigError(
+            f"the user configuration {path} is invalid: {exc}"
+        ) from exc
+
+
+def _role_differences(
+    baseline: Any,
+    steps: Any,
+    overlay: dict[str, Any],
+    other: list[str],
+    compare: bool,
+) -> None:
+    if not isinstance(steps, list):
+        other.append("steps is not a role list")
+        return
+    base_by_id = {
+        step.get("id"): step
+        for step in (baseline if isinstance(baseline, list) else [])
+        if isinstance(step, dict)
+    }
+    for step in steps:
+        if not isinstance(step, dict):
+            other.append("a role is not an object")
+            continue
+        role_id = step.get("id")
+        base = base_by_id.get(role_id)
+        base = base if isinstance(base, dict) else {}
+        if role_id not in ROLE_IDS:
+            if compare and step != base:
+                other.append(f"steps.{role_id}")
+            continue
+        for name, value in step.items():
+            if name == "id":
+                continue
+            if name in USER_ROLE_FIELDS:
+                if name not in base or base[name] != value:
+                    overlay.setdefault("roles", {}).setdefault(role_id, {})[
+                        name
+                    ] = value
+            elif compare and (name not in base or base[name] != value):
+                other.append(f"steps.{role_id}.{name}")
+
+
+def _setting_differences(
+    baseline: Any,
+    settings: Any,
+    overlay: dict[str, Any],
+    other: list[str],
+    compare: bool,
+) -> None:
+    if not isinstance(settings, dict):
+        other.append("settings is not an object")
+        return
+    base_settings = baseline if isinstance(baseline, dict) else {}
+    for name, entry in settings.items():
+        base = base_settings.get(name)
+        base = base if isinstance(base, dict) else {}
+        if not isinstance(entry, dict):
+            if compare and entry != base_settings.get(name):
+                other.append(f"settings.{name}")
+            continue
+        for field, value in entry.items():
+            if field == "value":
+                if "value" not in base or base["value"] != value:
+                    overlay.setdefault("settings", {})[name] = value
+            elif compare and (field not in base or base[field] != value):
+                other.append(f"settings.{name}.{field}")
+
+
+def _price_differences(
+    baseline: Any,
+    prices: Any,
+    overlay: dict[str, Any],
+    other: list[str],
+    compare: bool,
+) -> None:
+    if not isinstance(prices, dict):
+        other.append("prices is not an object")
+        return
+    base_prices = baseline if isinstance(baseline, dict) else {}
+    for name, value in prices.items():
+        if name == "models":
+            if not isinstance(value, dict):
+                other.append("prices.models")
+                continue
+            base_models = base_prices.get("models")
+            base_models = base_models if isinstance(base_models, dict) else {}
+            for model_id, entry in value.items():
+                if model_id not in base_models or base_models[model_id] != entry:
+                    overlay.setdefault("prices", {}).setdefault("models", {})[
+                        model_id
+                    ] = entry
+        elif name in USER_PRICE_KEYS:
+            if name not in base_prices or base_prices[name] != value:
+                overlay.setdefault("prices", {})[name] = value
+        elif compare and (
+            name not in base_prices or base_prices[name] != value
+        ):
+            other.append(f"prices.{name}")
+
+
+def tunable_differences(
+    baseline: dict[str, Any],
+    document: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Split one manifest's drift from another into what is configurable.
+
+    The first element is a user configuration carrying every difference
+    the allow-list recognises; the second names the rest in readable
+    form, a hand-edited summary or a rebuilt chart, which no user layer
+    can hold and which therefore exist nowhere but the working tree.
+
+    A key the baseline has and the document lacks is not a difference:
+    the user never set it, so the shipped default is what applies once
+    the tracked file goes back to HEAD.
+
+    An empty baseline is the no-git case, where every tunable in the
+    document is taken as configuration. Nothing is reported as
+    non-tunable there, because with nothing to compare against the
+    shipped chart would be listed as a hand edit, which it is not.
+    """
+    compare = bool(baseline)
+    overlay: dict[str, Any] = {}
+    other: list[str] = []
+    for key, value in document.items():
+        base = baseline.get(key)
+        if key in USER_SCALAR_KEYS:
+            if key not in baseline or base != value:
+                overlay[key] = value
+        elif key == "steps":
+            _role_differences(base, value, overlay, other, compare)
+        elif key == "settings":
+            _setting_differences(base, value, overlay, other, compare)
+        elif key == "prices":
+            _price_differences(base, value, overlay, other, compare)
+        elif key in USER_MAPPING_KEYS:
+            # endpoints, route_effort and allowances: one entry deep,
+            # each entry whole, exactly as the merge reads them.
+            if not isinstance(value, dict):
+                other.append(f"{key} is not an object")
+                continue
+            base_map = base if isinstance(base, dict) else {}
+            for name, entry in value.items():
+                if name not in base_map or base_map[name] != entry:
+                    overlay.setdefault(key, {})[name] = entry
+        elif compare and (key not in baseline or base != value):
+            other.append(key)
+    if overlay:
+        overlay["version"] = USER_CONFIG_VERSION
+    return overlay, other
+
+
+def role_from_manifest(
+    manifest: dict[str, Any],
+    role_id: str,
+    override: dict[str, Any] | None = None,
+) -> Role:
+    """Derive and validate one role from a manifest already in hand.
+
+    Separate from `load_role` so a candidate document can be validated
+    before it is written, with the same rules the readers apply.
     """
     if role_id not in ROLE_IDS:
         raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
-    manifest = load_manifest(path)
     steps = manifest.get("steps")
     if not isinstance(steps, list):
         raise RuntimeConfigError("the orchestration manifest has no role list")
@@ -561,21 +1018,19 @@ def load_role(
             f"the orchestration manifest must define {role_id} exactly once"
         )
     step = dict(matches[0])
-    if role_id == "orchestrator" and path == MANIFEST_PATH and apply_override:
-        override = project_override(cwd or Path.cwd())
-        if override is not None:
-            unknown = set(override) - {
-                "provider",
-                "model",
-                "thinking",
-                "endpoint",
-            }
-            if unknown:
-                raise RuntimeConfigError(
-                    "the repository orchestrator override contains unknown "
-                    f"fields: {sorted(unknown)}"
-                )
-            step.update(override)
+    if override is not None:
+        unknown = set(override) - {
+            "provider",
+            "model",
+            "thinking",
+            "endpoint",
+        }
+        if unknown:
+            raise RuntimeConfigError(
+                "the repository orchestrator override contains unknown "
+                f"fields: {sorted(unknown)}"
+            )
+        step.update(override)
     title = step.get("title")
     provider = step.get("provider")
     model = step.get("model")
@@ -698,6 +1153,154 @@ def load_role(
     )
 
 
+def load_role(
+    role_id: str,
+    path: Path | None = None,
+    *,
+    manifest: dict[str, Any] | None = None,
+    cwd: Path | None = None,
+    apply_override: bool = True,
+) -> Role:
+    """The validated role, optionally ignoring repository overrides.
+
+    With neither `path` nor `manifest`, the effective configuration is
+    read: the shipped default with this machine's user configuration
+    merged over it.
+
+    `manifest` is that same effective document, already read by the
+    command so it reads once and threads it, so the repository override
+    applies to it exactly as it does to a layered read. Only an explicit
+    `path` means "this document alone", with no layers and no override,
+    which is what a caller passing a fixture is asking for.
+
+    `apply_override=False` is for callers that write global state: a
+    repository's `.orrery.json` principal is correct for that
+    directory only, so projecting it into a machine-wide setting would
+    silently change every other repository's default. It still returns
+    the machine's user-configured principal, which is what those callers
+    are projecting.
+    """
+    if role_id not in ROLE_IDS:
+        # Ahead of any read, so a typo is named as one rather than as
+        # whatever the configuration happens to be wrong about.
+        raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
+    if path is not None and manifest is not None:
+        raise RuntimeConfigError("load_role takes a path or a manifest, not both")
+    if manifest is None:
+        manifest = load_manifest(path) if path is not None else effective_manifest()
+    override = None
+    if path is None and role_id == "orchestrator" and apply_override:
+        override = project_override(cwd or Path.cwd())
+    return role_from_manifest(manifest, role_id, override)
+
+
+def _private_directory(path: Path) -> None:
+    """Create `path` and every missing ancestor with owner-only access.
+
+    pathlib applies `mode=` to the leaf alone and lets the umask decide
+    the intermediates, so under umask 002 a freshly created config home
+    would be born group-writable and `_secure` would then refuse the
+    directory the command had just made. Each missing level is created
+    explicitly instead; levels that already exist keep their mode.
+    """
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
+def user_config_text(document: dict[str, Any]) -> str:
+    """The exact bytes `write_user_config` puts in the file.
+
+    Shared so a preview's `after` and the file the apply writes are one
+    text. The apply is a compare-and-swap over that text, and two
+    serialisations that merely mean the same thing would fail it.
+    """
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def validate_user_config(document: dict[str, Any]) -> dict[str, Any]:
+    """The manifest a candidate would produce, or the refusal it earns.
+
+    Every check the writer makes, without writing, so the page can
+    refuse a candidate while it is still a preview.
+    """
+    candidate = merge_user_config(load_manifest(MANIFEST_PATH), document)
+    for role_id in sorted(ROLE_IDS):
+        role_from_manifest(candidate, role_id)
+    # Verbosity too, because the runtime owns that validator; the other
+    # scalars are checked by the readers that own theirs.
+    load_verbosity(candidate)
+    return candidate
+
+
+def write_user_config(document: dict[str, Any], *, expected: str | None) -> str:
+    """Replace the user configuration, refusing a stale read.
+
+    The only writer. `expected` is the exact text the caller read, or
+    None when the file must not exist yet; the comparison happens under
+    the same lock as the replace, so a preview-then-apply check cannot
+    be overtaken between the two. Readers take no lock, because one
+    `os.replace` publishes a whole document.
+    """
+    # Validated before anything is written, and before the lock is even
+    # taken: a document the next command would refuse must never reach
+    # the file, because that refusal is fatal to every command and would
+    # leave no working page to repair it with.
+    validate_user_config(document)
+    text = user_config_text(document)
+
+    home = config_home()
+    _private_directory(home)
+    os.chmod(home, 0o700)
+    path = home / "config.json"
+    lock = home / "config.lock"
+    with lock.open("a+") as handle:
+        os.chmod(lock, 0o600)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        current = None
+        if os.path.lexists(path):
+            _secure(path, "user configuration", regular=True)
+            current = path.read_text()
+        if current != expected:
+            raise RuntimeConfigError(
+                f"the user configuration {path} changed since it was read"
+            )
+        descriptor, name = tempfile.mkstemp(prefix=".config.", dir=home)
+        temporary = Path(name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w") as output:
+                output.write(text)
+                output.flush()
+                os.fsync(output.fileno())
+            if current is not None:
+                # One deep, the same safety net the settings installer
+                # gives ~/.claude/settings.json. A refused configuration
+                # stops every command, so the previous text is what
+                # makes that recoverable without an editor.
+                previous = os.open(
+                    home / "config.previous.json",
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                    0o600,
+                )
+                with os.fdopen(previous, "w") as copy:
+                    os.fchmod(copy.fileno(), 0o600)
+                    copy.write(current)
+                    copy.flush()
+                    os.fsync(copy.fileno())
+            temporary.replace(path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return text
+
+
 VERBOSITY_LEVELS = frozenset({1, 2, 3})
 VERBOSITY_STYLE = {
     1: (
@@ -728,7 +1331,7 @@ def load_verbosity(manifest: dict[str, Any] | None = None) -> int:
             )
         return int(raw)
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     value = manifest.get("verbosity", 1)
     if (
         isinstance(value, bool)
@@ -1367,7 +1970,16 @@ def provider_environment(
     tmp_dir: Path,
     role_id: str = "",
     endpoint: Endpoint | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, str]:
+    """The scrubbed environment one delegated provider CLI is started in.
+
+    `manifest` is the document the calling command already read. It is
+    required whenever a role is routed at an endpoint, because that is
+    what names the other endpoints' key variables to strip; reading a
+    second document here could differ from the one the dispatch was
+    validated against, and failing that read used to strip nothing.
+    """
     if provider not in PROVIDERS:
         raise RuntimeConfigError(f"unknown provider: {provider}")
     environment = {
@@ -1423,7 +2035,14 @@ def provider_environment(
     if provider == "openai":
         environment["CODEX_HOME"] = str(codex_home())
     if endpoint is not None:
-        endpoint_keys = endpoint_key_names()
+        if manifest is None:
+            raise RuntimeConfigError(
+                f"routing {role_id or provider} at endpoint {endpoint.id} "
+                "needs the manifest: without it the other endpoints' key "
+                "variables cannot be named, and the delegate would carry "
+                "every one of them"
+            )
+        endpoint_keys = endpoint_key_names(manifest)
         for name in tuple(environment):
             if (
                 name
@@ -1491,11 +2110,15 @@ def endpoint_environment(endpoint: Endpoint) -> dict[str, str]:
     return {endpoint.key_env: key} if endpoint.key_env else {}
 
 
-def endpoint_key_names() -> set[str]:
-    try:
-        endpoints = load_manifest().get("endpoints", {})
-    except RuntimeConfigError:
-        return set()
+def endpoint_key_names(manifest: dict[str, Any]) -> set[str]:
+    """Every endpoint credential variable a manifest names.
+
+    Takes the document the caller already read, and has no error path.
+    It decides which other endpoints' keys are stripped from a
+    delegate's environment, so an empty set returned because a read had
+    failed would start that delegate carrying every one of them.
+    """
+    endpoints = manifest.get("endpoints", {})
     if not isinstance(endpoints, dict):
         return set()
     return {

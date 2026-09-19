@@ -150,6 +150,94 @@ def read_json(path: Path) -> Any:
     return json.loads(path.read_text())
 
 
+def write_user_config_file(home: Path, document: Any) -> Path:
+    """Put one user configuration in place, with the modes it needs.
+
+    A string is written verbatim, so a malformed document can be staged;
+    anything else is serialised. Both the directory and the file are
+    narrowed explicitly, because the developer's umask makes a plain
+    write 0664 and the runtime refuses a group-writable configuration.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    os.chmod(home, 0o700)
+    path = home / "config.json"
+    path.write_text(
+        document if isinstance(document, str) else json.dumps(document, indent=2)
+    )
+    path.chmod(0o600)
+    return path
+
+
+@contextlib.contextmanager
+def isolated_config_home(base: str | None = None) -> Any:
+    """A private config home for one test, restored and removed after.
+
+    Separate from the suite-wide one so a test that doctors the file's
+    mode, owner or location cannot move another test's reading. Under
+    TMPDIR rather than the real home, which the suite's opt-in to
+    ORRERY_ALLOW_TMP_REPOSITORY is what makes acceptable; `base` is for
+    the one test that needs a broad grant specifically.
+    """
+    directory = tempfile.mkdtemp(prefix="kit-user-config.", dir=base)
+    saved = os.environ.get("XDG_CONFIG_HOME")
+    os.environ["XDG_CONFIG_HOME"] = directory
+    try:
+        yield Path(directory) / "orrery"
+    finally:
+        if saved is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = saved
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def shipped_manifest(**overrides: Any) -> Any:
+    """Run a block against a doctored copy of the shipped default.
+
+    The user layer merges mappings one entry deep, so a mapping the
+    shipped file carries cannot be emptied from it: `allowances: {}` in
+    a user configuration leaves the shipped entry standing, which is
+    what per-provider merging means. A test that needs the shipped
+    layer itself to differ, rather than a machine's choices, therefore
+    substitutes the document every reader takes as its default.
+    """
+    saved = runtime_module.MANIFEST_PATH
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "orchestration.json"
+        document = runtime_module.load_manifest(saved)
+        document.update(overrides)
+        write_json(path, document)
+        runtime_module.MANIFEST_PATH = path
+        try:
+            yield document
+        finally:
+            runtime_module.MANIFEST_PATH = saved
+
+
+@contextlib.contextmanager
+def user_configuration(**overlay: Any) -> Any:
+    """Run a block under a real user configuration file.
+
+    The overlay is written into the suite's own config home, so what is
+    exercised is the runtime's merge rather than a doctored loader, and
+    the effective manifest the block will read is yielded. Every reader
+    in the kit reaches that file by the same route the user's own
+    machine does.
+    """
+    path = runtime_module.user_config_path()
+    previous = path.read_text() if path.exists() else None
+    write_user_config_file(path.parent, {"version": 1, **overlay})
+    manifest = runtime_module.effective_manifest()
+    try:
+        yield manifest
+    finally:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(previous)
+
+
 def run_settings(
     *arguments: str,
     expect_success: bool = True,
@@ -354,6 +442,12 @@ def review_environment(
     HOME_DIRS.append(str(home))
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".codex").mkdir(parents=True, exist_ok=True)
+    # Inside the temporary home, so it is removed with it and can never
+    # sit under a broad grant: the runtime refuses a config home there,
+    # and a subprocess that drops the opt-in would be refused before it
+    # reached whatever the test is actually measuring.
+    (home / ".config").mkdir(parents=True, exist_ok=True)
+    environment["XDG_CONFIG_HOME"] = str(home / ".config")
     live_settings = Path.home() / ".claude" / "settings.json"
     if live_settings.exists():
         # Seeded from the real file so a test that expects a populated
@@ -2596,6 +2690,686 @@ def test_invalid_manifest_role_refused() -> None:
             )
         finally:
             shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# The user configuration layer: the shipped default, the machine's own
+# choices, and the repository override, in that order of precedence
+# ---------------------------------------------------------------------------
+
+
+@test("with no user configuration the shipped default is the whole answer")
+def test_user_configuration_absent() -> None:
+    with isolated_config_home() as home, tempfile.TemporaryDirectory() as plain:
+        require(
+            not home.exists(),
+            f"a fresh install should have no config home yet: {home}",
+        )
+        require(runtime_module.load_user_config() == {}, "an absent file overrode")
+        shipped = runtime_module.load_manifest(runtime_module.MANIFEST_PATH)
+        require(
+            runtime_module.effective_manifest() == shipped,
+            "the effective configuration diverged from the shipped default",
+        )
+        for step in shipped["steps"]:
+            # From outside any repository, so an adopted kit on the
+            # developer's own machine cannot steer the principal row.
+            role = runtime_module.load_role(step["id"], cwd=Path(plain))
+            require(
+                (role.provider, role.model, role.thinking)
+                == (step["provider"], step["model"], step.get("thinking")),
+                f"{step['id']} did not load its shipped values: {role}",
+            )
+
+
+@test("a user field wins for itself, and the repository override wins over both")
+def test_user_configuration_precedence() -> None:
+    with isolated_config_home() as home, tempfile.TemporaryDirectory() as directory:
+        shipped = runtime_module.load_manifest(runtime_module.MANIFEST_PATH)
+        reviewer = next(
+            step for step in shipped["steps"] if step["id"] == "reviewer"
+        )
+        write_user_config_file(
+            home,
+            {
+                "version": 1,
+                "roles": {
+                    "reviewer": {"model": "gpt-5.6-terra"},
+                    "orchestrator": {"model": "sonnet"},
+                },
+            },
+        )
+        configured = runtime_module.load_role("reviewer")
+        require(
+            configured.model == "gpt-5.6-terra" != reviewer["model"],
+            f"the user layer did not win: {configured}",
+        )
+        # Field by field: naming a model must not silently take the rest
+        # of the role with it.
+        require(
+            configured.provider == reviewer["provider"]
+            and configured.thinking == reviewer.get("thinking")
+            and configured.title == reviewer["title"]
+            and configured.access == reviewer["access"]
+            and configured.timeout_seconds == reviewer.get("timeout_seconds"),
+            f"an unnamed field of the same role moved: {configured}",
+        )
+        require(
+            runtime_module.load_role("implementer").model
+            == next(
+                step for step in shipped["steps"] if step["id"] == "implementer"
+            )["model"],
+            "a role the user never named moved",
+        )
+
+        sources: dict[str, str] = {}
+        runtime_module.effective_manifest(sources)
+        require(
+            sources
+            == {
+                "roles.reviewer.model": "user",
+                "roles.orchestrator.model": "user",
+            },
+            f"the provenance record is wrong: {sources}",
+        )
+
+        repository = adopted_repository(directory)
+        write_json(
+            repository / ".orrery.json",
+            {"orchestrator": {"provider": "anthropic", "model": "opus"}},
+        )
+        principal = runtime_module.load_role("orchestrator", cwd=repository)
+        require(
+            principal.model == "opus",
+            f"the repository override did not outrank the user layer: {principal}",
+        )
+        # The machine-wide projection deliberately ignores the repository
+        # and must still see the user's own choice, or orrery-sync would
+        # project the shipped default over it.
+        machine = runtime_module.load_role(
+            "orchestrator", cwd=repository, apply_override=False
+        )
+        shipped_principal = next(
+            step for step in shipped["steps"] if step["id"] == "orchestrator"
+        )
+        require(
+            machine.model == "sonnet"
+            and machine.thinking == shipped_principal.get("thinking"),
+            f"apply_override=False lost the user layer: {machine}",
+        )
+        # An explicit path is one document alone: no user layer, no
+        # repository override, which is what every fixture relies on.
+        alone = runtime_module.load_role(
+            "orchestrator", runtime_module.MANIFEST_PATH, cwd=repository
+        )
+        require(
+            alone.model == shipped_principal["model"],
+            f"an explicit path picked up a layer: {alone}",
+        )
+
+
+@test("an unrecognised user configuration is refused, never ignored")
+def test_user_configuration_refusals() -> None:
+    refusals = [
+        ({"unicorn": 1}, "unknown key 'unicorn'"),
+        ({"chart": {}}, "unknown key 'chart'"),
+        ({"steps": []}, "unknown key 'steps'"),
+        ({"roles": {"boss": {"model": "opus"}}}, "unknown role 'roles.boss'"),
+        ({"roles": {"reviewer": {"access": "principal"}}}, "cannot set 'access'"),
+        ({"roles": {"reviewer": {"title": "Mine"}}}, "cannot set 'title'"),
+        ({"settings": {"plan_review_rounds": 9}}, "above its shipped maximum"),
+        ({"settings": {"plan_review_rounds": 0}}, "below its shipped minimum"),
+        ({"settings": {"nonesuch": 1}}, "unknown setting 'settings.nonesuch'"),
+        ({"version": 2}, "unsupported 'version'"),
+        ("{not json", "unreadable"),
+        ("[]", "must be a JSON object"),
+    ]
+    with isolated_config_home() as home:
+        for document, expected in refusals:
+            path = write_user_config_file(home, document)
+            try:
+                runtime_module.effective_manifest()
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    expected in str(exc) and str(path) in str(exc),
+                    f"{document!r} had the wrong refusal: {exc}",
+                )
+            else:
+                raise Failure(f"{document!r} was accepted")
+
+    # A fault in the shipped file is the shipped file's own, not the
+    # user configuration's, and is named as such even with no user file.
+    with isolated_config_home(), tempfile.TemporaryDirectory() as broken:
+        bad = Path(broken) / "orchestration.json"
+        bad.write_text("{not json")
+        saved_manifest_path = runtime_module.MANIFEST_PATH
+        runtime_module.MANIFEST_PATH = bad
+        try:
+            runtime_module.effective_manifest()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "orchestration manifest is unreadable" in str(exc)
+                and "user configuration" not in str(exc),
+                f"a shipped fault was blamed on the user configuration: {exc}",
+            )
+        else:
+            raise Failure("a corrupt shipped manifest was accepted")
+        finally:
+            runtime_module.MANIFEST_PATH = saved_manifest_path
+
+
+@test("an unsafe user configuration or config home is refused")
+def test_user_configuration_trust() -> None:
+    saved = os.environ.get("XDG_CONFIG_HOME")
+    try:
+        for raw in ("", "relative/config", "."):
+            os.environ["XDG_CONFIG_HOME"] = raw
+            try:
+                runtime_module.user_config_path()
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "XDG_CONFIG_HOME" in str(exc),
+                    f"{raw!r} had the wrong refusal: {exc}",
+                )
+            else:
+                raise Failure(f"XDG_CONFIG_HOME={raw!r} was accepted")
+
+        # Inside the kit checkout, where a pull would overwrite it and a
+        # tracked file would carry the machine's configuration again.
+        os.environ["XDG_CONFIG_HOME"] = str(KIT_DIR / "tests")
+        try:
+            runtime_module.user_config_path()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "inside the kit checkout" in str(exc),
+                f"the wrong refusal inside the kit: {exc}",
+            )
+        else:
+            raise Failure("a config home inside the kit checkout was accepted")
+    finally:
+        if saved is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = saved
+
+    # A broad grant is writable by every contained delegate, so a
+    # configuration there could choose that delegate's own model and
+    # credential. The suite opts in globally; this drops the opt-in the
+    # way real use runs.
+    with isolated_config_home(base="/tmp"):
+        allowed = os.environ.pop("ORRERY_ALLOW_TMP_REPOSITORY", None)
+        try:
+            runtime_module.user_config_path()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "/tmp" in str(exc) and "delegate" in str(exc),
+                f"the wrong refusal under a grant: {exc}",
+            )
+        else:
+            raise Failure("a config home under /tmp was accepted")
+        finally:
+            if allowed is not None:
+                os.environ["ORRERY_ALLOW_TMP_REPOSITORY"] = allowed
+        require(
+            runtime_module.user_config_path().name == "config.json",
+            "the opt-in did not restore the grant case",
+        )
+
+    with isolated_config_home() as home:
+        path = write_user_config_file(home, {"version": 1})
+        for mode in (0o664, 0o666):
+            path.chmod(mode)
+            try:
+                runtime_module.load_user_config()
+            except runtime_module.RuntimeConfigError as exc:
+                require(
+                    "group- or world-writable" in str(exc),
+                    f"{mode:o} had the wrong refusal: {exc}",
+                )
+            else:
+                raise Failure(f"a {mode:o} user configuration was honoured")
+        path.chmod(0o600)
+
+        # The foreign-owner refusal cannot be staged for real without a
+        # second uid, so the file's lstat result is doctored: the path
+        # from the stat to the refusal is the one a genuinely foreign
+        # file would take.
+        real_lstat = runtime_module.os.lstat
+
+        def foreign_lstat(target, *arguments, **keywords):
+            details = real_lstat(target, *arguments, **keywords)
+            if Path(target) == path:
+                doctored = list(details)
+                doctored[stat.ST_UID] = details.st_uid + 1
+                return os.stat_result(doctored)
+            return details
+
+        runtime_module.os.lstat = foreign_lstat
+        try:
+            runtime_module.load_user_config()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "foreign-owned" in str(exc),
+                f"the wrong refusal for a foreign owner: {exc}",
+            )
+        else:
+            raise Failure("a foreign-owned user configuration was honoured")
+        finally:
+            runtime_module.os.lstat = real_lstat
+
+        path.unlink()
+        path.symlink_to(home / "elsewhere.json")
+        (home / "elsewhere.json").write_text('{"version": 1}')
+        try:
+            runtime_module.load_user_config()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "symlinked" in str(exc),
+                f"the wrong refusal for a symlink: {exc}",
+            )
+        else:
+            raise Failure("a symlinked user configuration was honoured")
+        path.unlink()
+
+        home.chmod(0o770)
+        try:
+            runtime_module.load_user_config()
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "group- or world-writable" in str(exc),
+                f"the wrong refusal for a loose directory: {exc}",
+            )
+        else:
+            raise Failure("a group-writable config home was honoured")
+        home.chmod(0o700)
+
+
+@test("the user configuration writer locks, compares, and keeps one copy")
+def test_user_configuration_writer() -> None:
+    first = {
+        "version": 1,
+        "roles": {
+            "reviewer": {
+                "provider": "anthropic",
+                "model": "opus",
+                "thinking": "max",
+            }
+        },
+    }
+    with isolated_config_home() as home:
+        text = runtime_module.write_user_config(first, expected=None)
+        path = home / "config.json"
+        require(
+            read_json(path) == first and path.read_text() == text,
+            f"the written document is not what was asked for: {path.read_text()}",
+        )
+        require(
+            stat.S_IMODE(home.stat().st_mode) == 0o700
+            and stat.S_IMODE(path.stat().st_mode) == 0o600,
+            f"the writer left loose modes: {oct(home.stat().st_mode)} "
+            f"{oct(path.stat().st_mode)}",
+        )
+
+        # A candidate the next command would refuse must never reach the
+        # file: that refusal is fatal to every command, including the
+        # page the user would repair it with.
+        try:
+            runtime_module.write_user_config(
+                {"version": 1, "roles": {"reviewer": {"model": "opus"}}},
+                expected=text,
+            )
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "belongs to anthropic" in str(exc),
+                f"the wrong refusal for an invalid candidate: {exc}",
+            )
+        else:
+            raise Failure("a candidate no command could read was written")
+        require(read_json(path) == first, "a refused candidate still landed")
+
+        second = {"version": 1, "verbosity": 2}
+        later = runtime_module.write_user_config(second, expected=text)
+        previous = home / "config.previous.json"
+        require(
+            read_json(previous) == first
+            and stat.S_IMODE(previous.stat().st_mode) == 0o600,
+            f"the previous copy is missing or loose: {list(home.iterdir())}",
+        )
+        try:
+            runtime_module.write_user_config({"version": 1}, expected=text)
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "changed since it was read" in str(exc),
+                f"the wrong refusal for a stale read: {exc}",
+            )
+        else:
+            raise Failure("a stale expected text was accepted")
+        require(read_json(path) == second, "a stale write still landed")
+
+        # Two writers holding the same text: the lock serialises them,
+        # and the compare-and-swap is what makes the loser lose rather
+        # than overwrite work it never saw.
+        barrier = threading.Barrier(2)
+        results: list[Any] = []
+
+        def contend(document: dict[str, Any]) -> None:
+            barrier.wait(timeout=30)
+            try:
+                runtime_module.write_user_config(document, expected=later)
+            except BaseException as exc:  # noqa: BLE001 - recorded, not raised
+                results.append(exc)
+            else:
+                results.append(document)
+
+        threads = [
+            threading.Thread(target=contend, args=({"version": 1, "verbosity": v},))
+            for v in (1, 3)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        winners = [entry for entry in results if isinstance(entry, dict)]
+        losers = [entry for entry in results if isinstance(entry, BaseException)]
+        require(
+            len(winners) == 1 and len(losers) == 1,
+            f"concurrent writers did not serialise: {results}",
+        )
+        require(
+            "changed since it was read" in str(losers[0]),
+            f"the loser failed for the wrong reason: {losers[0]}",
+        )
+        require(
+            read_json(path) == winners[0],
+            "the file holds neither writer's document whole",
+        )
+        require(
+            sorted(entry.name for entry in home.iterdir())
+            == ["config.json", "config.lock", "config.previous.json"],
+            f"the writer left a partial file behind: {list(home.iterdir())}",
+        )
+
+
+@test("no in-process read of the suite reaches the real user configuration")
+def test_user_configuration_isolated_from_the_developer() -> None:
+    suite_home = Path(os.environ["XDG_CONFIG_HOME"]).resolve()
+    resolved = runtime_module.user_config_path().resolve()
+    require(
+        resolved.is_relative_to(suite_home),
+        f"{resolved} is not under the suite's config home {suite_home}",
+    )
+    require(
+        not resolved.is_relative_to((Path.home() / ".config").resolve()),
+        f"{resolved} resolves into the developer's own configuration",
+    )
+    require(
+        suite_home.name.startswith("kit-config."),
+        f"the suite's config home is not its own: {suite_home}",
+    )
+    require(runtime_module.load_user_config() == {}, "the suite carries an overlay")
+
+
+@test("an endpoint-routed delegate carries its own key and no other's")
+def test_provider_environment_strips_other_endpoint_keys() -> None:
+    # Both key variables are named so the provider allow-list carries
+    # them in; what the endpoint document decides is which one is then
+    # taken back out again.
+    manifest = {
+        "endpoints": {
+            "routed": {
+                "label": "Routed",
+                "adapter": "openai",
+                "base_url": "https://routed.test",
+                "key_env": "OPENAI_ROUTED_KEY",
+            },
+            "other": {
+                "label": "Other",
+                "adapter": "openai",
+                "base_url": "https://other.test",
+                "key_env": "OPENAI_OTHER_KEY",
+            },
+        }
+    }
+    require(
+        runtime_module.endpoint_key_names(manifest)
+        == {"OPENAI_ROUTED_KEY", "OPENAI_OTHER_KEY"},
+        "the key names were not read from the document handed over",
+    )
+    endpoint = runtime_module.Endpoint(
+        "routed", "Routed", "openai", "https://routed.test", "OPENAI_ROUTED_KEY"
+    )
+    saved = {
+        name: os.environ.get(name)
+        for name in ("OPENAI_ROUTED_KEY", "OPENAI_OTHER_KEY")
+    }
+    os.environ["OPENAI_ROUTED_KEY"] = "routed-secret"
+    os.environ["OPENAI_OTHER_KEY"] = "other-secret"
+    try:
+        require(
+            "OPENAI_OTHER_KEY"
+            in runtime_module.provider_environment(
+                "openai", Path(tempfile.gettempdir()), "reviewer"
+            ),
+            "the fixture assumes an unrouted role carries both variables",
+        )
+        environment = runtime_module.provider_environment(
+            "openai",
+            Path(tempfile.gettempdir()),
+            "reviewer",
+            endpoint,
+            manifest,
+        )
+        require(
+            "OPENAI_OTHER_KEY" not in environment,
+            "the delegate carried another endpoint's credential",
+        )
+        require(
+            environment.get("OPENAI_ROUTED_KEY") == "routed-secret",
+            f"the routed credential did not survive: {environment}",
+        )
+        # Without a document there is nothing to name the other keys, so
+        # the dispatch is refused rather than started carrying them: the
+        # empty set this used to fall back to stripped nothing at all.
+        try:
+            runtime_module.provider_environment(
+                "openai", Path(tempfile.gettempdir()), "reviewer", endpoint
+            )
+        except runtime_module.RuntimeConfigError as exc:
+            require(
+                "needs the manifest" in str(exc),
+                f"the wrong refusal without a manifest: {exc}",
+            )
+        else:
+            raise Failure("an endpoint route was built without a manifest")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@test("a delegate and the pickup timer both carry the config home")
+def test_config_home_reaches_delegates_and_timers() -> None:
+    """AC13. A layer a delegated run cannot see is not a layer.
+
+    Delegated units run with ProtectHome=read-only and their
+    environment is rebuilt from an allow-list, and the pickup timer runs
+    under the user manager rather than the arming shell, so in both
+    places the variable has to be carried deliberately or the fired run
+    reads the shipped default while the principal reads the machine's
+    own configuration.
+    """
+    with isolated_config_home() as home:
+        write_user_config_file(home, {"version": 1, "verbosity": 2})
+        configured = os.environ["XDG_CONFIG_HOME"]
+        for provider in sorted(runtime_module.PROVIDERS):
+            environment = runtime_module.provider_environment(
+                provider, Path(tempfile.gettempdir()), "reviewer"
+            )
+            require(
+                environment.get("XDG_CONFIG_HOME") == configured,
+                f"a {provider} delegate lost the config home: "
+                f"{environment.get('XDG_CONFIG_HOME')!r}",
+            )
+        # Measured through the loader the delegate would itself use, so
+        # this is the layer arriving and not merely the variable.
+        require(
+            runtime_module.load_verbosity() == 2,
+            "the fixture overlay did not reach the runtime at all",
+        )
+
+    pickup = load_script(
+        KIT_DIR / "scripts" / "orrery-pickup", "kit_pickup_timer_environment"
+    )
+    require(
+        "XDG_CONFIG_HOME" in pickup.TIMER_ENVIRONMENT_NAMES
+        and "XDG_STATE_HOME" in pickup.TIMER_ENVIRONMENT_NAMES,
+        f"the timer does not carry the config home: "
+        f"{pickup.TIMER_ENVIRONMENT_NAMES}",
+    )
+
+
+def python_sources() -> list[tuple[Path, str]]:
+    """Every Python source the kit ships, heredocs included.
+
+    Extensionless entry points are found by their shebang, the way CI
+    finds them for ruff. A shell heredoc fed to `python3 -` is Python
+    that no extension-based walk can see, and the doctor keeps two
+    hundred lines of it.
+
+    A heredoc is recognised by its own quoted tag rather than by the
+    command in front of it, because that command wraps over several
+    continued lines in four places; the python3 that opens it is looked
+    for in the text just before the tag instead.
+    """
+    sources: list[tuple[Path, str]] = []
+    for directory in (KIT_DIR / "scripts", KIT_DIR / "global" / "hooks"):
+        for path in sorted(directory.iterdir()):
+            if not path.is_file() or path.suffix == ".sh":
+                continue
+            text = path.read_text()
+            if path.suffix == ".py" or "python" in text.splitlines()[0]:
+                sources.append((path, text))
+    heredoc = re.compile(
+        r"<<'(?P<tag>[A-Za-z_]+)'[^\n]*\n(?P<body>.*?)\n(?P=tag)\n",
+        re.DOTALL,
+    )
+    for path in sorted((KIT_DIR / "scripts").glob("*.sh")):
+        text = path.read_text()
+        for match in heredoc.finditer(text):
+            if "python3" not in text[max(0, match.start() - 400):match.start()]:
+                continue
+            line = text[: match.start()].count("\n") + 1
+            sources.append((Path(f"{path}:{line}"), match.group("body")))
+    return sources
+
+
+@test("nothing in the kit reads the manifest without naming a document")
+def test_no_unlayered_manifest_read() -> None:
+    """AC15. A required positional fails at call time, not at import.
+
+    So the inventory cannot be held by the interpreter and is held here
+    instead: nobody calls `load_manifest()` with no argument, which
+    would be the shipped default read behind a user's configuration,
+    and nobody defines a second `load_manifest` to slip past the first
+    rule.
+    """
+    sources = python_sources()
+    names = {Path(str(path).split(":")[0]).name for path, _ in sources}
+    heredocs = [str(path) for path, _ in sources if ":" in str(path)]
+    require(
+        {
+            "orrery_runtime.py",
+            "orrery-review",
+            "leave-no-trace.py",
+            "doctor.sh",
+        }
+        <= names,
+        f"the scan missed a whole class of source: {sorted(names)}",
+    )
+    require(
+        len([name for name in heredocs if "doctor.sh" in name]) >= 10,
+        f"the doctor's heredocs were not extracted: {heredocs}",
+    )
+
+    offenders: list[str] = []
+    definitions: list[str] = []
+    for path, text in sources:
+        tree = ast.parse(text, filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "load_manifest"
+                and not node.args
+                and not node.keywords
+            ):
+                offenders.append(f"{path}:{node.lineno}")
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "load_manifest"
+                and path != RUNTIME_SCRIPT
+            ):
+                definitions.append(f"{path}:{node.lineno}")
+    require(
+        not offenders,
+        f"load_manifest() was called with no document: {offenders}",
+    )
+    require(
+        not definitions,
+        f"load_manifest is defined outside the runtime: {definitions}",
+    )
+
+    # The shell scripts also embed Python through `python3 -c`, which is
+    # shell-quoted rather than parseable, so the same rule is held over
+    # their raw text.
+    inline = [
+        f"{path}:{path.read_text()[:index].count(chr(10)) + 1}"
+        for path in sorted((KIT_DIR / "scripts").glob("*.sh"))
+        for index in [path.read_text().find("load_manifest()")]
+        if index >= 0
+    ]
+    require(
+        not inline,
+        f"a shell script embeds an unlayered read: {inline}",
+    )
+
+    # The scan above sees calls, not raw reads. A `json.loads(...read_text())`
+    # of the tracked file bypasses it, which is how the doctor's endpoint
+    # section kept reading the shipped default after everything else had
+    # moved. So every mention of the file's name in kit Python is
+    # enumerated: the doctor's structural validation of the shipped file
+    # and its migration diagnosis (the committed copy and the working
+    # copy), --import's baseline and the two git commands it prints.
+    # Anything new has to be argued in here, beside the others.
+    mentions: dict[str, int] = {}
+    for path, text in sources:
+        name = Path(str(path).split(":")[0]).name
+        count = text.count("orchestration.json")
+        if count:
+            mentions[name] = mentions.get(name, 0) + count
+    require(
+        mentions == {"orrery_runtime.py": 1, "doctor.sh": 3, "orrery-config": 5},
+        f"the tracked manifest is named somewhere new: {mentions}",
+    )
+
+
+@test("the task plane's concurrency cap follows the user configuration")
+def test_concurrency_cap_reads_the_user_layer() -> None:
+    """AC10, the task plane's half."""
+    shipped = runtime_module.load_manifest(runtime_module.MANIFEST_PATH)
+    value = 1 if shipped["max_concurrent_tasks"] != 1 else 3
+    with user_configuration(max_concurrent_tasks=value):
+        require(
+            task_module.concurrency_cap(KIT_DIR) == value,
+            f"the cap ignored the user configuration: "
+            f"{task_module.concurrency_cap(KIT_DIR)}",
+        )
+    require(
+        task_module.concurrency_cap(KIT_DIR) == shipped["max_concurrent_tasks"],
+        "the shipped cap did not return once the overlay was removed",
+    )
 
 
 @test("an empty or missing prompt is rejected")
@@ -6956,54 +7730,111 @@ def test_plan_review_session_context() -> None:
         KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
         "kit_lnt_plan_review_context",
     )
-    with tempfile.TemporaryDirectory() as directory:
-        manifest_path = Path(directory) / "orchestration.json"
-        hook.ORCHESTRATION_MANIFEST = manifest_path
-
-        def configure(value: Any) -> None:
-            write_json(
-                manifest_path,
-                {"settings": {"plan_review_rounds": {"value": value}}},
-            )
-
-        for value in (1, 2, 4):
-            configure(value)
+    # The cap the hook states is the effective one, so a machine that
+    # configured a different number is told its own, not the shipped
+    # default it never runs at.
+    for value in (1, 2, 4):
+        with user_configuration(settings={"plan_review_rounds": value}):
             require(
                 hook.configured_plan_review_rounds() == value,
                 f"the hook did not read a {value}-round cap",
             )
-            context = hook.plan_review_context(value)
+        context = hook.plan_review_context(value)
+        require(
+            f"at most {value} reviewer round" in context
+            and "blocking or advisory" in context
+            and "stop before implementation" in context
+            and "Do not iterate merely to obtain agreement" in context,
+            f"the {value}-round context omits its safety contract: {context}",
+        )
+        if value == 1:
             require(
-                f"at most {value} reviewer round" in context
-                and "blocking or advisory" in context
-                and "stop before implementation" in context
-                and "Do not iterate merely to obtain agreement" in context,
-                f"the {value}-round context omits its safety contract: {context}",
+                "cannot receive an independent confirmation round" in context,
+                "the one-round escalation rule is absent",
             )
-            if value == 1:
-                require(
-                    "cannot receive an independent confirmation round" in context,
-                    "the one-round escalation rule is absent",
-                )
-            else:
-                require(
-                    "the original blocking objections" in context,
-                    "confirmation rounds are not narrowly scoped",
-                )
+        else:
+            require(
+                "the original blocking objections" in context,
+                "confirmation rounds are not narrowly scoped",
+            )
 
-        for invalid in (0, 5, True, "2", None):
-            configure(invalid)
+    # A refused configuration is fatal to every command that dispatches;
+    # this hook runs for every Claude session on the machine and must
+    # fall back instead. Written past the writer on purpose: these are
+    # exactly the documents `write_user_config` would never produce.
+    with isolated_config_home() as home:
+        refused: list[Any] = [
+            {"version": 1, "settings": {"plan_review_rounds": value}}
+            for value in (0, 5, True, "2", None)
+        ]
+        refused.append("{broken")
+        for document in refused:
+            write_user_config_file(home, document)
             require(
                 hook.configured_plan_review_rounds()
                 == hook.DEFAULT_PLAN_REVIEW_ROUNDS,
-                f"invalid cap did not fall back safely: {invalid!r}",
+                f"a refused configuration did not fall back: {document!r}",
             )
-        manifest_path.write_text("{broken")
+
+
+@test("only the round cap imports the runtime, and never at import time")
+def test_hook_runtime_import_is_lazy() -> None:
+    """AC16. hook-guard runs on every Bash call under a five-second budget.
+
+    So the import belongs inside the one function that needs it, and
+    a runtime that cannot be imported at all has to leave the cap at
+    its default rather than take the session down with it.
+    """
+    def runtime_imports(tree: ast.AST) -> set[int]:
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            else:
+                continue
+            if any(name.startswith("orrery_") for name in names):
+                found.add(node.lineno)
+        return found
+
+    tree = ast.parse(
+        (KIT_DIR / "global" / "hooks" / "leave-no-trace.py").read_text()
+    )
+    everywhere = runtime_imports(tree)
+    inside = {
+        line
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "configured_plan_review_rounds"
+        for line in runtime_imports(node)
+    }
+    require(
+        inside and everywhere == inside,
+        f"a runtime import sits outside the round cap: "
+        f"{sorted(everywhere - inside)}",
+    )
+
+    hook = load_script(
+        KIT_DIR / "global" / "hooks" / "leave-no-trace.py",
+        "kit_lnt_lazy_runtime",
+    )
+    # None in sys.modules is what an interpreter that cannot import the
+    # runtime looks like from inside the function, whatever sys.path
+    # the installed copy ends up with.
+    saved = sys.modules.get("orrery_runtime")
+    sys.modules["orrery_runtime"] = None
+    try:
         require(
             hook.configured_plan_review_rounds()
             == hook.DEFAULT_PLAN_REVIEW_ROUNDS,
-            "malformed JSON disabled the safe plan-review default",
+            "an unimportable runtime did not leave the safe default",
         )
+    finally:
+        if saved is None:
+            sys.modules.pop("orrery_runtime", None)
+        else:
+            sys.modules["orrery_runtime"] = saved
 
 
 @test("an aged state directory without metadata is reclaimed")
@@ -8020,8 +8851,9 @@ def test_plan_review_setting_validation() -> None:
         require(module.print_state() == 0, "--print state failed")
     require(
         "review rounds" in printed.getvalue()
-        and "1–4; global/orchestration.json" in printed.getvalue(),
-        f"--print hid the plan-review cap: {printed.getvalue()!r}",
+        and "1–4; default" in printed.getvalue(),
+        f"--print hid the plan-review cap or its source: "
+        f"{printed.getvalue()!r}",
     )
 
     for value in (1, 4):
@@ -8029,8 +8861,8 @@ def test_plan_review_setting_validation() -> None:
         require(len(edits) == 1, f"{value} rounds did not produce one edit")
         after = json.loads(edits[0]["after"])
         require(
-            after["settings"]["plan_review_rounds"]["value"] == value,
-            f"{value} rounds was not planned correctly",
+            after["settings"]["plan_review_rounds"] == value,
+            f"{value} rounds was not planned correctly: {after}",
         )
 
     def refused(change: Any, expected: str) -> None:
@@ -8062,29 +8894,39 @@ def test_plan_review_setting_validation() -> None:
         manifest = read_json(manifest_path)
         manifest["settings"]["plan_review_rounds"]["maximum"] = 99
         write_json(manifest_path, manifest)
-        module.KIT_DIR = kit
+        # The page reads the effective configuration through the
+        # runtime now, so it is the runtime's shipped layer that has to
+        # be pointed at the doctored copy; the page's own KIT_DIR no
+        # longer decides where the document comes from.
+        saved_manifest_path = runtime_module.MANIFEST_PATH
+        runtime_module.MANIFEST_PATH = manifest_path
         try:
-            module.settings_snapshot()
-        except module.ConfigError as exc:
-            require(
-                "bounded from 1 to 4" in str(exc),
-                f"a mutated bound gave the wrong error: {exc}",
-            )
-        else:
-            raise Failure("a mutable 99-round cap was accepted")
+            try:
+                module.settings_snapshot()
+            except module.ConfigError as exc:
+                require(
+                    "bounded from 1 to 4" in str(exc),
+                    f"a mutated bound gave the wrong error: {exc}",
+                )
+            else:
+                raise Failure("a mutable 99-round cap was accepted")
 
-        manifest["settings"]["plan_review_rounds"]["maximum"] = 4
-        manifest["settings"]["plan_review_rounds"]["node"] = "missing"
-        write_json(manifest_path, manifest)
-        try:
-            module.settings_snapshot()
-        except module.ConfigError as exc:
-            require(
-                "missing chart node" in str(exc),
-                f"a missing setting node gave the wrong error: {exc}",
-            )
-        else:
-            raise Failure("a setting attached to a missing node was accepted")
+            manifest["settings"]["plan_review_rounds"]["maximum"] = 4
+            manifest["settings"]["plan_review_rounds"]["node"] = "missing"
+            write_json(manifest_path, manifest)
+            try:
+                module.settings_snapshot()
+            except module.ConfigError as exc:
+                require(
+                    "missing chart node" in str(exc),
+                    f"a missing setting node gave the wrong error: {exc}",
+                )
+            else:
+                raise Failure(
+                    "a setting attached to a missing node was accepted"
+                )
+        finally:
+            runtime_module.MANIFEST_PATH = saved_manifest_path
 
 
 @test("policy, skill and SessionStart agree on bounded plan review")
@@ -8201,6 +9043,15 @@ def exercise_provider_neutral_config_surface() -> None:
         environment = review_environment("success")
         environment["HOME"] = str(home)
         environment["CODEX_HOME"] = str(home / ".codex")
+        # The page writes the machine's configuration, not the kit's
+        # tracked manifest, so what has to be isolated is the config
+        # home. Inside this HOME, so the page shows it as ~/.
+        environment["XDG_CONFIG_HOME"] = str(home / ".config")
+        user_config = home / ".config" / "orrery" / "config.json"
+        display = "~/.config/orrery/config.json"
+        manifest_path = kit / "global" / "orchestration.json"
+        shipped = read_json(manifest_path)
+        shipped_bytes = manifest_path.read_bytes()
 
         process = subprocess.Popen(
             [
@@ -8392,33 +9243,41 @@ def exercise_provider_neutral_config_surface() -> None:
             preview = post("preview", all_anthropic)
             require(
                 len(preview.get("edits", [])) == 1
-                and preview["edits"][0]["file"]
-                == "global/orchestration.json"
+                and preview["edits"][0]["file"] == display
+                and preview["edits"][0]["diff"].startswith(
+                    f"--- {display}\n+++ {display}\n"
+                )
                 and '"provider": "anthropic"' in preview["edits"][0]["diff"],
-                f"multi-role preview was not one manifest edit: {preview}",
+                f"multi-role preview was not one edit of the user "
+                f"configuration: {preview}",
             )
-            unchanged = read_json(kit / "global" / "orchestration.json")
             require(
-                next(
-                    step
-                    for step in unchanged["steps"]
-                    if step["id"] == "reviewer"
-                )["provider"]
-                == "openai",
-                "preview modified the manifest",
+                not user_config.exists()
+                and manifest_path.read_bytes() == shipped_bytes,
+                "preview wrote configuration instead of previewing it",
             )
 
             applied = post("apply", all_anthropic)
             require(
-                applied.get("applied") == ["global/orchestration.json"],
-                f"the atomic apply wrote unexpected files: {applied}",
+                applied.get("applied") == [display],
+                f"the apply wrote unexpected files: {applied}",
             )
-            manifest = read_json(kit / "global" / "orchestration.json")
+            configured = read_json(user_config)
             require(
-                {step["provider"] for step in manifest["steps"]}
+                {
+                    entry["provider"]
+                    for entry in configured["roles"].values()
+                }
                 == {"anthropic"}
-                and manifest["settings"]["plan_review_rounds"]["value"] == 4,
-                "the all-Anthropic configuration was not applied",
+                and set(configured["roles"])
+                == {"mechanic", "implementer", "plan-reviewer", "reviewer"}
+                and configured["settings"]["plan_review_rounds"] == 4,
+                f"the all-Anthropic configuration was not applied: "
+                f"{configured}",
+            )
+            require(
+                manifest_path.read_bytes() == shipped_bytes,
+                "applying a change rewrote the kit's tracked manifest",
             )
 
             # A Codex principal and Claude reviewers are equally valid.
@@ -8432,14 +9291,13 @@ def exercise_provider_neutral_config_surface() -> None:
             post("preview", codex_principal)
             switched = post("apply", codex_principal)
             require(
-                switched.get("applied") == ["global/orchestration.json"],
+                switched.get("applied") == [display],
                 f"the Codex-principal switch failed: {switched}",
             )
-            manifest = read_json(kit / "global" / "orchestration.json")
-            by_id = {step["id"]: step for step in manifest["steps"]}
+            roles = read_json(user_config)["roles"]
             require(
-                by_id["orchestrator"]["provider"] == "openai"
-                and by_id["reviewer"]["provider"] == "anthropic",
+                roles["orchestrator"]["provider"] == "openai"
+                and roles["reviewer"]["provider"] == "anthropic",
                 "principal and reviewer providers remain artificially coupled",
             )
 
@@ -8546,15 +9404,50 @@ def exercise_provider_neutral_config_surface() -> None:
                 }
             }
             post("preview", stale_change)
-            manifest_path = kit / "global" / "orchestration.json"
-            externally_changed = read_json(manifest_path)
-            externally_changed["external"] = "preserve"
-            write_json(manifest_path, externally_changed)
+            externally_changed = read_json(user_config)
+            externally_changed["verbosity"] = 3
+            write_user_config_file(user_config.parent, externally_changed)
             stale = post("apply", stale_change)
             require(
                 "changed since" in stale.get("error", "")
-                and read_json(manifest_path).get("external") == "preserve",
-                f"a concurrent manifest edit was overwritten: {stale}",
+                and read_json(user_config).get("verbosity") == 3,
+                f"a concurrent configuration edit was overwritten: {stale}",
+            )
+
+            # What deviates is what is stored: a role put back to the
+            # shipped default leaves nothing behind, and the section
+            # holding it goes with the last entry in it.
+            defaults = {
+                step["id"]: {
+                    "provider": step["provider"],
+                    "model": step["model"],
+                    "thinking": step["thinking"],
+                }
+                for step in shipped["steps"]
+            }
+            post("preview", defaults)
+            restored = post("apply", defaults)
+            require(
+                restored.get("applied") == [display],
+                f"the restore to the shipped defaults failed: {restored}",
+            )
+            document = read_json(user_config)
+            require(
+                "roles" not in document
+                and document["settings"]["plan_review_rounds"] == 4
+                and document["verbosity"] == 3,
+                f"a role back at its default left residue behind: {document}",
+            )
+            post("preview", {"plan_review_rounds": {"value": 2}})
+            post("apply", {"plan_review_rounds": {"value": 2}})
+            require(
+                read_json(user_config) == {"verbosity": 3, "version": 1},
+                f"an emptied section stayed in the file: "
+                f"{user_config.read_text()}",
+            )
+            require(
+                manifest_path.read_bytes() == shipped_bytes,
+                "the kit's tracked manifest was written at some point",
             )
         finally:
             with contextlib.suppress(ProcessLookupError):
@@ -8569,6 +9462,506 @@ def exercise_provider_neutral_config_surface() -> None:
 def test_config_surface() -> None:
     exercise_provider_neutral_config_surface()
     return
+
+
+def committed_kit(root: Path) -> Path:
+    """A copy of the kit with its own history, so HEAD is a baseline.
+
+    The migration reads `git show HEAD:global/orchestration.json` to
+    tell configuration from default, so a copy without history would
+    make every one of these tests measure the no-baseline path instead.
+    """
+    kit = root / "kit"
+    shutil.copytree(
+        KIT_DIR,
+        kit,
+        ignore=shutil.ignore_patterns(".git", "__pycache__"),
+    )
+    for command in (
+        ["git", "init", "--quiet", str(kit)],
+        ["git", "-C", str(kit), "add", "-A"],
+        [
+            "git", "-C", str(kit),
+            "-c", "user.email=kit@example.invalid",
+            "-c", "user.name=Kit",
+            "commit", "--quiet", "-m", "shipped",
+        ],
+    ):
+        subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+    return kit
+
+
+def kit_git_state(kit: Path) -> tuple[str, str]:
+    """The working tree and the commit it sits on, as one comparison."""
+    return tuple(
+        subprocess.run(
+            ["git", "-C", str(kit), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=60,
+            check=True,
+        ).stdout
+        for arguments in (["status", "--porcelain"], ["rev-parse", "HEAD"])
+    )
+
+
+def run_config(
+    kit: Path,
+    *arguments: str,
+    home: Path,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["HOME"] = str(home)
+    environment["XDG_CONFIG_HOME"] = str(home / ".config")
+    environment["XDG_STATE_HOME"] = str(home / "state")
+    return subprocess.run(
+        [sys.executable, str(kit / "scripts" / "orrery-config"), *arguments],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+
+@test("--import moves configuration out of a tracked manifest")
+def test_config_import_migrates_a_configured_manifest() -> None:
+    """AC8. Every install configured before the user layer existed has
+    its choices in the tracked file, mixed in with anything else that
+    was edited there. The migration moves what it can hold, names what
+    it cannot, and runs no git write of its own."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = committed_kit(root)
+        manifest_path = kit / "global" / "orchestration.json"
+        home = root / "home"
+        home.mkdir()
+        user_config = home / ".config" / "orrery" / "config.json"
+
+        manifest = read_json(manifest_path)
+        for step in manifest["steps"]:
+            if step["id"] == "mechanic":
+                step.update(
+                    provider="anthropic", model="opus", thinking="max"
+                )
+            if step["id"] == "implementer":
+                step["summary"] = "a hand edit no user layer can hold"
+        manifest["settings"]["plan_review_rounds"]["value"] = 3
+        write_json(manifest_path, manifest)
+
+        before = kit_git_state(kit)
+        result = run_config(kit, "--import", home=home)
+        require(
+            result.returncode == 0,
+            f"--import failed: {result.stdout} {result.stderr}",
+        )
+        require(
+            read_json(user_config)
+            == {
+                "version": 1,
+                "roles": {
+                    "mechanic": {
+                        "provider": "anthropic",
+                        "model": "opus",
+                        "thinking": "max",
+                    }
+                },
+                "settings": {"plan_review_rounds": 3},
+            },
+            f"the import wrote the wrong configuration: "
+            f"{user_config.read_text()}",
+        )
+        require(
+            "steps.implementer.summary" in result.stdout
+            and "diff HEAD -- global/orchestration.json" in result.stdout
+            and "checkout HEAD" not in result.stdout,
+            f"a difference no user layer can hold was mishandled: "
+            f"{result.stdout}",
+        )
+        require(
+            kit_git_state(kit) == before,
+            "--import wrote to git rather than printing the command",
+        )
+
+        # Idempotent: the same differences, the same file, nothing moved.
+        imported = user_config.read_text()
+        again = run_config(kit, "--import", home=home)
+        require(
+            again.returncode == 0
+            and user_config.read_text() == imported
+            and kit_git_state(kit) == before,
+            f"a second import was not idempotent: {again.stdout}",
+        )
+
+        # With nothing but tunables left, the restore is safe and is the
+        # only command offered.
+        subprocess.run(
+            [
+                "git", "-C", str(kit), "checkout", "HEAD", "--",
+                "global/orchestration.json",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        manifest = read_json(manifest_path)
+        for step in manifest["steps"]:
+            if step["id"] == "reviewer":
+                step.update(
+                    provider="anthropic", model="sonnet", thinking="high"
+                )
+        write_json(manifest_path, manifest)
+        tunable_only = run_config(kit, "--import", home=home)
+        require(
+            tunable_only.returncode == 0
+            and "checkout HEAD -- global/orchestration.json"
+            in tunable_only.stdout
+            and "diff HEAD" not in tunable_only.stdout,
+            f"a purely configurable manifest was not offered the restore: "
+            f"{tunable_only.stdout}",
+        )
+        require(
+            read_json(user_config)["roles"]["reviewer"]["model"] == "sonnet",
+            f"the second import lost the first: {user_config.read_text()}",
+        )
+
+        # A tarball install has no baseline to subtract, so every
+        # configurable value is configuration and neither git command
+        # can be offered.
+        loose = root / "loose"
+        shutil.copytree(
+            kit, loose, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        loose_home = root / "loose-home"
+        loose_home.mkdir()
+        without_git = run_config(loose, "--import", home=loose_home)
+        require(
+            without_git.returncode == 0
+            and "No committed baseline" in without_git.stdout
+            and "checkout HEAD" not in without_git.stdout
+            and "diff HEAD" not in without_git.stdout,
+            f"a kit without history was handled wrongly: "
+            f"{without_git.stdout} {without_git.stderr}",
+        )
+        document = read_json(
+            loose_home / ".config" / "orrery" / "config.json"
+        )
+        require(
+            set(document["roles"])
+            == {
+                "orchestrator",
+                "mechanic",
+                "implementer",
+                "plan-reviewer",
+                "reviewer",
+            }
+            and document["roles"]["reviewer"]["model"] == "sonnet"
+            and document["roles"]["orchestrator"]["model"] == "fable"
+            and document["settings"]["plan_review_rounds"] == 2,
+            f"a baseline-free import lost tunables: {document}",
+        )
+
+
+@test("the doctor reports the user configuration and names a migration")
+def test_doctor_user_configuration_section() -> None:
+    """AC9. A configured machine's kit is permanently dirty today. The
+    doctor still fails on that, but where every difference can be moved
+    it says so and names the two commands that move it."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = committed_kit(root)
+        manifest_path = kit / "global" / "orchestration.json"
+        home = root / "home"
+        config_home = home / ".config" / "orrery"
+        config_home.mkdir(parents=True)
+
+        def doctor() -> str:
+            environment = os.environ.copy()
+            environment["HOME"] = str(home)
+            environment["XDG_CONFIG_HOME"] = str(home / ".config")
+            environment["XDG_STATE_HOME"] = str(home / "state")
+            # The .gitignore keeps compiled modules out of the tree, but
+            # not writing them at all keeps the check about the fixture.
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["ORRERY_MODEL_DISCOVERY"] = "0"
+            return subprocess.run(
+                ["bash", str(kit / "scripts" / "doctor.sh")],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=300,
+                check=False,
+            ).stdout
+
+        absent = doctor()
+        require(
+            "PASS  No user configuration at "
+            f"{config_home / 'config.json'}; shipped defaults apply" in absent
+            and "PASS  Kit repository is clean" in absent,
+            f"a fresh install was not reported as one: {absent}",
+        )
+
+        path = write_user_config_file(
+            config_home,
+            {
+                "version": 1,
+                "roles": {
+                    "reviewer": {
+                        "provider": "anthropic",
+                        "model": "opus",
+                        "thinking": "max",
+                    }
+                },
+            },
+        )
+        present = doctor()
+        require(
+            f"PASS  User configuration is valid: {path}" in present
+            and "roles.reviewer.model" in present
+            and "roles.reviewer.provider" in present,
+            f"the user configuration was not reported: {present}",
+        )
+
+        manifest = read_json(manifest_path)
+        for step in manifest["steps"]:
+            if step["id"] == "mechanic":
+                step.update(
+                    provider="anthropic", model="opus", thinking="max"
+                )
+        write_json(manifest_path, manifest)
+        migrating = doctor()
+        require(
+            "the tracked manifest carries machine configuration; run "
+            "orrery-config --import, then git -C "
+            f"{kit} checkout HEAD -- global/orchestration.json" in migrating,
+            f"a configured manifest was not diagnosed: {migrating}",
+        )
+
+        # An edit no user layer can hold exists in the working tree
+        # alone, so the restore command is never named for it.
+        manifest = read_json(manifest_path)
+        for step in manifest["steps"]:
+            if step["id"] == "implementer":
+                step["summary"] = "a hand edit no user layer can hold"
+        write_json(manifest_path, manifest)
+        ordinary = doctor()
+        require(
+            "FAIL  Kit repository has uncommitted changes" in ordinary
+            and "orrery-config --import" not in ordinary,
+            f"an unconfigurable edit was offered a restore: {ordinary}",
+        )
+
+        subprocess.run(
+            [
+                "git", "-C", str(kit), "checkout", "HEAD", "--",
+                "global/orchestration.json",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        path.chmod(0o660)
+        refused = doctor()
+        require(
+            "FAIL  refusing group- or world-writable user configuration "
+            f"{path}" in refused,
+            f"a forgeable user configuration was accepted: {refused}",
+        )
+
+
+@test("the doctor's endpoint check follows the user configuration")
+def test_doctor_endpoint_section_reads_the_user_layer() -> None:
+    """An endpoint route and its registry entry live in the user
+    configuration and nowhere else, so a section reading the shipped
+    file would call every role first-party on a machine that routes one
+    elsewhere, and its credential check, the only one the doctor makes,
+    would never fire."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR, kit, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        home = root / "home"
+        write_user_config_file(
+            home / ".config" / "orrery",
+            {
+                "version": 1,
+                "roles": {
+                    "reviewer": {
+                        "provider": "anthropic",
+                        "model": "kimi-k3[1m]",
+                        "thinking": None,
+                        "endpoint": "kimi",
+                    }
+                },
+                "endpoints": {
+                    "kimi": {
+                        "label": "Kimi (Moonshot AI)",
+                        "adapter": "anthropic",
+                        "base_url": "https://api.moonshot.ai/anthropic",
+                        "key_env": "MOONSHOT_API_KEY",
+                    }
+                },
+            },
+        )
+
+        def doctor(**extra: str) -> str:
+            environment = os.environ.copy()
+            environment.pop("MOONSHOT_API_KEY", None)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "XDG_CONFIG_HOME": str(home / ".config"),
+                    "XDG_STATE_HOME": str(home / "state"),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "ORRERY_MODEL_DISCOVERY": "0",
+                    **extra,
+                }
+            )
+            return subprocess.run(
+                ["bash", str(kit / "scripts" / "doctor.sh")],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=300,
+                check=False,
+            ).stdout
+
+        unset = doctor()
+        require(
+            "FAIL  reviewer routes to Kimi (Moonshot AI) but MOONSHOT_API_KEY "
+            "is unset" in unset
+            and "Every role uses its provider's first-party endpoint"
+            not in unset,
+            f"the endpoint route in the user configuration was not seen: "
+            f"{unset}",
+        )
+        present = doctor(MOONSHOT_API_KEY="not-a-real-key")
+        require(
+            "PASS  reviewer routes to Kimi (Moonshot AI)" in present,
+            f"a routed role with its key set was not passed: {present}",
+        )
+
+
+@test("--export renders the shipped default, never this machine")
+def test_config_export_ignores_the_user_layer() -> None:
+    """AC12. The export is published; rendering it from the effective
+    configuration would publish whoever wrote it."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        home = root / "home"
+        config_home = home / ".config" / "orrery"
+        config_home.mkdir(parents=True)
+        (home / ".codex").mkdir()
+        environment = review_environment("success")
+        environment["HOME"] = str(home)
+        environment["CODEX_HOME"] = str(home / ".codex")
+        environment["XDG_CONFIG_HOME"] = str(home / ".config")
+
+        def export(target: Path) -> None:
+            result = subprocess.run(
+                [sys.executable, str(CONFIG_SCRIPT), "--export", str(target)],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            require(
+                result.returncode == 0,
+                f"--export failed: {result.stdout} {result.stderr}",
+            )
+
+        plain = root / "plain.html"
+        export(plain)
+        require(
+            "ready to commit" not in plain.read_text()
+            and "kit repository now holds" not in plain.read_text(),
+            "the page still says an apply lands in the repository",
+        )
+        write_user_config_file(
+            config_home,
+            {
+                "version": 1,
+                "roles": {
+                    "orchestrator": {
+                        "provider": "openai",
+                        "model": "gpt-5.6-sol",
+                        "thinking": "ultra",
+                    }
+                },
+                "settings": {"plan_review_rounds": 4},
+            },
+        )
+        overlaid = root / "overlaid.html"
+        export(overlaid)
+        require(
+            plain.read_text() == overlaid.read_text(),
+            "the export followed this machine's configuration",
+        )
+
+        # A standing approval is consent this machine recorded, not a
+        # default, so the export must not publish it either. Seeded in
+        # the store the export subprocess reads.
+        saved_state = os.environ.get("XDG_STATE_HOME")
+        os.environ["XDG_STATE_HOME"] = environment["XDG_STATE_HOME"]
+        try:
+            reviewer = runtime_module.load_role(
+                "reviewer", runtime_module.MANIFEST_PATH
+            )
+            standing_record_for(reviewer, ("anthropic", "opus"))
+            require(
+                standing_module.list_active(),
+                "the standing approval fixture is inert",
+            )
+        finally:
+            if saved_state is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved_state
+        with_standing = root / "standing.html"
+        export(with_standing)
+        require(
+            "Standing fallback approvals" not in with_standing.read_text()
+            and with_standing.read_text() == plain.read_text(),
+            "the export published a standing approval",
+        )
+        # Not vacuous: the overlay above is one the page would otherwise
+        # render, so the state has to be shown to still be the shipped
+        # one rather than merely unchanged between two broken renders.
+        shipped = read_json(KIT_DIR / "global" / "orchestration.json")
+        principal = next(
+            step for step in shipped["steps"] if step["id"] == "orchestrator"
+        )
+        state = json.loads(
+            re.search(
+                r"const STATE = (.*);\nconst SETTINGS =", overlaid.read_text()
+            ).group(1)
+        )
+        exported = next(row for row in state if row["id"] == "orchestrator")
+        require(
+            exported["provider"] == principal["provider"]
+            and exported["model"] == principal["model"],
+            f"the export shows a configured principal: {exported}",
+        )
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
 
 
 @test("the config token stays out of argv and substitution is one pass")
@@ -12246,7 +13639,10 @@ def test_endpoint_environment_exclusivity() -> None:
             "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CODE_USE_VERTEX": "1",
             "OPENAI_API_KEY": "openai", "OPENAI_BASE_URL": "https://openai.test",
         })
-        environment = runtime_module.provider_environment("anthropic", Path(tempfile.gettempdir()), endpoint=endpoint)
+        environment = runtime_module.provider_environment(
+            "anthropic", Path(tempfile.gettempdir()), endpoint=endpoint,
+            manifest=runtime_module.effective_manifest(),
+        )
         forbidden = {"AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "GCLOUD_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "OPENAI_API_KEY", "OPENAI_BASE_URL"}
         require(not forbidden & set(environment), f"alternate endpoint route leaked: {environment}")
         require(environment["ANTHROPIC_AUTH_TOKEN"] == "endpoint" and environment["ANTHROPIC_API_KEY"] == "", str(environment))
@@ -13804,26 +15200,6 @@ def test_d1_recorded_failure_starts_the_candidate() -> None:
 # ---------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def manifest_settings(**settings: Any) -> Any:
-    """Rank against a doctored copy of the manifest's own settings.
-
-    `global/orchestration.json` is simultaneously the shipped default
-    and the live configuration, so a test that needs a non-default
-    value reads a copy rather than writing the developer's own file.
-    The readers under test are the real ones; only the document they
-    read is substituted.
-    """
-    saved = fallback_module.load_manifest
-    manifest = copy.deepcopy(runtime_module.load_manifest())
-    manifest.update(settings)
-    fallback_module.load_manifest = lambda *_a, **_k: copy.deepcopy(manifest)
-    try:
-        yield manifest
-    finally:
-        fallback_module.load_manifest = saved
-
-
 def standing_record_for(configured: Any, candidate_identity: Any) -> None:
     """Seed one live standing approval naming an exact candidate."""
     standing_module.record_approval(
@@ -13984,7 +15360,7 @@ def test_d2_cross_provider_thinking_cap() -> None:
     )
 
     def crossed(**settings: str) -> Any:
-        with manifest_settings(
+        with user_configuration(
             delegate_fallback_scope="principal-model", **settings
         ):
             return fallback_module.nearest_fallback(
@@ -14011,7 +15387,7 @@ def test_d2_cross_provider_thinking_cap() -> None:
     # A role configured without a thinking level has no name to match,
     # so the candidate's own default chooses; the ceiling still binds
     # it, or the cap would be optional for anyone who omits the field.
-    with manifest_settings(delegate_fallback_scope="principal-model"):
+    with user_configuration(delegate_fallback_scope="principal-model"):
         unset = fallback_module.nearest_fallback(
             dataclasses.replace(reviewer, thinking=None),
             "test",
@@ -14149,7 +15525,7 @@ def test_d2_delegate_fallback_scope() -> None:
         nearest() is None,
         "the default scope offered a candidate on the principal's provider",
     )
-    with manifest_settings(delegate_fallback_scope="principal-model"):
+    with user_configuration(delegate_fallback_scope="principal-model"):
         require(
             fallback_module.principal_exclusions(reviewer)
             == (set(), {(principal.provider, principal.model)}),
@@ -14164,7 +15540,7 @@ def test_d2_delegate_fallback_scope() -> None:
         )
 
     for wrong in ("principal", "", None, True):
-        with manifest_settings(delegate_fallback_scope=wrong):
+        with user_configuration(delegate_fallback_scope=wrong):
             refused = False
             try:
                 fallback_module.delegate_fallback_scope()
@@ -14175,7 +15551,7 @@ def test_d2_delegate_fallback_scope() -> None:
                 f"an invalid delegate_fallback_scope was accepted: {wrong!r}",
             )
     for wrong in ("higher", 3, None):
-        with manifest_settings(delegate_fallback_thinking_ceiling=wrong):
+        with user_configuration(delegate_fallback_thinking_ceiling=wrong):
             refused = False
             try:
                 fallback_module.delegate_thinking_ceiling()
@@ -14433,26 +15809,6 @@ def codex_rollout(
 
 
 @contextlib.contextmanager
-def manifest_allowances(**allowances: Any) -> Any:
-    """Read allowances from a doctored copy of the live manifest.
-
-    `global/orchestration.json` is the shipped default and the live
-    configuration at once, so a test that needs a configured allowance
-    reads a copy rather than writing the developer's own file.
-    """
-    saved = allowance_module.load_manifest
-    manifest = copy.deepcopy(runtime_module.load_manifest())
-    manifest["allowances"] = {
-        provider: dict(entry) for provider, entry in allowances.items()
-    }
-    allowance_module.load_manifest = lambda *_a, **_k: copy.deepcopy(manifest)
-    try:
-        yield manifest
-    finally:
-        allowance_module.load_manifest = saved
-
-
-@contextlib.contextmanager
 def counted_opens(suffix: str = ".jsonl") -> Any:
     """Record every session log opened while the block runs."""
     opened: list[str] = []
@@ -14493,8 +15849,8 @@ def test_d3_ceiling_from_a_real_transcript() -> None:
             ],
         )
         role = anthropic_role()
-        with manifest_allowances(
-            anthropic={"tokens": 1000, "window_days": 7}
+        with user_configuration(
+            allowances={"anthropic": {"tokens": 1000, "window_days": 7}}
         ) as manifest:
             refusal = allowance_module.ceiling_refusal(role, manifest=manifest)
         require(
@@ -14515,8 +15871,8 @@ def test_d3_ceiling_from_a_real_transcript() -> None:
             "cache reads" in refusal,
             f"the refusal did not say what it counts: {refusal}",
         )
-        with manifest_allowances(
-            anthropic={"tokens": 1001, "window_days": 7}
+        with user_configuration(
+            allowances={"anthropic": {"tokens": 1001, "window_days": 7}}
         ) as manifest:
             require(
                 allowance_module.ceiling_refusal(role, manifest=manifest)
@@ -14553,7 +15909,7 @@ def test_d3_manifest_named_model_is_attributed() -> None:
     # all and its spend counted towards no allowance.
     with standing_stores(), transcript_roots() as (_projects, sessions):
         codex_rollout(sessions / "rollout-fixture.jsonl", "gpt-6-astra", 900)
-        manifest = copy.deepcopy(runtime_module.load_manifest())
+        manifest = copy.deepcopy(runtime_module.load_manifest(runtime_module.MANIFEST_PATH))
         manifest["allowances"] = {"openai": {"tokens": 900, "window_days": 7}}
         manifest["steps"] = [
             {"id": "plan-reviewer", "provider": "openai", "model": "gpt-6-astra"}
@@ -14639,7 +15995,9 @@ def test_d3_dispatch_refusal_starts_nothing() -> None:
             state = review_module.DelegationState(
                 configured=reviewer, role=anthropic_role()
             )
-            with manifest_allowances(anthropic={"tokens": 1_000, "window_days": 7}):
+            with user_configuration(
+                allowances={"anthropic": {"tokens": 1_000, "window_days": 7}}
+            ):
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
                     status = review_module.main(invocation, state)
@@ -14665,8 +16023,8 @@ def test_d3_dispatch_refusal_starts_nothing() -> None:
             # The same dispatch under a ceiling the spend is inside runs
             # on, which is what makes the refusal above a measurement
             # rather than a blanket stop.
-            with manifest_allowances(
-                anthropic={"tokens": 10_000, "window_days": 7}
+            with user_configuration(
+                allowances={"anthropic": {"tokens": 10_000, "window_days": 7}}
             ):
                 errors = io.StringIO()
                 with contextlib.redirect_stderr(errors):
@@ -14729,8 +16087,8 @@ def test_d3_one_accounting_source() -> None:
                 sabotaged.append((name, value))
                 setattr(ledger_module, name, refuse)
         try:
-            with manifest_allowances(
-                anthropic={"tokens": 900, "window_days": 7}
+            with user_configuration(
+                allowances={"anthropic": {"tokens": 900, "window_days": 7}}
             ) as manifest:
                 refusal = allowance_module.ceiling_refusal(
                     anthropic_role(), manifest=manifest
@@ -14767,7 +16125,7 @@ def test_d3_accounting_deduplicates_by_identity() -> None:
                 transcript_response("msg_d2", "req_d2", "claude-opus-5", 300),
             ],
         )
-        with manifest_allowances() as manifest:
+        with user_configuration(allowances={}) as manifest:
             rollup = allowance_module.refresh(manifest=manifest)
             require(
                 allowance_module.window_spend(
@@ -14886,7 +16244,7 @@ def test_d3_rollup_opens_only_changed_files() -> None:
             busy,
             [transcript_response("msg_f2", "req_f2", "claude-opus-5", 20)],
         )
-        with manifest_allowances() as manifest:
+        with user_configuration(allowances={}) as manifest:
             with counted_opens() as opened:
                 allowance_module.refresh(manifest=manifest)
             require(
@@ -14931,21 +16289,24 @@ def test_d3_doctor_warns_without_an_allowance() -> None:
                 repository / ".orrery.json",
                 {"orchestrator": {"provider": "anthropic", "model": "opus"}},
             )
-            with manifest_allowances():
+            # The shipped default now carries a placeholder allowance,
+            # so "no allowance is configured" is a statement about the
+            # shipped layer as well as the machine's own.
+            with shipped_manifest(allowances={}):
                 lines = allowance_module.doctor_report(repository)
             require(
                 any(
                     line.startswith("WARN|no allowance is configured for "
                                     "anthropic")
                     and "anthropic/opus" in line
-                    and "global/orchestration.json" in line
+                    and str(runtime_module.user_config_path()) in line
                     for line in lines
                 ),
                 f"a missing allowance was not warned about: {lines}",
             )
 
-            with manifest_allowances(
-                anthropic={"tokens": 1_000, "window_days": 7}
+            with user_configuration(
+                allowances={"anthropic": {"tokens": 1_000, "window_days": 7}}
             ):
                 covered = allowance_module.doctor_report(repository)
             require(
@@ -14960,7 +16321,7 @@ def test_d3_doctor_warns_without_an_allowance() -> None:
         with tempfile.TemporaryDirectory() as directory:
             plain = Path(directory)
             subprocess.run(["git", "init", "-q", str(plain)], check=True)
-            with manifest_allowances():
+            with shipped_manifest(allowances={}):
                 unadopted = allowance_module.doctor_report(plain)
             require(
                 unadopted == [
@@ -15049,12 +16410,12 @@ def test_d3_allowance_validation() -> None:
 def prompt_hook_kit(**settings: Any) -> Any:
     """A copied kit, an adopted repository, and empty transcript roots.
 
-    The hook runs as a subprocess, so the manifest it reads has to be a
-    real file: `manifest_allowances` doctors an import and cannot reach
-    another process. The copy is also what keeps the developer's own
-    manifest, which is simultaneously the shipped default, out of every
-    assertion here, and lets the principal be pinned rather than
-    inherited from whatever this machine is configured for.
+    The hook runs as a subprocess and reads the effective configuration,
+    so its shipped layer has to be a real copied file. The copy is also
+    what keeps the developer's own manifest out of every assertion here,
+    and lets the principal be pinned rather than inherited from whatever
+    this machine is configured for; the subprocess inherits the suite's
+    own config home, which carries no overlay unless a test writes one.
     """
     with standing_stores(), transcript_roots() as (projects, sessions):
         with tempfile.TemporaryDirectory() as directory:
@@ -15174,7 +16535,8 @@ def test_session_start_role_table() -> None:
     require(table, "the role table was empty for a valid manifest")
     lines = table.splitlines()
     configured = [
-        step for step in runtime_module.load_manifest()["steps"]
+        step
+        for step in runtime_module.effective_manifest()["steps"]
         if isinstance(step, dict) and step.get("provider")
     ]
     # Every role, then the review round cap, two cells to a line.
@@ -15340,7 +16702,7 @@ def test_d3_prompt_block_mode() -> None:
         # be changed from outside it, and say that it takes effect
         # without a restart.
         require(
-            "orchestration.json" in result.stderr
+            str(runtime_module.user_config_path()) in result.stderr
             and "on_exceeded" in result.stderr
             and "re-read on every turn" in result.stderr
             and "ORRERY_ALLOWANCE_OVERRIDE=1" in result.stderr,
@@ -15490,6 +16852,53 @@ def test_d3_prompt_fails_open() -> None:
         f"an unexpected exception did not permit the turn: {status} "
         f"{spoken.getvalue()!r}",
     )
+
+
+@test("a refused configuration costs the turn one line, not the turn")
+def test_d3_prompt_reports_a_refused_configuration() -> None:
+    """AC17, the prompt-submit half.
+
+    The read used to sit outside any handler while `main` swallowed
+    every exception and returned 0, so a refused configuration stopped
+    allowance enforcement and said nothing at all.
+    """
+    with prompt_hook_kit(
+        allowances={"anthropic": {"tokens": 1_000, "window_days": 7}},
+        on_exceeded="block",
+    ) as (kit, repository, projects, _sessions):
+        transcript = projects / "session.jsonl"
+        transcript_with_effort(transcript, "claude-opus-5", 1_200, "high")
+        stopped = run_prompt_hook(kit, repository, transcript=transcript)
+        require(
+            stopped.returncode == 2,
+            f"the fixture does not cross its ceiling: {stopped.returncode} "
+            f"{stopped.stderr!r}",
+        )
+
+        with isolated_config_home() as home:
+            path = write_user_config_file(home, {"version": 1, "chart": {}})
+            result = run_prompt_hook(kit, repository, transcript=transcript)
+        require(
+            result.returncode == 0,
+            f"a refused configuration stopped the turn: {result.returncode} "
+            f"{result.stderr!r}",
+        )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        require(
+            len(lines) == 1,
+            f"the refusal was not one line: {result.stdout!r}",
+        )
+        report = json.loads(lines[0])
+        message = report["systemMessage"]
+        context = report["hookSpecificOutput"]["additionalContext"]
+        require(
+            str(path) in message and "chart" in message,
+            f"the refusal did not name the file and the key: {message!r}",
+        )
+        require(
+            str(path) in context,
+            f"the model was not told which file to name: {context!r}",
+        )
 
 
 @test("an override and a slash command are never stopped by the ceiling")
@@ -16845,6 +18254,160 @@ def test_sync_claude_projection() -> None:
             record["surface"] == "anthropic"
             and record["fallbackModel"] == ["opus", "sonnet"],
             f"the projection record is wrong: {record}",
+        )
+
+
+@test("orrery-sync projects the user-configured principal")
+def test_sync_projects_the_user_principal() -> None:
+    """AC7. The surface has to show the principal the machine is
+    configured to, and a repository's own principal is correct for that
+    directory alone: projecting it would change every other
+    repository's default."""
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / ".claude").mkdir()
+        settings = home / ".claude" / "settings.json"
+        write_json(settings, {"permissions": {"allow": ["Bash(ls:*)"]}})
+        write_user_config_file(
+            home / ".config" / "orrery",
+            {
+                "version": 1,
+                "roles": {
+                    "orchestrator": {
+                        "provider": "anthropic",
+                        "model": "sonnet",
+                        "thinking": "max",
+                    }
+                },
+            },
+        )
+
+        repository = home / "adopted"
+        repository.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(repository)],
+            check=True, timeout=60,
+        )
+        marker = repository / ".orrery.json"
+        write_json(marker, {"orchestrator": {"model": "opus"}})
+        marker.chmod(0o600)
+        # Proved live first, or the assertion below would pass because
+        # the fixture is inert rather than because sync ignores it.
+        require(
+            runtime_module.project_override(repository) == {"model": "opus"},
+            "the repository override fixture is inert",
+        )
+
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_CONFIG_HOME"] = str(home / ".config")
+        environment["XDG_STATE_HOME"] = str(home / "state")
+
+        result = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT)],
+            cwd=str(repository),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            result.returncode == 0,
+            f"sync failed: {result.stdout} {result.stderr}",
+        )
+        live = read_json(settings)
+        require(
+            live["model"] == "sonnet"
+            and live["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "max",
+            f"the user-configured principal was not projected: {live}",
+        )
+        record = read_json(home / "state" / "orrery" / "projection.json")
+        require(
+            record["model"] == "sonnet",
+            f"the projection record follows something else: {record}",
+        )
+
+        checked = subprocess.run(
+            [sys.executable, str(SYNC_SCRIPT), "--check"],
+            cwd=str(repository),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            checked.returncode == 0,
+            f"--check disagrees with the sync it just ran: {checked.stdout}",
+        )
+
+
+@test("the doctor and orrery-sync agree when no ladder is armed")
+def test_disarmed_ladder_agrees_across_surfaces() -> None:
+    """AC17, second half. One says what the other does, or the report
+    describes a machine nobody is running."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        kit = root / "kit"
+        shutil.copytree(
+            KIT_DIR, kit, ignore=shutil.ignore_patterns(".git", "__pycache__")
+        )
+        home = root / "home"
+        (home / ".claude").mkdir(parents=True)
+        settings = home / ".claude" / "settings.json"
+        write_json(settings, {"fallbackModel": ["opus", "sonnet"]})
+        write_user_config_file(
+            home / ".config" / "orrery",
+            {"version": 1, "principal_auto_fallback": False},
+        )
+
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_CONFIG_HOME"] = str(home / ".config")
+        environment["XDG_STATE_HOME"] = str(home / "state")
+        environment["ORRERY_MODEL_DISCOVERY"] = "0"
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        report = subprocess.run(
+            ["bash", str(kit / "scripts" / "doctor.sh")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+            check=False,
+        ).stdout
+        require(
+            "the principal's automatic fallback ladder is switched off"
+            in report
+            and "no automatic same-provider fallback ladder" not in report,
+            f"the doctor described a ladder that is switched off: {report}",
+        )
+
+        result = subprocess.run(
+            [sys.executable, str(kit / "scripts" / "orrery-sync")],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        require(
+            result.returncode == 0,
+            f"sync failed: {result.stdout} {result.stderr}",
+        )
+        require(
+            # An emptied ladder is removed from the surface rather than
+            # written as an empty list, which is the same statement.
+            not read_json(settings).get("fallbackModel")
+            and read_json(
+                home / "state" / "orrery" / "projection.json"
+            )["fallbackModel"] == [],
+            f"a ladder stayed armed: {read_json(settings)}",
         )
 
 
@@ -23330,6 +24893,65 @@ def test_git_indirection_swap_refused() -> None:
         )
 
 
+@test("a config home inside a write grant refuses the dispatch")
+def test_config_home_inside_a_grant_is_refused() -> None:
+    """R7. The document that chooses a delegate's provider, model and
+    credential must not sit where that delegate can write. A read-only
+    mapping inside a grant is defeated by renaming its parent, so a
+    config home under the workspace of a write-capable role, or under
+    any other grant, refuses the dispatch rather than being mapped."""
+    with tempfile.TemporaryDirectory() as directory:
+        workspace = Path(directory) / "repo"
+        workspace.mkdir()
+        subprocess.run(
+            ["git", "init", "--quiet", str(workspace)], check=True, timeout=60
+        )
+        environment = review_environment("success")
+        try:
+            inside = workspace / ".config"
+            write_user_config_file(inside / "orrery", {"version": 1})
+            environment["XDG_CONFIG_HOME"] = str(inside)
+            process = start_review(
+                environment,
+                "--role", "implementer",
+                "--workspace", str(workspace),
+                "--timeout", "60",
+                "--", "prompt",
+                cwd=workspace,
+            )
+            _stdout, stderr = finish_review(process, environment)
+            require(
+                process.returncode == 2
+                and "grants write access" in stderr
+                and str(inside.resolve() / "orrery") in stderr
+                and "no process was started" in stderr,
+                f"a config home inside the workspace grant dispatched: "
+                f"{process.returncode} {stderr[-600:]}",
+            )
+
+            # The same run with the config home where it belongs is not
+            # refused for that reason.
+            environment["XDG_CONFIG_HOME"] = str(
+                Path(environment["HOME"]) / ".config"
+            )
+            process = start_review(
+                environment,
+                "--role", "implementer",
+                "--workspace", str(workspace),
+                "--timeout", "60",
+                "--", "prompt",
+                cwd=workspace,
+            )
+            _stdout, stderr = finish_review(process, environment)
+            require(
+                "grants write access" not in stderr,
+                f"a config home under the home was refused: {stderr[-600:]}",
+            )
+        finally:
+            remove_helper_state(environment)
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+
+
 @test("a repository under a broad grant is refused before it dispatches")
 def test_tmp_repository_refused() -> None:
     """The one configuration where a delegate can forge the store.
@@ -25312,6 +26934,7 @@ def main() -> int:
     saved_environment = {
         name: os.environ.get(name)
         for name in (
+            "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "CLAUDE_CODE_EFFORT_LEVEL",
             "CLAUDE_EFFORT",
@@ -25320,8 +26943,25 @@ def main() -> int:
             "GIT_CONFIG_VALUE_0",
         )
     }
+    # Where the developer's own user configuration lives, read before the
+    # override below moves it, so the guard digest can name a test that
+    # writes the real file.
+    real_config_base = saved_environment["XDG_CONFIG_HOME"]
+    real_user_config = (
+        Path(real_config_base) if real_config_base else Path.home() / ".config"
+    ) / "orrery" / "config.json"
+
     suite_state = tempfile.mkdtemp(prefix="kit-suite-state.")
     os.environ["XDG_STATE_HOME"] = suite_state
+    # The suite's own user configuration, so every in-process read sees
+    # the shipped default rather than whatever this machine is
+    # configured to. Under the real home, never TMPDIR: run-like-ci.sh
+    # forces TMPDIR=/tmp, which is a broad grant, and two tests
+    # deliberately drop ORRERY_ALLOW_TMP_REPOSITORY from a subprocess to
+    # prove the workspace refusal. A config home under /tmp would be
+    # refused first and take both of them down with it.
+    suite_config = tempfile.mkdtemp(prefix="kit-config.", dir=Path.home())
+    os.environ["XDG_CONFIG_HOME"] = suite_config
     os.environ.pop("CLAUDE_CODE_EFFORT_LEVEL", None)
     os.environ.pop("CLAUDE_EFFORT", None)
 
@@ -25348,16 +26988,21 @@ def main() -> int:
     # than assumed. HOME is deliberately not overridden globally:
     # doctor tests legitimately inspect the real installation.
     def live_settings_digest() -> str | None:
-        # Both files a test has been observed to disturb, digested
-        # together so a single comparison names the offending test.
-        # The manifest is here because a claim that no test can reach
-        # it should be a measurement rather than an argument: it is
-        # also shared mutable state between concurrent sessions on one
-        # machine, so drift in it is worth catching whatever the cause.
+        # Every file a test has been observed to disturb, or could now
+        # reach, digested together so a single comparison names the
+        # offending test. The manifest is here because a claim that no
+        # test can reach it should be a measurement rather than an
+        # argument: it is also shared mutable state between concurrent
+        # sessions on one machine, so drift in it is worth catching
+        # whatever the cause. The user configuration is here because the
+        # isolation that keeps the suite off it is one environment
+        # variable, and a test that resets that variable would otherwise
+        # rewrite the developer's live role assignments in silence.
         digest = hashlib.sha256()
         for path in (
             Path.home() / ".claude" / "settings.json",
             KIT_DIR / "global" / "orchestration.json",
+            real_user_config,
         ):
             try:
                 digest.update(path.read_bytes())
@@ -25398,9 +27043,10 @@ def main() -> int:
                 failures += 1
                 print(
                     f"FAIL  {name}\n      this test wrote the live "
-                    "~/.claude/settings.json or global/orchestration.json; "
-                    "it needs HOME isolation, a copied kit, or an "
-                    "explicit --target"
+                    "~/.claude/settings.json, global/orchestration.json or "
+                    f"{real_user_config}; it needs HOME isolation, a copied "
+                    "kit, an isolated XDG_CONFIG_HOME, or an explicit "
+                    "--target"
                 )
     finally:
         for name, value in saved_environment.items():
@@ -25409,13 +27055,15 @@ def main() -> int:
             else:
                 os.environ[name] = value
         shutil.rmtree(suite_state, ignore_errors=True)
+        shutil.rmtree(suite_config, ignore_errors=True)
         for leftover in (*STATE_DIRS, *FAKE_BIN_DIRS, *HOME_DIRS):
             shutil.rmtree(leftover, ignore_errors=True)
         if live_settings_digest() != live_settings_before:
             failures += 1
             print(
                 "FAIL  the suite modified the developer's own "
-                "~/.claude/settings.json or global/orchestration.json\n"
+                "~/.claude/settings.json, global/orchestration.json or "
+                f"{real_user_config}\n"
                 "      a test is missing HOME isolation or a copied kit, "
                 "or another session changed the manifest while this ran"
             )

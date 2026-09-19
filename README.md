@@ -138,10 +138,13 @@ orrery                            # start the configured principal
 Roles, models, thinking levels, endpoints and the plan-review cap are
 configured visually with `orrery-config`; a frozen copy of the page is
 **[browsable on GitHub Pages](https://nikfilippas.github.io/orrery/config-demo.html)**
-without installing anything. The shipped defaults put the principal on
-Anthropic and the workers and reviewers on OpenAI; every row of
-`global/orchestration.json` may be changed to either provider, a
-third-party endpoint, or one provider for everything.
+without installing anything. What you choose is written to
+`~/.config/orrery/config.json`, which carries only your deviations; the
+shipped defaults stay in the repository, so configuring a machine leaves
+the checkout clean and a pull keeps delivering new defaults. Those
+defaults put the principal on Anthropic and the workers and reviewers on
+OpenAI; every role may be moved to either provider, a third-party
+endpoint, or one provider for everything.
 
 ## The commands
 
@@ -154,7 +157,7 @@ are read-only unless the description says otherwise.
 | `orrery-init` | Adopts a repository: writes the marker, records trust, and optionally pins a per-repository principal. Writes. |
 | `orrery-agent --role <role>` | Runs one configured role in its own provider process, with that role's model, access mode, timeout and containment. Writes, for a write-capable role. |
 | `orrery-review` | The final reviewer, and a compatibility alias for `orrery-agent --role reviewer`. |
-| `orrery-config` | The visual configuration surface: change a role's provider, model or thinking level, preview the exact diff, then apply. Writes on apply. |
+| `orrery-config` | The visual configuration surface: change a role's provider, model or thinking level, preview the exact diff, then apply. `--print` lists the effective configuration and says whether each row is shipped or yours; `--import` moves an older install's manifest edits into the user configuration. Writes on apply and on import. |
 | `orrery-sync` | Projects the configured principal onto the surface that starts it, so a new session begins on the right model. Writes. |
 | `orrery-doctor` | Validates the whole installation and reports what it could not verify. |
 | `orrery-task` | Creates, dispatches and verifies durable task contracts, with evidence-gated merges. Writes. |

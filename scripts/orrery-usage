@@ -293,10 +293,10 @@ def price_records(records: list[dict]) -> tuple[float | None, str | None]:
             total += float(reported)
             continue
         if table is None:
-            from orrery_runtime import RuntimeConfigError, load_manifest
+            from orrery_runtime import RuntimeConfigError, effective_manifest
 
             try:
-                table = orrery_spend.price_table(load_manifest())
+                table = orrery_spend.price_table(effective_manifest())
             except (RuntimeConfigError, orrery_spend.SpendError) as exc:
                 return None, str(exc)
             refusal = orrery_spend.price_refusal(table)

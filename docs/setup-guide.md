@@ -9,6 +9,7 @@ are adapters, not workflow roles. Every role can use either provider.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Configure roles](#configure-roles)
+- [Where configuration lives](#where-configuration-lives)
 - [Watch and capture a delegated run](#watch-and-capture-a-delegated-run)
 - [Align the principal's own surface](#align-the-principals-own-surface)
 - [Start and delegate](#start-and-delegate)
@@ -94,8 +95,10 @@ orrery-config
 The page binds only to `127.0.0.1`, uses a random URL token, and exits after an
 idle timeout. It is generated from:
 
-- `global/orchestration.json` for role assignment, workflow settings, and
-  chart geometry;
+- the effective configuration for role assignment and workflow settings,
+  which is the shipped `global/orchestration.json` under this machine's
+  `~/.config/orrery/config.json`, and the shipped file alone for chart
+  geometry;
 - the installed Claude and Codex CLIs for picker-visible models and each
   model's exact thinking levels;
 - `global/model-catalogue.json` for provider fallbacks and Orrery-specific
@@ -109,9 +112,12 @@ rebuilds the adjacent thinking selector from that model's reported levels. A
 custom model requires an explicit provider and has no inferred thinking
 selector.
 
-Preview computes one unified manifest diff. Apply is accepted only for the
-exact content previously previewed, uses an atomic replacement, and runs the
-doctor.
+Preview computes one unified diff of `~/.config/orrery/config.json`, the
+small file holding this machine's deviations, not of the shipped manifest.
+Apply is accepted only for the exact content previously previewed, uses an
+atomic replacement, and runs `orrery-sync` and the doctor. A role set back
+to its shipped value disappears from the file rather than being written
+out again. See [Where configuration lives](#where-configuration-lives).
 
 Default assignments:
 
@@ -126,8 +132,8 @@ Default assignments:
 These are defaults only. All five may use Anthropic, all five may use OpenAI,
 or they may be mixed in either direction.
 
-The plan-review cap is also in the manifest. It accepts one through four
-rounds and defaults to two.
+The plan-review cap is a workflow setting on the same page. It accepts one
+through four rounds and defaults to two.
 
 Delegated budgets are progress-aware. A role's `timeout_seconds` is its
 base budget; an optional `hard_timeout_seconds` (30 to 14400, at least
@@ -163,12 +169,150 @@ into the ledger and `orrery-task show`. The deadline remains the outer
 authority: a run that reaches its budget is a timeout even if a
 signature was forming.
 
-The manifest's top-level `verbosity` steers how delegated roles write:
-`1` (the default) injects a terse plain-prose report style into every
+The top-level `verbosity` steers how delegated roles write: `1` (the
+default) injects a terse plain-prose report style into every
 `ORRERY ROLE HANDOFF`, `2` a milder concise line, and `3` nothing.
 `ORRERY_VERBOSITY` overrides it for one run. The dial shapes delegated
 prompts only; principal and direct sessions take the static
 communication-style rule in `global/AGENTS.md`.
+
+## Where configuration lives
+
+Three documents decide what runs. In precedence order, lowest first:
+
+1. `global/orchestration.json` in this checkout is the shipped default.
+   It carries every role's title, summary and access contract, the chart
+   the page draws, the settings metadata, and the default value of every
+   tunable. Configuration never writes it, so configuring a machine
+   leaves the checkout clean and a pull keeps delivering new defaults.
+2. `~/.config/orrery/config.json`, or `$XDG_CONFIG_HOME/orrery/config.json`
+   where that variable is set, is this machine's own configuration. It is
+   untracked, machine-wide, and sparse: it holds only the values that
+   differ from the shipped default. `orrery-config` writes it, and the
+   keys the page does not offer are edited by hand.
+3. A repository's `.orrery.json` `orchestrator` block still wins over
+   both, for that directory alone.
+
+The merge is computed on every read and nothing is cached, so a change
+applies to the next command without restarting anything.
+`orrery-config --print` shows the result and marks each row `default` or
+`user`. `orrery-config --export` renders the shipped default alone, so a
+published page never carries the machine that wrote it.
+
+### What the user configuration may carry
+
+```json
+{
+  "version": 1,
+  "roles": {
+    "reviewer": {"provider": "anthropic", "model": "opus", "thinking": "max"}
+  },
+  "settings": {"plan_review_rounds": 3},
+  "route_effort": {"standard": "medium"},
+  "verbosity": 2,
+  "max_concurrent_tasks": 3
+}
+```
+
+`roles.<id>` names one of the five roles and accepts `provider`, `model`,
+`thinking`, `endpoint`, `timeout_seconds`, `hard_timeout_seconds` and
+`stall_detection`. Fields it does not mention keep their shipped values,
+so moving a reviewer's model leaves that role's budgets alone, and a
+field set to `null` is a deliberate unset rather than an omission. For
+`stall_detection` the precedence is `ORRERY_STALL_DETECTION` first, then
+this file, then the shipped default.
+
+The rest of the file is `endpoints.<id>` for an endpoint registry entry,
+`settings.<name>` as a bare scalar (the label, description and bounds
+stay shipped, and a value outside those bounds is refused),
+`route_effort` per route, `allowances` per provider, `prices`, and the
+scalars `verbosity`, `max_concurrent_tasks`, `delegate_fallback_scope`,
+`delegate_fallback_thinking_ceiling`, `on_exceeded` and
+`principal_auto_fallback`. The page writes roles, endpoints and
+settings; the timeouts, stall detection, allowances, prices, route
+effort, verbosity, concurrency, fallback scope and ceiling, and the
+automatic principal fallback are hand-edited.
+
+These mappings merge one entry deep: naming one provider's allowance,
+one endpoint or one route replaces that entry and leaves the others as
+the shipped default has them. An entry the shipped default carries can
+therefore be changed here but not removed, and an empty object means no
+change rather than none.
+
+Anything else is refused by name, `chart` and a role's `access` or
+`title` included: they are shipped facts rather than choices. A refused
+or malformed file stops every command with an error naming the path and
+the offending key, because falling back to the defaults would move a
+delegate onto a provider, a model and an allowance nobody chose. The
+hooks are the deliberate exceptions, since none of them may fail a
+session: the lifecycle hook falls back to two plan-review rounds,
+`orrery-prompt-submit` says in one line that allowance enforcement is
+off for the turn, and the SessionStart check reports that the principal
+could not be verified. The doctor names the problem, and the text the
+file had before the last write stays in `config.previous.json` beside it.
+An absent file is the fresh-install state and means the shipped defaults
+apply.
+
+Writes go through one locked compare-and-swap: an apply whose starting
+text is no longer the one that was previewed is refused rather than
+overwriting, and the file and the directory are created `0600` and
+`0700`.
+
+### The trust rules
+
+The file can name an endpoint's base URL and the environment variable
+holding its key, so a forged one would redirect a role's traffic and its
+credential. It is trusted like the adoption store: `XDG_CONFIG_HOME`,
+when set, must be absolute and non-empty; the `orrery` directory and the
+file must be owned by you, must not be symlinks, and must not be group-
+or world-writable; and a config home under `/tmp` or `/var/tmp`, or one
+inside this checkout, is refused. Ancestors are deliberately not walked
+for symlinks, because `~/.config` is commonly a symlink into a dotfiles
+repository and refusing that would make the kit unusable for those
+users; the grant check inspects the resolved location instead.
+
+Delegated runs receive `XDG_CONFIG_HOME` and run with the home
+read-only, so a delegate reads the same layer the principal read and
+cannot write it. The pickup timer carries the variable for the same
+reason: a fired run re-derives its role and must read the configuration
+the arming session read.
+
+### Migrating an install configured before this
+
+An install whose choices were made by editing the tracked manifest keeps
+them there, where a pull cannot update around them and the doctor
+reports a permanently dirty tree. Move them out with:
+
+```bash
+orrery-config --import
+```
+
+It classifies every difference against `HEAD`'s copy of the manifest,
+writes the configurable ones into the user configuration, and prints
+what it imported. A key the committed copy has and the working one lacks
+is not a difference: the shipped default applies once the file is
+restored. What it prints next depends on what was left behind. When
+every difference was configuration, it names the one command that
+finishes the job:
+
+```bash
+git -C ~/src/orrery checkout HEAD -- global/orchestration.json
+```
+
+When something no user layer can hold remains, a hand-edited summary or
+a rebuilt chart, it lists each one and prints a `git diff HEAD` command
+that saves them to a patch instead, and never offers the restore
+command, because running it would destroy edits that exist nowhere else.
+Nothing in the kit runs either command for you, and a second import
+changes nothing.
+
+`orrery-doctor` reports the result in its own `User configuration`
+section: the path, "shipped defaults apply" when the file is absent, the
+overlaid keys when it is present and valid, and the runtime's own
+message when it is refused. `Kit repository` still fails on any
+uncommitted change, and where the tracked manifest is one of them and
+carries nothing but configuration it says so and names the two commands
+above.
 
 ## Bound what a provider may spend
 
@@ -530,12 +674,14 @@ orrery-agent --role reviewer --approve-fallback anthropic:fable \
 ```
 
 The flag approves only that provider/model, starts it directly rather than
-retrying the process that produced the proposal, and never changes
-`global/orchestration.json`. `--approval-scope` defaults to `run` and, on a
-non-interactive rerun, also accepts `session`; a multi-day `until:<ISO8601>`
-standing approval is refused from a flag rerun and can be granted only from
-the interactive consent menu, which is bound to the scopes actually
-offered. A recorded standing approval is prior recorded consent: a later
+retrying the process that produced the proposal, and changes neither the
+shipped defaults nor this machine's configuration: the role it fell back
+from stays assigned exactly as it was. `--approval-scope` defaults to
+`run` and, on a non-interactive rerun, also accepts `session`; a multi-day
+`until:<ISO8601>` standing approval is refused from a flag rerun and can be
+granted only from the interactive consent menu, which is bound to the
+scopes actually offered. A recorded standing approval is prior recorded
+consent: a later
 invocation whose configured role still matches starts the recorded
 candidate directly, never re-ranked, and prints a disclosure line on every
 use. Session-scope records live under
@@ -636,10 +782,18 @@ confused-delegate model the confinement is built for:
   hide only by creating a cgroup namespace where the host permits
   unprivileged namespaces; the provider's own sandbox needs namespaces, so
   they are not blanket-restricted.
-- The standing-approval and control stores are trusted because they sit
-  under `ProtectHome`. Do not set `XDG_STATE_HOME` or `XDG_RUNTIME_DIR`
-  under a delegate-writable grant (`/tmp`, `/var/tmp`, a provider home): a
-  store there could be forged by a delegate.
+- The standing-approval and control stores, and this machine's user
+  configuration, are trusted because they sit under `ProtectHome`. Do not
+  set `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` or `XDG_CONFIG_HOME` under a
+  delegate-writable grant (`/tmp`, `/var/tmp`, a provider home): a store
+  there could be forged by a delegate, and a forged user configuration
+  would choose the next delegate's provider, model and endpoint
+  credential. A config home under `/tmp` or `/var/tmp` is refused
+  outright by every command, and `orrery-agent` refuses to dispatch
+  when the config home resolves under any path that run grants write
+  access to, a provider home or a write-capable role's workspace
+  included: a read-only mapping there would be defeated by renaming
+  its parent, so the dispatch stops instead.
 
 The wrapper’s timeout fires first so diagnostics can be reported. Cleanup then
 stops the whole control group and removes the private prompt, settings, log,
@@ -1040,9 +1194,9 @@ orrery-incidents --json
 
 `scripts/orrery-incidents` aggregates events by kind, role, and model
 with a recent tail, and the doctor warns when anything was recorded in
-the last 7 days. Use the counts to tune defaults in
-`global/orchestration.json` with evidence: a role `timeout_seconds` that
-keeps expiring, a model that repeatedly hits per-model limits, or a
+the last 7 days. Use the counts to tune this machine's settings in
+`~/.config/orrery/config.json` with evidence: a role `timeout_seconds`
+that keeps expiring, a model that repeatedly hits per-model limits, or a
 surface that never verifies its principal.
 
 ## Verification and maintenance
@@ -1133,9 +1287,12 @@ Orrery-specific default should change. Pinned identifiers remain available
 through the custom option and must not be duplicated as aliases in the
 fallback menu.
 
-When changing workflow geometry, update `global/orchestration.json`, render the
-configuration page at desktop and narrow widths, inspect screenshots, and
-verify that paths and labels do not intersect unrelated nodes.
+When changing workflow geometry, update `global/orchestration.json`. The
+chart stays in the shipped file, where the tool that draws it regenerates
+it; the user configuration cannot hold chart geometry and no
+configuration command writes it. Then render the configuration page at
+desktop and narrow widths, inspect screenshots, and verify that paths and
+labels do not intersect unrelated nodes.
 
 ## Repository map
 
@@ -1187,8 +1344,10 @@ The maintained artefacts are:
 - `global/codex-hooks.json` — the Codex SessionStart principal-mismatch hook.
 - `global/model-catalogue.json` — provider fallback choices and
   Orrery-specific thinking defaults.
-- `global/orchestration.json` — the role manifest, workflow setting, and
-  configuration-chart geometry.
+- `global/orchestration.json` — the shipped default: the role manifest,
+  workflow setting, and configuration-chart geometry. A machine's own
+  choices live in `~/.config/orrery/config.json` instead, which is
+  untracked and therefore not listed here.
 - `global/hooks/.gitignore` and `global/hooks/leave-no-trace.py` — lifecycle
   state exclusion and implementation.
 - `global/skills/development-orchestrator/SKILL.md` — shared detailed workflow.
@@ -1318,8 +1477,14 @@ verifies the thinking level from the environment where possible, and
 terminal sessions started with `orrery` stay silent because the
 launcher pins the model itself.
 
-**The configuration page refuses Apply** — an external writer changed the
-manifest after Preview. Reload and preview the new exact diff.
+**The configuration page refuses Apply** — an external writer changed
+`~/.config/orrery/config.json` after Preview. Reload and preview the new
+exact diff.
+
+**A command refuses this machine's configuration** — the message names
+the file and the offending key. Repair it, or restore the copy the last
+write left in `~/.config/orrery/config.previous.json`; removing the file
+altogether returns the machine to the shipped defaults.
 
 **The doctor reports stale links** — rerun `./scripts/install.sh`; it is
 idempotent and preserves displaced files in a namespaced backup.

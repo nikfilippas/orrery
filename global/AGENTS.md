@@ -231,7 +231,8 @@ code, then rerun affected checks.
 
 ##### Bounded plan review
 
-Read the configured round cap from `global/orchestration.json`; default to two
+Read the configured round cap from the effective configuration, which the
+SessionStart hook states and `orrery-config --print` shows; default to two
 and never exceed four when it is unavailable. The cap is a maximum, not a
 target.
 
@@ -408,8 +409,9 @@ for is one line, not an action. Where the classified route's recommended level
 is below the level the session is running at, say so once and name the level,
 and never state that the level changed. The recommended levels are
 investigation `medium`, trivial `low`, mechanical `low`, standard `high`, and
-complex `max`, unless `route_effort` in `global/orchestration.json` names
-others. They are provisional until it is measured whether changing the level
+complex `max`, unless `route_effort` in the effective configuration names
+others, which `orrery-doctor` reports as the recommended level per route.
+They are provisional until it is measured whether changing the level
 inside a session costs a cache re-read; if it does, staying put is cheaper than
 switching. `orrery-doctor` reports the level the newest transcript for a
 repository recorded, and says so rather than naming a level it did not read.

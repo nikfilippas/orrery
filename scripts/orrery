@@ -10,6 +10,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -30,6 +31,7 @@ from orrery_fallback import (  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
+    effective_manifest,
     endpoint_environment,
     load_role,
     principal_command,
@@ -219,6 +221,7 @@ def _proposal_status(
     approval_required_status: int | None = None,
     failure_scope: str = "provider",
     kind: str = "provider-failure",
+    manifest: dict[str, Any] | None = None,
 ) -> tuple[Role | None, int]:
     incident_log.record(
         kind,
@@ -233,6 +236,7 @@ def _proposal_status(
         reason,
         excluded_providers=excluded_providers,
         excluded_models=excluded_models,
+        manifest=manifest,
     )
     if proposal is None:
         print(
@@ -324,7 +328,11 @@ def main() -> int:
         return 0
 
     try:
-        configured = load_role("orchestrator")
+        # One read for the whole launch, threaded into the role and
+        # into every ranking below it, so nothing this run decides can
+        # rest on a configuration a later read would disagree with.
+        manifest = effective_manifest()
+        configured = load_role("orchestrator", manifest=manifest)
     except RuntimeConfigError as exc:
         print(f"orrery: {exc}", file=sys.stderr)
         incident_log.record(
@@ -344,6 +352,7 @@ def main() -> int:
         proposal, excluded_providers, excluded_models = proposal_for_approval(
             configured,
             invocation.approval,
+            manifest=manifest,
         )
         if proposal is None:
             print(
@@ -470,6 +479,7 @@ def main() -> int:
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
                 kind="provider-unavailable",
+                manifest=manifest,
             )
             if candidate is None:
                 return status
@@ -504,6 +514,7 @@ def main() -> int:
                     approval_required_status=APPROVAL_REQUIRED,
                     failure_scope="model",
                     kind="model-unavailable",
+                    manifest=manifest,
                 )
                 if candidate is None:
                     return status
@@ -545,6 +556,7 @@ def main() -> int:
                 context_warning=False,
                 approval_required_status=APPROVAL_REQUIRED,
                 kind="config-error",
+                manifest=manifest,
             )
             if candidate is None:
                 return status
@@ -634,6 +646,7 @@ def main() -> int:
                 if spawn_failure is not None
                 else "provider-failure"
             ),
+            manifest=manifest,
         )
         if candidate is None:
             return status

@@ -73,8 +73,12 @@ PENDING_GRACE_SECONDS = 180
 # rides a unit property or argv. The provider CLIs read their own
 # on-disk authentication at fire time; a role whose credential exists
 # only in the shell (an endpoint key) is refused at park instead.
+# XDG_CONFIG_HOME travels for the same reason XDG_STATE_HOME does: the
+# fired run re-derives its role, and it must read the configuration the
+# arming session read rather than whatever the user manager defaults to.
 TIMER_ENVIRONMENT_NAMES = (
     "PATH",
+    "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",

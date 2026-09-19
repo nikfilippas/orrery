@@ -74,10 +74,11 @@ from orrery_runtime import (  # noqa: E402
     RuntimeConfigError,
     adopted_root,
     codex_home,
+    effective_manifest,
     load_catalogue,
-    load_manifest,
     load_role,
     same_model,
+    user_config_path,
 )
 
 
@@ -139,7 +140,7 @@ def load_allowances(manifest: dict[str, Any] | None = None) -> dict[str, Allowan
     pass while the real limit had been reached.
     """
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     raw = manifest.get("allowances", {})
     if not isinstance(raw, dict):
         raise RuntimeConfigError("the manifest allowances must be an object")
@@ -187,7 +188,7 @@ def on_exceeded(manifest: dict[str, Any] | None = None) -> str:
     block mode it costs the session.
     """
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     value = manifest.get("on_exceeded", ON_EXCEEDED_MODES[0])
     if value not in ON_EXCEEDED_MODES:
         raise RuntimeConfigError(
@@ -233,7 +234,7 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
         if isinstance(entry.get("id"), str) and entry["id"]
     ]
     try:
-        steps = (load_manifest() if manifest is None else manifest).get("steps")
+        steps = (effective_manifest() if manifest is None else manifest).get("steps")
     except RuntimeConfigError:
         steps = None
     if isinstance(steps, list):
@@ -798,7 +799,7 @@ def ceiling_refusal(
         f"ceiling of {allowance.tokens:,}"
         + (f" ({breakdown})" if breakdown else "")
         + ". The count includes cache reads, as orrery-usage does. Raise "
-        f"allowances.{role.provider} in global/orchestration.json, route "
+        f"allowances.{role.provider} in {user_config_path()}, route "
         "the role at another provider, or wait for the window to pass"
     )
 
@@ -832,7 +833,7 @@ def principal_crossing(
     if not isinstance(model, str) or not model:
         return None
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     allowances = load_allowances(manifest)
     if not allowances:
         return None
@@ -907,7 +908,7 @@ def doctor_report(cwd: Path | None = None) -> list[str]:
             f"provider this repository's principal ({principal.provider}/"
             f"{principal.model}) runs on, so nothing bounds what it spends. "
             f'Add allowances.{principal.provider} ({{"tokens": N, '
-            '"window_days": 7}) to global/orchestration.json'
+            f'"window_days": 7}}) to {user_config_path()}'
         )
     for provider in sorted(allowances):
         entry = allowances[provider]

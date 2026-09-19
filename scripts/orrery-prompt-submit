@@ -57,12 +57,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from orrery_runtime import (  # noqa: E402
-    MANIFEST_PATH,
     Role,
     RuntimeConfigError,
     adopted_root,
-    load_manifest,
+    effective_manifest,
     load_role,
+    user_config_path,
 )
 import orrery_allowance as allowance  # noqa: E402
 import orrery_effort as effort  # noqa: E402
@@ -87,19 +87,26 @@ def hook_output(system_message: str, context: str) -> dict[str, Any]:
     }
 
 
-def configured_principal(cwd: Path) -> Role | None:
+def configured_principal(
+    cwd: Path,
+    manifest: dict[str, Any] | None = None,
+) -> Role | None:
     """The principal this repository runs under, or None.
 
-    `apply_override=False` is tried second for the reason the ranking
-    already uses it: every remaining raiser is the adoption marker, the
-    trust store or the repository override, and if the override cannot
-    be read the repository is not adopted, so the global principal is
-    the one that would have applied anyway.
+    The turn's configuration is handed in, so nothing here reads it and
+    no read can raise. `apply_override=False` is tried second for the
+    reason the ranking already uses it: what is left to raise is the
+    adoption marker, the trust store or the repository override, and if
+    the override cannot be read the repository is not adopted, so the
+    global principal is the one that would have applied anyway.
     """
     for apply_override in (True, False):
         try:
             return load_role(
-                "orchestrator", cwd=cwd, apply_override=apply_override
+                "orchestrator",
+                manifest=manifest,
+                cwd=cwd,
+                apply_override=apply_override,
             )
         except RuntimeConfigError:
             continue
@@ -158,9 +165,9 @@ def way_out(crossing: allowance.Crossing) -> str:
     """How to proceed, from outside a session that cannot be typed in."""
     return (
         f"From another terminal, raise allowances.{crossing.provider} or "
-        f"set on_exceeded to warn in {MANIFEST_PATH}; it is re-read on "
-        f"every turn, so no restart is needed. A new session started with "
-        f"{OVERRIDE}=1 proceeds without stopping."
+        f"set on_exceeded to warn in {user_config_path()}; it is re-read "
+        f"on every turn, so no restart is needed. A new session started "
+        f"with {OVERRIDE}=1 proceeds without stopping."
     )
 
 
@@ -187,13 +194,33 @@ def run() -> int:
     ):
         return 0
 
-    manifest = load_manifest()
+    try:
+        manifest = effective_manifest()
+    except RuntimeConfigError as exc:
+        # This read used to sit outside any handler, and main swallows
+        # every exception and returns 0, so a refused configuration
+        # stopped allowance enforcement without saying anything at all.
+        # One line in the channel the user can see; the turn still runs,
+        # because a hook that cannot measure has no business stopping
+        # one.
+        print(
+            json.dumps(
+                hook_output(
+                    f"Orrery: {exc}. Allowance enforcement is off for this "
+                    "turn until it is repaired.",
+                    "ORRERY CONFIGURATION REFUSED\n"
+                    f"{exc}. No allowance could be measured for this turn. "
+                    "Tell the user in one short line, naming the file.",
+                )
+            )
+        )
+        return 0
     transcript = payload.get("transcript_path")
     seen = effort.observe(transcript)
     session = payload.get("session_id") or transcript or ""
     if not isinstance(session, str):
         session = ""
-    principal = configured_principal(Path(cwd))
+    principal = configured_principal(Path(cwd), manifest)
     record_drift(session, seen, principal)
 
     crossing = allowance.principal_crossing(seen.model, manifest=manifest)

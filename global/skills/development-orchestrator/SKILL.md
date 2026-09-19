@@ -28,8 +28,12 @@ the user to verify the recommended level where possible.
 
 ## Runtime roles
 
-`global/orchestration.json` is the only source of role provider, model,
-thinking, and access assignments. Defaults are configuration, not policy.
+The effective configuration is the only source of role provider, model,
+thinking, and access assignments: the shipped `global/orchestration.json`
+under this machine's `~/.config/orrery/config.json`, with a repository's
+`.orrery.json` principal override on top. The SessionStart hook states it
+and `orrery-config --print` shows it. Defaults are configuration, not
+policy.
 
 Invoke supporting roles through:
 
@@ -131,9 +135,9 @@ not framed.
 
 ### Bounded plan review
 
-Read `settings.plan_review_rounds.value` from
-`global/orchestration.json`. It is a cap, not a target; use two and never more
-than four if unavailable.
+Read `settings.plan_review_rounds.value` from the effective configuration,
+which the SessionStart hook states and `orrery-config --print` shows. It is
+a cap, not a target; use two and never more than four if unavailable.
 
 Round one prompt:
 

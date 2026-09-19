@@ -2253,9 +2253,9 @@ def concurrency_cap(root: Path) -> int:
     this machine. One restores the single-task behaviour of Phase 1.
     """
     default = 2
-    # An override, as the verification budget has: without it the cap can
-    # only be exercised by editing the shipped manifest, so the test that
-    # was meant to prove it enforced proved nothing instead.
+    # An override, as the verification budget has: it outranks both
+    # configuration layers, so a single run can exercise the cap without
+    # a machine-wide setting being changed around it.
     override = os.environ.get("ORRERY_MAX_CONCURRENT_TASKS")
     if override:
         try:
@@ -2270,9 +2270,8 @@ def concurrency_cap(root: Path) -> int:
             )
         return value
     try:
-        from orrery_runtime import MANIFEST_PATH  # noqa: E402
-        manifest = json.loads(MANIFEST_PATH.read_text())
-        value = manifest["max_concurrent_tasks"]
+        from orrery_runtime import effective_manifest  # noqa: E402
+        value = effective_manifest()["max_concurrent_tasks"]
         low, high = 1, 8
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return default

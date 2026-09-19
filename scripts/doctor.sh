@@ -351,13 +351,81 @@ else
     fail "Manifest, model catalogue, access contracts, or chart is invalid"
 fi
 
-printf '\n=== Configured providers ===\n'
-CONFIGURED_PROVIDERS="$(
-    python3 - "$KIT_DIR/global/orchestration.json" <<'PY'
-import json
+printf '\n=== User configuration ===\n'
+if USER_CONFIG_REPORT="$(
+    python3 - "$KIT_DIR" <<'PY'
+import os
 import sys
 from pathlib import Path
-manifest = json.loads(Path(sys.argv[1]).read_text())
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_runtime import (  # noqa: E402
+    RuntimeConfigError,
+    effective_manifest,
+    user_config_path,
+)
+
+
+def emit(kind, message):
+    print(f"{kind}:{' '.join(str(message).split())}")
+
+
+try:
+    path = user_config_path()
+except RuntimeConfigError as exc:
+    # The config home itself was refused: a relative XDG_CONFIG_HOME, a
+    # directory under a broad grant, one inside the kit. No command on
+    # this machine can read its configuration until that is fixed.
+    emit("FAIL", exc)
+    raise SystemExit(0)
+
+# lexists, so a symlinked file is refused below rather than reported
+# absent, which is the forgery the trust checks exist for.
+if not os.path.lexists(path):
+    emit("PASS", f"No user configuration at {path}; shipped defaults apply")
+    raise SystemExit(0)
+
+sources = {}
+try:
+    effective_manifest(sources)
+except RuntimeConfigError as exc:
+    emit("FAIL", exc)
+    raise SystemExit(0)
+
+emit("PASS", f"User configuration is valid: {path}")
+if sources:
+    emit("INFO", "Overlaid on the shipped default: " + ", ".join(sorted(sources)))
+else:
+    emit("INFO", f"{path} overlays nothing; the shipped defaults apply")
+PY
+)"; then
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            PASS:*) pass "${line#PASS:}" ;;
+            INFO:*) pass "${line#INFO:}" ;;
+            WARN:*) warn "${line#WARN:}" ;;
+            SKIP:*) skip "${line#SKIP:}" ;;
+            FAIL:*) fail "${line#FAIL:}" ;;
+        esac
+    done <<< "$USER_CONFIG_REPORT"
+else
+    fail "The user configuration could not be checked"
+fi
+
+printf '\n=== Configured providers ===\n'
+CONFIGURED_PROVIDERS="$(
+    python3 - "$KIT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+# The effective configuration, not the shipped file: this asks which
+# providers are actually configured, and a role moved in the user
+# configuration would otherwise have its provider checked nowhere.
+from orrery_runtime import effective_manifest  # noqa: E402
+
+manifest = effective_manifest()
 print("\n".join(sorted({step["provider"] for step in manifest["steps"]})))
 PY
 )"
@@ -423,8 +491,8 @@ from orrery_runtime import (  # noqa: E402
     PROVIDERS,
     RuntimeConfigError,
     ROLE_IDS,
+    effective_manifest,
     load_catalogue,
-    load_manifest,
     load_role,
     provider_installs,
     version_tuple,
@@ -467,7 +535,10 @@ for provider in sorted(PROVIDERS):
                 "fewer models.",
             )
 
-manifest = load_manifest()
+# One read for this whole section, threaded through every check
+# below it: a role checked against one document and a tunable read
+# from another would report on a configuration that never ran.
+manifest = effective_manifest()
 bundled = load_catalogue()
 
 # Discovered once per provider, then handed to every check: asking each
@@ -493,7 +564,7 @@ for step in manifest.get("steps", []):
     if role_id not in ROLE_IDS:
         continue
     try:
-        role = load_role(role_id)
+        role = load_role(role_id, manifest=manifest)
     except RuntimeConfigError as exc:
         emit("WARN", f"{role_id} could not be loaded: {exc}")
         continue
@@ -531,11 +602,13 @@ for step in manifest.get("steps", []):
 # effort and no fallback list, so an OpenAI principal has none to lose
 # and must not be told that a missing tier is what cost it one.
 try:
-    principal = load_role("orchestrator", apply_override=False)
+    principal = load_role(
+        "orchestrator", manifest=manifest, apply_override=False
+    )
 except RuntimeConfigError:
     principal = None
 if principal is not None and principal.endpoint is None:
-    automatic = load_manifest().get("principal_auto_fallback", True)
+    automatic = manifest.get("principal_auto_fallback", True)
     # The type is checked for every provider, because orrery-sync
     # refuses a non-boolean before it reaches its own provider branch
     # and then projects nothing at all, model and effort included. Only
@@ -929,16 +1002,18 @@ fi
 
 printf '\n=== Model endpoints ===\n'
 ENDPOINT_REPORT="$(
-    python3 - "$KIT_DIR/global/orchestration.json" "$KIT_DIR" <<'PY'
-import json
+    python3 - "$KIT_DIR" <<'PY'
 import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
-from orrery_runtime import load_endpoint  # noqa: E402
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+from orrery_runtime import effective_manifest, load_endpoint  # noqa: E402
 
-manifest = json.loads(Path(sys.argv[1]).read_text())
+# The effective configuration: an endpoint route and its registry entry
+# live in the user configuration, so the shipped file alone would say
+# every role is first-party on a machine that routes one elsewhere.
+manifest = effective_manifest()
 used = {
     step["endpoint"]: step["id"]
     for step in manifest.get("steps", [])
@@ -1209,10 +1284,56 @@ PY
 fi
 
 printf '\n=== Kit repository ===\n'
-if [ -z "$(git -C "$KIT_DIR" status --porcelain)" ]; then
+KIT_PORCELAIN="$(git -C "$KIT_DIR" status --porcelain)"
+if [ -z "$KIT_PORCELAIN" ]; then
     pass "Kit repository is clean"
 else
-    fail "Kit repository has uncommitted changes"
+    # A tracked manifest carrying nothing but tunables is the machine
+    # configured before the user layer existed, which is a migration
+    # rather than unfinished work. The restore command is named only
+    # where every difference can be moved, because a hand-edited
+    # summary or a rebuilt chart exists nowhere else.
+    MIGRATION=""
+    if printf '%s\n' "$KIT_PORCELAIN" | grep -q 'global/orchestration.json$'; then
+        MIGRATION="$(
+            python3 - "$KIT_DIR" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+kit = Path(sys.argv[1])
+sys.path.insert(0, str(kit / "scripts"))
+from orrery_runtime import tunable_differences  # noqa: E402
+
+committed = subprocess.run(
+    ["git", "-C", str(kit), "show", "HEAD:global/orchestration.json"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+    text=True,
+    timeout=60,
+    check=False,
+)
+if committed.returncode != 0:
+    raise SystemExit(0)
+try:
+    baseline = json.loads(committed.stdout)
+    document = json.loads((kit / "global/orchestration.json").read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+if not isinstance(baseline, dict) or not isinstance(document, dict):
+    raise SystemExit(0)
+overlay, remaining = tunable_differences(baseline, document)
+if overlay and not remaining:
+    print("migration")
+PY
+        )"
+    fi
+    if [ "$MIGRATION" = "migration" ]; then
+        fail "Kit repository has uncommitted changes: the tracked manifest carries machine configuration; run orrery-config --import, then git -C $KIT_DIR checkout HEAD -- global/orchestration.json"
+    else
+        fail "Kit repository has uncommitted changes"
+    fi
     git -C "$KIT_DIR" status --short
 fi
 

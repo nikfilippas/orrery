@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """Visual configuration surface for the Órrery orchestration kit.
 
-Serves a single local page generated from the orchestration manifest,
+Serves a single local page generated from the effective configuration,
 showing the whole pipeline with the provider, model and thinking level
-behind each role. Changes are previewed as one unified manifest diff,
-applied atomically, then validated by the doctor.
+behind each role. Changes are previewed as one unified diff of this
+machine's user configuration, written through the runtime's locked
+writer, then validated by the doctor. The kit's tracked manifest is the
+shipped default and is never written here.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 import html
 import json
@@ -18,7 +21,6 @@ import re
 import secrets
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
@@ -36,8 +38,18 @@ from orrery_model_catalogue import (  # noqa: E402
     discover_catalogue,
 )
 from orrery_runtime import (  # noqa: E402
+    MANIFEST_PATH,
+    USER_CONFIG_VERSION,
     RuntimeConfigError,
+    effective_manifest,
     load_endpoint,
+    load_manifest,
+    load_user_config,
+    tunable_differences,
+    user_config_path,
+    user_config_text,
+    validate_user_config,
+    write_user_config,
 )
 from orrery_standing import (  # noqa: E402
     describe as describe_standing,
@@ -60,15 +72,6 @@ CATALOGUE_DISCOVERY = DiscoveryResult(
 
 class ConfigError(Exception):
     pass
-
-
-def load_manifest() -> dict[str, Any]:
-    path = KIT_DIR / "global" / "orchestration.json"
-    manifest = json.loads(path.read_text())
-    steps = manifest.get("steps")
-    if not isinstance(steps, list) or not steps:
-        raise ConfigError(f"no steps defined in {path}")
-    return manifest
 
 
 def integer_setting_state(
@@ -113,7 +116,7 @@ def settings_snapshot(
     manifest: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     settings = manifest.get("settings", {})
     if not isinstance(settings, dict):
         raise ConfigError("the manifest settings must be an object")
@@ -291,7 +294,6 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
         "model": model,
         "thinking": thinking or "",
         "access": step.get("access", ""),
-        "file": "global/orchestration.json",
         "summary": step.get("summary", ""),
         "selects": step.get("selects", ""),
         "endpoint": step.get("endpoint") or "",
@@ -300,20 +302,74 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
-def prune_endpoints(manifest: dict[str, Any]) -> None:
-    """Drop endpoint definitions no role refers to any more."""
-    registry = manifest.get("endpoints")
-    if not isinstance(registry, dict):
-        return
-    used = {
-        step.get("endpoint")
-        for step in manifest.get("steps", [])
-        if step.get("endpoint")
+def user_config_display(path: Path) -> str:
+    """The user configuration's path with the home written as ~."""
+    try:
+        return f"~/{path.relative_to(Path.home())}"
+    except ValueError:
+        return str(path)
+
+
+def prune_user_config(
+    candidate: dict[str, Any],
+    shipped: dict[str, Any],
+) -> None:
+    """Reduce a candidate to the deviations it actually carries.
+
+    Everything that merely repeats the shipped default is removed, so
+    the file says what this machine chose and nothing else, and setting
+    a role back to its default leaves no residue behind to explain.
+    """
+    shipped_steps = {
+        step.get("id"): step
+        for step in shipped.get("steps", [])
+        if isinstance(step, dict)
     }
-    for name in [name for name in registry if name not in used]:
-        del registry[name]
-    if not registry:
-        manifest.pop("endpoints", None)
+    roles = candidate.get("roles")
+    if isinstance(roles, dict):
+        for role_id in list(roles):
+            entry = roles[role_id]
+            step = shipped_steps.get(role_id, {})
+            for name in list(entry):
+                if name not in step:
+                    # An explicit null unsets a field the default never
+                    # set, which is what the default already does.
+                    if entry[name] is None:
+                        del entry[name]
+                elif entry[name] == step[name]:
+                    del entry[name]
+            if not entry:
+                del roles[role_id]
+
+    registry = candidate.get("endpoints")
+    if isinstance(registry, dict):
+        used = set()
+        for role_id, step in shipped_steps.items():
+            entry = candidate.get("roles", {}).get(role_id, {})
+            named = (
+                entry["endpoint"]
+                if "endpoint" in entry
+                else step.get("endpoint")
+            )
+            if named:
+                used.add(named)
+        for name in [name for name in registry if name not in used]:
+            del registry[name]
+
+    settings = candidate.get("settings")
+    shipped_settings = shipped.get("settings", {})
+    if isinstance(settings, dict) and isinstance(shipped_settings, dict):
+        for name in list(settings):
+            definition = shipped_settings.get(name)
+            if (
+                isinstance(definition, dict)
+                and definition.get("value") == settings[name]
+            ):
+                del settings[name]
+
+    for key in ("roles", "endpoints", "settings"):
+        if key in candidate and not candidate[key]:
+            del candidate[key]
 
 
 def endpoint_presets() -> list[dict[str, Any]]:
@@ -364,7 +420,7 @@ def snapshot(
     manifest: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     return [step_state(step) for step in manifest["steps"]]
 
 
@@ -490,10 +546,20 @@ def validate_setting_change(
 def planned_manifest_edit(
     requested: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """One atomic manifest edit for all role and workflow changes."""
-    path = KIT_DIR / "global" / "orchestration.json"
-    before = path.read_text()
-    manifest = json.loads(before)
+    """One edit of the user configuration for every requested change.
+
+    The tracked manifest is never written: it is the shipped default,
+    and a machine's choices are a sparse overlay on top of it. What the
+    change is measured against is the effective configuration, which is
+    what the page is showing; what is stored is only where that ends up
+    differing from the default.
+    """
+    path = user_config_path()
+    user = load_user_config(path)
+    before = path.read_text() if os.path.lexists(path) else ""
+    candidate = copy.deepcopy(user)
+    manifest = effective_manifest()
+    shipped = load_manifest(MANIFEST_PATH)
     steps = {
         step.get("id"): step
         for step in manifest.get("steps", [])
@@ -503,7 +569,10 @@ def planned_manifest_edit(
     if not isinstance(definitions, dict):
         raise ConfigError("the manifest settings must be an object")
 
-    changed: list[str] = []
+    def role_entry(role_id: str) -> dict[str, Any]:
+        return candidate.setdefault("roles", {}).setdefault(role_id, {})
+
+    changed: set[str] = set()
     for item_id, change in requested.items():
         if item_id in definitions:
             definition = definitions[item_id]
@@ -511,8 +580,8 @@ def planned_manifest_edit(
                 raise ConfigError(f"invalid setting: {item_id}")
             value = validate_setting_change(item_id, change, definition)
             if definition.get("value") != value:
-                definition["value"] = value
-                changed.append(item_id)
+                changed.add(item_id)
+            candidate.setdefault("settings", {})[item_id] = value
             continue
 
         step = steps.get(item_id)
@@ -551,8 +620,7 @@ def planned_manifest_edit(
                     str(thinking)
                 ):
                     raise ConfigError("invalid thinking level")
-                registry = manifest.setdefault("endpoints", {})
-                registry[endpoint_id] = {
+                candidate.setdefault("endpoints", {})[endpoint_id] = {
                     "label": preset["label"],
                     "adapter": preset["adapter"],
                     "base_url": preset["base_url"],
@@ -575,12 +643,14 @@ def planned_manifest_edit(
                     step.get(key) != value
                     for key, value in replacement.items()
                 ):
-                    step.update(replacement)
-                    changed.append(item_id)
-                prune_endpoints(manifest)
+                    changed.add(item_id)
+                role_entry(item_id).update(replacement)
                 continue
-            step.pop("endpoint", None)
-            prune_endpoints(manifest)
+            if step.get("endpoint"):
+                changed.add(item_id)
+            # Stored as an explicit unset, which the pruning below turns
+            # back into silence when the default never routed the role.
+            role_entry(item_id)["endpoint"] = None
 
         model = validate_model(change.get("model", current["model"]))
         known_providers = [
@@ -618,22 +688,30 @@ def planned_manifest_edit(
             "thinking": thinking,
         }
         if any(step.get(key) != value for key, value in replacement.items()):
-            step.update(replacement)
-            changed.append(item_id)
+            changed.add(item_id)
+        role_entry(item_id).update(replacement)
 
     if not changed:
         return None
-    after = json.dumps(manifest, indent=2) + "\n"
+    prune_user_config(candidate, shipped)
+    candidate["version"] = USER_CONFIG_VERSION
+    # The whole document, not just the part that moved: a change is only
+    # previewable if the configuration it produces is one every command
+    # can read.
+    validate_user_config(candidate)
+    after = user_config_text(candidate)
+    display = user_config_display(path)
     diff = "".join(
         difflib.unified_diff(
             before.splitlines(keepends=True),
             after.splitlines(keepends=True),
-            fromfile="a/global/orchestration.json",
-            tofile="b/global/orchestration.json",
+            fromfile=display,
+            tofile=display,
         )
     )
     return {
-        "file": "global/orchestration.json",
+        "file": display,
+        "path": str(path),
         "before": before,
         "after": after,
         "diff": diff,
@@ -642,104 +720,10 @@ def planned_manifest_edit(
 
 
 def plan(changes: dict[str, Any]) -> list[dict[str, Any]]:
-    manifest = load_manifest()
+    manifest = effective_manifest()
     settings_snapshot(manifest)
     edit = planned_manifest_edit(changes)
     return [edit] if edit is not None else []
-
-
-def write_atomically(path: Path, content: str) -> None:
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        delete=False,
-    ) as handle:
-        handle.write(content)
-        handle.flush()
-        os.fsync(handle.fileno())
-        temporary = Path(handle.name)
-    temporary.replace(path)
-
-
-def stage_edits(edits: list[dict[str, Any]]) -> list[tuple[Path, Path, str]]:
-    """Write every replacement to a sibling temporary file.
-
-    Staging all of them before renaming any means a failure that would
-    otherwise leave the configuration half-applied is caught while nothing
-    has moved yet. The renames afterwards are individually atomic.
-    """
-    staged: list[tuple[Path, Path, str]] = []
-    try:
-        for edit in edits:
-            path = KIT_DIR / edit["file"]
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                delete=False,
-            ) as handle:
-                handle.write(edit["after"])
-                handle.flush()
-                os.fsync(handle.fileno())
-                staged.append((Path(handle.name), path, edit["before"]))
-    except BaseException:
-        for temporary, _destination, _before in staged:
-            temporary.unlink(missing_ok=True)
-        raise
-    return staged
-
-
-def commit_staged(staged: list[tuple[Path, Path, str]]) -> None:
-    """Rename every staged file into place, undoing the set on failure.
-
-    POSIX has no transaction across several files, so all-or-nothing is
-    approximated: each destination is re-read immediately before its
-    rename, and a failure part way restores the ones already renamed from
-    the content the preview recorded. A writer landing inside the window
-    between that final read and the rename cannot be excluded without its
-    cooperation; the window is microseconds and the check makes anything
-    wider than that impossible.
-    """
-    completed: list[tuple[Path, str, str]] = []
-    try:
-        for temporary, destination, before in staged:
-            if destination.read_text() != before:
-                raise ConfigError(
-                    f"{destination.name} changed while it was being written. "
-                    "Nothing further was applied; preview again."
-                )
-            applied = temporary.read_text()
-            temporary.replace(destination)
-            completed.append((destination, before, applied))
-    except BaseException:
-        # Undo every rename that did land, then clean up. Each rollback is
-        # attempted even if an earlier one failed, and a file another
-        # writer has since changed is left to that writer rather than
-        # having this apply's idea of the past forced back over it.
-        problems: list[str] = []
-        for destination, before, applied in reversed(completed):
-            try:
-                if destination.read_text() != applied:
-                    problems.append(
-                        f"{destination.name} was changed by something else "
-                        "after this apply wrote it and was left alone"
-                    )
-                    continue
-                write_atomically(destination, before)
-            except OSError as exc:
-                problems.append(f"{destination.name} could not be restored: {exc}")
-
-        for temporary, _destination, _before in staged:
-            temporary.unlink(missing_ok=True)
-
-        if problems:
-            raise ConfigError(
-                "The apply failed and the configuration could not be fully "
-                "restored: " + "; ".join(problems) + ". Inspect these files "
-                "before continuing."
-            ) from None
-        raise
 
 
 def run_kit(command: list[str], timeout: float) -> tuple[int, str]:
@@ -781,7 +765,13 @@ def apply_edits(
                 "that was previewed. Nothing was written; preview again."
             )
 
-    commit_staged(stage_edits(edits))
+    # The runtime is the only writer, and it repeats the before-check
+    # under the lock it holds across the replace, so an edit landing
+    # between the preview and here loses rather than being overwritten.
+    for edit in edits:
+        write_user_config(
+            json.loads(edit["after"]), expected=edit["before"] or None
+        )
 
     result: dict[str, Any] = {
         "applied": [edit["file"] for edit in edits],
@@ -2162,7 +2152,7 @@ applyButton.addEventListener("click", async () => {
     `<pre>${esc(reply.doctor_tail)}</pre>`;
   result.innerHTML = `<h3 class="ok">Applied: ${esc(reply.applied.join(", "))}</h3>` +
     doctor +
-    '<p class="note">Reload to edit further; the kit repository now holds these values, ready to commit.</p>';
+    '<p class="note">Reload to edit further; your user configuration now holds these values, and the shipped defaults in the repository are untouched.</p>';
 });
 
 document.addEventListener("keydown", event => {
@@ -2213,7 +2203,10 @@ def script_json(value: Any) -> str:
 
 
 def render_page(token: str, demo: bool = False) -> str:
-    manifest = load_manifest()
+    # An export is published. Rendering it from the effective
+    # configuration would publish whoever wrote it, so the demo shows
+    # the shipped defaults and the live page shows this machine.
+    manifest = load_manifest(MANIFEST_PATH) if demo else effective_manifest()
     if demo:
         # An export cannot ask anything. Its menus are whatever was
         # installed when it was written, so saying they were "discovered
@@ -2253,7 +2246,10 @@ def render_page(token: str, demo: bool = False) -> str:
         "__TOKEN_PATH__": script_json(f"/t/{token}/"),
         "__DEMO__": "true" if demo else "false",
         "__CATALOGUE_NOTE__": script_json(catalogue_note),
-        "__STANDING__": standing_html(),
+        # An export is published, and a standing approval names what
+        # this machine consented to: it is part of the machine, not of
+        # the defaults, so the demo renders none.
+        "__STANDING__": "" if demo else standing_html(),
     }
     # One pass, so a substituted value that happens to contain another
     # placeholder is served verbatim rather than substituted again.
@@ -2293,27 +2289,197 @@ def standing_html() -> str:
 
 
 def print_state() -> int:
-    manifest = load_manifest()
+    # Where each row comes from, rather than which file holds it: the
+    # shipped default and this machine's configuration are two
+    # documents now, and only the answer to "did I change this?" is
+    # worth a column.
+    sources: dict[str, str] = {}
+    manifest = effective_manifest(sources)
     for state in snapshot(manifest):
         thinking = (
             f" · thinking {state['thinking']}"
             if state.get("thinking")
             else " · thinking unavailable"
         )
+        source = (
+            "user"
+            if any(
+                key.startswith(f"roles.{state['id']}.") for key in sources
+            )
+            else "default"
+        )
         print(f"{state['title']:24} {state['provider']:10} "
-              f"{state['model']}{thinking}   [{state['file']}]")
+              f"{state['model']}{thinking}   [{source}]")
     for setting in settings_snapshot(manifest):
+        source = (
+            "user" if f"settings.{setting['id']}" in sources else "default"
+        )
         print(
             f"{setting['label']:24} {'workflow':10} "
             f"{setting['value']} "
-            f"[{setting['minimum']}–{setting['maximum']}; "
-            "global/orchestration.json]"
+            f"[{setting['minimum']}–{setting['maximum']}; {source}]"
         )
     for record in list_standing():
         print(
             f"{'Standing fallback':24} {'consent':10} "
             f"{describe_standing(record)}"
         )
+    return 0
+
+
+TRACKED_MANIFEST = KIT_DIR / "global" / "orchestration.json"
+
+
+def committed_manifest() -> tuple[dict[str, Any], str | None]:
+    """HEAD's copy of the tracked manifest, or nothing and the reason.
+
+    A tarball install has no git to ask, which is not an error: it just
+    means nothing distinguishes configuration from default, so every
+    configurable value in the document is taken as configuration.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(KIT_DIR),
+                "show", "HEAD:global/orchestration.json",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {}, f"git could not be run here ({exc})"
+    if result.returncode != 0:
+        return {}, "this kit has no committed global/orchestration.json"
+    try:
+        committed = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return {}, f"the committed manifest cannot be parsed ({exc})"
+    if not isinstance(committed, dict):
+        return {}, "the committed manifest is not a JSON object"
+    return committed, None
+
+
+def merged_overlay(
+    user: dict[str, Any],
+    overlay: dict[str, Any],
+) -> dict[str, Any]:
+    """The user configuration with an imported overlay folded in.
+
+    Imported values win for the keys they name and every other key is
+    kept, so importing a role the user never configured cannot delete
+    the one they did. Two levels deep, which is as deep as a tunable
+    goes: a role's fields, a price's models.
+    """
+    merged = copy.deepcopy(user)
+    for key, value in overlay.items():
+        current = merged.get(key)
+        if not isinstance(value, dict) or not isinstance(current, dict):
+            merged[key] = copy.deepcopy(value)
+            continue
+        nested = dict(current)
+        for name, entry in value.items():
+            inner = nested.get(name)
+            if isinstance(entry, dict) and isinstance(inner, dict):
+                combined = dict(inner)
+                combined.update(entry)
+                nested[name] = combined
+            else:
+                nested[name] = entry
+        merged[key] = nested
+    return merged
+
+
+def overlay_lines(overlay: dict[str, Any]) -> list[str]:
+    """Every value an overlay carries, one readable line each."""
+    lines: list[str] = []
+    for key in sorted(overlay):
+        if key == "version":
+            continue
+        value = overlay[key]
+        if not isinstance(value, dict):
+            lines.append(f"{key} = {json.dumps(value)}")
+            continue
+        for name in sorted(value):
+            entry = value[name]
+            if isinstance(entry, dict):
+                for field in sorted(entry):
+                    lines.append(
+                        f"{key}.{name}.{field} = {json.dumps(entry[field])}"
+                    )
+            else:
+                lines.append(f"{key}.{name} = {json.dumps(entry)}")
+    return lines
+
+
+def import_configuration(source: Path) -> int:
+    """Move a configured manifest's choices into the user configuration.
+
+    Nothing in git is written here. What the tracked file should become
+    is printed as a command for the user to run, and only where running
+    it would destroy nothing: a difference no user layer can hold
+    exists in the working tree alone.
+    """
+    try:
+        document = json.loads(source.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"{source} cannot be read: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ConfigError(f"{source} must be a JSON object")
+
+    committed, unavailable = committed_manifest()
+    if unavailable is not None:
+        print(
+            f"No committed baseline: {unavailable}. Every configurable "
+            f"value in {source} is treated as configuration."
+        )
+    overlay, remaining = tunable_differences(committed, document)
+
+    path = user_config_path()
+    display = user_config_display(path)
+    user = load_user_config(path)
+    before = path.read_text() if os.path.lexists(path) else ""
+    candidate = merged_overlay(user, overlay)
+    candidate["version"] = USER_CONFIG_VERSION
+    after = user_config_text(candidate)
+    if not overlay:
+        print("Nothing configurable differs from the shipped default.")
+    elif after == before:
+        print(f"{display} already carries every configurable difference:")
+        for line in overlay_lines(overlay):
+            print(f"  {line}")
+    else:
+        write_user_config(candidate, expected=before or None)
+        print(f"Imported into {display}:")
+        for line in overlay_lines(overlay):
+            print(f"  {line}")
+
+    if unavailable is not None or source.resolve() != TRACKED_MANIFEST.resolve():
+        # Without a baseline there is no HEAD to restore from, and a
+        # document from somewhere else says nothing about what the
+        # tracked manifest should become.
+        return 0
+    if remaining:
+        print(
+            "These differences are not configuration, so the user "
+            "configuration cannot hold them and they exist only in the "
+            "working tree:"
+        )
+        for item in remaining:
+            print(f"  {item}")
+        print(
+            "Save them before deciding what to do with them:\n"
+            f"  git -C {KIT_DIR} diff HEAD -- global/orchestration.json "
+            "> <file>"
+        )
+        return 0
+    print(
+        "The tracked manifest now carries nothing this machine needs. "
+        "Restore it with:\n"
+        f"  git -C {KIT_DIR} checkout HEAD -- global/orchestration.json"
+    )
     return 0
 
 
@@ -2440,7 +2606,16 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self.send_error(404)
-        except (ConfigError, json.JSONDecodeError, OSError) as exc:
+        except (
+            ConfigError,
+            RuntimeConfigError,
+            json.JSONDecodeError,
+            OSError,
+        ) as exc:
+            # A refused user configuration reaches the page as the
+            # runtime's own message: the page is what the user would
+            # repair it with, so it must say what is wrong rather than
+            # fail as an unexplained error.
             self.reply({"error": str(exc)}, status=400)
 
 
@@ -2491,6 +2666,18 @@ def main() -> int:
         description="Configure the Órrery orchestration visually."
     )
     parser.add_argument("--print", action="store_true", dest="print_state")
+    parser.add_argument(
+        "--import",
+        dest="import_path",
+        type=Path,
+        nargs="?",
+        const=TRACKED_MANIFEST,
+        metavar="PATH",
+        help="move a configured manifest's choices into this machine's "
+             "user configuration and report what could not be moved. "
+             "Defaults to the kit's tracked manifest. It never runs a "
+             "git write itself; the command to run is printed.",
+    )
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--no-browser", action="store_true")
@@ -2506,6 +2693,10 @@ def main() -> int:
     arguments = parser.parse_args()
 
     try:
+        if arguments.import_path is not None:
+            # Ahead of discovery, which spawns both provider CLIs to
+            # build model menus a migration has no use for.
+            return import_configuration(arguments.import_path)
         activate_discovered_catalogue()
         for warning in CATALOGUE_DISCOVERY.warnings:
             print(f"Model discovery: {warning}", file=sys.stderr, flush=True)
@@ -2521,7 +2712,7 @@ def main() -> int:
             arguments.timeout,
             open_browser=not arguments.no_browser,
         )
-    except ConfigError as exc:
+    except (ConfigError, RuntimeConfigError) as exc:
         print(f"orrery-config: {exc}", file=sys.stderr)
         return 2
 

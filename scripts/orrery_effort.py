@@ -52,7 +52,7 @@ from orrery_runtime import (  # noqa: E402
     MODEL_ID,
     THINKING_LEVEL,
     RuntimeConfigError,
-    load_manifest,
+    effective_manifest,
     load_role,
 )
 
@@ -102,7 +102,7 @@ def route_effort(manifest: dict[str, Any] | None = None) -> dict[str, str]:
     recommendation is one table rather than five opinions.
     """
     if manifest is None:
-        manifest = load_manifest()
+        manifest = effective_manifest()
     configured = manifest.get("route_effort", {})
     if not isinstance(configured, dict):
         raise RuntimeConfigError("the manifest route_effort must be an object")
