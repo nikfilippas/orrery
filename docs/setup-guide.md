@@ -320,10 +320,14 @@ level to a prompt hook.
 
 Once the window spend for the model **actually running** crosses that
 provider's allowance, every turn carries one line naming the measured spend,
-the ceiling and the window. It is sent to `systemMessage`, the channel you see,
-and not to the model's context alone: whether a line delivered only to the
-model is ever repeated to you depends on the model choosing to repeat it.
-`on_exceeded: block` stops the crossing turn instead. Blocking is opt-in
+the ceiling and the window. It is sent on `systemMessage` and also delivered
+to the model's context with an instruction to say it in one short line,
+because `systemMessage` is not rendered on every surface: the VS Code
+extension shows no SessionStart `systemMessage` at all, and whether it shows
+a prompt hook's has not been verified. Whether the model's line reaches you
+depends on the model following that instruction, which is the same
+dependence the roster above accepts. `on_exceeded: block` stops the crossing
+turn instead. Blocking is opt-in
 because the accounting can overcount on a resumed session, and an overcount in
 warn mode costs a sentence rather than a session.
 
