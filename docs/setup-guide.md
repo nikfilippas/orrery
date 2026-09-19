@@ -1048,11 +1048,22 @@ surface that never verifies its principal.
 ## Verification and maintenance
 
 ```bash
-./tests/run-tests.py
+./tests/run-pinned.sh
 orrery-doctor
 ```
 
 The suite uses fake provider commands. The doctor makes no model calls.
+
+`./tests/run-tests.py` runs the suite in place, and on a configured machine
+that reads the live `global/orchestration.json`, which holds that machine's
+own role choices while many tests assume the shipped ones, so its result
+depends on what the file says when the run starts and on whether another
+session edits it mid-run. `./tests/run-pinned.sh` runs the same suite against
+an isolated copy whose manifest is the committed one, provisioned like a CI
+runner and never adopted; it writes nothing live and reports whether the live
+manifest or settings moved while it ran. Use it for any pass or fail you
+intend to rely on, and `run-tests.py` with a name filter for one test while
+working.
 
 Two surfaces cannot be proven by the suite, because its fake browser and
 fake providers are unconfined where the real ones are not. Both classes
@@ -1255,6 +1266,10 @@ The maintained artefacts are:
   lifecycle helpers.
 - `tests/run-tests.py`, `tests/fake-codex`, and `tests/fake-claude` — offline
   regression suite and provider stand-ins.
+- `tests/run-pinned.sh` — the suite against an isolated copy pinned to the
+  committed manifest, with a provisioned HOME and no adoption, so a
+  configured machine gets the result CI would; the live tree is never
+  written.
 - `tests/run-like-ci.sh` — the suite under the ways a CI runner differs from
   a developer machine: `TMPDIR` at `/tmp`, no `init.defaultBranch`, and no
   provider CLI on `PATH`. Every one of those has hidden a real defect behind
