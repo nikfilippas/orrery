@@ -411,9 +411,15 @@ and never state that the level changed. The recommended levels are
 investigation `medium`, trivial `low`, mechanical `low`, standard `high`, and
 complex `max`, unless `route_effort` in the effective configuration names
 others, which `orrery-doctor` reports as the recommended level per route.
-They are provisional until it is measured whether changing the level
-inside a session costs a cache re-read; if it does, staying put is cheaper than
-switching. `orrery-doctor` reports the level the newest transcript for a
+Changing the level inside a session does not rebuild the prompt cache:
+measured on 2026-09-19, the turn after an `/effort` change read the whole
+cached prefix and wrote only its own turn, so lowering for a cheap route costs
+nothing beyond the line that asks for it. The lever exists only where the
+level is persisted through `effortLevel`, `low` to `xhigh`; a principal
+configured at `max` is pinned through `CLAUDE_CODE_EFFORT_LEVEL`, which
+overrides `/effort` and the editor's slider for the whole session, so at `max`
+there is no in-session lever and the only saving on a cheap route is
+delegation. `orrery-doctor` reports the level the newest transcript for a
 repository recorded, and says so rather than naming a level it did not read.
 
 Do not delegate trivial work, require plan review for straightforward work, or

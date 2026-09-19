@@ -515,9 +515,16 @@ it takes.
 ```
 
 Those are the defaults, and the block may be omitted entirely or name only the
-routes you want to move. They are provisional: whether changing the level
-inside a session costs a cache re-read has not been measured, and if it does,
-staying put is cheaper than switching.
+routes you want to move. Changing the level inside a session does not
+rebuild the prompt cache: measured on 2026-09-19 on `claude-fable-5-1`, the
+turn after `/effort low` read 60,286 cached tokens and wrote 207, the same
+shape as the steady-state turn before it, so lowering for a cheap route costs
+nothing. The lever exists only where the level is persisted through
+`effortLevel`, `low` to `xhigh`. `max` cannot be persisted there and is pinned
+through `CLAUDE_CODE_EFFORT_LEVEL`, which overrides `/effort` and the editor's
+slider for the whole session; a principal configured at `max` therefore has no
+in-session lever at all, which is a reason to configure it at `xhigh` and reach
+`max` per session when a task needs it.
 
 What is observable is the level actually running. The same prompt hook reads it
 from the transcript tail and records an `effort-drift` incident when it differs
