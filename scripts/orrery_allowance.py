@@ -9,14 +9,22 @@ kind. So the ceiling reads a rollup of its own, in the shared state
 directory, keyed by provider and model, and every enforcement point
 reads that one file.
 
-What the rollup measures is local session spend: Claude transcripts
-under the Claude configuration directory and Codex rollout files under
-CODEX_HOME. A delegated run appears in neither, by construction, since
-it is launched with `--no-session-persistence` or `--ephemeral`. That is
-the point rather than a gap: delegate spend is what the ledger already
-accounts for, and principal spend is what nothing did.
+What the rollup measures is local spend from three sources: every
+Claude transcript under the Claude configuration directory, subagent
+and workflow-agent transcripts nested beneath a session included, Codex
+rollout files under CODEX_HOME, and the `spend` records of the incident
+log. A delegated run appears in no transcript or rollout, by
+construction, since it is launched with `--no-session-persistence` or
+`--ephemeral`; what it spent is known only from the `spend` record its
+wrapper writes on the way out, so that record is read here. A run under
+`--receipts`, as `orrery-task` dispatches, writes the same record as
+well as its task's attempt record, both from one parse of its log, so
+a task dispatch is measured here without the per-repository ledger
+ever being read. A record whose usage was not recovered carries no
+counts and adds nothing; one recovered from a run that died before its
+result is a floor, marked `partial`.
 
-Four properties are load-bearing.
+Five properties are load-bearing.
 
 Responses are deduplicated by identity, never by byte offset alone. A
 session resumed into a second transcript replays the responses it
@@ -34,6 +42,16 @@ no provider: the directory a transcript sits in says which CLI wrote it,
 not which account paid for it, and the Claude CLI can be pointed at a
 third-party endpoint. That spend is kept under an empty provider so it
 is visible rather than silently absent.
+
+A delegated run is counted once however the incident log rotates. Its
+record's identity is the wrapper's process run id with the record's own
+millisecond timestamp, since a transient retry or an approved fallback
+re-enters the wrapper in the same process and writes a second record
+under the same run id. Rotation renames the live log to the previous
+one, so an offset is trusted only while the file under a name is still
+the file it was taken in, by inode and by a digest of its first line,
+since a freed inode is reused; otherwise the file is read again from
+the start and the identities discard what was already counted.
 
 The total counts cache reads. It sums the same four token classes
 `orrery-usage` reports, and cache reads dominate real figures by an
@@ -67,7 +85,12 @@ from typing import Any, Iterator
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from orrery_incidents import store_dir  # noqa: E402
+from orrery_incidents import (  # noqa: E402
+    previous_path,
+    store_dir,
+    store_path,
+    valid_event,
+)
 from orrery_runtime import (  # noqa: E402
     PROVIDERS,
     Role,
@@ -116,6 +139,11 @@ IDENTITY_DIGITS = 16
 # assistant response nor a token count.
 CLAUDE_MARKER = b'"usage"'
 CODEX_MARKERS = (b"token_count", b"turn_context")
+SPEND_MARKER = b'"spend"'
+
+# The token classes a `spend` record carries, as `orrery_spend` names
+# them: the same four `TOKEN_FIELDS` sums, under the wrapper's names.
+SPEND_FIELDS = ("fresh_in", "cache_read", "cache_write", "output")
 
 
 @dataclass(frozen=True)
@@ -282,12 +310,19 @@ def claude_projects_root() -> Path:
 
 
 def source_files() -> list[tuple[str, Path]]:
-    """Every local session log, with the parser each one needs."""
+    """Every local spend log, with the parser each one needs.
+
+    Claude transcripts are found at any depth: a session's subagents
+    write theirs under `<session>/subagents/`, and a workflow's agents
+    under `<session>/subagents/workflows/<run>/`, and neither response
+    is recorded in the parent transcript. The previous incident log is
+    listed before the live one, so a rotation reads in write order.
+    """
     found: list[tuple[str, Path]] = []
     with contextlib.suppress(OSError):
         found.extend(
             ("claude", path)
-            for path in sorted(claude_projects_root().glob("*/*.jsonl"))
+            for path in sorted(claude_projects_root().rglob("*.jsonl"))
         )
     try:
         sessions = codex_home() / "sessions"
@@ -299,6 +334,7 @@ def source_files() -> list[tuple[str, Path]]:
                 ("codex", path)
                 for path in sorted(sessions.rglob("rollout-*.jsonl"))
             )
+    found.extend(("incidents", path) for path in (previous_path(), store_path()))
     return found
 
 
@@ -396,7 +432,7 @@ def read_rollup(path: Path | None = None) -> dict[str, Any]:
             if not isinstance(name, str) or not isinstance(record, dict):
                 continue
             kept: dict[str, Any] = {}
-            for field in ("offset", "counted"):
+            for field in ("offset", "counted", "inode"):
                 value = record.get(field)
                 if (
                     isinstance(value, int)
@@ -406,8 +442,9 @@ def read_rollup(path: Path | None = None) -> dict[str, Any]:
                     kept[field] = value
             if "offset" not in kept:
                 continue
-            if isinstance(record.get("model"), str):
-                kept["model"] = record["model"]
+            for field in ("model", "head"):
+                if isinstance(record.get(field), str):
+                    kept[field] = record[field]
             rollup["sources"][name] = kept
     hours = stored.get("hours")
     if isinstance(hours, dict):
@@ -520,6 +557,80 @@ def _scan_claude(
     return rows, consumed
 
 
+def _head_digest(handle: Any) -> str | None:
+    """A digest of the file's first line, or None until it is complete.
+
+    Every incident line carries a millisecond timestamp and a process
+    run id, so the first line names the file as its inode cannot.
+    """
+    handle.seek(0)
+    first = handle.readline()
+    if not first.endswith(b"\n"):
+        return None
+    return hashlib.sha256(first).hexdigest()[:IDENTITY_DIGITS]
+
+
+def _scan_incidents(
+    handle: Any,
+    offset: int,
+    horizon: float,
+    resolve: Any,
+) -> tuple[list[tuple[float, str, int, str]], int]:
+    """Counted delegated runs after `offset`, and the offset they end at."""
+    rows: list[tuple[float, str, int, str]] = []
+    consumed = offset
+    for raw, position in _lines(handle, offset):
+        consumed = position
+        if SPEND_MARKER not in raw:
+            continue
+        try:
+            event = valid_event(json.loads(raw))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if event is None or event.get("kind") != "spend":
+            continue
+        total = sum(_integer(event.get(field)) for field in SPEND_FIELDS)
+        if not total:
+            # A run whose usage was not recovered carries no counts.
+            continue
+        stamp = _timestamp(event.get("ts"))
+        if stamp is None or stamp < horizon:
+            continue
+        run = event.get("run")
+        if not isinstance(run, str) or not run:
+            continue
+        rows.append(
+            (
+                stamp,
+                spend_key(event, resolve),
+                total,
+                identity_digest(f"spend:{run}", event["ts"]),
+            )
+        )
+    return rows, consumed
+
+
+def spend_key(event: dict[str, Any], resolve: Any) -> str:
+    """The bucket a `spend` record's run is counted under.
+
+    The record names the provider the role was configured on, which is
+    authoritative for a role with no endpoint, so the catalogue's key for
+    the model is used only when it names that provider. A run routed
+    at an endpoint drew on a third-party service, and is kept under an
+    empty provider exactly as an uncatalogued transcript model is.
+    """
+    model = event.get("model")
+    if not isinstance(model, str) or not model:
+        model = "unknown"
+    provider = event.get("provider")
+    if event.get("endpoint") is not None or provider not in PROVIDERS:
+        return f"/{model}"
+    key = resolve(model)
+    if split_key(key)[0] != provider:
+        key = f"{provider}/{model}"
+    return key
+
+
 def _scan_codex(
     handle: Any,
     offset: int,
@@ -599,10 +710,11 @@ def refresh(
     now: float | None = None,
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Fold every new session log into the rollup and store it.
+    """Fold every new session log and spend record in, and store it.
 
     Only files whose recorded offset no longer equals their size are
-    opened, so a refresh on an unchanged machine reads nothing at all. A
+    opened, so a refresh on an unchanged machine reads no transcript at
+    all; incident logs are the exception, opened to check their head. A
     file shorter than its recorded offset was truncated or replaced and
     is read from the start again.
     """
@@ -631,15 +743,26 @@ def refresh(
                 details = source.stat()
             except OSError:
                 continue
+            if kind == "incidents" and record.get("inode") != details.st_ino:
+                # Rotation renames the live log over the previous one, so
+                # an offset under either name may belong to another file.
+                # Read from the start; the identities discard the rest.
+                record = {"inode": details.st_ino}
             offset = record.get("offset")
             if offset is None:
                 if details.st_mtime < horizon:
                     # Nothing in it can fall inside the window, so it is
                     # marked consumed without ever being opened.
-                    rollup["sources"][name] = {"offset": details.st_size}
+                    rollup["sources"][name] = {
+                        **record,
+                        "offset": details.st_size,
+                    }
                     continue
                 offset = 0
-            elif offset == details.st_size:
+            elif offset == details.st_size and kind != "incidents":
+                # Not for an incident log: a different file under a reused
+                # inode can happen to equal the old offset, and only its
+                # head says so. The logs are small enough to open always.
                 continue
             elif offset > details.st_size:
                 # Truncated or replaced under the same name. `counted`
@@ -657,6 +780,24 @@ def refresh(
                         rows, offset = _scan_claude(
                             handle, offset, horizon, resolve
                         )
+                    elif kind == "incidents":
+                        if os.fstat(handle.fileno()).st_ino != details.st_ino:
+                            # Rotated between the stat and the open. The
+                            # next refresh finds it under its new name.
+                            continue
+                        head = _head_digest(handle)
+                        if head != record.get("head"):
+                            # ext4 reuses a freed inode, so two rotations
+                            # between refreshes can leave a different
+                            # file under the recorded inode. Its first
+                            # line says which file it is.
+                            record = {"inode": details.st_ino}
+                            offset = 0
+                        if head is not None:
+                            record["head"] = head
+                        rows, offset = _scan_incidents(
+                            handle, offset, horizon, resolve
+                        )
                     else:
                         stamp, total, earliest, offset = _scan_codex(
                             handle, offset, record
@@ -664,7 +805,7 @@ def refresh(
             except OSError:
                 continue
             record["offset"] = offset
-            if kind == "claude":
+            if kind != "codex":
                 for moment_of, key, counted, digest in rows:
                     if digest in seen:
                         continue

@@ -3051,50 +3051,38 @@ def main(
             opening half with no completion is precisely the durable
             statement that a paid run began and its cost is unknown.
             """
-            if receipts is None:
-                # A run with no receipts directory belongs to no task:
-                # a plan review, a final review, an ad-hoc delegation.
-                # It still spends, and its run directory is removed on
-                # the way out, so the count goes to the incident log
-                # rather than being lost with the directory.
-                usage = None
-                try:
-                    usage = orrery_spend.parse_usage(
-                        role_config.provider, log_path.read_text(errors="replace")
-                    )
-                except OSError:
-                    pass
-                incident_log.record(
-                    "spend",
-                    program=PROGRAM_NAME,
-                    role=role_config,
-                    outcome=outcome,
-                    status=status,
-                    unknown=usage is None,
-                    **(usage["tokens"] if usage else {}),
-                )
-                return
-            # A receipted run's accounting goes to its attempt files,
-            # which the incident log never sees. Without a marker here,
-            # a dispatch that succeeded under `--receipts` leaves no
-            # trace that can cancel an older failure, so that failure
-            # would keep authorising a pre-emptive substitution for the
-            # rest of its window. Written before `handle_failed_attempt`
-            # records any authorising kind, exactly as `spend` is, so a
-            # failing run still cannot cancel its own failure.
+            # Every run's count goes to the incident log, which is what
+            # the allowance ceiling reads: a run's directory is removed
+            # on the way out, and a receipted run's attempt files sit in
+            # a per-task ledger the ceiling never opens. The one parse
+            # feeds the attempt record too, so their counts agree; for a
+            # partial figure they classify it differently on purpose: a
+            # counted floor here, unknown spend in the attempt record.
+            # Written before `handle_failed_attempt` records any
+            # authorising kind, so a failing run still cannot cancel its
+            # own failure.
+            measured = orrery_spend.measure_usage(role_config.provider, log_path)
+            usage = measured[0]
             incident_log.record(
-                "dispatch-closed",
+                "spend",
                 program=PROGRAM_NAME,
                 role=role_config,
                 outcome=outcome,
                 status=status,
+                unknown=usage is None,
+                partial=True if usage and usage.get("partial") else None,
+                **(usage["tokens"] if usage else {}),
             )
+            if receipts is None:
+                # A plan review, a final review, an ad-hoc delegation:
+                # no task, so the incident log is the only record.
+                return
             try:
                 orrery_spend.close_attempt(
                     receipts,
                     exit_status=status,
                     outcome=outcome,
-                    log_path=log_path,
+                    measured=measured,
                     duration_seconds=time.monotonic() - started,
                 )
             except OSError as exc:

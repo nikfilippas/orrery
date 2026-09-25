@@ -1789,6 +1789,11 @@ def delegated_command(
         str(settings_path),
         "--allowedTools",
         allowed_tools,
+        # --allowedTools only pre-approves; it removes nothing, so the
+        # tools that spawn a subagent stay offered unless denied, and a
+        # delegate never spawns an agent. Task is the tool's former name.
+        "--disallowedTools",
+        "Agent,Task",
         "--permission-mode",
         "plan" if role.read_only else "acceptEdits",
     ]

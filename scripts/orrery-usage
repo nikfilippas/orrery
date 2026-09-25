@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Aggregate Claude Code and Codex CLI token usage from local session logs.
+"""Aggregate Claude Code and Codex CLI token usage from local logs.
 
 Claude Code writes one JSONL transcript per session under
-~/.claude/projects, with per-message usage. The Codex CLI writes one
-rollout file per session under $CODEX_HOME/sessions, with a cumulative
-token count per session. Both are read here, never modified. The numbers
-are what the providers reported at the time and are an accounting of
-usage, not of billing.
+~/.claude/projects, or $CLAUDE_CONFIG_DIR/projects, with per-message
+usage, and one more per subagent beneath the session's own directory.
+The Codex CLI writes one rollout file per session under
+$CODEX_HOME/sessions, with a cumulative token count per session. Both
+are read here, never modified. The numbers are what the providers
+reported at the time and are an accounting of usage, not of billing.
 
-`--task` reports a different population entirely. Delegated runs are
-ephemeral by design, so they write no session file and appear in no
-global scan; their accounting comes from the attempt records the wrapper
-writes beside each run. The two views therefore cover disjoint sets of
-runs and must never be added together, which the report says out loud
-rather than leaving to be inferred.
+Delegated runs are ephemeral by design, so they write no session file
+and appear in neither; each writes a `spend` record to the incident log
+instead, which is reported as a separate delegated figure keyed exactly
+as the allowance ceiling keys it, so the two add up to what the ceiling
+measures. `--task` reports one task's runs from the attempt records the
+wrapper writes beside each run. Those runs write a `spend` record too,
+so a task's figures are part of the global delegated figure and must
+never be added to it, which the report says out loud rather than
+leaving to be inferred.
 """
 
 from __future__ import annotations
@@ -98,7 +102,10 @@ def read_claude(
     seen: set[tuple[str, str]] = set()
     files = 0
 
-    for path in sorted(root.glob("*/*.jsonl")):
+    # At any depth, as the allowance rollup reads them: subagent and
+    # workflow-agent transcripts nest beneath their session, and none of
+    # their responses is recorded in the parent transcript.
+    for path in sorted(root.rglob("*.jsonl")):
         try:
             handle = path.open(encoding="utf-8", errors="replace")
         except OSError:
@@ -232,6 +239,49 @@ def read_codex(
         bucket["events"] += 1
 
     return files
+
+
+def read_delegated(
+    since: datetime,
+    totals: dict[tuple[str, str], dict[str, int]],
+) -> tuple[int, int, int]:
+    """Aggregate delegated runs' `spend` records under the ceiling's keys.
+
+    Records carry the manifest's short model names where transcripts
+    carry API identifiers, so both go through the allowance's resolver
+    and its key for a record, and an endpoint-routed run lands under an
+    empty provider exactly as the ceiling files it. A run is unknown only
+    where its record says so; one whose provider reported zero usage is
+    counted and adds no row. Returns the runs counted, the runs unknown,
+    and how many counted runs are a partial floor.
+    """
+    from orrery_allowance import SPEND_FIELDS, model_resolver, spend_key, split_key
+    from orrery_incidents import read_events
+
+    resolve = model_resolver()
+    counted = unknown = partial = 0
+    for event in read_events(since=since):
+        if event.get("kind") != "spend":
+            continue
+        if event.get("unknown") is True:
+            unknown += 1
+            continue
+        counted += 1
+        if event.get("partial") is True:
+            partial += 1
+        counts = {name: integer(event.get(name)) for name in SPEND_FIELDS}
+        if not any(counts.values()):
+            # A run the provider reported as free: it adds nothing, and
+            # the ceiling files no row for it either.
+            continue
+        bucket = totals.setdefault(
+            split_key(spend_key(event, resolve)), new_bucket()
+        )
+        for name, value in counts.items():
+            bucket[name] += value
+            bucket["total"] += value
+        bucket["events"] += 1
+    return counted, unknown, partial
 
 
 def task_attempts(store: Path, task_id: str) -> tuple[list[dict], int]:
@@ -383,7 +433,10 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
                     "attempts": len(records),
                     "unknown_attempts": unknown,
                     "unattributed_runs": unattributed,
-                    "population": "delegated runs only; disjoint from the global scan",
+                    "population": (
+                        "this task's delegated runs; already part of the "
+                        "global delegated figure"
+                    ),
                     "usage": [
                         {
                             "role": role,
@@ -407,8 +460,9 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
 
     print(f"Token usage attributed to {task_id}")
     print(
-        "Delegated runs are ephemeral and write no session file, so these "
-        "figures are disjoint from the global scan and cannot be added to it."
+        "Every delegated run also records its spend in the incident log, so "
+        "these figures are part of the global delegated figure and cannot be "
+        "added to it."
     )
     print()
     print(f"{'ATTRIBUTION':14} {'RUNS':>5}  MEANING")
@@ -505,10 +559,16 @@ def main() -> int:
     since = parse_since(args.since)
     totals: dict[tuple[str, str], dict[str, int]] = {}
 
+    claude_config = os.environ.get("CLAUDE_CONFIG_DIR")
     claude_files = read_claude(
-        Path.home() / ".claude" / "projects", since, totals
+        (Path(claude_config) if claude_config else Path.home() / ".claude")
+        / "projects",
+        since,
+        totals,
     )
     codex_files = read_codex(codex_home() / "sessions", since, totals)
+    delegated: dict[tuple[str, str], dict[str, int]] = {}
+    delegated_runs, unknown_runs, partial_runs = read_delegated(since, delegated)
 
     if args.as_json:
         print(
@@ -520,6 +580,17 @@ def main() -> int:
                         {"provider": provider, "model": model, **bucket}
                         for (provider, model), bucket in sorted(totals.items())
                     ],
+                    "delegated": {
+                        "runs": delegated_runs,
+                        "unknown_runs": unknown_runs,
+                        "partial_runs": partial_runs,
+                        "usage": [
+                            {"provider": provider or None, "model": model, **bucket}
+                            for (provider, model), bucket in sorted(
+                                delegated.items()
+                            )
+                        ],
+                    },
                 },
                 indent=2,
             )
@@ -529,8 +600,35 @@ def main() -> int:
     print(f"Token usage since {since:%Y-%m-%d %H:%M} UTC")
     print(
         f"Sources: {claude_files} Claude transcript(s), "
-        f"{codex_files} Codex session(s)\n"
+        f"{codex_files} Codex session(s), "
+        f"{delegated_runs + unknown_runs} delegated run(s)\n"
     )
+    print_table(totals)
+
+    print(
+        "\nDelegated runs, from the spend record each writes on the way out."
+        "\nThey keep no session file, so they are not in the table above; the"
+        "\nallowance ceiling counts both. Runs routed at an endpoint are listed"
+        "\nas `endpoint` and count towards no provider's ceiling.\n"
+    )
+    print_table({
+        (provider or "endpoint", model): bucket
+        for (provider, model), bucket in delegated.items()
+    })
+    if unknown_runs:
+        print(
+            f"\n{unknown_runs} delegated run(s) started and their usage was not "
+            "recovered, so this figure is a floor."
+        )
+    if partial_runs:
+        print(
+            f"{partial_runs} delegated run(s) ended without a result and were "
+            "counted from their messages, which understates their output."
+        )
+    return 0
+
+
+def print_table(totals: dict[tuple[str, str], dict[str, int]]) -> None:
     header = (
         f"{'PROVIDER':10} {'MODEL':26} {'FRESH IN':>12} {'CACHE RD':>12} "
         f"{'CACHE WR':>12} {'OUTPUT':>10} {'TOTAL':>14} {'EVENTS':>7}"
@@ -555,7 +653,6 @@ def main() -> int:
         f"{grand['cache_read']:>12,} {grand['cache_write']:>12,} "
         f"{grand['output']:>10,} {grand['total']:>14,} {grand['events']:>7,}"
     )
-    return 0
 
 
 if __name__ == "__main__":

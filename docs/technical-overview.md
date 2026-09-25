@@ -1145,15 +1145,18 @@ orrery-usage --task T-1 --money
 The first form reads local Claude and Codex session logs, deduplicates
 replayed messages, and reports fresh input, cache reads, cache writes,
 and output by provider and model. It does not access the network.
+Delegated runs are ephemeral by design and write no session file, so
+they are reported separately, from the `spend` record each writes to
+the incident log, under the keys the allowance ceiling uses.
 
-`--task` reports a different population, and the two must never be
-added together. Delegated runs are ephemeral by design and write no
-session file, so they appear in no global scan; their accounting comes
-from the attempt record the wrapper opens beside each run before it
-starts the provider and completes after it exits. That record names the
-run, the role, and the provider, model and endpoint that actually ran,
-which is not always the configured one: a run that fell over to another
-provider is attributed to the model that answered.
+`--task` reports one task's delegated runs, which are already part of
+that delegated figure, so the two must never be added together. Its
+accounting comes from the attempt record the wrapper opens beside each
+run before it starts the provider and completes after it exits, from
+the same parse of the provider's log as the `spend` record. That record
+names the run, the role, and the provider, model and endpoint that
+actually ran, which is not always the configured one: a run that fell
+over to another provider is attributed to the model that answered.
 
 Three numbers are reported rather than one. Attributed tokens come from
 attempts whose usage parsed. Unknown attempts are runs that started and

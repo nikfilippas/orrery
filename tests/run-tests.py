@@ -4552,6 +4552,15 @@ def test_every_role_is_provider_neutral() -> None:
                             f"{role_id} has the wrong delegated tool "
                             f"declaration: {allowed}",
                         )
+                        # Allowing tools removes none, so the ones that
+                        # spawn a subagent must be denied outright.
+                        denied = command[
+                            command.index("--disallowedTools") + 1
+                        ].split(",")
+                        require(
+                            {"Agent", "Task"} <= set(denied),
+                            f"{role_id} can spawn a subagent: {command}",
+                        )
     finally:
         runtime_module.shutil.which = original_which
 
@@ -8331,6 +8340,7 @@ def test_usage_tracker() -> None:
         environment = os.environ.copy()
         environment["HOME"] = str(home)
         environment["CODEX_HOME"] = str(home / "codex")
+        environment.pop("CLAUDE_CONFIG_DIR", None)
 
         result = subprocess.run(
             [
@@ -14986,10 +14996,9 @@ def test_d1_failure_is_current_and_local() -> None:
                 "consent bookkeeping cancelled the failure it follows",
             )
 
-            # dispatch-closed is what a receipted run leaves behind:
-            # its accounting goes to attempt files the incident log
-            # never sees, so without it a receipted success could not
-            # cancel an older failure.
+            # spend is what every run leaves behind, receipted or not;
+            # dispatch-closed is what a receipted run left before that,
+            # and one still in the window must keep closing its failure.
             for cancelling in ("spend", "transient-retry", "dispatch-closed"):
                 reset()
                 write_incident(
@@ -16599,6 +16608,579 @@ def test_d3_rollup_opens_only_changed_files() -> None:
                 == 60,
                 "the incremental read lost or repeated spend",
             )
+
+
+def nested_transcripts(projects: Path) -> tuple[Path, Path]:
+    """A session's subagent and workflow-agent transcript locations.
+
+    The shapes Claude Code writes: a subagent beneath the session's own
+    directory, and a workflow's agents one level further down.
+    """
+    subagents = projects / "session" / "subagents"
+    workflow = subagents / "workflows" / "wf_fixture"
+    workflow.mkdir(parents=True)
+    return subagents / "agent-a1.jsonl", workflow / "agent-b1.jsonl"
+
+
+def record_spend(
+    tokens: int, *, model: str = "opus", role: Any = None, **fields: Any
+) -> None:
+    """One delegated run's `spend` record, through the wrapper's writer.
+
+    Written by `orrery_incidents.record` itself, so the fields and the
+    run identity are the ones a real run leaves. The pause keeps two
+    records from one process on distinct millisecond timestamps, which
+    a real retry, separated by a whole provider run, always is.
+    """
+    quarter = tokens // 4
+    incidents_module.record(
+        "spend",
+        program="orrery-agent",
+        role=role or anthropic_role("implementer", model),
+        outcome="completed",
+        status=0,
+        unknown=False,
+        fresh_in=tokens - 3 * quarter,
+        cache_read=quarter,
+        cache_write=quarter,
+        output=quarter,
+        **fields,
+    )
+    time.sleep(0.01)
+
+
+@test("subagent and workflow-agent transcripts are counted")
+def test_d3_nested_transcripts_are_counted() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [transcript_response("msg_n1", "req_n1", "claude-opus-5", 100)],
+        )
+        subagent, workflow_agent = nested_transcripts(projects)
+        write_transcript(
+            subagent,
+            [transcript_response("msg_n2", "req_n2", "claude-opus-5", 20)],
+        )
+        write_transcript(
+            workflow_agent,
+            [transcript_response("msg_n3", "req_n3", "claude-fable-5-1", 3)],
+        )
+        with user_configuration(allowances={}) as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+        spend = allowance_module.window_spend("anthropic", 7, rollup=rollup)
+        require(
+            spend["total"] == 123
+            and spend["models"] == {"opus": 120, "fable": 3},
+            f"a nested transcript was not counted: {spend}",
+        )
+
+
+@test("a response in both a parent and a subagent transcript counts once")
+def test_d3_parent_and_subagent_response_counts_once() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        shared = transcript_response("msg_s1", "req_s1", "claude-opus-5", 40)
+        write_transcript(
+            projects / "session.jsonl",
+            [shared, transcript_response("msg_s2", "req_s2", "claude-opus-5", 5)],
+        )
+        subagent, _workflow_agent = nested_transcripts(projects)
+        write_transcript(subagent, [shared])
+        with user_configuration(allowances={}) as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+            total = allowance_module.window_spend(
+                "anthropic", 7, rollup=rollup
+            )["total"]
+            require(total == 45, f"the shared response was not counted once: {total}")
+            # Appended to later, after the parent's copy was counted.
+            subagent.write_text(
+                subagent.read_text()
+                + transcript_response("msg_s2", "req_s2", "claude-opus-5", 5)
+                + "\n"
+            )
+            rollup = allowance_module.refresh(manifest=manifest)
+        total = allowance_module.window_spend("anthropic", 7, rollup=rollup)["total"]
+        require(total == 45, f"a later duplicate was counted again: {total}")
+
+
+@test("a delegated run's spend record counts once across log rotation")
+def test_d3_spend_record_counts_once_across_rotation() -> None:
+    saved_rotate = incidents_module.ROTATE_BYTES
+    with standing_stores(), transcript_roots():
+        with user_configuration(allowances={}) as manifest:
+
+            def measured() -> int:
+                rollup = allowance_module.refresh(manifest=manifest)
+                return allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+
+            try:
+                record_spend(100)
+                require(measured() == 100, "a spend record was not counted")
+                require(
+                    measured() == 100, "a second refresh counted it again"
+                )
+                # A retry in the same process: same run id, a new record.
+                record_spend(200)
+                incidents_module.ROTATE_BYTES = 0
+                # This write rotates the log holding both earlier records
+                # to the previous file before appending to a fresh one.
+                record_spend(300)
+                incidents_module.ROTATE_BYTES = saved_rotate
+                require(
+                    incidents_module.previous_path().exists(),
+                    "the fixture did not rotate the incident log",
+                )
+                total = measured()
+                require(
+                    total == 600,
+                    f"rotation lost or repeated a spend record: {total}",
+                )
+                require(measured() == 600, "an unchanged log counted again")
+                # A second rotation replaces the previous file outright.
+                incidents_module.ROTATE_BYTES = 0
+                record_spend(400)
+                incidents_module.ROTATE_BYTES = saved_rotate
+                total = measured()
+                require(
+                    total == 1000,
+                    f"a second rotation lost or repeated spend: {total}",
+                )
+                # Unrecovered usage carries no counts, and a run routed
+                # at an endpoint is kept off the first-party provider.
+                incidents_module.record(
+                    "spend",
+                    program="orrery-agent",
+                    role=anthropic_role("implementer"),
+                    outcome="no-result",
+                    unknown=True,
+                )
+                record_spend(
+                    50,
+                    role=dataclasses.replace(
+                        anthropic_role("implementer"),
+                        endpoint=runtime_module.Endpoint(
+                            "fixture-endpoint",
+                            "Fixture endpoint",
+                            "anthropic",
+                            "https://example.test",
+                        ),
+                    ),
+                )
+                rollup = allowance_module.refresh(manifest=manifest)
+            finally:
+                incidents_module.ROTATE_BYTES = saved_rotate
+        require(
+            allowance_module.window_spend("anthropic", 7, rollup=rollup)["total"]
+            == 1000,
+            "an unknown or endpoint-routed run reached the allowance",
+        )
+        keys = {
+            key: total
+            for entry in rollup["hours"].values()
+            for key, total in entry["spend"].items()
+        }
+        require(
+            keys == {"anthropic/opus": 1000, "/opus": 50},
+            f"delegated spend landed under the wrong keys: {keys}",
+        )
+
+
+@test("the ceiling and the principal crossing both see delegated spend")
+def test_d3_ceiling_sees_delegated_spend() -> None:
+    with standing_stores(), transcript_roots():
+        record_spend(1000)
+        with user_configuration(
+            allowances={"anthropic": {"tokens": 1000, "window_days": 7}}
+        ) as manifest:
+            refusal = allowance_module.ceiling_refusal(
+                anthropic_role(), manifest=manifest
+            )
+            crossing = allowance_module.principal_crossing(
+                "claude-opus-5", manifest=manifest
+            )
+        require(
+            refusal is not None and "1,000 tokens" in refusal,
+            f"the dispatch ceiling missed delegated spend: {refusal}",
+        )
+        require(
+            crossing is not None
+            and crossing.provider == "anthropic"
+            and crossing.total == 1000,
+            f"the principal crossing missed delegated spend: {crossing}",
+        )
+
+
+@test("orrery-usage agrees with the rollup's per-model totals")
+def test_d3_usage_agrees_with_the_rollup() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        shared = transcript_response("msg_u1", "req_u1", "claude-opus-5", 400)
+        write_transcript(
+            projects / "session.jsonl",
+            [
+                *transcript_noise(),
+                shared,
+                transcript_response("msg_u2", "req_u2", "claude-fable-5-1", 80),
+            ],
+        )
+        subagent, workflow_agent = nested_transcripts(projects)
+        write_transcript(
+            subagent,
+            [shared, transcript_response("msg_u3", "req_u3", "claude-opus-5", 12)],
+        )
+        write_transcript(
+            workflow_agent,
+            [transcript_response("msg_u4", "req_u4", "claude-fable-5-1", 8)],
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(KIT_DIR / "scripts" / "orrery-usage"),
+                "--since",
+                "1",
+                "--json",
+            ],
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        require(result.returncode == 0, f"orrery-usage failed: {result.stderr}")
+        with user_configuration(allowances={}) as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+            resolve = allowance_module.model_resolver(manifest)
+        reported: dict[str, int] = {}
+        for row in json.loads(result.stdout)["usage"]:
+            key = resolve(row["model"])
+            reported[key] = reported.get(key, 0) + row["total"]
+        measured: dict[str, int] = {}
+        for entry in rollup["hours"].values():
+            for key, total in entry["spend"].items():
+                measured[key] = measured.get(key, 0) + total
+        require(
+            reported == measured == {"anthropic/opus": 412, "anthropic/fable": 88},
+            f"orrery-usage and the rollup disagree: {reported} != {measured}",
+        )
+
+
+@test("an incident log under a reused inode is read from its start")
+def test_d3_reused_inode_is_read_again() -> None:
+    with standing_stores(), transcript_roots():
+        with user_configuration(allowances={}) as manifest:
+
+            def measured() -> int:
+                rollup = allowance_module.refresh(manifest=manifest)
+                return allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+
+            record_spend(100)
+            require(measured() == 100, "a spend record was not counted")
+            # Two rotations between refreshes free the recorded file's
+            # inode, and a new log is created on it. The inode is forced
+            # here, since a filesystem reuses one only when it chooses.
+            live = incidents_module.store_path()
+            live.unlink()
+            record_spend(200)
+            record_spend(300)
+            path = allowance_module.rollup_path()
+            rollup = allowance_module.read_rollup(path)
+            stored = rollup["sources"][str(live)]
+            require(
+                stored["offset"] < live.stat().st_size and "head" in stored,
+                f"the fixture cannot show a skipped prefix: {stored}",
+            )
+            stored["inode"] = live.stat().st_ino
+            allowance_module.write_rollup(rollup, path)
+            total = measured()
+        require(
+            total == 600,
+            f"a new file under a reused inode lost its first bytes: {total}",
+        )
+
+
+@test("an incident log under a reused inode is read even at the old size")
+def test_d3_reused_inode_equal_size_is_read() -> None:
+    with standing_stores(), transcript_roots():
+        with user_configuration(allowances={}) as manifest:
+
+            def measured() -> int:
+                rollup = allowance_module.refresh(manifest=manifest)
+                return allowance_module.window_spend(
+                    "anthropic", 7, rollup=rollup
+                )["total"]
+
+            record_spend(100)
+            require(measured() == 100, "a spend record was not counted")
+            # A new log on the freed inode that happens to be exactly as
+            # long as the offset recorded for the old one.
+            live = incidents_module.store_path()
+            live.unlink()
+            record_spend(200)
+            path = allowance_module.rollup_path()
+            rollup = allowance_module.read_rollup(path)
+            stored = rollup["sources"][str(live)]
+            require("head" in stored, f"no head was recorded: {stored}")
+            stored["inode"] = live.stat().st_ino
+            stored["offset"] = live.stat().st_size
+            allowance_module.write_rollup(rollup, path)
+            total = measured()
+        require(
+            total == 300,
+            f"a same-sized file under a reused inode was never opened: {total}",
+        )
+
+
+@test("orrery-usage calls a delegated run unknown only where it says so")
+def test_d3_usage_zero_spend_is_not_unknown() -> None:
+    with standing_stores(), transcript_roots():
+        record_spend(400)
+        # A result object that reported zero usage: known, and free.
+        incidents_module.record(
+            "spend",
+            program="orrery-agent",
+            role=anthropic_role("implementer"),
+            outcome="completed",
+            status=0,
+            unknown=False,
+            fresh_in=0, cache_read=0, cache_write=0, output=0,
+        )
+        with user_configuration(allowances={}):
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(KIT_DIR / "scripts" / "orrery-usage"),
+                    "--since",
+                    "1",
+                    "--json",
+                ],
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        require(result.returncode == 0, f"orrery-usage failed: {result.stderr}")
+        delegated = json.loads(result.stdout)["delegated"]
+        require(
+            delegated["runs"] == 2
+            and delegated["unknown_runs"] == 0
+            and [(row["model"], row["total"]) for row in delegated["usage"]]
+            == [("opus", 400)],
+            f"a zero-usage run was reported as unknown: {delegated}",
+        )
+
+
+@test("orrery-usage reports delegated spend as the ceiling keys it")
+def test_d3_usage_reports_delegated_spend() -> None:
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [transcript_response("msg_d1", "req_d1", "claude-opus-5", 400)],
+        )
+        record_spend(1000)
+        record_spend(200, model="fable")
+        record_spend(
+            50,
+            role=dataclasses.replace(
+                anthropic_role("implementer"),
+                endpoint=runtime_module.Endpoint(
+                    "fixture-endpoint",
+                    "Fixture endpoint",
+                    "anthropic",
+                    "https://example.test",
+                ),
+            ),
+        )
+        incidents_module.record(
+            "spend",
+            program="orrery-agent",
+            role=anthropic_role("implementer"),
+            outcome="no-result",
+            unknown=True,
+        )
+        with user_configuration(allowances={}) as manifest:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(KIT_DIR / "scripts" / "orrery-usage"),
+                    "--since",
+                    "1",
+                    "--json",
+                ],
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            text = subprocess.run(
+                [sys.executable, str(KIT_DIR / "scripts" / "orrery-usage")],
+                env=os.environ.copy(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            rollup = allowance_module.refresh(manifest=manifest)
+            resolve = allowance_module.model_resolver(manifest)
+        require(result.returncode == 0, f"orrery-usage failed: {result.stderr}")
+        report = json.loads(result.stdout)
+        delegated = report["delegated"]
+        rows = {
+            (row["provider"], row["model"]): row["total"]
+            for row in delegated["usage"]
+        }
+        require(
+            rows
+            == {("anthropic", "opus"): 1000, ("anthropic", "fable"): 200,
+                (None, "opus"): 50}
+            and delegated["runs"] == 3
+            and delegated["unknown_runs"] == 1,
+            f"the delegated figure is wrong: {delegated}",
+        )
+        reported: dict[str, int] = {}
+        for row in report["usage"]:
+            key = resolve(row["model"])
+            reported[key] = reported.get(key, 0) + row["total"]
+        for row in delegated["usage"]:
+            key = f"{row['provider'] or ''}/{row['model']}"
+            reported[key] = reported.get(key, 0) + row["total"]
+        measured: dict[str, int] = {}
+        for entry in rollup["hours"].values():
+            for key, total in entry["spend"].items():
+                measured[key] = measured.get(key, 0) + total
+        require(
+            reported == measured,
+            f"orrery-usage does not add up to the ceiling: {reported} != {measured}",
+        )
+        require(
+            text.returncode == 0
+            and "1 delegated run(s) started and their usage was not recovered"
+            in text.stdout
+            and re.search(r"^endpoint\s+opus\s", text.stdout, re.MULTILINE),
+            f"the text report hides the delegated figure: {text.stdout}",
+        )
+
+
+@test("a Claude run that died before its result is counted from its messages")
+def test_claude_partial_usage_from_messages() -> None:
+    lines = (
+        KIT_DIR / "tests" / "streams" / "claude-implementer-genuine.jsonl"
+    ).read_text().splitlines()
+    complete = spend_module.parse_claude_usage("\n".join(lines))
+    cut = [line for line in lines if json.loads(line).get("type") != "result"]
+    require(len(cut) < len(lines), "the fixture carries no result object")
+    partial = spend_module.parse_claude_usage("\n".join(cut))
+    require(
+        complete is not None
+        and "partial" not in complete
+        and partial is not None
+        and partial["partial"] is True
+        and partial["provider_cost_usd"] is None,
+        f"a run without its result was not recovered as partial: {partial}",
+    )
+    # Each message is repeated per content block; counted once, the
+    # input classes are exactly the result's and the output a floor.
+    for name in ("fresh_in", "cache_read", "cache_write"):
+        require(
+            partial["tokens"][name] == complete["tokens"][name],
+            f"{name} was not counted once per message: {partial['tokens']}",
+        )
+    require(
+        0 < partial["tokens"]["output"] <= complete["tokens"]["output"],
+        f"the partial output is not a floor: {partial['tokens']}",
+    )
+    # A run that streamed no message at all spent an unknown amount.
+    empty = [line for line in cut if json.loads(line).get("type") != "assistant"]
+    require(
+        spend_module.parse_claude_usage("\n".join(empty)) is None,
+        "a run with no messages was counted as zero rather than unknown",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        receipts = Path(directory)
+        log = receipts / "agent.log"
+        log.write_text("\n".join(cut) + "\n")
+        spend_module.open_attempt(
+            receipts, run_id="p", role="implementer", provider="anthropic",
+            model="sonnet", endpoint=None, thinking=None,
+            access="workspace-write", fallback_from=None,
+        )
+        record = spend_module.close_attempt(
+            receipts, exit_status=1, outcome="no-result",
+            measured=spend_module.measure_usage("anthropic", log),
+        )
+        # A floor is not the run's usage: the ledger must read it as
+        # unknown, with the floor kept beside the named gap.
+        require(
+            record is not None
+            and record["usage"] is None
+            and record["usage_floor"] == partial["tokens"]
+            and record["usage_gap"]
+            == "the run ended before its result; only a floor was recovered",
+            f"the attempt record passed a floor off as a figure: {record}",
+        )
+        log.write_text("\n".join(empty) + "\n")
+        require(
+            spend_module.measure_usage("anthropic", log)
+            == (None, "provider output carried no usage record"),
+            "an empty run was not a named gap",
+        )
+
+
+@test("a receipted run writes the one spend record its attempt record agrees with")
+def test_receipted_run_records_spend() -> None:
+    """A task dispatch passes --receipts, and wrote only its attempt
+    record and `dispatch-closed`, so the allowance ceiling, which reads
+    `spend` alone, never saw what a task spent."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "state"
+        state.mkdir()
+        receipts = Path(directory) / "receipts"
+        receipts.mkdir()
+        environment = review_environment("success", standing_state=state)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, str(REVIEW_SCRIPT), "--role", "reviewer",
+                    "--timeout", "60", "--receipts", str(receipts),
+                    "--", "prompt",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=environment, timeout=120, check=False,
+            )
+            require(result.returncode == 0, f"the run failed: {result.stderr[-300:]}")
+            events = [
+                json.loads(line)
+                for path in state.rglob("*.jsonl")
+                for line in path.read_text().splitlines()
+                if line.strip()
+            ]
+            attempt = json.loads((receipts / "attempt.json").read_text())
+        finally:
+            remove_helper_state(environment)
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        spend = [event for event in events if event.get("kind") == "spend"]
+        require(
+            not any(event.get("kind") == "dispatch-closed" for event in events),
+            f"a receipted run still wrote dispatch-closed: {events}",
+        )
+        require(
+            len(spend) == 1
+            and spend[0]["unknown"] is False
+            and isinstance(attempt["usage"], dict)
+            and all(
+                spend[0][name] == attempt["usage"][name]
+                for name in spend_module.TOKEN_CLASSES
+            ),
+            f"the spend record and the attempt record disagree: "
+            f"{spend} {attempt.get('usage')}",
+        )
 
 
 @test("the doctor warns when an adopted repository has no allowance")
@@ -25739,7 +26321,7 @@ def test_usage_per_task() -> None:
             require(
                 report.returncode == 0
                 and "1,000" in report.stdout
-                and "disjoint from the global scan" in report.stdout,
+                and "part of the global delegated figure" in report.stdout,
                 f"the per-task report is wrong: {report.stdout[-400:]} "
                 f"{report.stderr[-200:]}",
             )
@@ -25851,6 +26433,110 @@ def test_provider_reported_cost_needs_no_table() -> None:
                 abs(payload["computed_cost_usd"] - 0.0125) < 1e-12
                 and payload["priced_by"] == ["the provider's own figure"],
                 f"the provider's own cost was not used: {payload}",
+            )
+        finally:
+            discard_task_environment(environment)
+
+
+@test("a partial Claude figure is unknown spend wherever the ledger is read")
+def test_partial_claude_figure_is_unknown_spend() -> None:
+    """A floor recovered from messages is not a run's usage.
+
+    Written as usage, it read as a complete figure: the task ceiling and
+    pickup's fail-closed rule stopped refusing, `--task` called the run
+    attributed, and `--money` refused the whole task instead of pricing
+    the rest.
+    """
+    lines = (
+        KIT_DIR / "tests" / "streams" / "claude-implementer-genuine.jsonl"
+    ).read_text().splitlines()
+    cut = [line for line in lines if json.loads(line).get("type") != "result"]
+    gap = "the run ended before its result; only a floor was recovered"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        init_task_repository(root)
+        create_dispatch_task(root, {
+            **dispatch_contract(), "budget": {"tokens": 10**9},
+        })
+        environment = task_review_environment("edit")
+        try:
+            require(
+                run_task(root, "run", "T-1", environment=environment).returncode == 0,
+                "the dispatch did not complete",
+            )
+            attempt = dispatch_attempt(root)
+            good = json.loads((attempt / "attempt.json").read_text())
+            good["provider_cost_usd"] = 0.0125
+            (attempt / "attempt.json").write_text(json.dumps(good))
+
+            # A second Claude run for the task that stalled after some
+            # turns, closed exactly as the wrapper closes one.
+            stalled = root / ".orrery" / "reviews" / "T-1" / "1"
+            stalled.mkdir(parents=True)
+            log = Path(directory) / "agent.log"
+            log.write_text("\n".join(cut) + "\n")
+            spend_module.open_attempt(
+                stalled, run_id="stalled", role="reviewer", provider="anthropic",
+                model="sonnet", endpoint=None, thinking=None,
+                access="read-only", fallback_from=None,
+            )
+            partial = spend_module.close_attempt(
+                stalled, exit_status=114, outcome="stalled",
+                measured=spend_module.measure_usage("anthropic", log),
+            )
+            require(
+                partial is not None
+                and partial["usage"] is None
+                and partial["usage_gap"] == gap
+                and partial["usage_floor"]["fresh_in"] > 0,
+                f"the stalled run's record is wrong: {partial}",
+            )
+            spend = spend_module.spend_of([good, partial])
+            require(
+                spend["unknown"] is True
+                and spend["total"] == spend_module.spend_of([good])["total"]
+                and any(gap in entry for entry in spend["gaps"]),
+                f"a floor was summed as a known figure: {spend}",
+            )
+
+            # Carried into the ledger as the runner carries any spend.
+            ledger = root / ".orrery" / "ledger" / "T-1.jsonl"
+            records = [json.loads(line) for line in ledger.read_text().splitlines()]
+            carrier = [record for record in records if "spend" in record][-1]
+            carrier["spend"] = spend
+            ledger.write_text("".join(json.dumps(record) + "\n" for record in records))
+            conflict = task_module.budget_conflict(
+                {"budget": {"tokens": 10**9}}, task_records(root)
+            )
+            require(
+                conflict is not None and conflict[0] == "spend-unknown",
+                f"the task ceiling read a floor as known spend: {conflict}",
+            )
+            pickup_module = load_script(PICKUP_SCRIPT, "kit_orrery_pickup_partial")
+            _tokens, gaps = pickup_module.ledger_spend_after(root, "T-1", 0)
+            require(
+                any(gap in entry for entry in gaps),
+                f"pickup's fail-closed rule saw no gap: {gaps}",
+            )
+
+            report = run_usage(root, "--task", "T-1", environment=environment)
+            require(
+                report.returncode == 0
+                and "attributed         1" in report.stdout
+                and "unknown            1" in report.stdout
+                and "a floor" in report.stdout,
+                f"--task counted a floor as attributed: {report.stdout}",
+            )
+            priced = run_usage(
+                root, "--task", "T-1", "--money", "--json", environment=environment
+            )
+            require(priced.returncode == 0, f"pricing refused: {priced.stderr[-300:]}")
+            payload = json.loads(priced.stdout)
+            require(
+                abs(payload["computed_cost_usd"] - 0.0125) < 1e-12
+                and payload["unknown_attempts"] == 1
+                and payload["attempts"] == 2,
+                f"--money did not price the rest and list the run: {payload}",
             )
         finally:
             discard_task_environment(environment)

@@ -421,7 +421,7 @@ a real figure looks like this:
 Cache reads dominate real figures by an order of magnitude, so a number
 copied from a provider's own headline usage figure will mean something
 quite different from this one. Set it from `orrery-usage` instead, which
-is the same measurement for Anthropic.
+measures Anthropic's session logs the same way.
 
 For OpenAI it is not, and the difference is worth knowing before you set
 a number from it. A Codex rollout records a cumulative session total and
@@ -437,12 +437,26 @@ is account-wide: Anthropic reports one five-hour and one seven-day window
 for the whole account with no per-model breakdown, so every Anthropic
 model's spend sums into the one bucket.
 
-Spend is measured from the local session logs, the Claude transcripts and
-Codex rollout files this machine has written, and folded into one rollup
-beside the incident store. Delegated runs keep no session file at all, so
-they are absent by construction and are accounted for by the task ledger
-instead. The figure is therefore a local estimate of interactive spend and
-not the provider's billing.
+Spend is measured from the local session logs, the Claude transcripts
+(subagent and workflow-agent transcripts included) and Codex rollout
+files this machine has written, and folded into one rollup beside the
+incident store. Delegated runs keep no session file at all, so their
+spend is read from the `spend` record `orrery-agent` writes to the
+incident log when each run ends, counted once per run however the log
+rotates. A run dispatched by `orrery-task` writes that record too, beside
+its task's ledger entry, so it is counted like any other. `orrery-usage`
+reports those records as a separate delegated figure, keyed as the
+ceiling keys them, so its session table and its delegated table add up
+to what the ceiling measures. A run that died before reporting its usage
+is counted from the messages it did stream, which understates its
+output; one that streamed none adds nothing, and `orrery-usage` says how
+many there were. The figure is therefore a local estimate of this
+machine's spend and not the provider's billing.
+
+The measured figure now includes subagent and delegated spend, which it
+once omitted, so a ceiling calibrated on the old interactive-only figure
+should be re-derived from `orrery-usage`, above all under
+`on_exceeded: block`, where the higher figure can stop a principal turn.
 
 Once a provider's window spend reaches its ceiling, `orrery-agent` refuses
 to start any role on that provider and exits 78, naming the measured

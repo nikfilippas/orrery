@@ -130,20 +130,63 @@ def _json_objects(text: str) -> list[dict[str, Any]]:
     return found
 
 
+def _claude_message_usage(
+    objects: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """What a Claude run that never finished spent, as far as is known.
+
+    The stream repeats an assistant message once per content block, so
+    messages are counted once by id, the last copy winning. The input
+    and cache classes match the result object exactly (measured on a
+    recorded stream), but a message's output count is the one it was
+    started with, so the output is understated. Hence `partial`: this
+    is a floor, never the figure a result object would have carried.
+    """
+    usages: dict[str, dict[str, Any]] = {}
+    models: set[str] = set()
+    for event in objects:
+        message = event.get("message")
+        if event.get("type") != "assistant" or not isinstance(message, dict):
+            continue
+        identity, usage = message.get("id"), message.get("usage")
+        if not isinstance(identity, str) or not isinstance(usage, dict):
+            continue
+        usages[identity] = usage
+        if isinstance(message.get("model"), str):
+            models.add(message["model"])
+    if not usages:
+        return None
+    tokens = empty_tokens()
+    for usage in usages.values():
+        if _accumulate(tokens, usage, CLAUDE_FLAT_FIELDS) is None:
+            return None
+    return {
+        "tokens": tokens,
+        "provider_cost_usd": None,
+        "models": sorted(models),
+        "partial": True,
+    }
+
+
 def parse_claude_usage(text: str) -> dict[str, Any] | None:
-    """Usage from a `claude --output-format json` run.
+    """Usage from a `claude --output-format stream-json` run.
 
     The per-model breakdown is preferred because it includes subagent
-    spend, which the top-level `usage` field omits. A delegated run
-    cannot spawn subagents today, but reading the narrower field would
-    silently under-report the moment one can.
+    spend, which the top-level `usage` field omits. A delegated run is
+    denied the tools that spawn subagents, but reading the narrower
+    field would silently under-report the moment one can.
+
+    A run that died before its result object is summed from its
+    assistant messages instead and marked partial. A run with neither
+    stays unknown.
     """
+    objects = _json_objects(text)
     result = None
-    for candidate in _json_objects(text):
+    for candidate in objects:
         if "usage" in candidate or "total_cost_usd" in candidate:
             result = candidate
     if result is None:
-        return None
+        return _claude_message_usage(objects)
 
     tokens = empty_tokens()
     models: list[str] = []
@@ -217,6 +260,29 @@ def parse_usage(provider: str, text: str) -> dict[str, Any] | None:
     if provider == "openai":
         return parse_codex_usage(text)
     return None
+
+
+def measure_usage(
+    provider: str, log_path: Path | None
+) -> tuple[dict[str, Any] | None, str | None]:
+    """A run's usage from its provider log, or None and the named gap.
+
+    One parse serves both the incident log's `spend` record and the
+    attempt record, so their counts for one run agree. A partial figure is
+    classified differently on purpose: the incident log counts it as a
+    floor for the account ceiling, and the attempt record calls it unknown
+    so every fail-closed rule on unknown spend still fires.
+    """
+    if log_path is None:
+        return None, "no provider log was kept"
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError as exc:
+        return None, f"provider log unreadable: {exc.strerror or exc}"
+    usage = parse_usage(provider, text)
+    if usage is None:
+        return None, "provider output carried no usage record"
+    return usage, None
 
 
 def _write(path: Path, payload: dict[str, Any]) -> None:
@@ -321,10 +387,10 @@ def close_attempt(
     *,
     exit_status: int | None,
     outcome: str,
-    log_path: Path | None,
+    measured: tuple[dict[str, Any] | None, str | None],
     duration_seconds: float | None = None,
 ) -> dict[str, Any] | None:
-    """Complete the open record, parsing usage from the provider's log.
+    """Complete the open record with the usage `measure_usage` found.
 
     A log that cannot be parsed leaves a named gap. A zero would be
     worse than a gap: a ceiling reading a missing measurement as free
@@ -338,20 +404,15 @@ def close_attempt(
     if not isinstance(record, dict):
         return None
 
-    usage: dict[str, Any] | None = None
-    gap: str | None = None
-    if log_path is None:
-        gap = "no provider log was kept"
-    else:
-        try:
-            text = log_path.read_text(errors="replace")
-        except OSError as exc:
-            gap = f"provider log unreadable: {exc.strerror or exc}"
-        else:
-            usage = parse_usage(str(record.get("provider")), text)
-            if usage is None:
-                gap = "provider output carried no usage record"
-
+    usage, gap = measured
+    # A floor is not the run's usage. Written as usage it would read as a
+    # complete figure to every consumer of the ledger, so the fail-closed
+    # rules that stop on unknown spend would stop firing; it is kept
+    # beside the gap instead, for a reader that wants the lower bound.
+    if usage and usage.get("partial"):
+        record["usage_floor"] = usage["tokens"]
+        usage = None
+        gap = "the run ended before its result; only a floor was recovered"
     record["ended"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     # The wrapper's own measurement, written after the child is dead and
     # therefore beyond its reach.

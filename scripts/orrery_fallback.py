@@ -77,12 +77,16 @@ AUTHORISING_FAILURE_KINDS = frozenset(
     }
 )
 
-# What closes a standing failure. A run that succeeded writes `spend`
-# when it carries no receipts, and a transient failure that was retried
-# and then succeeded leaves only `transient-retry`, because a receipted
-# completion writes nothing to this log at all. The consent bookkeeping
-# kinds a failure is always followed by are neither: they are neutral,
-# so a rerun after a documented consent stop still finds its failure.
+# What closes a standing failure. A run that reached the provider writes
+# `spend` on the way out, receipted or not, before any failure it ends in
+# is recorded. The exception is a timed-out or stalled run whose unit
+# would not stop: it may still be spending, so it writes no `spend` and
+# its failure stands alone. A transient failure that was retried leaves
+# `transient-retry`. `dispatch-closed` is what a receipted run wrote
+# before it wrote `spend`, kept so such a record still in the window
+# closes what it closed then. The consent bookkeeping kinds a failure is
+# always followed by are neither: they are neutral, so a rerun after a
+# documented consent stop still finds its failure.
 CANCELLING_INCIDENT_KINDS = frozenset(
     {"spend", "transient-retry", "dispatch-closed"}
 )
