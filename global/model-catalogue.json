@@ -1,10 +1,10 @@
 {
-  "note": "Bundled fallback choices and Orrery-specific thinking defaults. orrery-config replaces each provider's entries with picker-visible models and exact effort capabilities discovered from the installed CLI; a provider falls back to these entries only when live discovery is unavailable.",
+  "note": "Bundled fallback choices and Orrery-specific thinking defaults. orrery-config replaces each provider's entries with picker-visible models and exact effort capabilities discovered from the installed CLI; a provider falls back to these entries only when live discovery is unavailable. Labels here are Orrery's; the exact entries' descriptions are the CLIs' own, as Claude Code 2.1.282 and Codex 0.157.0 served them.",
   "providers": {
     "anthropic": [
       {
         "id": "fable",
-        "label": "fable",
+        "label": "Fable (latest)",
         "fallback_tier": 3,
         "thinking_levels": [
           "low",
@@ -17,7 +17,7 @@
       },
       {
         "id": "opus",
-        "label": "opus",
+        "label": "Opus (latest)",
         "fallback_tier": 3,
         "thinking_levels": [
           "low",
@@ -30,7 +30,7 @@
       },
       {
         "id": "sonnet",
-        "label": "sonnet",
+        "label": "Sonnet (latest)",
         "fallback_tier": 2,
         "thinking_levels": [
           "low",
@@ -43,9 +43,51 @@
       },
       {
         "id": "haiku",
-        "label": "haiku",
+        "label": "Haiku (latest)",
         "fallback_tier": 1,
         "thinking_levels": []
+      },
+      {
+        "id": "claude-opus-5-5",
+        "label": "Opus 5.5",
+        "description": "Most capable for ambitious work",
+        "fallback_tier": 3,
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
+      },
+      {
+        "id": "claude-opus-5",
+        "label": "Opus 5",
+        "description": "Best for everyday, complex tasks",
+        "fallback_tier": 3,
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
+      },
+      {
+        "id": "claude-fable-5-1",
+        "label": "Fable 5.1",
+        "description": "For your toughest challenges",
+        "fallback_tier": 3,
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_thinking": "max"
       }
     ],
     "openai": [
@@ -101,6 +143,21 @@
           "xhigh"
         ],
         "default_thinking": "medium"
+      },
+      {
+        "id": "gpt-6-astra",
+        "label": "GPT-6-Astra",
+        "description": "Frontier intelligence for the most demanding work.",
+        "fallback_tier": 3,
+        "thinking_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ],
+        "default_thinking": "low"
       }
     ]
   }

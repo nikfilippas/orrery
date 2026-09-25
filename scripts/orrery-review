@@ -3073,6 +3073,12 @@ def main(
                 status=status,
                 unknown=usage is None,
                 partial=True if usage and usage.get("partial") else None,
+                # What the run actually ran as, in the provider's words:
+                # the only evidence of which version a floating alias
+                # meant that day.
+                reported_models=incident_log.reported_models_field(
+                    usage.get("models") if usage else None
+                ),
                 **(usage["tokens"] if usage else {}),
             )
             if receipts is None:

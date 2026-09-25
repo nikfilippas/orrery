@@ -264,3 +264,69 @@ def read_events(since: datetime | None = None) -> list[dict[str, Any]]:
             events.append((timestamp, event))
     events.sort(key=lambda item: item[0])
     return [event for _timestamp, event in events]
+
+
+def last_reported_model(
+    provider: str,
+    model: str,
+) -> tuple[str, str] | None:
+    """The model a configured name last ran as, and when, or None.
+
+    Read from delegated runs' `spend` records, which carry what the
+    provider itself reported. This is how a stored alias with no row in
+    the picker is labelled: by the version it was last observed to run
+    as, dated, never by Orrery's guess at the version it would pick. A
+    run that reported more than one model of the alias's family says
+    nothing unambiguous about it and is passed over, as is a run whose
+    reported models do not include the configured one's family at all.
+    """
+    # Imported here: every launcher and hook imports this module, and
+    # only this reader needs the catalogue's process machinery.
+    from orrery_model_catalogue import model_identity
+
+    wanted = model_identity(provider, model)
+    for event in reversed(read_events()):
+        if (
+            event.get("kind") != "spend"
+            or event.get("provider") != provider
+            or event.get("model") != model
+            or event.get("endpoint") is not None
+        ):
+            continue
+        reported = event.get("reported_models")
+        if not isinstance(reported, str) or not reported:
+            continue
+        names = [name for name in reported.split(",") if name]
+        if wanted.family is not None:
+            names = [
+                name
+                for name in names
+                if model_identity(provider, name).family == wanted.family
+            ]
+        # By identity, not by name: `claude-opus-5-5` and its `[1m]`
+        # window in one run are one model, not an ambiguity.
+        if len({model_identity(provider, name) for name in names}) == 1:
+            plain = [name for name in names if not name.endswith("]")]
+            return (plain or names)[0], event["ts"]
+    return None
+
+
+def reported_models_field(models: Any) -> str | None:
+    """Reported model ids as one incident field, or None.
+
+    Comma-joined because an incident field is a scalar. Never cut: an
+    ordinary field is truncated to its limit, and a truncated list could
+    end inside an id (`claude-fable-5-1` read back as `claude-fable-5`),
+    so a list that does not fit, or an id that could not be split back
+    out, is not recorded at all.
+    """
+    if not isinstance(models, list) or not models:
+        return None
+    names = [str(name) for name in models]
+    if any(
+        not name or "," in name or name != _squash(name, DETAIL_LIMIT)
+        for name in names
+    ):
+        return None
+    joined = ",".join(names)
+    return joined if len(joined) <= DETAIL_LIMIT else None

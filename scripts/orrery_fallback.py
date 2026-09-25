@@ -36,7 +36,9 @@ from orrery_model_catalogue import (  # noqa: E402
     discover_claude_models,
     discover_codex_models,
     ModelIdentity,
+    known_entry,
     model_identity,
+    visible_entries,
 )
 from orrery_runtime import (  # noqa: E402
     MODEL_ID,
@@ -475,11 +477,10 @@ def _catalogue_entries(
     except (CatalogueDiscoveryError, OSError, RuntimeError):
         return bundled, "bundled catalogue"
 
-    seed_by_id = {entry.get("id"): entry for entry in bundled}
     merged: list[dict[str, Any]] = []
     for entry in live:
         candidate = dict(entry)
-        seed = seed_by_id.get(candidate.get("id"), {})
+        seed = known_entry(provider, str(candidate.get("id")), bundled) or {}
         tier = seed.get("fallback_tier")
         if isinstance(tier, int) and not isinstance(tier, bool):
             candidate["fallback_tier"] = tier
@@ -499,9 +500,24 @@ def model_status(
     `live` lets a caller that has already discovered pass the result in,
     so a diagnostic checking several roles spawns one CLI per provider
     rather than one per question. Omitted, the behaviour is unchanged.
+
+    Known means known to the bundled catalogue or, where a caller passed
+    the live one, to the picker itself. A custom id is not discovered
+    for here: the verdict for it could only be UNKNOWN or READY, and
+    neither stops a dispatch, so the spawn would buy nothing.
     """
     bundled = load_catalogue().get(role.provider, [])
-    if not any(entry.get("id") == role.model for entry in bundled):
+    seed = known_entry(role.provider, role.model, bundled)
+    if seed is None:
+        if (
+            live is not None
+            and live[1] == "installed CLI catalogue"
+            and visible_entries(role.provider, role.model, live[0])
+        ):
+            return (
+                Availability.READY,
+                f"{role.provider}/{role.model} is picker-visible",
+            )
         return (
             Availability.UNKNOWN,
             f"{role.provider}/{role.model} is a custom model identifier",
@@ -522,6 +538,33 @@ def model_status(
         return (
             Availability.READY,
             f"{role.provider}/{role.model} is picker-visible",
+        )
+    offered = visible_entries(role.provider, role.model, entries)
+    if offered:
+        # A stored alias the CLI lists no row for, or an exact id listed
+        # under another form of itself: the CLI still accepts it.
+        if model_identity(role.provider, role.model).version is None:
+            return (
+                Availability.READY,
+                f"{role.provider}/{role.model} has no row of its own; the "
+                "installed CLI resolves it within its picker-visible family",
+            )
+        return (
+            Availability.READY,
+            f"{role.provider}/{role.model} is picker-visible as "
+            f"{offered[0]['id']}",
+        )
+    if (
+        seed.get("id") != role.model
+        and model_identity(role.provider, str(seed.get("id"))).version is None
+    ):
+        # Known only through its family's alias: the bundle does not name
+        # this version, and Claude Code accepts full model names its
+        # picker does not list, so absence from the picker proves nothing.
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} is not listed by the installed "
+            "CLI, which may still accept it",
         )
     return (
         Availability.UNAVAILABLE,
@@ -547,9 +590,9 @@ def thinking_status(
     Deliberately conservative, and never a source of new failures on its
     own: an endpoint-routed role, a custom identifier, a provider whose
     live catalogue could not be read, and a model that is itself no
-    longer picker-visible all return UNKNOWN. Only a bundled-known,
-    picker-visible model whose live levels genuinely lack the configured
-    one is reported UNAVAILABLE.
+    longer picker-visible all return UNKNOWN. Only a known (bundled or
+    picker-listed), picker-visible model whose live levels genuinely
+    lack the configured one is reported UNAVAILABLE.
     """
     if role.endpoint is not None:
         return (
@@ -563,7 +606,10 @@ def thinking_status(
             f"{role.provider}/{role.model} has no configured thinking level",
         )
     bundled = load_catalogue().get(role.provider, [])
-    if not any(entry.get("id") == role.model for entry in bundled):
+    discovered = live is not None and live[1] == "installed CLI catalogue"
+    if known_entry(role.provider, role.model, bundled) is None and not (
+        discovered and visible_entries(role.provider, role.model, live[0])
+    ):
         return (
             Availability.UNKNOWN,
             f"{role.provider}/{role.model} is a custom model identifier",
@@ -580,16 +626,32 @@ def thinking_status(
             Availability.UNKNOWN,
             f"{role.provider} thinking levels could not be confirmed",
         )
-    entry = next(
-        (item for item in entries if item.get("id") == role.model),
-        None,
-    )
-    if entry is None:
+    offered = visible_entries(role.provider, role.model, entries)
+    if not offered:
         # model_status already reports this; do not fail it twice.
         return (
             Availability.UNKNOWN,
             f"{role.provider}/{role.model} is not picker-visible",
         )
+    if len(offered) > 1:
+        # Offered through several rows, a stored alias through each
+        # version of its family: which one the CLI picks is its own
+        # decision, so a level is confirmed only where every row offers
+        # it, and nothing is failed on a guess about which row runs.
+        if all(
+            role.thinking in (item.get("thinking_levels") or [])
+            for item in offered
+        ):
+            return (
+                Availability.READY,
+                f"{role.provider}/{role.model} supports thinking {role.thinking}",
+            )
+        return (
+            Availability.UNKNOWN,
+            f"{role.provider}/{role.model} is offered through rows whose "
+            "thinking levels differ",
+        )
+    entry = offered[0]
     levels = entry.get("thinking_levels")
     if not isinstance(levels, list):
         return (
@@ -632,13 +694,8 @@ def _thinking_for(
     if not isinstance(levels, list) or not levels:
         return None
 
-    source = next(
-        (
-            entry
-            for entry in source_entries
-            if entry.get("id") == original.model
-        ),
-        None,
+    source = known_entry(
+        original.provider, original.model, list(source_entries)
     )
     source_levels = source.get("thinking_levels") if source else None
     if (
@@ -751,13 +808,8 @@ def _ranked_candidates(
     allowance = principal_exclusions(original, manifest)
     bundled = load_catalogue()
     source_entries = bundled.get(original.provider, [])
-    source_seed = next(
-        (
-            entry
-            for entry in source_entries
-            if entry.get("id") == original.model
-        ),
-        None,
+    source_seed = known_entry(
+        original.provider, original.model, source_entries
     )
     seeded_source_tier = (
         source_seed.get("fallback_tier")
@@ -845,6 +897,24 @@ def _ranked_candidates(
             barred.append(identity_of(original.model))
 
         ordered = list(by_id.values())
+        # A configured bare alias the CLI lists no row for (the shipped
+        # `fable` on a CLI listing only Fable's versions) is configured
+        # for the rows it is offered through, so they keep its distance.
+        configured_here = {
+            (provider, model): tier
+            for (configured_provider, model), tier in configured_tiers.items()
+            if configured_provider == provider
+        }
+        for (configured_provider, alias), tier in configured_tiers.items():
+            if (
+                configured_provider != provider
+                or alias in by_id
+                or model_identity(provider, alias).version is not None
+            ):
+                continue
+            for row in visible_entries(provider, alias, ordered):
+                key = (provider, row["id"])
+                configured_here[key] = max(configured_here.get(key, 0), tier)
         for index, entry in enumerate(ordered):
             model = entry["id"]
             identity = (provider, model)
@@ -854,7 +924,7 @@ def _ranked_candidates(
                 continue
             tier = entry.get("fallback_tier")
             if not isinstance(tier, int) or isinstance(tier, bool):
-                tier = configured_tiers.get(
+                tier = configured_here.get(
                     identity,
                     _picker_tier(index, len(ordered)),
                 )
@@ -878,8 +948,8 @@ def _ranked_candidates(
                 endpoint=None,
             )
             configured_distance = (
-                abs(configured_tiers[identity] - target_tier)
-                if identity in configured_tiers
+                abs(configured_here[identity] - target_tier)
+                if identity in configured_here
                 else 4
             )
             tier_gap = abs(tier - target_tier)
@@ -975,7 +1045,12 @@ def same_provider_ladder(role: Role, *, limit: int = 2) -> list[str]:
         and isinstance(entry.get("fallback_tier"), int)
         and not isinstance(entry.get("fallback_tier"), bool)
     }
-    source_tier = tiers.get(role.model)
+    seed = known_entry(role.provider, role.model, entries)
+    source_tier = (
+        seed.get("fallback_tier")
+        if seed is not None and seed.get("id") in tiers
+        else None
+    )
     if source_tier is None:
         # A model outside the first-party catalogue cannot be placed on
         # the tier scale, so no ladder can be justified for it.

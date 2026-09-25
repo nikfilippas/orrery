@@ -67,6 +67,80 @@ def probe_writes() -> None:
     Path(result_path).write_text(json.dumps(results, sort_keys=True))
 
 
+FIVE_LEVELS = ["low", "medium", "high", "xhigh", "max"]
+
+
+def picker_row(
+    value: str,
+    resolved: str,
+    name: str,
+    description: str,
+    levels: list[str] | None = None,
+) -> dict:
+    row = {
+        "value": value,
+        "resolvedModel": resolved,
+        "displayName": name,
+        "description": description,
+    }
+    if levels is not None:
+        row["supportsEffort"] = True
+        row["supportedEffortLevels"] = levels
+    return row
+
+
+# Claude Code 2.1.282's initialize rows as captured from the installed
+# CLI on 2026-09-26: native `opus`, `sonnet` and `haiku` aliases, Opus
+# 5.5 behind both `default` and `opus`, exact rows for every other
+# version, no `fable` alias and no `[1m]` rows.
+SHAPE_2_1_282 = [
+    picker_row("default", "claude-opus-5-5", "Default (recommended)",
+               "Opus 5.5 · Best for everyday, complex tasks", FIVE_LEVELS),
+    picker_row("opus", "claude-opus-5-5", "Opus 5.5",
+               "Most capable for ambitious work", FIVE_LEVELS),
+    picker_row("claude-fable-5-1", "claude-fable-5-1", "Fable 5.1",
+               "For your toughest challenges", FIVE_LEVELS),
+    picker_row("sonnet", "claude-sonnet-5", "Sonnet 5",
+               "Most efficient for everyday tasks", FIVE_LEVELS),
+    picker_row("haiku", "claude-haiku-4-5-20251001", "Haiku 4.5",
+               "Fastest for quick answers"),
+    picker_row("claude-opus-5", "claude-opus-5", "Opus 5",
+               "Best for everyday, complex tasks", FIVE_LEVELS),
+    picker_row("claude-fable-5", "claude-fable-5", "Fable 5",
+               "Most capable for your hardest and longest-running tasks",
+               FIVE_LEVELS),
+    picker_row("claude-opus-4-8", "claude-opus-4-8", "Opus 4.8",
+               "Best for everyday, complex tasks", FIVE_LEVELS),
+    picker_row("claude-opus-4-7", "claude-opus-4-7", "Opus 4.7",
+               "Best for everyday, complex tasks", FIVE_LEVELS),
+    picker_row("claude-opus-4-6", "claude-opus-4-6", "Opus 4.6",
+               "Best for everyday, complex tasks",
+               ["low", "medium", "high", "max"]),
+    picker_row("claude-sonnet-4-6", "claude-sonnet-4-6", "Sonnet 4.6",
+               "Efficient for routine tasks",
+               ["low", "medium", "high", "max"]),
+]
+
+
+def catalogue_shape() -> str:
+    """Which initialize shape this copy serves.
+
+    `CLAUDE_FAKE_CATALOGUE` selects one for every copy; the per-path
+    map `CLAUDE_FAKE_CATALOGUE_PATHS`, a JSON object from an installed
+    copy's path to a shape, overrides it for that copy alone, so two
+    installs on one machine can disagree the way a PATH CLI and an
+    editor's newer sibling do.
+    """
+    shape = os.environ.get("CLAUDE_FAKE_CATALOGUE", "default")
+    raw = os.environ.get("CLAUDE_FAKE_CATALOGUE_PATHS")
+    if raw:
+        here = os.path.realpath(sys.argv[0])
+        for path, selected in json.loads(raw).items():
+            if os.path.realpath(path) == here:
+                return selected
+    return shape
+
+
 def serve_catalogue() -> int:
     """Speak the initialization subset used by the Agent SDK."""
     for line in sys.stdin:
@@ -124,6 +198,8 @@ def serve_catalogue() -> int:
                 "supportedEffortLevels": ["low", "high"],
             },
         ]
+        if catalogue_shape() == "2.1.282":
+            models = [dict(row) for row in SHAPE_2_1_282]
         hidden = os.environ.get("CLAUDE_FAKE_HIDE_MODEL")
         if hidden:
             models = [

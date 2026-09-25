@@ -4624,11 +4624,28 @@ def test_nearest_fallback_ranking() -> None:
     )
 
     reviewer = runtime_module.load_role("reviewer")
-    same_provider = fallback_module.nearest_fallback(
+    # The bundle lists gpt-6-astra at Sol's own tier, so a failed Sol
+    # model is offered Astra first; with Astra gone too, proximity still
+    # decides among the rest.
+    same_tier = fallback_module.nearest_fallback(
         reviewer,
         "test",
         excluded_providers={"anthropic"},
         excluded_models={("openai", "gpt-5.6-sol")},
+        assumed_ready={"openai"},
+        discover_live=False,
+    )
+    require(
+        same_tier is not None
+        and (same_tier.candidate.provider, same_tier.candidate.model)
+        == ("openai", "gpt-6-astra"),
+        f"a same-tier model was passed over: {same_tier}",
+    )
+    same_provider = fallback_module.nearest_fallback(
+        reviewer,
+        "test",
+        excluded_providers={"anthropic"},
+        excluded_models={("openai", "gpt-5.6-sol"), ("openai", "gpt-6-astra")},
         assumed_ready={"openai"},
         discover_live=False,
     )
@@ -4668,10 +4685,12 @@ def test_fallback_same_provider_ladder() -> None:
     )
 
     reviewer = runtime_module.load_role("reviewer")
+    # gpt-6-astra sits at Sol's own tier in the bundle and would be the
+    # nearest same-provider model; excluded so the tier gap is tested.
     terra = fallback_module.nearest_fallback(
         reviewer,
         "test",
-        excluded_models={("openai", "gpt-5.6-sol")},
+        excluded_models={("openai", "gpt-5.6-sol"), ("openai", "gpt-6-astra")},
         assumed_ready={"anthropic", "openai"},
         discover_live=False,
     )
@@ -4687,6 +4706,7 @@ def test_fallback_same_provider_ladder() -> None:
         "test",
         excluded_models={
             ("openai", "gpt-5.6-sol"),
+            ("openai", "gpt-6-astra"),
             ("openai", "gpt-5.6-terra"),
             ("openai", "gpt-5.5"),
         },
@@ -5627,7 +5647,7 @@ def test_doctor_reports_a_ladderless_principal() -> None:
     """
     no_tier = (
         "WARN",
-        "the principal anthropic/claude-fable-5-1 has no automatic "
+        "the principal anthropic/claude-nova-1 has no automatic "
         "same-provider fallback ladder: it carries no fallback_tier in "
         "global/model-catalogue.json, so orrery-sync cannot arm one and "
         "an overloaded service goes unanswered",
@@ -5693,9 +5713,20 @@ def test_doctor_reports_a_ladderless_principal() -> None:
             "a catalogued principal produced a ladder verdict",
         )
 
-        # A model the picker offers and the bundle does not: exactly
-        # what selecting a newly shipped flagship produces.
-        set_principal(model="claude-fable-5-1")
+        # A new version of a family the bundle carries is known through
+        # that family's alias and inherits its tier, so it keeps a
+        # ladder; so does an exact version the bundle lists itself.
+        for known in ("claude-fable-5-1", "claude-opus-4-8"):
+            set_principal(model=known)
+            require(
+                not ladder_lines(doctor()),
+                f"a known exact principal {known} lost its ladder: "
+                f"{ladder_lines(doctor())}",
+            )
+
+        # A model outside every catalogued family and the bundle: what
+        # selecting a newly shipped model line produces.
+        set_principal(model="claude-nova-1")
         require(
             ladder_lines(doctor()) == {no_tier},
             f"a ladderless principal went unreported: {ladder_lines(doctor())}",
@@ -6253,9 +6284,14 @@ def test_delegated_quota_fallback() -> None:
             cwd=repository,
         )
         _, failed_stderr = finish_review(failed, failed_environment)
+        # The fake CLI lists no `fable` row, and discovery no longer
+        # invents one; the configured `fable` still counts for the row
+        # it is offered through, so its family stays the nearest.
         require(
             failed.returncode == 7
-            and "ORRERY FALLBACK APPROVAL REQUIRED" in failed_stderr,
+            and "ORRERY FALLBACK APPROVAL REQUIRED" in failed_stderr
+            and "Nearest candidate: Anthropic / claude-fable-5[1m] / "
+            "thinking high" in failed_stderr,
             f"the failed reviewer did not wait for approval: {failed_stderr}",
         )
         original_arguments = codex_arguments.read_text()
@@ -6271,7 +6307,7 @@ def test_delegated_quota_fallback() -> None:
             "--timeout",
             "60",
             "--approve-fallback",
-            "anthropic:fable",
+            "anthropic:claude-fable-5[1m]",
             "--",
             "prompt",
             cwd=repository,
@@ -6286,10 +6322,11 @@ def test_delegated_quota_fallback() -> None:
             # D2's named ceiling caps a cross-provider delegate, so an
             # ultra reviewer arrives at high rather than at the top of
             # the candidate's scale.
-            "Nearest candidate: Anthropic / fable / thinking high" in stderr
-            and "Fallback approved for anthropic:fable" in stderr
-            and "↳ Fallback reviewer · anthropic · fable · thinking high"
-            in stderr,
+            "Nearest candidate: Anthropic / claude-fable-5[1m] / thinking "
+            "high" in stderr
+            and "Fallback approved for anthropic:claude-fable-5[1m]" in stderr
+            and "↳ Fallback reviewer · anthropic · claude-fable-5[1m] · "
+            "thinking high" in stderr,
             f"delegated fallback was not fully announced: {stderr}",
         )
         require(
@@ -8526,6 +8563,9 @@ def test_model_catalogue() -> None:
             "opus": ["low", "medium", "high", "xhigh", "max"],
             "sonnet": ["low", "medium", "high", "xhigh", "max"],
             "haiku": [],
+            "claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+            "claude-opus-5": ["low", "medium", "high", "xhigh", "max"],
+            "claude-fable-5-1": ["low", "medium", "high", "xhigh", "max"],
         },
         "openai": {
             "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -8536,7 +8576,19 @@ def test_model_catalogue() -> None:
                 "low", "medium", "high", "xhigh", "max", "ultra"
             ],
             "gpt-5.5": ["low", "medium", "high", "xhigh"],
+            "gpt-6-astra": [
+                "low", "medium", "high", "xhigh", "max", "ultra"
+            ],
         },
+    }
+    # Offline, the exact current models are still offered, each with a
+    # name a reader recognises and the CLI's own description, so the
+    # version is never something to guess.
+    exact_names = {
+        "claude-opus-5-5": "Opus 5.5",
+        "claude-opus-5": "Opus 5",
+        "claude-fable-5-1": "Fable 5.1",
+        "gpt-6-astra": "GPT-6-Astra",
     }
     for provider, entries in providers.items():
         require(bool(entries), f"{provider} has no models to offer")
@@ -8547,9 +8599,18 @@ def test_model_catalogue() -> None:
                 f"{provider} has an entry with no identifier: {entry}",
             )
             require(
-                entry.get("label") == entry["id"],
-                f"{provider} entry {entry['id']} has a characterised label",
+                isinstance(entry.get("label"), str) and entry["label"].strip(),
+                f"{provider} entry {entry['id']} has no label",
             )
+            if entry["id"] in exact_names:
+                require(
+                    entry["label"] == exact_names[entry["id"]]
+                    and isinstance(entry.get("description"), str)
+                    and entry["description"].strip()
+                    and isinstance(entry.get("fallback_tier"), int),
+                    f"exact entry {entry['id']} lacks a name, description "
+                    f"or tier: {entry}",
+                )
             levels = entry.get("thinking_levels")
             require(
                 isinstance(levels, list)
@@ -8593,6 +8654,15 @@ def test_model_catalogue() -> None:
     # page cannot silently change its current selection.
     module = load_script(
         KIT_DIR / "scripts" / "orrery-config", "kit_config_choices"
+    )
+    # Every bundled label is Orrery's, not a CLI's, and says so.
+    require(
+        all(
+            entry["label_derived"] is True
+            for entries in module.bundled_catalogue().values()
+            for entry in entries
+        ),
+        "a bundled label was presented as the CLI's own name",
     )
     for state in module.snapshot():
         offered = {
@@ -8660,14 +8730,45 @@ def test_model_catalogue() -> None:
     )
 
 
-@test("an alias binds to its family's highest version, whatever the order")
-def test_claude_alias_is_deterministic() -> None:
-    """The alias used to go to whichever family row came first.
+@test("an exact option synthesised from a suffixed alias row is not named 1M")
+def test_synthesised_exact_label() -> None:
+    load_script(CONFIG_SCRIPT, f"kit_config_label_{time.time_ns()}")
+    discovery = sys.modules["orrery_model_catalogue"]
+    suffixed = discovery._normalise_claude_models([{
+        "value": "opus[1m]", "resolvedModel": "claude-opus-5[1m]",
+        "displayName": "Opus 5 (1M context)",
+        "supportsEffort": True, "supportedEffortLevels": ["low", "high"],
+    }])
+    by_id = {entry["id"]: entry for entry in suffixed}
+    require(
+        by_id["claude-opus-5"]["label"] == "Opus 5"
+        and by_id["claude-opus-5"]["label_derived"] is True
+        and by_id["opus"]["resolved_label"] == "Opus 5",
+        f"the unsuffixed exact id kept the 1M row's name: {by_id}",
+    )
+    # An unsuffixed alias row's name is the CLI's own, and is kept.
+    plain = discovery._normalise_claude_models([{
+        "value": "opus", "resolvedModel": "claude-opus-5-5",
+        "displayName": "Opus 5.5",
+        "supportsEffort": True, "supportedEffortLevels": ["low", "high"],
+    }])
+    by_id = {entry["id"]: entry for entry in plain}
+    require(
+        by_id["claude-opus-5-5"]["label"] == "Opus 5.5"
+        and by_id["claude-opus-5-5"]["label_derived"] is False,
+        f"the CLI's own name for the exact id was replaced: {by_id}",
+    )
 
-    A provider listing two Fable versions could therefore move `fable`,
-    and the manifests written against it, onto a different model purely
-    by reordering its response, and could collapse an exactly pinned
-    identifier out of the catalogue entirely.
+
+@test("discovery never invents an alias, whatever the order")
+def test_claude_alias_is_deterministic() -> None:
+    """The alias used to go to a family row Orrery chose.
+
+    First whichever row came first, then the highest version: either
+    way the version behind `fable` was Orrery's inference rather than
+    the CLI's statement. A family the CLI lists no alias row for is now
+    offered as its exact versions only, each keeping its own id and
+    levels whatever order the provider lists them in.
     """
     load_script(CONFIG_SCRIPT, f"kit_config_alias_{time.time_ns()}")
     discovery = sys.modules["orrery_model_catalogue"]
@@ -8689,23 +8790,19 @@ def test_claude_alias_is_deterministic() -> None:
         entries = discovery._normalise_claude_models(list(order))
         by_id = {entry["id"]: entry for entry in entries}
         require(
-            by_id.get("fable", {}).get("resolved") == "claude-fable-5-1",
-            f"the alias did not bind to the highest version: {by_id}",
+            set(by_id) == {"claude-fable-5[1m]", "claude-fable-5-1[1m]"},
+            f"an alias was invented or an exact row dropped: {sorted(by_id)}",
         )
         require(
-            by_id["fable"]["selectable"] == "claude-fable-5-1[1m]",
-            f"the alias lost its selectable identifier: {by_id['fable']}",
+            by_id["claude-fable-5-1[1m]"]["thinking_levels"]
+            == ["low", "medium", "high"]
+            and by_id["claude-fable-5[1m]"]["thinking_levels"]
+            == ["low", "high"],
+            f"a row took another row's levels: {by_id}",
         )
         require(
-            by_id["fable"]["thinking_levels"] == ["low", "medium", "high"],
-            f"the alias took another row's levels: {by_id['fable']}",
-        )
-        # The loser keeps its exact identifier rather than vanishing, so
-        # a manifest pinning that version still resolves.
-        pinned = by_id.get("claude-fable-5[1m]")
-        require(
-            pinned is not None and pinned["resolved"] == "claude-fable-5",
-            f"the older row was collapsed away: {sorted(by_id)}",
+            by_id["claude-fable-5[1m]"]["resolved"] == "claude-fable-5",
+            f"the exact row lost its resolution: {by_id}",
         )
 
     # The collision that matters: a native alias row and an exact row of
@@ -8786,6 +8883,15 @@ def test_claude_alias_is_deterministic() -> None:
             by_id["sonnet"]["thinking_levels"] == ["low"],
             f"the alias took the other row's levels: {by_id['sonnet']}",
         )
+        # Every listed model is its own option now: the suffixed exact
+        # row and the version the alias resolves to both survive, and
+        # none of the three reads like another.
+        labels = [entry["label"] for entry in by_id.values()]
+        require(
+            {"claude-sonnet-5", "claude-sonnet-5[1m]"} <= set(by_id)
+            and len(labels) == len(set(labels)),
+            f"an exact option was collapsed or labels collide: {by_id}",
+        )
 
     # `supportsEffort: true` with no level list asserts that effort
     # exists without saying which levels do, so the levels are unknown.
@@ -8860,19 +8966,23 @@ def test_live_model_catalogue_discovery() -> None:
     openai = {
         entry["id"]: entry for entry in result.providers["openai"]
     }
+    # Native aliases stay aliases, each beside the exact version it
+    # resolves to; a family with no alias row (Fable here) is offered as
+    # its exact row only, and no `fable` is invented for it.
     require(
         set(anthropic)
-        == {"fable", "opus", "sonnet", "haiku", "nova"},
+        == {
+            "opus", "claude-opus-5", "claude-fable-5[1m]", "sonnet",
+            "claude-sonnet-5", "haiku", "claude-haiku-4-5", "nova",
+        },
         f"Claude aliases were duplicated or future models vanished: {anthropic}",
     )
     require(
-        "default" not in anthropic
-        and "opus[1m]" not in anthropic
-        and "claude-fable-5[1m]" not in anthropic,
+        "default" not in anthropic and "opus[1m]" not in anthropic,
         f"Claude's equivalent rows were not collapsed: {anthropic}",
     )
     require(
-        anthropic["fable"]["thinking_levels"]
+        anthropic["claude-fable-5[1m]"]["thinking_levels"]
         == ["low", "medium", "high", "xhigh", "max"]
         and anthropic["haiku"]["thinking_levels"] == []
         and anthropic["nova"]["thinking_levels"] == ["low", "high"],
@@ -8900,9 +9010,639 @@ def test_live_model_catalogue_discovery() -> None:
         and {
             entry["id"] for entry in partial.providers["anthropic"]
         }
-        == {"fable", "opus", "sonnet", "haiku"}
+        == {
+            "fable", "opus", "sonnet", "haiku",
+            "claude-opus-5-5", "claude-opus-5", "claude-fable-5-1",
+        }
         and any("anthropic:" in warning for warning in partial.warnings),
         f"one provider failure discarded the other live catalogue: {partial}",
+    )
+
+
+def config_on_shape(
+    shape: str | None = None,
+    **fake_environment: str,
+) -> types.ModuleType:
+    """orrery-config with its catalogue discovered from the fake CLIs.
+
+    `shape` selects the fake Claude's initialize response; None is the
+    fake's default shape.
+    """
+    config = load_script(CONFIG_SCRIPT, f"kit_config_shape_{time.time_ns()}")
+    discovery = sys.modules["orrery_model_catalogue"]
+    environment = review_environment("success")
+    if shape is not None:
+        environment["CLAUDE_FAKE_CATALOGUE"] = shape
+    environment.update(fake_environment)
+    try:
+        result = discovery.discover_catalogue(
+            config.bundled_catalogue(), timeout=5, environment=environment
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
+    config.CATALOGUE_DISCOVERY = result
+    config.ACTIVE_CATALOGUE = config._parse_catalogue(result.providers)
+    return config
+
+
+def offered_choices(
+    config: types.ModuleType, role_id: str, provider: str
+) -> dict[str, dict[str, Any]]:
+    state = next(item for item in config.snapshot() if item["id"] == role_id)
+    return {
+        choice["id"]: choice
+        for choice in state["choices"]
+        if choice["provider"] == provider and choice["known"]
+    }
+
+
+@test("the page offers each exact version under the CLI's own name")
+def test_page_offers_exact_versions() -> None:
+    """Claude Code 2.1.282 lists Opus 5.5 and Opus 5 side by side, and
+    the page offered only `opus`, which named neither. Every model the
+    CLI lists is now its own option, carrying the picker's name and
+    description verbatim; the alias floats and says what it resolves
+    to; and Fable, which that CLI lists no alias row for, is offered
+    only as the versions it does list."""
+    config = config_on_shape("2.1.282")
+    require(
+        config.CATALOGUE_DISCOVERY.sources["anthropic"] == "installed CLI",
+        f"the 2.1.282 shape was not discovered: {config.CATALOGUE_DISCOVERY}",
+    )
+    offered = offered_choices(config, "implementer", "anthropic")
+    for model, name, description in (
+        ("claude-opus-5-5", "Opus 5.5", "Most capable for ambitious work"),
+        ("claude-opus-5", "Opus 5", "Best for everyday, complex tasks"),
+        ("claude-fable-5-1", "Fable 5.1", "For your toughest challenges"),
+        (
+            "claude-fable-5",
+            "Fable 5",
+            "Most capable for your hardest and longest-running tasks",
+        ),
+    ):
+        choice = offered.get(model)
+        require(
+            choice is not None
+            and choice["label"] == name
+            and choice["description"] == description
+            and choice["label_derived"] is False
+            and choice["alias"] is False,
+            f"{model} is not offered under the CLI's own name: {choice}",
+        )
+    alias = offered.get("opus")
+    require(
+        alias is not None
+        and alias["alias"] is True
+        and alias["resolved"] == "claude-opus-5-5"
+        and alias["resolved_label"] == "Opus 5.5"
+        and alias["label"] != "Opus 5.5"
+        and alias["label_derived"] is True,
+        f"the alias does not carry its current resolution: {alias}",
+    )
+    require(
+        {model for model in offered if "fable" in model}
+        == {"claude-fable-5-1", "claude-fable-5"},
+        f"an alias was invented for Fable: {sorted(offered)}",
+    )
+    labels = [choice["label"] for choice in offered.values()]
+    require(
+        len(labels) == len(set(labels)),
+        f"two options read alike: {labels}",
+    )
+    # The shipped principal holds `fable`, which this CLI lists no row
+    # for. It stays a known, selectable value with its thinking levels,
+    # and carries no version: Orrery's guess is exactly what is removed.
+    stored = offered_choices(config, "orchestrator", "anthropic").get("fable")
+    require(
+        stored is not None
+        and stored["alias"] is True
+        and stored["resolved"] is None
+        and stored["resolved_label"] is None
+        and stored["label_derived"] is True
+        and "5" not in stored["label"]
+        and "max" in stored["thinking_levels"],
+        f"the stored fable lost its levels or was given a version: {stored}",
+    )
+
+
+@test("offline, the bundled catalogue still offers the exact versions")
+def test_bundled_exact_versions_offered() -> None:
+    config = config_on_shape(ORRERY_MODEL_DISCOVERY="0")
+    require(
+        config.CATALOGUE_DISCOVERY.sources
+        == {"anthropic": "fallback", "openai": "fallback"},
+        f"discovery was not unavailable: {config.CATALOGUE_DISCOVERY}",
+    )
+    anthropic = offered_choices(config, "implementer", "anthropic")
+    openai = offered_choices(config, "implementer", "openai")
+    for choices, model, name in (
+        (anthropic, "claude-opus-5-5", "Opus 5.5"),
+        (anthropic, "claude-opus-5", "Opus 5"),
+        (anthropic, "claude-fable-5-1", "Fable 5.1"),
+        (openai, "gpt-6-astra", "GPT-6-Astra"),
+    ):
+        choice = choices.get(model)
+        require(
+            choice is not None
+            and choice["label"] == name
+            and choice["description"]
+            and choice["label_derived"] is True
+            and choice["thinking_levels"],
+            f"{model} is not offered offline with a name: {choice}",
+        )
+    require(
+        anthropic["opus"]["alias"] is True
+        and anthropic["opus"]["resolved"] is None
+        and anthropic["claude-opus-5-5"]["alias"] is False,
+        "offline, an alias and an exact version were not told apart",
+    )
+
+
+@test("a stored alias with no row of its own stays visible to the gates")
+def test_stored_alias_visibility() -> None:
+    discovery = sys.modules["orrery_model_catalogue"]
+    environment = review_environment("success")
+    environment["CLAUDE_FAKE_CATALOGUE"] = "2.1.282"
+    executable = str(Path(environment["KIT_FAKE_BIN"]) / "claude")
+    try:
+        entries = discovery.discover_claude_models(
+            executable, timeout=5, environment=environment
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
+    ready = fallback_module.Availability.READY
+    status = fallback_module.ProviderStatus(
+        "anthropic", ready, executable, "fixture"
+    )
+    live = (entries, "installed CLI catalogue")
+    principal = runtime_module.load_role("orchestrator")
+    require(
+        (principal.provider, principal.model) == ("anthropic", "fable"),
+        f"the fixture assumes the shipped fable principal: {principal}",
+    )
+    require(
+        "fable" not in {entry["id"] for entry in entries},
+        "the 2.1.282 shape lists a fable row, so this proves nothing",
+    )
+    visibility, reason = fallback_module.model_status(principal, status, live=live)
+    require(
+        visibility is ready,
+        f"the stored fable was reported unavailable: {visibility} {reason}",
+    )
+    thinking, reason = fallback_module.thinking_status(principal, status, live=live)
+    require(
+        thinking is ready,
+        f"the stored fable's level went unconfirmed: {thinking} {reason}",
+    )
+    # Without its family the alias really is gone, and still says so.
+    without = [entry for entry in entries if "fable" not in entry["id"]]
+    visibility, _reason = fallback_module.model_status(
+        principal, status, live=(without, "installed CLI catalogue")
+    )
+    require(
+        visibility is fallback_module.Availability.UNAVAILABLE,
+        f"a vanished family was still reported visible: {visibility}",
+    )
+    # Known exact ids are judged too; a truly unknown one stays custom.
+    # An id known only through its family alias that the picker does
+    # not list is attempted: Claude Code accepts full model names its
+    # picker omits, and HEAD ran them.
+    unknown = fallback_module.Availability.UNKNOWN
+    unavailable = fallback_module.Availability.UNAVAILABLE
+    for model, expected, catalogue in (
+        ("claude-opus-4-8", ready, entries),
+        ("claude-opus-5-5[1m]", ready, entries),
+        ("claude-opus-4-1", unknown, entries),
+        ("claude-sonnet-4-5-20250929", unknown, entries),
+        ("claude-3-7-sonnet-20250219", unknown, entries),
+        ("us.anthropic.claude-opus-4-1-20250805-v1:0", unknown, entries),
+        ("claude-nova-1", unknown, entries),
+        # Listed in the bundle by itself or by its identity, and gone
+        # from the picker: that is a real absence.
+        ("claude-fable-5-1", unavailable, without),
+        ("claude-fable-5-1[1m]", unavailable, without),
+    ):
+        role = dataclasses.replace(principal, model=model, thinking="max")
+        visibility, reason = fallback_module.model_status(
+            role, status, live=(catalogue, "installed CLI catalogue")
+        )
+        require(
+            visibility is expected,
+            f"{model} was judged {visibility}, not {expected}: {reason}",
+        )
+
+    # The pre-dispatch gate itself: the principal launcher starts the
+    # stored alias against a CLI that lists no row for it.
+    with tempfile.TemporaryDirectory() as directory:
+        arguments_path = Path(directory) / "claude-args"
+        environment = review_environment("success")
+        environment["CLAUDE_FAKE_CATALOGUE"] = "2.1.282"
+        environment["CLAUDE_FAKE_ARGS"] = str(arguments_path)
+        result = run_principal(environment)
+        arguments = (
+            arguments_path.read_text().splitlines()
+            if arguments_path.exists()
+            else []
+        )
+    require(
+        result.returncode == 0
+        and "not picker-visible" not in result.stderr
+        and "--model" in arguments
+        and arguments[arguments.index("--model") + 1] == "fable",
+        f"the stored fable did not dispatch: {result.returncode} "
+        f"{result.stderr} {arguments}",
+    )
+
+
+@test("a versioned id the picker does not list is attempted, not refused")
+def test_unlisted_version_dispatches() -> None:
+    """Both pre-dispatch gates, on the 2.1.282 picker that omits it."""
+    model = "claude-sonnet-4-5-20250929"
+    for role_name, script in (
+        ("orchestrator", PRINCIPAL_SCRIPT),
+        ("mechanic", REVIEW_SCRIPT),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            # Inside the provider's configuration directory, the one place
+            # a confined delegate may write, as the other dispatch tests do.
+            provider_home = Path(directory) / "claude-home"
+            provider_home.mkdir(mode=0o700)
+            arguments_path = provider_home / "claude-args"
+            environment = review_environment("success")
+            environment["CLAUDE_CONFIG_DIR"] = str(provider_home)
+            environment["CLAUDE_FAKE_CATALOGUE"] = "2.1.282"
+            environment["CLAUDE_FAKE_ARGS"] = str(arguments_path)
+            config_path = (
+                Path(environment["XDG_CONFIG_HOME"]) / "orrery" / "config.json"
+            )
+            # 0700 explicitly: the runtime refuses a group-writable user
+            # configuration directory, and the process umask is not ours.
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.parent.chmod(0o700)
+            config_path.write_text(json.dumps({
+                "version": runtime_module.USER_CONFIG_VERSION,
+                "roles": {role_name: {
+                    "provider": "anthropic", "model": model, "thinking": "high",
+                }},
+            }))
+            config_path.chmod(0o600)
+            if script is PRINCIPAL_SCRIPT:
+                result = run_principal(environment)
+            else:
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable, str(script), "--role", role_name,
+                            "--timeout", "60", "--", "prompt",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, env=environment, timeout=120, check=False,
+                    )
+                finally:
+                    shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+                    remove_helper_state(environment)
+            arguments = (
+                arguments_path.read_text().splitlines()
+                if arguments_path.exists()
+                else []
+            )
+        require(
+            result.returncode == 0
+            and "not picker-visible" not in result.stderr
+            and "--model" in arguments
+            and arguments[arguments.index("--model") + 1] == model,
+            f"the unlisted {role_name} version was refused: "
+            f"{result.returncode} {result.stderr[-400:]} {arguments}",
+        )
+
+
+@test("each delegated run records the model it reported running as")
+def test_last_reported_model() -> None:
+    with until_store_only() as state_dir:
+        environment = review_environment("success", standing_state=state_dir)
+        environment["CLAUDE_FAKE_CATALOGUE"] = "2.1.282"
+        config_path = Path(environment["XDG_CONFIG_HOME"]) / "orrery" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.parent.chmod(0o700)
+        config_path.write_text(json.dumps({
+            "version": runtime_module.USER_CONFIG_VERSION,
+            "roles": {"reviewer": {
+                "provider": "anthropic", "model": "fable", "thinking": "high",
+            }},
+        }))
+        config_path.chmod(0o600)
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable, str(REVIEW_SCRIPT), "--role", "reviewer",
+                    "--timeout", "60", "--", "prompt",
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                env=environment, timeout=120, check=False,
+            )
+        finally:
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        # Through orrery-review's own visibility gate, on a CLI that
+        # lists no `fable` row.
+        require(
+            result.returncode == 0,
+            f"the stored fable delegate did not run: {result.stderr[-400:]}",
+        )
+        spend = [
+            event for event in incidents_module.read_events()
+            if event.get("kind") == "spend"
+        ]
+        require(
+            len(spend) == 1
+            and spend[0].get("model") == "fable"
+            and spend[0].get("reported_models") == "claude-fable-5",
+            f"the spend record lacks the reported model: {spend}",
+        )
+        observed = incidents_module.last_reported_model("anthropic", "fable")
+        require(
+            observed == ("claude-fable-5", spend[0]["ts"]),
+            f"the reader did not return the observed version: {observed}",
+        )
+
+
+@test("the last observed version is the newest unambiguous report")
+def test_last_reported_model_reader() -> None:
+    with until_store_only():
+        role = dataclasses.replace(
+            runtime_module.load_role("reviewer"),
+            provider="anthropic", model="fable", thinking="high", endpoint=None,
+        )
+
+        def ran(model: str, reported: str | None) -> None:
+            incidents_module.record(
+                "spend",
+                program="orrery-agent",
+                role=dataclasses.replace(role, model=model),
+                reported_models=reported,
+            )
+            time.sleep(0.002)
+
+        require(
+            incidents_module.last_reported_model("anthropic", "fable") is None,
+            "a name never run was given an observed version",
+        )
+        ran("fable", "claude-fable-5")
+        ran("fable", "claude-fable-5-1,claude-haiku-4-5")
+        # Newer, but about other names or saying nothing usable.
+        ran("opus", "claude-opus-5-5")
+        ran("fable", None)
+        ran("fable", "claude-fable-5,claude-fable-5-1")
+        observed = incidents_module.last_reported_model("anthropic", "fable")
+        require(
+            observed is not None and observed[0] == "claude-fable-5-1",
+            f"the most recent unambiguous observation was not returned: "
+            f"{observed}",
+        )
+        require(
+            incidents_module.last_reported_model("anthropic", "sonnet") is None,
+            "an observation was borrowed from another configured name",
+        )
+        # One model under two names, its window and without, is one model.
+        ran("opus", "claude-opus-5-5,claude-opus-5-5[1m]")
+        observed = incidents_module.last_reported_model("anthropic", "opus")
+        require(
+            observed is not None and observed[0] == "claude-opus-5-5",
+            f"one model's two names were read as ambiguous: {observed}",
+        )
+
+    # The writer never cuts a list inside an id: one that does not fit is
+    # not recorded, rather than read back as another model.
+    field = incidents_module.reported_models_field
+    limit = incidents_module.DETAIL_LIMIT
+    padding = [f"claude-haiku-4-5-{index:08d}" for index in range(40)]
+    fits = ["claude-fable-5-1", "claude-haiku-4-5"]
+    require(
+        field(fits) == "claude-fable-5-1,claude-haiku-4-5"
+        and field([]) is None
+        and field(None) is None
+        and field(["a,b"]) is None
+        and field(["claude\tfable"]) is None,
+        "the reported-models field misjoined an ordinary list",
+    )
+    cut = padding + ["claude-fable-5-1"]
+    require(
+        len(",".join(cut)) > limit and field(cut) is None,
+        f"an over-long list was recorded: {field(cut)!r}",
+    )
+    with until_store_only():
+        incidents_module.record(
+            "spend",
+            program="orrery-agent",
+            role=dataclasses.replace(
+                runtime_module.load_role("reviewer"),
+                provider="anthropic", model="fable", endpoint=None,
+            ),
+            reported_models=field(cut),
+        )
+        spend = [
+            event for event in incidents_module.read_events()
+            if event.get("kind") == "spend"
+        ]
+        require(
+            len(spend) == 1 and "reported_models" not in spend[0],
+            f"an over-long list was stored truncated: {spend}",
+        )
+
+
+@test("an exact id keeps its thinking level through preview and apply")
+def test_exact_id_keeps_thinking() -> None:
+    """A hand-typed exact id used to be custom: its level was refused,
+    stored as null, and the delegate started with no `--effort`."""
+    config = config_on_shape("2.1.282")
+    saved_run_kit = config.run_kit
+    # Apply refreshes the surfaces and runs the doctor as subprocesses
+    # of this machine; neither is what this test measures.
+    config.run_kit = lambda *_args, **_keywords: (0, "")
+    try:
+        with isolated_config_home(), provider_binaries_on_path(), \
+                tempfile.TemporaryDirectory() as directory:
+            change = {
+                "implementer": {
+                    "provider": "anthropic",
+                    "model": "claude-opus-5-5",
+                    "thinking": "high",
+                }
+            }
+            edits = config.plan(change)
+            require(
+                len(edits) == 1
+                and '"claude-opus-5-5"' in edits[0]["after"]
+                and '"high"' in edits[0]["after"],
+                f"the preview dropped the exact id's level: {edits}",
+            )
+            previewed = {
+                edit["file"]: {"before": edit["before"], "after": edit["after"]}
+                for edit in edits
+            }
+            config.apply_edits(config.plan(change), previewed)
+            role = runtime_module.load_role("implementer")
+            require(
+                (role.provider, role.model, role.thinking)
+                == ("anthropic", "claude-opus-5-5", "high"),
+                f"the applied role lost its level: {role}",
+            )
+            command = runtime_module.delegated_command(
+                role, Path(directory) / "v.txt", Path(directory) / "s.json"
+            )
+            require(
+                command[command.index("--model") + 1] == "claude-opus-5-5"
+                and "--effort" in command
+                and command[command.index("--effort") + 1] == "high",
+                f"the delegate was not started at its level: {command}",
+            )
+
+            # Changing the model alone takes the exact entry's default
+            # rather than null.
+            pinned = config.planned_manifest_edit(
+                {"implementer": {"model": "claude-opus-5"}}
+            )
+            require(
+                pinned is not None
+                and json.loads(pinned["after"])["roles"]["implementer"]
+                == {
+                    "provider": "anthropic",
+                    "model": "claude-opus-5",
+                    "thinking": "max",
+                },
+                f"a model change nulled the exact id's level: {pinned}",
+            )
+            # The stored `fable`, which this CLI lists no row for, still
+            # takes a level change instead of being refused as custom.
+            principal = config.planned_manifest_edit(
+                {"orchestrator": {"thinking": "high"}}
+            )
+            require(
+                principal is not None
+                and json.loads(principal["after"])["roles"]["orchestrator"]
+                == {"thinking": "high"},
+                f"the stored alias's level change was refused: {principal}",
+            )
+    finally:
+        config.run_kit = saved_run_kit
+
+
+@test("a role with no level stored keeps it through another role's preview")
+def test_unset_thinking_survives_preview() -> None:
+    """A hand-typed exact id with thinking null became a known choice
+    with levels; the unselected picker showed `low`, and previewing a
+    change to any other role wrote `"thinking": "low"` to this one.
+
+    Runs the page's own functions under node against a minimal DOM whose
+    select, like a browser's, reads as its first option when none is
+    selected."""
+    node = shutil.which("node")
+    if node is None:
+        print("      (skipped: node is not installed)")
+        return
+    config = config_on_shape("2.1.282")
+    template = config.PAGE_TEMPLATE
+    require(
+        "fillLevels(thinking, levels, step.thinking)" in template,
+        "roleControls no longer builds its levels through fillLevels",
+    )
+    pieces = []
+    for pattern in (
+        r"^const roles = .*?;$",
+        r"^const original = Object\.fromEntries\(.*?^\);$",
+        r"^const originalSettings = .*?;$",
+        *(
+            rf"^function {name}\(.*?^}}$"
+            for name in (
+                "option", "fillLevels", "choiceFor", "selectThinking",
+                "endpointChoice", "currentEndpoint", "currentProvider",
+                "currentModel", "currentThinking", "currentSetting", "changes",
+            )
+        ),
+    ):
+        match = re.search(pattern, template, re.M | re.S)
+        require(match is not None, f"the page lacks {pattern}")
+        pieces.append(match.group(0))
+    state = []
+    for role_id, model, thinking in (
+        ("implementer", "claude-opus-5-5", None),
+        ("reviewer", "opus", "high"),
+    ):
+        state.append({
+            "id": role_id, "provider": "anthropic", "model": model,
+            "thinking": thinking or "", "endpoint": "",
+            "choices": config.model_choices("anthropic", model),
+        })
+    harness = """
+const STATE = __STATE__;
+const ENDPOINTS = [];
+const SETTINGS = [];
+const controls = {};
+function select(value) {
+  return {
+    options: [], disabled: false, fixed: value,
+    parentNode: { querySelector: () => null },
+    appendChild(node) { this.options.push(node); },
+    replaceChildren() { this.options = []; },
+    get value() {
+      if (this.fixed !== undefined) return this.fixed;
+      const chosen = this.options.filter(item => item.selected);
+      return (chosen.pop() || this.options[0] || { value: "" }).value;
+    },
+    set value(text) { this.fixed = text; },
+  };
+}
+const document = {
+  createElement: () => ({ value: "", textContent: "", selected: false }),
+  querySelector: selector => controls[selector] || null,
+};
+__PIECES__
+const key = (id, kind) => `select[data-step="${id}"][data-kind="${kind}"]`;
+for (const step of STATE) {
+  controls[key(step.id, "endpoint")] = select(step.provider);
+  controls[key(step.id, "model")] = select(step.model);
+  const thinking = select();
+  const chosen = choiceFor(step.id, step.provider, step.model);
+  fillLevels(thinking, chosen.thinking_levels, step.thinking);
+  controls[key(step.id, "thinking")] = thinking;
+}
+const shown = controls[key("implementer", "thinking")];
+const before = { value: shown.value, label: shown.options[0].textContent };
+// The user moves the reviewer to Sonnet, and the implementer's own
+// controls are resynchronised the way syncRole does on any change.
+controls[key("reviewer", "model")].value = "sonnet";
+selectThinking(
+  controls[key("reviewer", "thinking")], "reviewer", "anthropic", "sonnet",
+  currentThinking("reviewer"),
+);
+selectThinking(
+  shown, "implementer", "anthropic", "claude-opus-5-5",
+  currentThinking("implementer"),
+);
+const after = { value: shown.value, label: shown.options[0].textContent };
+console.log(JSON.stringify({ before, after, changes: changes() }));
+"""
+    script = harness.replace("__STATE__", json.dumps(state)).replace(
+        "__PIECES__", "\n".join(pieces)
+    )
+    result = subprocess.run(
+        [node, "-e", script],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        timeout=30, check=False,
+    )
+    require(result.returncode == 0, f"the harness failed: {result.stderr}")
+    observed = json.loads(result.stdout)
+    unset = {"value": "", "label": "not set"}
+    require(
+        observed["before"] == unset and observed["after"] == unset,
+        f"the unset level was not shown as not set: {observed}",
+    )
+    require(
+        set(observed["changes"]) == {"reviewer"}
+        and observed["changes"]["reviewer"]["model"] == "sonnet",
+        f"a preview of the reviewer touched the implementer: {observed}",
     )
 
 
@@ -9419,12 +10159,17 @@ def exercise_provider_neutral_config_surface() -> None:
                 "· fast",
                 "· balanced",
                 "· strongest",
-                "claude-fable-5[1m]",
-                "claude-sonnet-5",
             ):
                 require(
                     forbidden not in page,
                     f"the configuration page still contains {forbidden!r}",
+                )
+            # Exact versions are options of their own now, beside the
+            # alias that resolves to one of them, rather than collapsed.
+            for exact in ('"claude-fable-5[1m]"', '"claude-sonnet-5"'):
+                require(
+                    exact in page,
+                    f"the configuration page does not offer {exact}",
                 )
             require(
                 'data-kind="endpoint"' in page
@@ -9474,11 +10219,17 @@ def exercise_provider_neutral_config_surface() -> None:
             )
             require(state_match is not None, "the page omitted its role state")
             live_states = json.loads(state_match.group(1))
-            identities = {
-                f"{choice['provider']}::{choice['id']}"
-                for choice in live_states[0]["choices"]
-                if choice["known"]
-            }
+            # Each role's menu is the discovered catalogue, plus that
+            # role's own stored value where the CLI lists no row for it
+            # (the shipped `fable`), which stays a known choice.
+            identities = set.intersection(*(
+                {
+                    f"{choice['provider']}::{choice['id']}"
+                    for choice in state["choices"]
+                    if choice["known"]
+                }
+                for state in live_states
+            ))
             require(
                 "anthropic::nova" in identities
                 and "openai::gpt-6-future" in identities,
@@ -9491,7 +10242,8 @@ def exercise_provider_neutral_config_surface() -> None:
                     if choice["known"]
                 ]
                 require(
-                    set(values) == identities
+                    set(values) - identities
+                    <= {f"{state['provider']}::{state['model']}"}
                     and len(values) == len(set(values)),
                     f"a model menu is incomplete or duplicated: {values}",
                 )
@@ -10002,6 +10754,40 @@ def test_config_import_migrates_a_configured_manifest() -> None:
             and document["settings"]["plan_review_rounds"] == 2,
             f"a baseline-free import lost tunables: {document}",
         )
+
+
+@test("a bundled model an older CLI does not list names updating the CLI")
+def test_doctor_names_older_cli() -> None:
+    """The fake default picker predates Opus 5.5, as a CLI before 2.1.280
+    does: it never offered the model, so it cannot have withdrawn it."""
+    environment = review_environment("success")
+    try:
+        output = subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+            check=False,
+        ).stdout
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
+    lines = [
+        " ".join(line.split())
+        for line in output.splitlines()
+        if "the bundled fallback still lists" in line
+        and line.lstrip().startswith("WARN") and "anthropic:" in line
+    ]
+    require(
+        len(lines) == 1
+        and "claude-opus-5-5" in lines[0]
+        and "which the installed CLI does not list; the CLI may be older "
+        "than these models, so update it" in lines[0]
+        and "no longer offers" not in lines[0],
+        f"the doctor did not name an older CLI: {lines or output[-2000:]}",
+    )
 
 
 @test("the doctor reports the user configuration and names a migration")
@@ -12511,7 +13297,7 @@ def test_explicit_approval_beats_standing() -> None:
     with until_store_only() as state_dir, d1_repository(
         OPENAI_PRINCIPAL
     ) as repository:
-        seed_standing_reviewer(candidate_model="opus")
+        seed_standing_reviewer(candidate_model="sonnet")
         environment = review_environment("success", standing_state=state_dir)
         environment["CODEX_FAKE_MODE"] = "quota"
         process = start_review(
@@ -12519,7 +13305,7 @@ def test_explicit_approval_beats_standing() -> None:
             "--timeout",
             "60",
             "--approve-fallback",
-            "anthropic:fable",
+            "anthropic:opus",
             "--",
             "prompt",
             cwd=repository,
@@ -12531,12 +13317,12 @@ def test_explicit_approval_beats_standing() -> None:
         )
         require(
             "standing fallback active" not in stderr
-            and "opus" not in stderr,
+            and "sonnet" not in stderr,
             "a standing record overrode an explicit approval",
         )
         active = standing_module.list_active()
         require(
-            len(active) == 1 and active[0]["candidate_model"] == "opus",
+            len(active) == 1 and active[0]["candidate_model"] == "sonnet",
             "the conflicting standing record was modified",
         )
 
@@ -12604,7 +13390,7 @@ def test_until_scope_refused_noninteractive() -> None:
             "--timeout",
             "60",
             "--approve-fallback",
-            "anthropic:fable",
+            "anthropic:opus",
             "--approval-scope",
             "until:2091-08-05T16:49",
             "--",
@@ -15314,13 +16100,15 @@ def test_d1_held_approval_applies_once() -> None:
             state = review_module.DelegationState(
                 configured=reviewer, role=reviewer
             )
-            state.held_approval = ("anthropic", "fable")
+            # A model the fake CLI lists a row for: an alias it lists
+            # none for is never proposed, so could never be held.
+            state.held_approval = ("anthropic", "opus")
             invocation = review_module.Invocation(
                 timeout_seconds=60,
                 output_path=None,
                 prompt="prompt",
                 role_id="reviewer",
-                approval=("anthropic", "fable"),
+                approval=("anthropic", "opus"),
                 no_fallback=False,
             )
             errors = io.StringIO()
@@ -15340,13 +16128,13 @@ def test_d1_held_approval_applies_once() -> None:
             require(
                 status is None
                 and (state.role.provider, state.role.model)
-                == ("anthropic", "fable")
+                == ("anthropic", "opus")
                 and state.is_fallback,
                 f"the held approval did not start its candidate: "
                 f"{status} {text}",
             )
             require(
-                "Fallback approved for anthropic:fable" in text
+                "Fallback approved for anthropic:opus" in text
                 and "ORRERY FALLBACK APPROVAL REQUIRED" not in text
                 and "names a different candidate" not in text,
                 f"the held approval asked a second time: {text}",
@@ -15383,7 +16171,7 @@ def test_d1_write_capable_rerun_stops_and_asks() -> None:
                 "--timeout",
                 "60",
                 "--approve-fallback",
-                "anthropic:fable",
+                "anthropic:opus",
                 "--",
                 "prompt",
                 cwd=repository,
@@ -15423,7 +16211,7 @@ def test_d1_read_only_rerun_holds_the_approval() -> None:
                 "--timeout",
                 "60",
                 "--approve-fallback",
-                "anthropic:fable",
+                "anthropic:opus",
                 "--",
                 "prompt",
                 cwd=repository,
@@ -15462,7 +16250,7 @@ def test_d1_read_only_rerun_holds_the_approval() -> None:
             "--timeout",
             "60",
             "--approve-fallback",
-            "anthropic:fable",
+            "anthropic:opus",
             "--",
             "prompt",
             cwd=repository,
@@ -15474,7 +16262,7 @@ def test_d1_read_only_rerun_holds_the_approval() -> None:
         )
         require(
             "held in reserve" in stderr
-            and "Fallback approved for anthropic:fable" in stderr
+            and "Fallback approved for anthropic:opus" in stderr
             and "ORRERY FALLBACK APPROVAL REQUIRED" not in stderr,
             f"the reserve asked a second time: {stderr}",
         )
@@ -15503,7 +16291,7 @@ def test_d1_recorded_failure_starts_the_candidate() -> None:
                 "--timeout",
                 "60",
                 "--approve-fallback",
-                "anthropic:fable",
+                "anthropic:opus",
                 "--",
                 "prompt",
                 cwd=repository,
@@ -15514,7 +16302,7 @@ def test_d1_recorded_failure_starts_the_candidate() -> None:
                 f"the approved candidate did not start: {stderr}",
             )
             require(
-                "Fallback approved for anthropic:fable" in stderr
+                "Fallback approved for anthropic:opus" in stderr
                 and "held in reserve" not in stderr,
                 f"an authorised approval was not applied directly: {stderr}",
             )
@@ -16193,8 +16981,9 @@ def test_d3_ceiling_from_a_real_transcript() -> None:
         )
         # (U2) One bucket for the provider: spend from two Anthropic
         # models sums, rather than each being measured against the whole.
+        # Each exact version the catalogue lists keeps its own key.
         require(
-            "fable 600" in refusal and "opus 400" in refusal,
+            "claude-fable-5-1 600" in refusal and "claude-opus-5 400" in refusal,
             f"the two models did not sum into one bucket: {refusal}",
         )
         require(
@@ -16220,7 +17009,7 @@ def test_d3_ceiling_from_a_real_transcript() -> None:
             for key in entry["spend"]
         }
         require(
-            keys == {"anthropic/fable", "anthropic/opus"},
+            keys == {"anthropic/claude-fable-5-1", "anthropic/claude-opus-5"},
             f"the transcript models were not mapped onto the manifest: {keys}",
         )
         require(
@@ -16235,19 +17024,20 @@ def test_d3_ceiling_from_a_real_transcript() -> None:
 @test("a model only the manifest names still reaches its own provider")
 def test_d3_manifest_named_model_is_attributed() -> None:
     # Measured rather than imagined: a live gpt-6-astra session, a model
-    # the bundled catalogue has never carried, reached no provider at
-    # all and its spend counted towards no allowance.
+    # the bundled catalogue did not then carry, reached no provider at
+    # all and its spend counted towards no allowance. The bundle now
+    # lists gpt-6-astra, so the fixture names one it still does not.
     with standing_stores(), transcript_roots() as (_projects, sessions):
-        codex_rollout(sessions / "rollout-fixture.jsonl", "gpt-6-astra", 900)
+        codex_rollout(sessions / "rollout-fixture.jsonl", "gpt-6-sol", 900)
         manifest = copy.deepcopy(runtime_module.load_manifest(runtime_module.MANIFEST_PATH))
         manifest["allowances"] = {"openai": {"tokens": 900, "window_days": 7}}
         manifest["steps"] = [
-            {"id": "plan-reviewer", "provider": "openai", "model": "gpt-6-astra"}
+            {"id": "plan-reviewer", "provider": "openai", "model": "gpt-6-sol"}
         ]
         rollup = allowance_module.refresh(manifest=manifest)
         spend = allowance_module.window_spend("openai", 7, rollup=rollup)
         require(
-            spend["total"] == 900 and spend["models"] == {"gpt-6-astra": 900},
+            spend["total"] == 900 and spend["models"] == {"gpt-6-sol": 900},
             f"a manifest-named model was not attributed: {spend}",
         )
 
@@ -16258,15 +17048,15 @@ def test_d3_manifest_named_model_is_attributed() -> None:
             {
                 "id": "plan-reviewer",
                 "provider": "openai",
-                "model": "gpt-6-astra",
+                "model": "gpt-6-sol",
                 "endpoint": "somewhere",
             }
         ]
         resolve = allowance_module.model_resolver(routed)
         require(
-            resolve("gpt-6-astra") == "/gpt-6-astra",
+            resolve("gpt-6-sol") == "/gpt-6-sol",
             f"an endpoint-routed model was claimed for its provider: "
-            f"{resolve('gpt-6-astra')}",
+            f"{resolve('gpt-6-sol')}",
         )
         # The catalogue still decides where it can. `load_role` refuses
         # a manifest that assigns a model to the wrong provider, so this
@@ -16283,8 +17073,9 @@ def test_d3_manifest_named_model_is_attributed() -> None:
                 ]
             }
         )("claude-opus-5")
+        # Owned by the bundle's own exact entry, on Anthropic.
         require(
-            misassigned == "anthropic/opus",
+            misassigned == "anthropic/claude-opus-5",
             f"a manifest entry overrode the catalogue's ownership: "
             f"{misassigned}",
         )
@@ -16435,7 +17226,7 @@ def test_d3_one_accounting_source() -> None:
         rollup = allowance_module.read_rollup()
         require(
             all(
-                allowance_module.split_key(key) == ("anthropic", "opus")
+                allowance_module.split_key(key) == ("anthropic", "claude-opus-5")
                 for entry in rollup["hours"].values()
                 for key in entry["spend"]
             )
@@ -16670,7 +17461,7 @@ def test_d3_nested_transcripts_are_counted() -> None:
         spend = allowance_module.window_spend("anthropic", 7, rollup=rollup)
         require(
             spend["total"] == 123
-            and spend["models"] == {"opus": 120, "fable": 3},
+            and spend["models"] == {"claude-opus-5": 120, "claude-fable-5-1": 3},
             f"a nested transcript was not counted: {spend}",
         )
 
@@ -16860,7 +17651,8 @@ def test_d3_usage_agrees_with_the_rollup() -> None:
             for key, total in entry["spend"].items():
                 measured[key] = measured.get(key, 0) + total
         require(
-            reported == measured == {"anthropic/opus": 412, "anthropic/fable": 88},
+            reported == measured
+            == {"anthropic/claude-opus-5": 412, "anthropic/claude-fable-5-1": 88},
             f"orrery-usage and the rollup disagree: {reported} != {measured}",
         )
 
@@ -18313,7 +19105,7 @@ def test_incidents_from_approved_rerun() -> None:
             "--timeout",
             "60",
             "--approve-fallback",
-            "anthropic:fable",
+            "anthropic:opus",
             "--",
             "prompt",
             cwd=repository,
@@ -18334,7 +19126,7 @@ def test_incidents_from_approved_rerun() -> None:
             len(approved) == 1
             and approved[0]["program"] == "orrery-review"
             and approved[0]["role"] == "reviewer"
-            and approved[0]["candidate"] == "anthropic:fable"
+            and approved[0]["candidate"] == "anthropic:opus"
             and approved[0]["approval_scope"] == "run"
             and approved[0]["crosses_provider"] is True,
             f"the approval fast-path did not record its incident: {events}",
@@ -19299,6 +20091,51 @@ def test_exact_identity_in_fallback_ranking() -> None:
         and "claude-opus-5-5" not in exact
         and "claude-opus-5" in exact,
         f"a failed exact id came back as the alias resolving to it: {exact}",
+    )
+
+
+@test("a configured alias with no row keeps its distance for its family's rows")
+def test_configured_alias_ranks_its_family() -> None:
+    """The shipped `fable` on a CLI listing only a Fable version: that
+    version used to rank behind `opus`, which won on list order alone."""
+    manifest = copy.deepcopy(read_json(KIT_DIR / "global" / "orchestration.json"))
+    for step in manifest["steps"]:
+        if step["id"] == "orchestrator":
+            step.update(provider="openai", model="gpt-5.6-sol", thinking="max")
+        if step["id"] == "plan-reviewer":
+            step.update(provider="anthropic", model="fable", thinking="high")
+    live = [
+        {"id": "opus", "resolved": "claude-opus-5", "fallback_tier": 3,
+         "thinking_levels": ["low", "high"], "default_thinking": "high"},
+        {"id": "claude-opus-5", "resolved": "claude-opus-5", "fallback_tier": 3,
+         "thinking_levels": ["low", "high"], "default_thinking": "high"},
+        {"id": "claude-fable-5[1m]", "resolved": "claude-fable-5",
+         "fallback_tier": 3, "thinking_levels": ["low", "high"],
+         "default_thinking": "high"},
+    ]
+    saved = fallback_module._catalogue_entries
+    fallback_module._catalogue_entries = lambda provider, **_keywords: (
+        [dict(item) for item in live] if provider == "anthropic" else [],
+        "installed CLI catalogue",
+    )
+    try:
+        reviewer = runtime_module.load_role(
+            "reviewer", manifest=manifest, apply_override=False
+        )
+        ranked = [
+            candidate.model
+            for _score, candidate, _source in fallback_module._ranked_candidates(
+                reviewer,
+                excluded_providers={"openai"},
+                assumed_ready={"anthropic"},
+                manifest=manifest,
+            )
+        ]
+    finally:
+        fallback_module._catalogue_entries = saved
+    require(
+        ranked[:1] == ["claude-fable-5[1m]"],
+        f"the configured fable's family lost its distance: {ranked}",
     )
 
 

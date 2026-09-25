@@ -35,7 +35,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orrery_model_catalogue import (  # noqa: E402
     EFFORT_NAME,
     DiscoveryResult,
+    derived_label,
     discover_catalogue,
+    known_entry,
+    model_identity,
 )
 from orrery_runtime import (  # noqa: E402
     MANIFEST_PATH,
@@ -140,10 +143,38 @@ def settings_snapshot(
     return states
 
 
+def _optional_text(model: str, name: str, value: Any) -> str | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 200
+        or not value.isprintable()
+    ):
+        raise ConfigError(f"{model} has an invalid {name}")
+    return value
+
+
+def is_alias(provider: str, model: str) -> bool:
+    """Whether a model id is a bare family alias, which floats."""
+    identity = model_identity(provider, model)
+    return identity.family is not None and identity.version is None
+
+
 def _parse_catalogue(
     providers: Any,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Validate provider entries from either discovery or the fallback."""
+    """Validate provider entries from either discovery or the fallback.
+
+    The label is the CLI's own name for the model, verbatim, and the
+    description beneath it likewise; only where the CLI supplied none,
+    the bundled catalogue among them, is the label Orrery's, and it is
+    then marked as derived so the page never presents Orrery's words as
+    the CLI's. The id stays the value passed to `--model`. Labels only
+    have to be unique, so the page can never offer two options that
+    read alike.
+    """
     if not isinstance(providers, dict):
         raise ConfigError("the model catalogue providers must be an object")
     if set(providers) != set(PROVIDERS):
@@ -156,6 +187,7 @@ def _parse_catalogue(
         if not isinstance(entries, list) or not entries:
             raise ConfigError(f"the {provider} model catalogue must be a list")
         seen: set[str] = set()
+        labels: set[str] = set()
         parsed: list[dict[str, Any]] = []
         for entry in entries:
             if not isinstance(entry, dict):
@@ -169,10 +201,22 @@ def _parse_catalogue(
                 raise ConfigError(f"every {provider} model needs an id")
             if model in seen:
                 raise ConfigError(f"duplicate {provider} model: {model}")
-            if label != model:
+            if _optional_text(model, "label", label) is None:
+                raise ConfigError(f"{model} needs a dropdown label")
+            if label in labels:
                 raise ConfigError(
-                    f"{model} needs an exact, uncharacterised dropdown label"
+                    f"{model} repeats the {provider} dropdown label {label!r}"
                 )
+            label_derived = entry.get("label_derived", True)
+            if not isinstance(label_derived, bool):
+                raise ConfigError(f"{model} has an invalid label_derived")
+            description = _optional_text(
+                model, "description", entry.get("description")
+            )
+            resolved = _optional_text(model, "resolution", entry.get("resolved"))
+            resolved_label = _optional_text(
+                model, "resolution label", entry.get("resolved_label")
+            )
             if not isinstance(levels, list) or any(
                 not isinstance(level, str) or not EFFORT_NAME.fullmatch(level)
                 for level in levels
@@ -204,6 +248,14 @@ def _parse_catalogue(
                     "provider": provider,
                     "id": model,
                     "label": label,
+                    "label_derived": label_derived,
+                    "description": description,
+                    # A bare alias floats; where discovery ran it also
+                    # states what it runs now, so the page can say
+                    # "latest" and name that version.
+                    "alias": is_alias(provider, model),
+                    "resolved": resolved,
+                    "resolved_label": resolved_label,
                     "thinking_levels": levels,
                     "default_thinking": default,
                     "fallback_tier": fallback_tier,
@@ -211,6 +263,7 @@ def _parse_catalogue(
                 }
             )
             seen.add(model)
+            labels.add(label)
         catalogue[provider] = parsed
     return catalogue
 
@@ -256,7 +309,40 @@ def model_choices(
                 seen.add(identity)
 
     current = (current_provider, current_model)
-    if current_model and current not in seen:
+    known = (
+        known_choice(current_provider, current_model)
+        if current_model and current not in seen
+        else None
+    )
+    if known is not None:
+        # Stored but not listed, typically an alias the CLI lists no row
+        # for or a version the catalogue has not caught up with: still a
+        # known model, with the levels of the entry it is known by, so
+        # opening the page cannot turn it into a custom one.
+        label = derived_label(current_provider, current_model)
+        if any(
+            choice["label"] == label
+            for choice in choices
+            if choice["provider"] == current_provider
+        ):
+            label = f"{label} ({current_model})"
+        choices.append(
+            {
+                "provider": current_provider,
+                "id": current_model,
+                "label": label,
+                "label_derived": True,
+                "description": None,
+                "alias": is_alias(current_provider, current_model),
+                "resolved": None,
+                "resolved_label": None,
+                "thinking_levels": list(known["thinking_levels"]),
+                "default_thinking": known.get("default_thinking"),
+                "fallback_tier": known.get("fallback_tier"),
+                "known": True,
+            }
+        )
+    elif current_model and current not in seen:
         choices.append(
             {
                 "provider": current_provider,
@@ -457,18 +543,25 @@ def validate_provider(value: Any) -> str:
     return value
 
 
-def catalogue_choice(
+def known_choice(
     provider: str,
     model: str,
 ) -> dict[str, Any] | None:
-    return next(
-        (
-            entry
-            for entry in load_catalogue().get(provider, [])
-            if entry["id"] == model
-        ),
-        None,
-    )
+    """The entry a model is known by, from the offered catalogue first.
+
+    The bundled catalogue is asked second because a stored alias the
+    installed CLI lists no row for (the shipped `fable`) is still a
+    known model: without it, changing only that role's thinking level
+    was refused as a custom model's.
+    """
+    for entries in (
+        load_catalogue().get(provider, []),
+        bundled_catalogue().get(provider, []),
+    ):
+        entry = known_entry(provider, model, entries)
+        if entry is not None:
+            return entry
+    return None
 
 
 def resolved_thinking(
@@ -481,7 +574,7 @@ def resolved_thinking(
 ) -> str | None:
     """Validate a model/thinking pair and choose a deterministic fallback."""
     current = step_state(step)
-    choice = catalogue_choice(provider, model)
+    choice = known_choice(provider, model)
     if choice is None:
         if supplied and requested not in (None, ""):
             raise ConfigError(
@@ -655,8 +748,8 @@ def planned_manifest_edit(
         model = validate_model(change.get("model", current["model"]))
         known_providers = [
             provider
-            for provider, entries in load_catalogue().items()
-            if any(entry["id"] == model for entry in entries)
+            for provider in PROVIDERS
+            if known_choice(provider, model) is not None
         ]
         provider_value = change.get("provider")
         if provider_value is None and model != current["model"]:
@@ -1239,6 +1332,18 @@ function option(value, label, selected) {
   return node;
 }
 
+// A stored level the model does not list, null included, reads as "not
+// set", which leaves it unchanged: left to the browser, the first level
+// would show as chosen and a preview of any other role would write it.
+function fillLevels(select, levels, chosen) {
+  if (!levels.includes(chosen)) {
+    select.appendChild(option("", "not set", true));
+  }
+  for (const level of levels) {
+    select.appendChild(option(level, level, level === chosen));
+  }
+}
+
 function settingControls(card) {
   const setting = SETTINGS.find(entry => entry.id === card.target);
   const box = document.createElement("div");
@@ -1325,9 +1430,7 @@ function roleControls(card) {
   thinking.dataset.kind = "thinking";
   const levels = preset ? [] : (chosen ? chosen.thinking_levels : []);
   if (levels.length) {
-    for (const level of levels) {
-      thinking.appendChild(option(level, level, level === step.thinking));
-    }
+    fillLevels(thinking, levels, step.thinking);
   } else {
     thinking.appendChild(option(
       "",
@@ -1903,19 +2006,17 @@ function selectThinking(select, roleId, provider, model, preferred) {
     select.disabled = true;
     return null;
   }
-  const remembered = preferred ||
-    (provider === roles[roleId].provider &&
-     model === roles[roleId].model ? roles[roleId].thinking : "");
-  const chosen = levels.includes(remembered)
-    ? remembered
-    : (choice.default_thinking || levels[0]);
-  for (const level of levels) {
-    const option = document.createElement("option");
-    option.value = level;
-    option.textContent = level;
-    option.selected = level === chosen;
-    select.appendChild(option);
-  }
+  const stored = provider === roles[roleId].provider &&
+    model === roles[roleId].model;
+  const remembered = preferred || (stored ? roles[roleId].thinking : "");
+  // Back on the stored model with its unlisted level: still not set.
+  const unset = !preferred && stored && !levels.includes(remembered);
+  const chosen = unset
+    ? null
+    : levels.includes(remembered)
+      ? remembered
+      : (choice.default_thinking || levels[0]);
+  fillLevels(select, levels, chosen);
   select.disabled = false;
   return chosen;
 }
@@ -1978,7 +2079,10 @@ function currentThinking(id) {
   const select = document.querySelector(
     `select[data-step="${id}"][data-kind="thinking"]`
   );
-  return !select || select.disabled ? null : select.value;
+  // "not set" leaves the stored level, whatever it is, unchanged.
+  return !select || select.disabled || select.value === ""
+    ? null
+    : select.value;
 }
 
 function currentSetting(id) {

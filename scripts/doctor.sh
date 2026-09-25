@@ -486,7 +486,11 @@ from orrery_fallback import (  # noqa: E402
     same_provider_ladder,
     thinking_status,
 )
-from orrery_model_catalogue import discover_catalogue  # noqa: E402
+from orrery_model_catalogue import (  # noqa: E402
+    discover_catalogue,
+    known_entry,
+    visible_entries,
+)
 from orrery_runtime import (  # noqa: E402
     PROVIDERS,
     RuntimeConfigError,
@@ -546,6 +550,7 @@ bundled = load_catalogue()
 # multiplied its timeout by the number of roles.
 statuses = {}
 live = {}
+configured_models = {}
 try:
     discovered = discover_catalogue(bundled)
 except Exception as exc:  # noqa: BLE001 - diagnostics must not raise
@@ -571,6 +576,7 @@ for step in manifest.get("steps", []):
     if role.endpoint is not None:
         emit("INFO", f"{role_id} is endpoint-routed; its service serves its own models")
         continue
+    configured_models.setdefault(role.provider, set()).add(role.model)
     if role.provider not in statuses:
         statuses[role.provider] = provider_status(role.provider)
     status = statuses[role.provider]
@@ -624,14 +630,12 @@ if principal is not None and principal.endpoint is None:
     elif not automatic:
         emit("INFO", "the principal's automatic fallback ladder is switched off")
     else:
-        tier = next(
-            (
-                entry.get("fallback_tier")
-                for entry in bundled.get(principal.provider, [])
-                if entry.get("id") == principal.model
-            ),
-            None,
+        seed = known_entry(
+            principal.provider,
+            principal.model,
+            bundled.get(principal.provider, []),
         )
+        tier = seed.get("fallback_tier") if seed else None
         if not isinstance(tier, int) or isinstance(tier, bool):
             emit(
                 "WARN",
@@ -653,28 +657,47 @@ if discovered is not None:
         if discovered.sources.get(provider) != "installed CLI":
             emit("SKIP", f"{provider} live catalogue unavailable; drift not checked")
             continue
-        offered = {entry["id"] for entry in entries}
-        known = {entry.get("id") for entry in bundled.get(provider, [])}
-        fresh = sorted(offered - known)
+        seeds = bundled.get(provider, [])
+        # Only a model a role actually uses: the picker lists every exact
+        # version it serves, and warning for each one the bundle has not
+        # caught up with would bury the one that matters, a configured
+        # model with no offline entry, tier or thinking levels. A new
+        # version of a family the bundle carries is known through that
+        # family's alias.
+        fresh = sorted(
+            model
+            for model in configured_models.get(provider, set())
+            if known_entry(provider, model, seeds) is None
+        )
         if fresh:
             emit(
                 "WARN",
                 f"{provider}: the bundled fallback does not list "
                 + ", ".join(fresh)
-                + "; add them to global/model-catalogue.json when they "
-                "should be offered offline",
+                + ", which a configured role uses; add them to "
+                "global/model-catalogue.json so they are offered offline",
             )
         # The other direction matters just as much: a bundled model the
-        # picker no longer offers stays in the automatic fallback ladder
-        # that orrery-sync installs, so it would be attempted.
-        retired = sorted(known - offered)
+        # picker does not list stays in the automatic fallback ladder
+        # that orrery-sync installs, so it would be attempted. A bundled
+        # alias the CLI lists no row for is still offered while its
+        # family is, since the CLI resolves it. Absence cannot say
+        # whether the CLI withdrew a model or predates it, and the usual
+        # case is a CLI older than the bundle, so that is what is named.
+        retired = sorted(
+            entry["id"]
+            for entry in seeds
+            if isinstance(entry.get("id"), str)
+            and not visible_entries(provider, entry["id"], entries)
+        )
         if retired:
             emit(
                 "WARN",
                 f"{provider}: the bundled fallback still lists "
                 + ", ".join(retired)
-                + ", which the installed CLI no longer offers; the "
-                "automatic fallback ladder can still propose them",
+                + ", which the installed CLI does not list; the CLI may "
+                "be older than these models, so update it, and until then "
+                "the automatic fallback ladder can still propose them",
             )
         for entry in entries:
             resolved = entry.get("resolved")
