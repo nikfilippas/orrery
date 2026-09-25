@@ -215,7 +215,27 @@ def run_settings_installer(
         directory.rmdir()
 
 
-def withdraw_claude_ladder(target: Path, record: dict[str, Any], role: Role) -> bool:
+def stale_claude_ladder(target: Path, record: dict[str, Any]) -> bool:
+    """Whether the Claude surface still carries the ladder Orrery wrote.
+
+    Decided by the previous projection alone, never by the current
+    principal: the ladder is left behind precisely when the principal
+    has moved off this surface. A ladder the user has since edited no
+    longer equals the record and is theirs, so it is left alone.
+    """
+    if record.get("surface") != "anthropic":
+        return False
+    expected = record.get("fallbackModel")
+    if not isinstance(expected, list) or not expected:
+        return False
+    try:
+        live = json.loads(target.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(live, dict) and live.get("fallbackModel") == expected
+
+
+def withdraw_claude_ladder(target: Path, record: dict[str, Any]) -> bool:
     """Remove an Orrery-written fallback ladder from the Claude surface.
 
     Used when this surface stops being the principal's, and when the
@@ -224,20 +244,7 @@ def withdraw_claude_ladder(target: Path, record: dict[str, Any], role: Role) -> 
     The model and thinking level are deliberately left alone, since the
     user may still work on this surface deliberately.
     """
-    if role.provider != "anthropic" or record.get("surface") != "anthropic":
-        return False
-    expected = record.get("fallbackModel")
-    if not isinstance(expected, list):
-        return False
-    try:
-        live = json.loads(target.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    if (
-        not isinstance(live, dict)
-        or not live.get("fallbackModel")
-        or live.get("fallbackModel") != expected
-    ):
+    if not stale_claude_ladder(target, record):
         return False
     # Shares the canonical guard and propagates failure, so a refused
     # or failed withdrawal is never reported as a successful cleanup.
@@ -468,24 +475,13 @@ def main() -> int:
             file=sys.stderr,
         )
         previous = read_record()
-        stale_ladder = (
-            role.provider == "anthropic"
-            and previous.get("surface") == "anthropic"
-            and isinstance(previous.get("fallbackModel"), list)
-            and previous.get("fallbackModel")
-        )
         if arguments.check:
-            if stale_ladder:
-                try:
-                    live = json.loads(claude_settings_path().read_text())
-                except (OSError, json.JSONDecodeError):
-                    live = {}
-                if isinstance(live, dict) and live.get("fallbackModel") == previous["fallbackModel"]:
-                    print(f"{PROGRAM}: fallbackModel: stale Orrery ladder remains armed")
-                    return 1
+            if stale_claude_ladder(claude_settings_path(), previous):
+                print(f"{PROGRAM}: fallbackModel: stale Orrery ladder remains armed")
+                return 1
         else:
             try:
-                withdraw_claude_ladder(claude_settings_path(), previous, role)
+                withdraw_claude_ladder(claude_settings_path(), previous)
             except SyncError as exc:
                 print(f"{PROGRAM}: {exc}", file=sys.stderr)
                 return 1
@@ -509,6 +505,7 @@ def main() -> int:
         return 2
     ladder = same_provider_ladder(role) if automatic else []
 
+    stale_ladder = False
     try:
         if role.provider == "anthropic":
             differences = claude_drift(role, ladder)
@@ -519,8 +516,12 @@ def main() -> int:
         else:
             differences = sync_codex(role, dry_run=arguments.check)
             previous = read_record()
-            if not arguments.check and previous.get("surface") == "anthropic":
-                withdraw_claude_ladder(claude_settings_path(), previous, role)
+            if arguments.check:
+                stale_ladder = stale_claude_ladder(
+                    claude_settings_path(), previous
+                )
+            else:
+                withdraw_claude_ladder(claude_settings_path(), previous)
     except SyncError as exc:
         print(f"{PROGRAM}: {exc}", file=sys.stderr)
         return 1
@@ -535,6 +536,9 @@ def main() -> int:
             }
         )
 
+    if stale_ladder:
+        print(f"{PROGRAM}: fallbackModel: stale Orrery ladder remains armed")
+
     if not differences:
         if not arguments.quiet:
             print(
@@ -543,7 +547,7 @@ def main() -> int:
                 + (f" at thinking {role.thinking}" if role.thinking else "")
                 + (f" with fallback {', '.join(ladder)}" if ladder else "")
             )
-        return 0
+        return 1 if stale_ladder else 0
 
     verb = "would change" if arguments.check else "aligned"
     if not arguments.quiet:

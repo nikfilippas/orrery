@@ -14,6 +14,7 @@ offline ranking half to explain direct-provider principal mismatches.
 from __future__ import annotations
 
 import io
+import json
 import os
 import re
 import shutil
@@ -1280,6 +1281,84 @@ def parse_reset_time(diagnostics: str) -> datetime | None:
     if parsed.timestamp() <= datetime.now().astimezone().timestamp():
         return None
     return parsed
+
+
+def _event_error_messages(event: dict[str, Any]) -> list[str]:
+    kind = event.get("type")
+    messages: list[Any] = []
+    if kind == "error":
+        messages.append(event.get("message"))
+        # Anthropic's API error body nests its words and its code.
+        error = event.get("error")
+        if isinstance(error, dict):
+            messages.append(error.get("message"))
+            code = error.get("type")
+            if isinstance(code, str):
+                messages.append(code.replace("_", " "))
+    elif kind == "turn.failed":
+        error = event.get("error")
+        if isinstance(error, dict):
+            messages.append(error.get("message"))
+    elif kind == "assistant" and event.get("is_api_error_message") is True:
+        # The CLI's own error code, as words: its prose for a missing
+        # model ("may not exist") matches no model pattern, while
+        # `model_not_found`, `billing_error` and `rate_limit` say it
+        # exactly.
+        code = event.get("error")
+        if isinstance(code, str):
+            messages.append(code.replace("_", " "))
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            messages.extend(
+                block.get("text")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+    elif kind == "result" and event.get("is_error") is True:
+        messages.append(event.get("result"))
+        errors = event.get("errors")
+        if isinstance(errors, list):
+            messages.extend(errors)
+    return [message for message in messages if isinstance(message, str)]
+
+
+def provider_error_text(log_text: str) -> str:
+    """Only the provider's own error content from a delegate's output.
+
+    A run log interleaves the CLI's stderr with its JSON event stream,
+    and that stream carries everything the delegate read and wrote:
+    command output, tool results, assistant prose. Classified whole, a
+    delegate that read the orchestrator skill's "model ... unavailable"
+    wording, or a file mentioning billing, decided its own failure
+    scope and reset time. Kept: lines that are not JSON events, which
+    are stderr; Codex's fatal `error` and `turn.failed` events; Claude's
+    API-error assistant message and erroring result. Codex `error`
+    items are dropped with the other items: they are non-fatal notices,
+    and a live probe of the installed CLI showed one reading "Model
+    metadata ... not found" on a run that failed for another reason.
+    """
+    kept: list[str] = []
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("{"):
+            kept.append(line)
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            # Most likely an event torn by a kill, which still carries
+            # its payload; losing a malformed stderr line is the cheaper
+            # error.
+            continue
+        if not isinstance(event, dict) or "type" not in event:
+            # A bare JSON error body the CLI printed to stderr.
+            kept.append(line)
+            continue
+        kept.extend(_event_error_messages(event))
+    return "\n".join(kept)
 
 
 def classify_failure(

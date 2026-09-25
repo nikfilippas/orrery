@@ -49,6 +49,7 @@ from orrery_fallback import (  # noqa: E402
     parse_approval,
     parse_reset_time,
     proposal_for_approval,
+    provider_error_text,
     provider_status,
     request_fallback_decision,
 )
@@ -824,6 +825,22 @@ def tail_text(path: Path, lines: int = 80) -> str:
         return ""
     content = path.read_text(errors="replace").splitlines()
     return sanitise_provider_text("\n".join(content[-lines:]))
+
+
+def provider_error_tail(path: Path, lines: int = 80) -> str:
+    """The same window as tail_text, reduced to the provider's own errors.
+
+    Every decision taken from a failed run's output, its failure scope
+    and the reset time that can bound a standing approval, reads this
+    rather than the printed tail, which also holds what the delegate
+    read.
+    """
+    if not path.exists():
+        return ""
+    content = path.read_text(errors="replace").splitlines()
+    return sanitise_provider_text(
+        provider_error_text("\n".join(content[-lines:]))
+    )
 
 
 def run_systemctl(
@@ -3431,6 +3448,7 @@ def main(
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
+                provider_errors = provider_error_tail(log_path)
                 write_terminal_marker(
                     receipts,
                     reason="timeout",
@@ -3476,7 +3494,7 @@ def main(
                     # model is excluded and the proposal ladder walks
                     # the same provider's nearest models first.
                     scope=FailureScope.MODEL,
-                    diagnostics=diagnostics,
+                    diagnostics=provider_errors,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
@@ -3500,6 +3518,7 @@ def main(
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
+                provider_errors = provider_error_tail(log_path)
                 write_terminal_marker(
                     receipts,
                     reason="stalled",
@@ -3527,7 +3546,7 @@ def main(
                     ),
                     status=114,
                     scope=FailureScope.MODEL,
-                    diagnostics=diagnostics,
+                    diagnostics=provider_errors,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
@@ -3544,6 +3563,7 @@ def main(
                 file=sys.stderr,
             )
             diagnostics = tail_text(log_path)
+            provider_errors = provider_error_tail(log_path)
             if diagnostics:
                 print(
                     "--- provider diagnostic output ---",
@@ -3559,8 +3579,8 @@ def main(
                     f"status {return_code}"
                 ),
                 status=return_code,
-                scope=classify_failure(diagnostics),
-                diagnostics=diagnostics,
+                scope=classify_failure(provider_errors),
+                diagnostics=provider_errors,
                 context_warning=not role_config.read_only,
                 require_rerun_after_inspection=(
                     workspace_requires_inspection()
@@ -3581,6 +3601,7 @@ def main(
                     file=sys.stderr,
                 )
                 diagnostics = tail_text(log_path)
+                provider_errors = provider_error_tail(log_path)
                 if diagnostics:
                     print(
                         "--- provider diagnostic output ---",
@@ -3596,8 +3617,8 @@ def main(
                         "no valid final result"
                     ),
                     status=1,
-                    scope=classify_failure(diagnostics),
-                    diagnostics=diagnostics,
+                    scope=classify_failure(provider_errors),
+                    diagnostics=provider_errors,
                     context_warning=not role_config.read_only,
                     require_rerun_after_inspection=(
                         workspace_requires_inspection()
@@ -3616,6 +3637,7 @@ def main(
                 file=sys.stderr,
             )
             diagnostics = tail_text(log_path)
+            provider_errors = provider_error_tail(log_path)
             if diagnostics:
                 print(
                     "--- provider diagnostic output ---",
@@ -3631,8 +3653,8 @@ def main(
                     "final result"
                 ),
                 status=1,
-                scope=classify_failure(diagnostics),
-                diagnostics=diagnostics,
+                scope=classify_failure(provider_errors),
+                diagnostics=provider_errors,
                 context_warning=not role_config.read_only,
                 require_rerun_after_inspection=(
                     workspace_requires_inspection()

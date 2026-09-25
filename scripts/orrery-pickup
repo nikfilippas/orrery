@@ -31,7 +31,7 @@ from typing import Any, Iterator
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orrery_incidents  # noqa: E402
 import orrery_runtime  # noqa: E402
-from orrery_fallback import parse_reset_time  # noqa: E402
+from orrery_fallback import parse_reset_time, provider_error_text  # noqa: E402
 from orrery_ledger import (  # noqa: E402
     LedgerError,
     private_directory,
@@ -62,7 +62,13 @@ ADVANCED_STATES = frozenset({
     "VERIFICATION_PASSED", "AWAITING_MERGE", "IN_REVIEW", "REVIEW_PASSED",
     "MERGED", "CLOSED", "CANCELLED", "NO_CHANGE",
 })
-TAIL_BYTES = 8192
+# How much of a preserved attempt log is read for its reset. The tail's
+# first line is dropped as torn, so a provider event longer than this
+# that straddles the start is lost. A Claude result event repeats the
+# final text, and the longest line in the recorded genuine streams is
+# 13 KB: a quarter of a megabyte leaves wide headroom and is still a
+# bounded read.
+TAIL_BYTES = 256 * 1024
 UNIT_PREFIX = "orrery-pickup-"
 ARM_DELAY_SECONDS = 120
 PENDING_GRACE_SECONDS = 180
@@ -416,12 +422,41 @@ def instance_identity(root: Path, create: bool) -> dict[str, str]:
     }
 
 
-def recovered_reset(root: Path, records: list[dict[str, Any]]) -> datetime | None:
-    """The provider-announced reset, from the preserved diagnostics.
+# orrery-review's live mirror of the delegate's stream, which reaches
+# the runner's captured stderr and consent.txt: tool output and prose
+# the delegate read, never the provider's own error. The provider's
+# channels are preserved whole in stdout.log and stderr.log.
+STREAM_MIRROR_PREFIX = "  | "
+
+
+def provider_errors(text: str, *, torn: bool = False) -> str:
+    """Only provider-originated error content from one captured channel.
+
+    A reset time or a quota verdict read from what the delegate read
+    would let a file that says "usage limit ... try again at" park the
+    task. A byte-bounded tail begins inside a line, and that fragment
+    of an event is no longer recognisably JSON, so it is dropped.
+    """
+    lines = text.splitlines()
+    if torn:
+        lines = lines[1:]
+    return provider_error_text(
+        "\n".join(
+            line for line in lines if not line.startswith(STREAM_MIRROR_PREFIX)
+        )
+    )
+
+
+def preserved_provider_errors(records: list[dict[str, Any]]) -> str | None:
+    """The provider's own errors from the latest attempt's preserved logs.
 
     Both channels are read: the launcher preserves stdout and stderr
     separately, a reset can be announced on either, and consent.txt
-    exists only for approval-required outcomes.
+    exists only for approval-required outcomes. Each is read from its
+    last TAIL_BYTES by seeking, so a long delegate's log is never loaded
+    whole, and a receipts path that is not absolute is refused rather
+    than resolved against whatever directory the executor runs in.
+    None when there is no attempt to read.
     """
     dispatch = next(
         (r["dispatch"] for r in reversed(records) if "dispatch" in r), None
@@ -442,10 +477,19 @@ def recovered_reset(root: Path, records: list[dict[str, Any]]) -> datetime | Non
                 handle.seek(0, os.SEEK_END)
                 size = handle.tell()
                 handle.seek(max(0, size - TAIL_BYTES))
-                pieces.append(handle.read().decode("utf-8", "replace"))
+                pieces.append(provider_errors(
+                    handle.read().decode("utf-8", "replace"),
+                    torn=size > TAIL_BYTES,
+                ))
         except OSError:
             continue
-    return parse_reset_time("\n".join(pieces)) if pieces else None
+    return "\n".join(pieces) if pieces else None
+
+
+def recovered_reset(root: Path, records: list[dict[str, Any]]) -> datetime | None:
+    """The provider-announced reset, from the preserved diagnostics."""
+    errors = preserved_provider_errors(records)
+    return parse_reset_time(errors) if errors else None
 
 
 def ask_priority(default: int) -> int:
@@ -1125,30 +1169,18 @@ QUOTA_WORDING = re.compile(
 )
 
 
-def quota_reset(root: Path, records: list[dict[str, Any]], combined: str):
+def quota_reset(root: Path, records: list[dict[str, Any]]):
     """A fresh reset time, only from a verified quota diagnosis.
 
     Reset-like wording alone is not a quota: a transient error can say
     'try again' too, and re-parking it would wait out a reset that
-    governs nothing. Both the runner's captured output and the
-    attempt's preserved diagnostics are consulted.
+    governs nothing. Only the attempt's preserved diagnostics are
+    consulted: the runner's captured stderr prefixes every line with
+    the task, so the mirror and the printed tail of what the delegate
+    read would pass for provider stderr, and the provider's own
+    channels are preserved whole in stdout.log and stderr.log.
     """
-    preserved = pieces = ""
-    dispatch = next(
-        (r["dispatch"] for r in reversed(records) if "dispatch" in r), None
-    )
-    if dispatch is not None:
-        attempt = Path(dispatch.get("receipts", ""))
-        chunks: list[str] = []
-        for candidate in (
-            attempt / "stdout.log",
-            attempt / "stderr.log",
-            attempt.parent / "consent.txt",
-        ):
-            with contextlib.suppress(OSError):
-                chunks.append(candidate.read_text(errors="replace")[-TAIL_BYTES:])
-        preserved = "\n".join(chunks)
-    pieces = combined + "\n" + preserved
+    pieces = preserved_provider_errors(records) or ""
     if not QUOTA_WORDING.search(pieces):
         return None
     return parse_reset_time(pieces)
@@ -1339,8 +1371,7 @@ def command_run(fired_unit: str | None = None) -> int:
                     cwd=root, stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, text=True,
                 )
-            out, err = child.communicate()
-            combined = out + "\n" + err
+            child.communicate()
             tokens, gaps = ledger_spend_after(root, claimed["task_id"], baseline)
             try:
                 after, _torn, _ = read_ledger(root / ".orrery", claimed["task_id"])
@@ -1359,7 +1390,7 @@ def command_run(fired_unit: str | None = None) -> int:
             # worked for its whole budget unmeasured.
             fresh = None
             if outcome_state == "DISPATCH_FAILED":
-                fresh = quota_reset(root, after, combined)
+                fresh = quota_reset(root, after)
             counted_gaps = (
                 [] if (outcome_state == "DISPATCH_FAILED" and fresh is not None) else gaps
             )

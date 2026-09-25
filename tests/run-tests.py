@@ -4884,6 +4884,274 @@ def test_failure_classification() -> None:
     )
 
 
+@test("an unknown role id is refused with the valid ids named")
+def test_unknown_role_names_valid_ids() -> None:
+    valid = sorted(runtime_module.ROLE_IDS)
+    for attempt in (
+        lambda: runtime_module.load_role("final-reviewer"),
+        lambda: runtime_module.role_from_manifest(
+            runtime_module.effective_manifest(), "final-reviewer"
+        ),
+    ):
+        try:
+            attempt()
+        except runtime_module.RuntimeConfigError as exc:
+            message = str(exc)
+        else:
+            raise Failure("final-reviewer was accepted as a role")
+        require(
+            message.startswith("unknown Orrery role: final-reviewer")
+            and all(role_id in message for role_id in valid),
+            f"the valid role ids were not named: {message!r}",
+        )
+
+
+@test("the shipped manifest and catalogue repeat no key at any depth")
+def test_shipped_json_has_no_duplicate_keys() -> None:
+    # json.load keeps the last of two equal keys without a word, so an
+    # edit to the first copy would silently do nothing.
+    for relative in ("global/orchestration.json", "global/model-catalogue.json"):
+        duplicates: list[str] = []
+
+        def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            seen: set[str] = set()
+            for key, _value in pairs:
+                if key in seen:
+                    duplicates.append(key)
+                seen.add(key)
+            return dict(pairs)
+
+        json.loads((KIT_DIR / relative).read_text(), object_pairs_hook=unique)
+        require(not duplicates, f"{relative} repeats {duplicates}")
+
+
+# The orchestrator skill's own wording, which delegates routinely read and
+# which on its own matches the model-scope pattern.
+SKILL_EXCERPT = (
+    "- If no authenticated candidate remains, report that fact; do not "
+    "describe a\n  merely installed or catalogued model as available.\n\n"
+    "If independent review is unavailable, the principal performs an "
+    "explicit\nself-review and reports that limitation."
+)
+CODEX_USAGE_LIMIT = "You've hit your usage limit. Try again later."
+CODEX_MODEL_MISSING = (
+    "unexpected status 404 Not Found: The model `gpt-nonexistent` does not "
+    "exist or you do not have access to it."
+)
+
+
+def codex_read_event(output: str) -> str:
+    return json.dumps({"type": "item.completed", "item": {
+        "id": "item_3", "type": "command_execution",
+        "command": "sed -n 270,290p SKILL.md",
+        "aggregated_output": output, "exit_code": 0, "status": "completed",
+    }})
+
+
+def codex_fatal_events(message: str) -> str:
+    # The shapes the installed Codex CLI emits under --json, measured
+    # against a loopback stub.
+    return "\n".join((
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "error", "message": message}),
+        json.dumps({"type": "turn.failed", "error": {"message": message}}),
+    ))
+
+
+def claude_read_event(output: str) -> str:
+    return "\n".join((
+        json.dumps({"type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": "toolu_1", "name": "Read",
+            "input": {"file_path": "SKILL.md"}}]}}),
+        json.dumps({"type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "toolu_1",
+            "content": output}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [{
+            "type": "text", "text": f"The skill says: {output}"}]}}),
+    ))
+
+
+def claude_api_error_events(text: str, code: str, status: int) -> str:
+    # The shapes the installed Claude CLI emits under stream-json,
+    # measured against a loopback stub.
+    return "\n".join((
+        json.dumps({
+            "type": "assistant",
+            "message": {"model": "<synthetic>", "content": [
+                {"type": "text", "text": text}]},
+            "error": code, "is_api_error_message": True,
+        }),
+        json.dumps({
+            "type": "result", "subtype": "success", "is_error": True,
+            "api_error_status": status, "result": text,
+        }),
+    ))
+
+
+@test("failure scope is decided from provider errors, not from what the delegate read")
+def test_failure_scope_ignores_read_content() -> None:
+    scope = fallback_module.FailureScope
+    classify = fallback_module.classify_failure
+    errors = fallback_module.provider_error_text
+
+    codex_log = (
+        codex_read_event(SKILL_EXCERPT) + "\n"
+        + codex_fatal_events(CODEX_USAGE_LIMIT)
+    )
+    require(
+        classify(codex_log) is scope.MODEL,
+        "the reproduction no longer reproduces; the excerpt lost its match",
+    )
+    require(
+        classify(errors(codex_log)) is scope.PROVIDER,
+        "skill text inside a Codex command output decided a usage limit's scope",
+    )
+
+    claude_log = (
+        claude_read_event(SKILL_EXCERPT) + "\n"
+        + claude_api_error_events(
+            "Claude AI usage limit reached", "rate_limit", 429
+        )
+    )
+    require(
+        classify(errors(claude_log)) is scope.PROVIDER,
+        "skill text inside a Claude tool result decided a usage limit's scope",
+    )
+
+    for log in (
+        codex_read_event("nothing relevant") + "\n"
+        + codex_fatal_events(CODEX_MODEL_MISSING),
+        claude_api_error_events(
+            "There's an issue with the selected model (claude-nonexistent). "
+            "It may not exist or you may not have access to it.",
+            "model_not_found", 404,
+        ),
+    ):
+        require(
+            classify(errors(log)) is scope.MODEL,
+            f"a genuine model error was not isolated to the model: {log!r}",
+        )
+
+    account_words = "Update billing details; a 401 means the quota key rotated."
+    for log in (
+        codex_read_event(account_words) + "\n"
+        + codex_fatal_events(CODEX_MODEL_MISSING),
+        claude_read_event(account_words) + "\n"
+        + claude_api_error_events(
+            "There's an issue with the selected model (claude-nonexistent). "
+            "It may not exist or you may not have access to it.",
+            "model_not_found", 404,
+        ),
+    ):
+        require(
+            classify(errors(log)) is scope.MODEL,
+            f"account wording the delegate read widened a model error: {log!r}",
+        )
+
+    stderr_only = (
+        "Reading additional input from stdin...\n"
+        "ERROR: You've hit your usage limit. Upgrade to Pro, or try again "
+        "at Aug 5th, 2091 4:49 PM.\n"
+    )
+    require(
+        errors(stderr_only) == stderr_only.rstrip("\n")
+        and classify(errors(stderr_only)) is scope.PROVIDER,
+        f"a plain stderr usage limit was not kept: {errors(stderr_only)!r}",
+    )
+
+    # The Codex error item is a non-fatal notice, and the installed CLI
+    # emits one naming a missing model on runs that fail for other
+    # reasons.
+    notice = json.dumps({"type": "item.completed", "item": {
+        "id": "item_0", "type": "error",
+        "message": "Model metadata for `gpt-x` not found. Defaulting to "
+        "fallback metadata; this can degrade performance and cause issues.",
+    }})
+    require(
+        classify(errors(notice + "\n" + codex_fatal_events(CODEX_USAGE_LIMIT)))
+        is scope.PROVIDER,
+        "a non-fatal Codex notice decided a usage limit's scope",
+    )
+
+    torn = codex_read_event(SKILL_EXCERPT)[:60]
+    require(
+        errors(torn) == "",
+        f"an event torn by a kill leaked its payload: {errors(torn)!r}",
+    )
+
+
+@test("a reset time the delegate read never bounds an approval")
+def test_reset_time_ignores_read_content() -> None:
+    announced = "usage limit reached; try again at Aug 5th, 2091 4:49 PM"
+    for log in (codex_read_event(announced), claude_read_event(announced)):
+        require(
+            fallback_module.parse_reset_time(log) is not None,
+            "the fixture does not carry a parseable reset",
+        )
+        require(
+            fallback_module.parse_reset_time(
+                fallback_module.provider_error_text(log)
+            ) is None,
+            f"a reset time the delegate read was trusted: {log!r}",
+        )
+    with tempfile.TemporaryDirectory() as directory:
+        log_path = Path(directory) / "run.log"
+        log_path.write_text(
+            codex_read_event(announced) + "\n"
+            + codex_fatal_events(
+                "You've hit your usage limit. Try again at Aug 6th, 2091 "
+                "9:15 AM."
+            ) + "\n"
+        )
+        failure = review_module.provider_error_tail(log_path)
+        reset = fallback_module.parse_reset_time(failure)
+        require(
+            "aggregated_output" in review_module.tail_text(log_path)
+            and "aggregated_output" not in failure
+            and "Aug 5th" not in failure
+            and reset is not None and (reset.day, reset.hour) == (6, 9),
+            f"the wrapper's decision text was not the provider's: {failure!r}",
+        )
+
+
+@test("nested provider error bodies and result error lists are kept")
+def test_provider_error_text_nested_shapes() -> None:
+    errors = fallback_module.provider_error_text
+    announced = "usage limit reached; try again at Aug 5th, 2091 4:49 PM"
+
+    anthropic = json.dumps({"type": "error", "error": {
+        "type": "rate_limit_error", "message": announced,
+    }})
+    kept = errors(anthropic)
+    require(
+        announced in kept and "rate limit error" in kept,
+        f"an Anthropic-shaped error body was dropped: {kept!r}",
+    )
+
+    result = json.dumps({
+        "type": "result", "subtype": "error_during_execution",
+        "is_error": True, "errors": [announced, {"not": "text"}],
+    })
+    kept = errors(result)
+    require(
+        kept == announced,
+        f"an erroring result's errors list was not kept alone: {kept!r}",
+    )
+    reset = fallback_module.parse_reset_time(kept)
+    require(
+        reset is not None and (reset.day, reset.hour) == (5, 16),
+        f"the reset in a result's errors list was not recovered: {reset!r}",
+    )
+
+    succeeded = json.dumps({
+        "type": "result", "is_error": False, "errors": [announced],
+    })
+    require(
+        errors(succeeded) == "",
+        "a successful result's errors list was treated as a failure",
+    )
+
+
 @test("the supervised principal requires approval before auth fallback")
 def test_principal_auth_fallback_requires_approval() -> None:
     with tempfile.TemporaryDirectory() as directory:
@@ -6033,6 +6301,59 @@ def test_model_failure_prefers_same_provider() -> None:
         "Nearest candidate: OpenAI / gpt-5.6-terra / thinking ultra" in stderr
         and "ORRERY FALLBACK APPROVAL REQUIRED" in stderr,
         f"same-provider fallback was not proposed: {stderr}",
+    )
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a usage limit stays provider-scoped when the delegate read model wording")
+def test_read_content_does_not_scope_wrapper_failure() -> None:
+    # The reported failure: an OpenAI usage limit, after the delegate had
+    # read the orchestrator skill, was scoped to the model and a
+    # same-provider model was proposed.
+    environment = review_environment("fail")
+    environment["CODEX_FAKE_FAIL_TEXT"] = (
+        codex_read_event(SKILL_EXCERPT) + "\n"
+        + codex_fatal_events(CODEX_USAGE_LIMIT)
+    )
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    _, stderr = finish_review(process, environment)
+
+    require(process.returncode == 7, f"provider failure status changed: {stderr}")
+    require(
+        "Nearest candidate: OpenAI" not in stderr
+        and "no authenticated or potentially authenticated fallback "
+        "candidate remains" in stderr,
+        f"read content scoped a usage limit to the model: {stderr}",
+    )
+    require(
+        "--- provider diagnostic output ---" in stderr
+        and "aggregated_output" in stderr,
+        f"the printed diagnostics no longer show the whole tail: {stderr}",
+    )
+    assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a failed run's standing-approval reset comes from the provider's error")
+def test_read_reset_does_not_bound_wrapper_approval() -> None:
+    # A model-scoped limit, so the same-provider proposal prints the
+    # scopes its reset time bounds.
+    environment = review_environment("fail")
+    environment["CODEX_FAKE_FAIL_TEXT"] = (
+        codex_read_event("usage limit; try again at Aug 5th, 2091 4:49 PM")
+        + "\n"
+        + codex_fatal_events(
+            "usage limit reached for model gpt-5.6-sol; try again at "
+            "Aug 6th, 2091 9:15 AM"
+        )
+    )
+    process = start_review(environment, "--timeout", "60", "--", "prompt")
+    _, stderr = finish_review(process, environment)
+
+    require(process.returncode == 7, f"model failure status changed: {stderr}")
+    require(
+        "Scopes:" in stderr and "until:2091-08-06" in stderr
+        and "2091-08-05" not in stderr,
+        f"the approval's reset was not the provider's own: {stderr}",
     )
     assert_no_review_residue(f"orrery-review-{process.pid}-")
 
@@ -18526,7 +18847,6 @@ def test_ladder_never_leaks() -> None:
                 sync_module.withdraw_claude_ladder(
                     settings_path,
                     {"surface": "anthropic", "fallbackModel": ["opus", "sonnet"]},
-                    principal,
                 )
             finally:
                 if saved is None:
@@ -18538,6 +18858,94 @@ def test_ladder_never_leaks() -> None:
                 "fallbackModel" not in live and live.get("model") == "fable",
                 f"the stale ladder was not withdrawn cleanly: {live}",
             )
+
+
+@test("a principal leaving Anthropic withdraws only the ladder Orrery wrote")
+def test_sync_withdraws_ladder_on_provider_move() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory)
+        (home / ".claude").mkdir()
+        settings = home / ".claude" / "settings.json"
+        write_json(settings, {"permissions": {"allow": ["Bash(ls:*)"]}})
+        environment = os.environ.copy()
+        environment["HOME"] = str(home)
+        environment["XDG_CONFIG_HOME"] = str(home / ".config")
+        environment["XDG_STATE_HOME"] = str(home / "state")
+        environment["CODEX_HOME"] = str(home / ".codex")
+        record_path = home / "state" / "orrery" / "projection.json"
+
+        def sync(*arguments: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, str(SYNC_SCRIPT), *arguments],
+                env=environment, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=120, check=False,
+            )
+
+        first = sync()
+        written = read_json(settings).get("fallbackModel")
+        require(
+            first.returncode == 0 and written
+            and read_json(record_path)["surface"] == "anthropic",
+            f"the Anthropic principal did not arm a ladder: {first.stdout} "
+            f"{first.stderr} {read_json(settings)}",
+        )
+        anthropic_record = read_json(record_path)
+
+        write_user_config_file(home / ".config" / "orrery", {
+            "version": 1,
+            "roles": {"orchestrator": {
+                "provider": "openai", "model": "gpt-5.6-sol",
+                "thinking": "high",
+            }},
+        })
+        checked = sync("--check")
+        require(
+            checked.returncode == 1
+            and "stale Orrery ladder remains armed" in checked.stdout
+            and read_json(settings).get("fallbackModel") == written,
+            f"--check did not report the stale ladder: {checked.stdout!r}",
+        )
+        moved = sync()
+        live = read_json(settings)
+        require(
+            moved.returncode == 0
+            and "fallbackModel" not in live
+            and live.get("model") == "fable"
+            and live["permissions"]["allow"] == ["Bash(ls:*)"],
+            f"the move to OpenAI left the ladder armed: {moved.stdout} "
+            f"{moved.stderr} {live}",
+        )
+        aligned = sync("--check")
+        require(
+            aligned.returncode == 0,
+            f"--check disagrees with the sync it just ran: {aligned.stdout}",
+        )
+
+        # Only the stale ladder keeps --check failing once Codex is aligned.
+        write_json(record_path, anthropic_record)
+        write_json(settings, {**live, "fallbackModel": written})
+        stale = sync("--check")
+        require(
+            stale.returncode == 1
+            and "stale Orrery ladder remains armed" in stale.stdout
+            and "would change" not in stale.stdout,
+            f"a stale ladder alone was not reported: {stale.stdout!r}",
+        )
+
+        # A ladder the user edited after Orrery wrote it is theirs.
+        edited = list(reversed(written)) + ["haiku"]
+        write_json(settings, {**live, "fallbackModel": edited})
+        kept = sync()
+        require(
+            kept.returncode == 0
+            and read_json(settings).get("fallbackModel") == edited,
+            f"a user-edited ladder was withdrawn: {read_json(settings)}",
+        )
+        write_json(record_path, anthropic_record)
+        require(
+            sync("--check").returncode == 0,
+            "a user-edited ladder was reported as Orrery's",
+        )
 
 
 @test("the Codex writer preserves comments and refuses a raced file")
@@ -21102,6 +21510,56 @@ def test_pickup_stdout_reset() -> None:
         )
 
 
+@test("a park reads its reset from provider errors, never from what the delegate read")
+def test_pickup_reset_ignores_read_content() -> None:
+    stamp = time.strftime(
+        "%Y-%m-%d %H:%M", time.localtime(time.time() + 90 * 60)
+    )
+    announced = announced_reset_line().strip()
+    for label, channel, text in (
+        ("codex command output", "stdout.log", codex_read_event(announced)),
+        ("claude tool result", "stdout.log", claude_read_event(announced)),
+        # orrery-review's live stream mirror, as the runner preserves it.
+        ("stream mirror", "../consent.txt", f"  | {announced}\n"),
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            root, environment, _state = parked_fixture(
+                directory, reset_text=text + "\n", channel=channel
+            )
+            parked = run_pickup(root, "park", "T-1", environment=environment)
+            require(
+                parked.returncode != 0
+                and "no provider-announced reset time" in parked.stderr,
+                f"{label}: a reset the delegate read parked the task: "
+                f"{parked.stdout!r} {parked.stderr!r}",
+            )
+    with tempfile.TemporaryDirectory() as directory:
+        root, environment, _state = parked_fixture(
+            directory,
+            reset_text=(
+                codex_read_event("nothing relevant") + "\n"
+                + codex_fatal_events(
+                    f"You've hit your usage limit. Try again at {stamp}."
+                ) + "\n"
+            ),
+            channel="stdout.log",
+        )
+        parked = run_pickup(root, "park", "T-1", environment=environment)
+        require(
+            parked.returncode == 0 and "parked T-1" in parked.stdout,
+            f"a provider error event's reset was not honoured: "
+            f"{parked.stdout!r} {parked.stderr!r}",
+        )
+
+    module = load_script(PICKUP_SCRIPT, "kit_pickup_provider_errors")
+    event = codex_read_event(announced)
+    require(
+        module.provider_errors(event[40:] + "\nstderr line", torn=True)
+        == "stderr line",
+        "the fragment a byte-bounded tail begins with leaked its payload",
+    )
+
+
 def pickup_timer_stubs(directory: Path, environment: dict[str, str]) -> Path:
     """Stub systemd-run, systemctl and loginctl, capturing every call."""
     stubs = directory / "timer-stubs"
@@ -21565,6 +22023,44 @@ def test_pickup_non_quota_failure() -> None:
             and payload["consumed_tokens"] >= payload["ceiling_tokens"],
             f"a non-quota failure was treated as a quota: {payload}",
         )
+
+
+@test("a quota reset the delegate read never re-parks an executor dispatch")
+def test_pickup_executor_ignores_read_reset() -> None:
+    # The runner tees the wrapper's stderr with a task prefix, so the
+    # printed tail of what the delegate read no longer looks like a
+    # JSON event there; only the preserved channels may decide.
+    with tempfile.TemporaryDirectory() as directory:
+        root, base, state = parked_fixture(
+            directory, reset_text=None, crafted=False
+        )
+        require(
+            run_pickup(
+                root, "park", "T-1", "--reset-at", recent_past_iso(),
+                environment=base,
+            ).returncode == 0,
+            "the park failed",
+        )
+        environment = pickup_executor_environment(base, "fail")
+        environment["CODEX_FAKE_FAIL_TEXT"] = (
+            codex_read_event(announced_reset_line(240).strip()) + "\n"
+            + codex_fatal_events(
+                "unexpected status 400 Bad Request: invalid tool schema"
+            )
+        )
+        try:
+            ran = run_pickup(root, "run", environment=environment)
+        finally:
+            discard_task_environment(environment)
+        require("1 failed" in ran.stdout, f"{ran.stdout!r} {ran.stderr!r}")
+        payload = read_json(state / "orrery" / "pickup.json")
+        require(
+            payload["records"] == []
+            and payload["consumed_tokens"] >= payload["ceiling_tokens"],
+            f"a read reset re-parked or exempted the spend: {payload}",
+        )
+        kinds = [e["kind"] for e in pickup_incidents(state)]
+        require("pickup-ceiling-stop" in kinds, f"no ceiling incident: {kinds}")
 
 
 def pickup_executor_environment(

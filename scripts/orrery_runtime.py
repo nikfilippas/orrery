@@ -995,6 +995,16 @@ def tunable_differences(
     return overlay, other
 
 
+def unknown_role(role_id: str) -> RuntimeConfigError:
+    # The valid ids are named because the near misses ("final-reviewer"
+    # for "reviewer") are what gets typed, and an alias would only move
+    # the guess.
+    return RuntimeConfigError(
+        f"unknown Orrery role: {role_id}; valid roles are "
+        + ", ".join(sorted(ROLE_IDS))
+    )
+
+
 def role_from_manifest(
     manifest: dict[str, Any],
     role_id: str,
@@ -1006,7 +1016,7 @@ def role_from_manifest(
     before it is written, with the same rules the readers apply.
     """
     if role_id not in ROLE_IDS:
-        raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
+        raise unknown_role(role_id)
     steps = manifest.get("steps")
     if not isinstance(steps, list):
         raise RuntimeConfigError("the orchestration manifest has no role list")
@@ -1183,7 +1193,7 @@ def load_role(
     if role_id not in ROLE_IDS:
         # Ahead of any read, so a typo is named as one rather than as
         # whatever the configuration happens to be wrong about.
-        raise RuntimeConfigError(f"unknown Orrery role: {role_id}")
+        raise unknown_role(role_id)
     if path is not None and manifest is not None:
         raise RuntimeConfigError("load_role takes a path or a manifest, not both")
     if manifest is None:
