@@ -42,7 +42,7 @@ VALIDATED_CLAUDE_CLI = "2.1.282"
 # was validated against this CLI version, and it has drifted between
 # releases before. The doctor warns when the installed version differs,
 # until a delegated probe revalidates the behaviour.
-VALIDATED_CODEX_CLI = "0.153.4"
+VALIDATED_CODEX_CLI = "0.157.0"
 ROLE_IDS = frozenset(
     {"orchestrator", "mechanic", "implementer", "plan-reviewer", "reviewer"}
 )
