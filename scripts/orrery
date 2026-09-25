@@ -40,6 +40,7 @@ from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
     candidate_role,
     describe,
+    failed_model_refusal,
     match,
     parse_approval_scope,
     record_approval,
@@ -423,6 +424,25 @@ def main() -> int:
             )
     else:
         record = match(configured)
+        refusal = None if record is None else failed_model_refusal(record)
+        if record is not None and refusal is not None:
+            # A record minted before ids were compared by identity goes
+            # inert rather than restarting the failed model under its
+            # other id.
+            print(
+                "orrery: the standing fallback candidate is not available: "
+                f"{refusal}. The configured principal will be attempted.",
+                file=sys.stderr,
+            )
+            incident_log.record(
+                "standing-excluded",
+                program="orrery",
+                role=configured,
+                detail=refusal,
+                candidate=f"{record['candidate_provider']}:"
+                f"{record['candidate_model']}",
+            )
+            record = None
         if record is not None:
             candidate = candidate_role(configured, record)
             availability = provider_status(candidate.provider)

@@ -35,6 +35,8 @@ from orrery_model_catalogue import (  # noqa: E402
     CatalogueDiscoveryError,
     discover_claude_models,
     discover_codex_models,
+    ModelIdentity,
+    model_identity,
 )
 from orrery_runtime import (  # noqa: E402
     MODEL_ID,
@@ -364,7 +366,10 @@ def principal_exclusions(
     The principal itself is not governed: it is the allowance holder,
     and an interactive session whose cost the user can see. A delegate
     loses the principal's provider, or under `principal-model` only the
-    principal's exact identity at any thinking level.
+    principal's exact identity at any thinking level. The pair is
+    returned as configured and every consumer compares it through
+    `model_identity`, so the principal's model is excluded under any of
+    its ids: `opus` and `claude-opus-5-5` are one allowance.
 
     Where the principal cannot be identified at all, no provider has
     been named, so the refusal is confined to crossing providers: an
@@ -383,6 +388,26 @@ def principal_exclusions(
     return {principal.provider}, set()
 
 
+def _allowance_bars(
+    identity: tuple[str, str],
+    exclusions: tuple[set[str], set[tuple[str, str]]],
+) -> bool:
+    """Whether `principal_exclusions` output bars this candidate.
+
+    By identity, not by literal pair, and with no discovery resolution:
+    a standing approval is started without re-ranking, so this is its
+    only guard, and ranking applies the same test so that nothing it
+    offers a delegate is refused here. An unresolved principal alias
+    therefore bars its whole family: nothing here says which version
+    the principal runs.
+    """
+    providers, models = exclusions
+    candidate = model_identity(*identity)
+    return identity[0] in providers or any(
+        candidate.matches(model_identity(*excluded)) for excluded in models
+    )
+
+
 def delegate_allowance_refusal(
     role: Role,
     identity: tuple[str, str],
@@ -396,8 +421,7 @@ def delegate_allowance_refusal(
     setting that decided it. Returned unpunctuated, so each caller can
     compose it into its own sentence.
     """
-    providers, models = principal_exclusions(role, manifest)
-    if identity[0] not in providers and identity not in models:
+    if not _allowance_bars(identity, principal_exclusions(role, manifest)):
         return None
     principal = principal_identity(manifest)
     if principal is None:
@@ -724,6 +748,7 @@ def _ranked_candidates(
         else delegate_thinking_ceiling(manifest)
     )
     configured_tiers = configured_model_tiers(manifest)
+    allowance = principal_exclusions(original, manifest)
     bundled = load_catalogue()
     source_entries = bundled.get(original.provider, [])
     source_seed = next(
@@ -795,13 +820,37 @@ def _ranked_candidates(
                     "default_thinking": None,
                 }
 
+        # Discovery says what each alias runs now; where it does, an
+        # alias is compared as that version, and where it does not, as
+        # its whole family. Either way a failed or excluded model cannot
+        # come back under its other id. The principal-allowance rule is
+        # applied separately, without resolution, by the very test that
+        # guards a standing approval, so ranking never offers a delegate
+        # a candidate that guard would refuse.
+        resolutions = {
+            entry["id"]: entry["resolved"]
+            for entry in by_id.values()
+            if isinstance(entry.get("resolved"), str)
+        }
+
+        def identity_of(model: str) -> ModelIdentity:
+            return model_identity(provider, model, resolutions.get(model))
+
+        barred = [
+            identity_of(model)
+            for excluded_provider, model in excluded_model_set
+            if excluded_provider == provider
+        ]
+        if provider == original.provider:
+            barred.append(identity_of(original.model))
+
         ordered = list(by_id.values())
         for index, entry in enumerate(ordered):
             model = entry["id"]
             identity = (provider, model)
-            if identity == (original.provider, original.model):
+            if any(identity_of(model).matches(item) for item in barred):
                 continue
-            if identity in excluded_model_set:
+            if _allowance_bars(identity, allowance):
                 continue
             tier = entry.get("fallback_tier")
             if not isinstance(tier, int) or isinstance(tier, bool):
@@ -931,14 +980,28 @@ def same_provider_ladder(role: Role, *, limit: int = 2) -> list[str]:
         # A model outside the first-party catalogue cannot be placed on
         # the tier scale, so no ladder can be justified for it.
         return []
+    source = model_identity(role.provider, role.model)
     ranked = sorted(
         (
             (abs(tier - source_tier), index, model)
             for index, (model, tier) in enumerate(tiers.items())
-            if model != role.model and abs(tier - source_tier) <= 1
+            if abs(tier - source_tier) <= 1
+            and not model_identity(role.provider, model).matches(source)
         )
     )
-    return [model for _distance, _index, model in ranked][:limit]
+    # One rung per family: with an alias and its exact versions listed
+    # side by side, a ladder by tier alone names one model twice, and
+    # an overloaded service is then retried on itself.
+    ladder: list[str] = []
+    families: set[str | None] = set()
+    for _distance, _index, model in ranked:
+        identity = model_identity(role.provider, model)
+        family = identity.family or identity.literal
+        if family in families:
+            continue
+        families.add(family)
+        ladder.append(model)
+    return ladder[:limit]
 
 
 def seconds_since_boot() -> float | None:

@@ -34,13 +34,13 @@ counted response leaves a digest of its `(message id, requestId)` pair
 beside the per-file offsets, and a file whose recorded offset exceeds
 its current size is read again from the start.
 
-A model reaches a provider through `same_model`, against the first-party
-catalogue. The manifest names a provider, a transcript records an API
-identifier such as `claude-fable-5-1`, and nothing else maps between
-them. A model the catalogue does not know is counted but attributed to
-no provider: the directory a transcript sits in says which CLI wrote it,
-not which account paid for it, and the Claude CLI can be pointed at a
-third-party endpoint. That spend is kept under an empty provider so it
+A model reaches a provider through `model_identity`, against the
+first-party catalogue. The manifest names a provider, a transcript
+records an API identifier such as `claude-fable-5-1`, and nothing else
+maps between them. A model the catalogue does not know is counted but
+attributed to no provider: the directory a transcript sits in says which
+CLI wrote it, not which account paid for it, and the Claude CLI can be
+pointed at a third-party endpoint. That spend is kept under an empty provider so it
 is visible rather than silently absent.
 
 A delegated run is counted once however the incident log rotates. Its
@@ -100,9 +100,9 @@ from orrery_runtime import (  # noqa: E402
     effective_manifest,
     load_catalogue,
     load_role,
-    same_model,
     user_config_path,
 )
+from orrery_model_catalogue import model_identity  # noqa: E402
 
 
 ROLLUP_VERSION = 1
@@ -238,9 +238,12 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
     """A memoised `raw model id -> provider/model key` lookup.
 
     The catalogue is the authority on which provider owns which model,
-    and `same_model` is what reaches a catalogue entry from the API
-    identifier a transcript records. Memoised because a busy window
-    holds tens of thousands of responses and the catalogue is a file.
+    and `model_identity` is what reaches a catalogue entry from the API
+    identifier a transcript records. An entry naming the exact version
+    is preferred over an alias that only shares its family, so two
+    versions listed side by side each keep their own spend. Memoised
+    because a busy window holds tens of thousands of responses and the
+    catalogue is a file.
 
     The manifest's own role assignments are consulted after it. A
     bundled catalogue goes stale between releases, and a role the user
@@ -261,12 +264,13 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
         for entry in catalogue[provider]
         if isinstance(entry.get("id"), str) and entry["id"]
     ]
+    assigned: list[tuple[str, str]] = []
     try:
         steps = (effective_manifest() if manifest is None else manifest).get("steps")
     except RuntimeConfigError:
         steps = None
     if isinstance(steps, list):
-        known.extend(
+        assigned.extend(
             (step["provider"], step["model"])
             for step in steps
             if isinstance(step, dict)
@@ -277,16 +281,23 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
         )
     cache: dict[str, str] = {}
 
+    def owner(model: str) -> tuple[str, str]:
+        # The catalogue is searched in full, exact then family, before
+        # any manifest step: preferring exactness across both would let
+        # a step assigning a model to the wrong provider outrank the
+        # catalogue's own owner of it.
+        for entries in (known, assigned):
+            for exact in (True, False):
+                for provider, name in entries:
+                    entry = model_identity(provider, name)
+                    active = model_identity(provider, model)
+                    if (entry == active) if exact else entry.matches(active):
+                        return provider, name
+        return "", model
+
     def resolve(model: str) -> str:
         if model not in cache:
-            provider, name = next(
-                (
-                    (provider, name)
-                    for provider, name in known
-                    if same_model(provider, name, model)
-                ),
-                ("", model),
-            )
+            provider, name = owner(model)
             cache[model] = f"{provider}/{name}"
         return cache[model]
 

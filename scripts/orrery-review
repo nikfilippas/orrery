@@ -61,6 +61,7 @@ from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
     candidate_role,
     describe,
+    failed_model_refusal,
     match,
     parse_approval_scope,
     record_approval,
@@ -2065,10 +2066,11 @@ def adopt_standing_approval(
     if record is None:
         return None
     candidate = candidate_role(state.configured, record)
-    # A record minted before the principal-allowance rule, or before the
-    # principal moved, goes inert rather than silently: the run says the
-    # candidate was excluded and dispatches the configured role.
-    refusal = delegate_allowance_refusal(
+    # A record minted before the principal-allowance rule, before the
+    # principal moved, or before ids were compared by identity goes
+    # inert rather than silently: the run says the candidate was
+    # excluded and dispatches the configured role.
+    refusal = failed_model_refusal(record) or delegate_allowance_refusal(
         state.configured, (candidate.provider, candidate.model), manifest
     )
     if refusal is not None:

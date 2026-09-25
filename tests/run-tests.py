@@ -19001,6 +19001,668 @@ def test_provider_text_cannot_forge_markers() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Exact model identity: one model under an alias and its exact id
+# ---------------------------------------------------------------------------
+
+
+def identity_catalogue(
+    *, resolved: bool, fable_5: bool = False
+) -> dict[str, list[dict[str, Any]]]:
+    """An alias beside its exact versions, as a picker can now list them.
+
+    `resolved` adds what discovery says each alias runs now; without it
+    the catalogue is the bundled shape, where nothing says. `fable_5`
+    adds the exact `claude-fable-5` row Claude CLI 2.1.282 lists beside
+    `fable`, which resolves to `claude-fable-5-1`.
+    """
+    levels = ["low", "medium", "high", "xhigh", "max"]
+
+    def entry(model: str, tier: int, runs: str | None = None) -> dict:
+        item: dict[str, Any] = {
+            "id": model,
+            "label": model,
+            "fallback_tier": tier,
+            "thinking_levels": levels if tier > 1 else [],
+            "default_thinking": "max" if tier > 1 else None,
+        }
+        if resolved:
+            item["resolved"] = runs or model
+        return item
+
+    return {
+        "anthropic": [
+            entry("fable", 3, "claude-fable-5-1"),
+            entry("claude-fable-5-1", 3),
+            *([entry("claude-fable-5", 3)] if fable_5 else []),
+            entry("opus", 3, "claude-opus-5-5"),
+            entry("claude-opus-5-5", 3),
+            entry("claude-opus-5", 3),
+            entry("sonnet", 2, "claude-sonnet-5"),
+            entry("haiku", 1, "claude-haiku-4-5-20251001"),
+        ],
+        "openai": [
+            entry("gpt-5.6-sol", 3),
+            entry("gpt-5.6-terra", 2),
+            entry("gpt-5.6-luna", 1),
+        ],
+    }
+
+
+@contextlib.contextmanager
+def identity_catalogue_served(
+    *, resolved: bool, fable_5: bool = False
+) -> Iterator[None]:
+    """Serve `identity_catalogue` to ranking and to the ladder."""
+    catalogue = identity_catalogue(resolved=resolved, fable_5=fable_5)
+    source = "installed CLI catalogue" if resolved else "bundled catalogue"
+    saved = (fallback_module._catalogue_entries, fallback_module.load_catalogue)
+
+    def entries(provider: str, **_keywords: Any) -> Any:
+        return [dict(item) for item in catalogue.get(provider, [])], source
+
+    fallback_module._catalogue_entries = entries
+    fallback_module.load_catalogue = lambda *_a, **_k: copy.deepcopy(catalogue)
+    try:
+        yield
+    finally:
+        fallback_module._catalogue_entries, fallback_module.load_catalogue = saved
+
+
+@test("an exact model id matches only its own identity")
+def test_exact_model_identity() -> None:
+    identity = sys.modules["orrery_model_catalogue"].model_identity
+    cases = [
+        ("anthropic", "claude-opus-5-5", None, "claude-opus-5-5[1m]", True),
+        ("anthropic", "claude-opus-5", None, "claude-opus-5-5", False),
+        ("anthropic", "claude-opus-5[1m]", None, "claude-opus-5-5[1m]", False),
+        ("anthropic", "claude-fable-5-1", None, "claude-fable-5", False),
+        # A snapshot date and a cloud provider's packaging name the same
+        # model; a date is never a version component.
+        ("anthropic", "claude-haiku-4-5", None, "claude-haiku-4-5-20251001", True),
+        (
+            "anthropic",
+            "claude-opus-5-5",
+            None,
+            "us.anthropic.claude-opus-5-5-20260901-v1:0",
+            True,
+        ),
+        ("anthropic", "claude-opus-5-5", None, "anthropic.claude-opus-5-5-v2:0", True),
+        ("anthropic", "claude-opus-5-5", None, "claude-opus-5-5@20260901", True),
+        (
+            "anthropic",
+            "claude-haiku-4-5-20251001[1m]",
+            None,
+            "claude-haiku-4-5",
+            True,
+        ),
+        (
+            "anthropic",
+            "claude-opus-5",
+            None,
+            "us.anthropic.claude-opus-5-5-20260901-v1:0",
+            False,
+        ),
+        ("anthropic", "claude-haiku-4-5", None, "claude-haiku-4-6", False),
+        ("anthropic", "claude-opus-5-5", None, "claude-opus-5-5-2", False),
+        # Where nothing says what an alias runs, it is its whole family.
+        ("anthropic", "opus", None, "claude-opus-5-5", True),
+        ("anthropic", "opus", None, "claude-opus-5", True),
+        ("anthropic", "opus[1m]", None, "opus", True),
+        ("anthropic", "opus", None, "claude-opus-5-5[1m]", True),
+        (
+            "anthropic",
+            "opus",
+            None,
+            "us.anthropic.claude-opus-5-5-20260901-v1:0",
+            True,
+        ),
+        ("anthropic", "opus", None, "claude-opus-5-5@20260901", True),
+        ("anthropic", "haiku", None, "claude-haiku-4-5-20251001", True),
+        ("anthropic", "fable", None, "claude-fable-5-1", True),
+        ("anthropic", "sonnet", None, "claude-sonnet-5", True),
+        # Where discovery says, it is that version and no other.
+        ("anthropic", "opus", "claude-opus-5-5", "claude-opus-5-5[1m]", True),
+        ("anthropic", "opus", "claude-opus-5-5", "claude-opus-5", False),
+        ("anthropic", "fable", None, "claude-opus-5-5", False),
+        # No shared identity through an empty version tuple.
+        ("anthropic", "claude-opus-preview", None, "claude-opus-latest", False),
+        ("anthropic", "claude-opus-preview", None, "opus", False),
+        ("openai", "gpt-5.5", None, "gpt-5.5", True),
+        ("openai", "gpt-5.6-sol", None, "gpt-5.6-terra", False),
+        ("openai", "gpt-5", None, "gpt-5.5", False),
+        ("openai", "opus", None, "claude-opus-5-5", False),
+    ]
+    for provider, first, runs, second, expected in cases:
+        one = identity(provider, first, runs)
+        other = identity(provider, second)
+        require(
+            one.matches(other) is expected and other.matches(one) is expected,
+            f"{provider} {first} ({runs}) against {second} was not "
+            f"{expected}: {one} {other}",
+        )
+        if runs is None:
+            require(
+                runtime_module.same_model(provider, first, second) is expected,
+                f"same_model disagreed with the identity for {first} "
+                f"against {second}",
+            )
+    require(
+        not identity("anthropic", "opus").matches(identity("openai", "opus")),
+        "one id on two providers was treated as one model",
+    )
+    for dated in (
+        "claude-haiku-4-5-20251001",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        "claude-haiku-4-5@20251001",
+        "claude-haiku-4-5-20251001[1m]",
+    ):
+        require(
+            identity("anthropic", dated).version == (4, 5),
+            f"a date was read as a version component of {dated}",
+        )
+
+    # Legacy ids put the version before the family. Each keeps its
+    # family, so every alias answers for it exactly as it did before
+    # identity, and its versions still tell its generations apart.
+    legacy = {
+        "claude-3-7-sonnet-20250219": ("sonnet", (3, 7)),
+        "claude-3-5-haiku-20241022": ("haiku", (3, 5)),
+        "claude-3-opus-20240229": ("opus", (3,)),
+        "us.anthropic.claude-3-5-haiku-20241022-v1:0": ("haiku", (3, 5)),
+        "claude-3-5-sonnet-v2@20241022": ("sonnet", (3, 5)),
+    }
+    aliases = sys.modules["orrery_model_catalogue"].CLAUDE_ALIASES
+    for model, (family, version) in legacy.items():
+        parsed = identity("anthropic", model)
+        require(
+            (parsed.family, parsed.version, parsed.literal)
+            == (family, version, None),
+            f"a legacy id lost its family or version: {model} {parsed}",
+        )
+        for alias in aliases:
+            require(
+                runtime_module.same_model("anthropic", alias, model)
+                is (alias == family)
+                and identity("anthropic", alias).matches(parsed)
+                is (alias == family),
+                f"the {alias} alias no longer answered for {model} as "
+                f"it did before identity",
+            )
+    require(
+        not identity("anthropic", "claude-3-7-sonnet-20250219").matches(
+            identity("anthropic", "claude-3-5-sonnet-20241022")
+        )
+        and not identity("anthropic", "claude-3-opus-20240229").matches(
+            identity("anthropic", "claude-opus-5")
+        ),
+        "two generations of one legacy family compared equal",
+    )
+
+    # A dotted version is not read, so it cannot truncate onto another
+    # model; the id matches itself and nothing else.
+    dotted = identity("anthropic", "claude-opus-5.5")
+    require(
+        dotted.literal == "claude-opus-5.5"
+        and dotted.matches(identity("anthropic", "claude-opus-5.5"))
+        and not any(
+            dotted.matches(identity("anthropic", other))
+            for other in ("claude-opus-5", "claude-opus-5-5", "opus")
+        ),
+        f"a dotted version truncated onto another model: {dotted}",
+    )
+
+    # A configured exact id is not proven by a session reporting only an
+    # alias, whose version nothing here knows; the other way round an
+    # alias still accepts any version of its family.
+    for configured, active, expected in (
+        ("claude-opus-5", "opus[1m]", False),
+        ("claude-opus-5-5", "opus", False),
+        ("claude-fable-5-1", "fable", False),
+        ("opus", "claude-opus-5-5", True),
+        ("opus", "opus[1m]", True),
+        ("claude-opus-5-5", "claude-opus-5-5[1m]", True),
+    ):
+        require(
+            runtime_module.same_model("anthropic", configured, active)
+            is expected,
+            f"same_model({configured!r}, {active!r}) was not {expected}",
+        )
+
+    # The allowance resolver prefers the exact entry, and a manifest step
+    # still never outranks the catalogue's owner of a model.
+    saved = allowance_module.load_catalogue
+    allowance_module.load_catalogue = lambda *_a, **_k: identity_catalogue(
+        resolved=False
+    )
+    try:
+        resolve = allowance_module.model_resolver(
+            {
+                "steps": [
+                    {"id": "reviewer", "provider": "openai", "model": model}
+                    for model in ("claude-opus-5", "claude-opus-4-8")
+                ]
+            }
+        )
+        expected = {
+            "claude-opus-5": "anthropic/claude-opus-5",
+            "claude-opus-5-5[1m]": "anthropic/claude-opus-5-5",
+            "claude-fable-5-1": "anthropic/claude-fable-5-1",
+            "claude-fable-5": "anthropic/fable",
+            "claude-opus-4-8": "anthropic/opus",
+            "claude-3-7-sonnet-20250219": "anthropic/sonnet",
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0": "anthropic/haiku",
+            "claude-3-opus-20240229": "anthropic/opus",
+            "gpt-5.6-terra": "openai/gpt-5.6-terra",
+            "gpt-5.6": "/gpt-5.6",
+        }
+        found = {model: resolve(model) for model in expected}
+    finally:
+        allowance_module.load_catalogue = saved
+    require(found == expected, f"the allowance resolver misattributed: {found}")
+
+
+@test("a failed model is never proposed back under its other id")
+def test_exact_identity_in_fallback_ranking() -> None:
+    principal = runtime_module.load_role("orchestrator")
+
+    def ranked(model: str, *, resolved: bool) -> list[str]:
+        # Model scope: the failed pair is excluded as well as being the
+        # source, exactly as an approved same-provider rerun builds it.
+        with identity_catalogue_served(resolved=resolved):
+            return [
+                candidate.model
+                for _score, candidate, _source in fallback_module._ranked_candidates(
+                    dataclasses.replace(principal, provider="anthropic", model=model),
+                    excluded_providers={"openai"},
+                    excluded_models={("anthropic", model)},
+                    assumed_ready={"anthropic"},
+                )
+            ]
+
+    resolved_opus = ranked("opus", resolved=True)
+    require(
+        "claude-opus-5-5" not in resolved_opus
+        and "opus" not in resolved_opus
+        and "claude-opus-5" in resolved_opus,
+        f"a failed opus came back as its resolution, or its sibling "
+        f"version was lost: {resolved_opus}",
+    )
+    unresolved_opus = ranked("opus", resolved=False)
+    require(
+        not {"opus", "claude-opus-5-5", "claude-opus-5"} & set(unresolved_opus)
+        and "fable" in unresolved_opus,
+        f"an unresolved opus did not bar its family: {unresolved_opus}",
+    )
+    exact = ranked("claude-opus-5-5", resolved=True)
+    require(
+        "opus" not in exact
+        and "claude-opus-5-5" not in exact
+        and "claude-opus-5" in exact,
+        f"a failed exact id came back as the alias resolving to it: {exact}",
+    )
+
+
+@test("model scope bars the principal's model under any of its ids")
+def test_exact_identity_principal_model_scope() -> None:
+    def ranked(resolved: bool, fable_5: bool = False) -> tuple[list[str], Any]:
+        reviewer = runtime_module.load_role("reviewer")
+        providers, models = fallback_module.principal_exclusions(reviewer)
+        with identity_catalogue_served(resolved=resolved, fable_5=fable_5):
+            candidates = [
+                candidate.model
+                for _score, candidate, _source in fallback_module._ranked_candidates(
+                    reviewer,
+                    excluded_providers={reviewer.provider} | providers,
+                    excluded_models=models,
+                    assumed_ready={"anthropic"},
+                )
+            ]
+            nearest = fallback_module.nearest_fallback(
+                reviewer,
+                "test",
+                excluded_providers={reviewer.provider},
+                assumed_ready={"anthropic"},
+            )
+        # Ranking and the standing-approval guard are one rule: nothing
+        # offered to a delegate may be refused when started.
+        refused = {
+            model: fallback_module.delegate_allowance_refusal(
+                reviewer, ("anthropic", model)
+            )
+            for model in candidates
+        }
+        require(
+            not any(refused.values()),
+            f"ranking offered a candidate the guard refuses: {refused}",
+        )
+        return candidates, nearest
+
+    with user_configuration(
+        delegate_fallback_scope="principal-model",
+        roles={"orchestrator": {"model": "opus"}},
+    ):
+        reviewer = runtime_module.load_role("reviewer")
+        require(
+            reviewer.provider == "openai",
+            f"the fixture assumes an OpenAI reviewer: {reviewer}",
+        )
+        # The guard cannot say which version an `opus` principal runs,
+        # so ranking, which answers to it, bars the whole family even
+        # where discovery resolved the alias.
+        candidates, _nearest = ranked(resolved=True)
+        require(
+            not {"opus", "claude-opus-5-5", "claude-opus-5"} & set(candidates)
+            and "fable" in candidates,
+            f"a delegate reached the principal's model under another id: "
+            f"{candidates}",
+        )
+        refusal = fallback_module.delegate_allowance_refusal(
+            reviewer, ("anthropic", "claude-opus-5")
+        )
+        require(
+            refusal is not None and "principal-allowance rule" in refusal,
+            f"a sibling of an unresolved principal alias was not refused: "
+            f"{refusal}",
+        )
+        candidates, _nearest = ranked(resolved=False)
+        require(
+            not {"opus", "claude-opus-5-5", "claude-opus-5"} & set(candidates),
+            f"an unresolved principal alias did not bar its family: "
+            f"{candidates}",
+        )
+        refusal = fallback_module.delegate_allowance_refusal(
+            reviewer, ("anthropic", "claude-opus-5-5")
+        )
+        require(
+            refusal is not None and "principal-allowance rule" in refusal,
+            f"the principal's model under its exact id was not refused: "
+            f"{refusal}",
+        )
+        require(
+            fallback_module.delegate_allowance_refusal(
+                reviewer, ("anthropic", "claude-fable-5-1")
+            )
+            is None,
+            "a model the principal does not run was refused",
+        )
+
+    with user_configuration(
+        delegate_fallback_scope="principal-model",
+        roles={"orchestrator": {"model": "claude-opus-5-5"}},
+    ):
+        reviewer = runtime_module.load_role("reviewer")
+        candidates, _nearest = ranked(resolved=True)
+        require(
+            "opus" not in candidates
+            and "claude-opus-5-5" not in candidates
+            and "claude-opus-5" in candidates,
+            f"an exact principal was reachable through its alias: "
+            f"{candidates}",
+        )
+        require(
+            fallback_module.delegate_allowance_refusal(
+                reviewer, ("anthropic", "claude-opus-5")
+            )
+            is None,
+            "another Opus version was refused as the principal's model",
+        )
+
+    # The shipped fable principal and Claude CLI 2.1.282's discovery:
+    # `fable` resolves to claude-fable-5-1 beside an exact claude-fable-5
+    # row. The row nearest by position is claude-fable-5-1, then
+    # claude-fable-5; only identity barring by the guard's own rule
+    # leaves Opus nearest.
+    with user_configuration(delegate_fallback_scope="principal-model"):
+        principal = runtime_module.load_role("orchestrator")
+        require(
+            (principal.provider, principal.model) == ("anthropic", "fable"),
+            f"the fixture assumes the shipped fable principal: {principal}",
+        )
+        reviewer = runtime_module.load_role("reviewer")
+        candidates, nearest = ranked(resolved=True, fable_5=True)
+        require(
+            nearest is not None and nearest.candidate.model == "opus",
+            f"a delegate's nearest fallback was the principal's model "
+            f"under another id: {nearest} {candidates}",
+        )
+        environment = review_environment("success")
+        try:
+            with identity_catalogue_served(resolved=True, fable_5=True):
+                approved, _providers, _models = (
+                    fallback_module.proposal_for_approval(
+                        reviewer,
+                        ("anthropic", "claude-fable-5"),
+                        environment=environment,
+                    )
+                )
+                sibling, _providers, _models = (
+                    fallback_module.proposal_for_approval(
+                        reviewer,
+                        ("anthropic", "claude-opus-5"),
+                        environment=environment,
+                    )
+                )
+                # A delegate on `opus` whose failure is approved away
+                # under the id its alias resolves to: missing because it
+                # is the failed model, which is not the allowance rule.
+                on_opus = dataclasses.replace(
+                    reviewer, provider="anthropic", model="opus"
+                )
+                itself, _providers, _models = (
+                    fallback_module.proposal_for_approval(
+                        on_opus,
+                        ("anthropic", "claude-opus-5-5"),
+                        environment=environment,
+                    )
+                )
+        finally:
+            shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+            shutil.rmtree(environment["XDG_STATE_HOME"], ignore_errors=True)
+        require(
+            approved is None
+            and fallback_module.delegate_allowance_refusal(
+                reviewer, ("anthropic", "claude-fable-5")
+            )
+            is not None,
+            f"an approval of the principal's model under another id "
+            f"resolved: {approved}",
+        )
+        require(
+            sibling is not None and sibling.candidate.model == "claude-opus-5",
+            f"an approval the rule does not bar was refused: {sibling}",
+        )
+        require(
+            itself is None
+            and fallback_module.delegate_allowance_refusal(
+                on_opus, ("anthropic", "claude-opus-5-5")
+            )
+            is None,
+            f"a failed alias's resolution was proposed, or its absence "
+            f"was blamed on the allowance rule: {itself}",
+        )
+
+
+@test("a standing approval goes inert when the principal is its model")
+def test_exact_identity_standing_approval() -> None:
+    for principal_model, candidate_model in (
+        ("opus", "claude-opus-5-5"),
+        ("claude-opus-5-5", "opus"),
+    ):
+        with user_configuration(
+            delegate_fallback_scope="principal-model",
+            roles={"orchestrator": {"model": principal_model}},
+        ), standing_stores():
+            reviewer = runtime_module.load_role("reviewer")
+            standing_record_for(reviewer, ("anthropic", candidate_model))
+            state = review_module.DelegationState(
+                configured=reviewer, role=reviewer
+            )
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                adopted = review_module.adopt_standing_approval(state)
+            text = errors.getvalue()
+            kinds = [event["kind"] for event in incidents_module.read_events()]
+            require(
+                adopted is None
+                and state.role is reviewer
+                and not state.is_fallback
+                and "principal-allowance rule" in text
+                and "standing-excluded" in kinds,
+                f"a standing {candidate_model} approval started under an "
+                f"{principal_model} principal: {text} {kinds}",
+            )
+
+
+def strip_identity_marker(path: Path) -> None:
+    """Rewrite a standing store as the literal ranking minted it."""
+    data = json.loads(path.read_text())
+    for record in data["approvals"]:
+        record.pop("identity_ranked", None)
+    path.write_text(json.dumps(data))
+
+
+@test("a standing record naming the failed model goes inert at adoption")
+def test_exact_identity_standing_failed_model() -> None:
+    # A record minted under the literal ranking: the configured `opus`
+    # failed, and the candidate is the id that alias resolves to. The
+    # principal runs fable under model scope, so the allowance rule has
+    # nothing to say and only the identity check can stop it.
+    with user_configuration(
+        delegate_fallback_scope="principal-model"
+    ), standing_stores() as (_runtime_dir, state_dir):
+        reviewer = dataclasses.replace(
+            runtime_module.load_role("reviewer"),
+            provider="anthropic",
+            model="opus",
+        )
+        standing_record_for(reviewer, ("anthropic", "claude-opus-5-5"))
+        minted = standing_module.match(reviewer)
+        require(
+            minted is not None
+            and standing_module.failed_model_refusal(minted) is None,
+            f"a record minted by identity ranking was second-guessed: "
+            f"{minted}",
+        )
+        strip_identity_marker(state_dir / "orrery" / "standing.json")
+        record = standing_module.match(reviewer)
+        require(
+            record is not None
+            and fallback_module.delegate_allowance_refusal(
+                reviewer, ("anthropic", "claude-opus-5-5")
+            )
+            is None,
+            f"the fixture assumes a live record the allowance rule "
+            f"allows: {record}",
+        )
+        state = review_module.DelegationState(configured=reviewer, role=reviewer)
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            adopted = review_module.adopt_standing_approval(state)
+        text = errors.getvalue()
+        events = incidents_module.read_events()
+        require(
+            adopted is None
+            and state.role is reviewer
+            and not state.is_fallback
+            and "anthropic/claude-opus-5-5 may be the failed model "
+            "anthropic/opus under another id" in text
+            and "configured role will be attempted" in text
+            and any(
+                event["kind"] == "standing-excluded"
+                and event.get("candidate") == "anthropic:claude-opus-5-5"
+                for event in events
+            ),
+            f"a standing record restarted the failed model: {text} {events}",
+        )
+        # Without discovery a failed alias is its whole family, but an
+        # exact failed id leaves its sibling versions alone.
+        require(
+            standing_module.failed_model_refusal(
+                {**record, "candidate_model": "claude-opus-5"}
+            )
+            is not None
+            and standing_module.failed_model_refusal(
+                {
+                    **record,
+                    "failed_model": "claude-opus-5-5",
+                    "candidate_model": "claude-opus-5",
+                }
+            )
+            is None
+            and standing_module.failed_model_refusal(
+                {**record, "candidate_model": "sonnet"}
+            )
+            is None,
+            "an unmarked record was judged against the wrong identity",
+        )
+
+    # The principal launcher applies the same check before adopting.
+    with until_store_only() as state_dir, tempfile.TemporaryDirectory() as directory:
+        principal = runtime_module.load_role("orchestrator")
+        standing_module.record_approval(
+            configured=principal,
+            candidate=dataclasses.replace(principal, model="claude-fable-5-1"),
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit reached",
+            failure_scope="model",
+        )
+        strip_identity_marker(state_dir / "orrery" / "standing.json")
+        claude_arguments = Path(directory) / "claude-args"
+        environment = review_environment("success", standing_state=state_dir)
+        environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+        result = run_principal(environment)
+        arguments = (
+            claude_arguments.read_text().splitlines()
+            if claude_arguments.exists()
+            else []
+        )
+        require(
+            result.returncode == 0
+            and "claude-fable-5-1 may be the failed model anthropic/fable "
+            "under another id" in result.stderr
+            and "configured principal will be attempted" in result.stderr
+            and "standing fallback active" not in result.stderr,
+            f"the principal adopted a record naming its failed model: "
+            f"{result.returncode} {result.stderr}",
+        )
+        require(
+            "--model" in arguments
+            and arguments[arguments.index("--model") + 1] == principal.model,
+            f"the configured principal did not run: {arguments}",
+        )
+
+
+@test("the ladder takes one rung per family and never the source's model")
+def test_exact_identity_ladder() -> None:
+    principal = runtime_module.load_role("orchestrator")
+    require(
+        (principal.provider, principal.model) == ("anthropic", "fable"),
+        f"the fixture assumes the shipped fable principal: {principal}",
+    )
+    with identity_catalogue_served(resolved=False):
+        shipped = fallback_module.same_provider_ladder(principal, limit=5)
+        opus = fallback_module.same_provider_ladder(
+            dataclasses.replace(principal, model="opus"), limit=5
+        )
+        exact = fallback_module.same_provider_ladder(
+            dataclasses.replace(principal, model="claude-opus-5-5"), limit=5
+        )
+    require(
+        shipped == ["opus", "sonnet"],
+        f"fable did not ladder to Opus then Sonnet once: {shipped}",
+    )
+    require(
+        opus == ["fable", "sonnet"],
+        f"opus laddered onto one of its own ids: {opus}",
+    )
+    require(
+        exact == ["fable", "claude-opus-5", "sonnet"],
+        f"an exact source laddered onto itself or repeated a family: {exact}",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Principal surface projection
 # ---------------------------------------------------------------------------
 

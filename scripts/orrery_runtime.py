@@ -20,10 +20,12 @@ from typing import Any
 
 import fcntl
 
-# The only intra-kit import the runtime makes. Sharing the grant rule
-# rather than restating it keeps one answer to "which directories is
-# every contained run handed", which is the whole reason a configuration
-# under one of them is refused.
+# The runtime's intra-kit imports. Sharing the grant rule rather than
+# restating it keeps one answer to "which directories is every contained
+# run handed", which is the whole reason a configuration under one of
+# them is refused; sharing model identity keeps one answer to "are these
+# two ids the same model" for every caller that compares them.
+from orrery_model_catalogue import model_identity
 from orrery_verify import under_broad_grant
 
 
@@ -147,28 +149,34 @@ def same_model(provider: str, configured: str, active: str) -> bool:
     """Whether a live model identifier is the configured one.
 
     The manifest names a model the way a picker does, `fable` or
-    `opus`, while a running session reports an API identifier such as
-    `claude-fable-5-1`, or a settings value such as `opus[1m]`. Only
-    Anthropic needs the family match: Codex reports the configured name
-    verbatim, so equality is the whole test there and a looser rule
-    would let one OpenAI model answer for another.
+    `opus`, or exactly, `claude-opus-5-5`, while a running session
+    reports an API identifier such as `claude-fable-5-1`, or a settings
+    value such as `opus[1m]`. Both go through `model_identity`: an exact
+    id matches only its own version, `[1m]` included, and a configured
+    alias matches its family's parseable ids. A dotted or unversioned
+    gateway form (`claude-opus-4.5`, `claude-opus-latest`) is a literal
+    and matches only itself, so a session reporting one is not taken as
+    the configured principal. The reverse is refused: a configured
+    exact id is not proven by a session reporting only an alias, since
+    nothing here says which version that alias runs, and the principal
+    check must not pass on a guess. An OpenAI id compares as its
+    literal with any `[..]` context suffix removed, so no looser rule
+    lets one OpenAI model answer for another.
 
     Shared rather than duplicated: the principal check compares a
-    session's model with the configured one, and the allowance rollup
-    maps a transcript's model onto the catalogue entry that says which
-    provider owns it. A second copy would let those two disagree.
+    session's model with the configured one, and the fallback and
+    allowance paths compare ids by the same identity. A second rule
+    would let those disagree.
     """
     if configured == active:
         return True
-    if provider != "anthropic":
+    expected = model_identity(provider, configured)
+    reported = model_identity(provider, active)
+    if expected.version is not None and reported.family is not None and (
+        reported.version is None
+    ):
         return False
-    family = configured.lower()
-    if family not in {"fable", "opus", "sonnet", "haiku"}:
-        return False
-    return re.search(
-        rf"(?:^|[-_/]){re.escape(family)}(?:[-_/\[\]]|$)",
-        active.lower(),
-    ) is not None
+    return expected.matches(reported)
 
 
 def load_manifest(path: Path) -> dict[str, Any]:

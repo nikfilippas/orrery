@@ -195,6 +195,108 @@ def _strip_context(value: str) -> str:
     return re.sub(r"\[[^\]]+\]$", "", value)
 
 
+def _bare_claude_id(value: str) -> str:
+    """A Claude id with its packaging removed, leaving family and version.
+
+    The context suffix goes first because it sits outermost, after any
+    date: `claude-haiku-4-5-20251001[1m]` would otherwise keep its date.
+    Then the Bedrock `us.anthropic.` prefix and `-v1:0` suffix, a Vertex
+    `@20260901` with any `-v2` before it, and a snapshot's `-20251001`,
+    so a date is never read as a version component and every form of
+    one model compares equal.
+    """
+    bare = _strip_context(value).lower()
+    bare = re.sub(r"^(?:[a-z0-9-]+\.)?anthropic\.", "", bare)
+    bare = re.sub(r"-v\d+(?::\d+)?$", "", bare)
+    bare = re.sub(r"(?:-v\d+)?@\d{8}$", "", bare)
+    return re.sub(r"-\d{8}$", "", bare)
+
+
+def _identity_version(bare: str, family: str) -> tuple[int, ...] | None:
+    """The version a bare Claude id carries, or None where it has none.
+
+    Read after the family, `claude-opus-5-5`, or where nothing follows
+    it, before, as the legacy `claude-3-5-haiku` puts it. A run ending
+    in `.`, `claude-opus-5.5`, is not a version this can read, so the
+    id stays a literal rather than truncating to `claude-opus-5`.
+    """
+    after = re.search(rf"(?:^|-){re.escape(family)}((?:-\d+)*)(\.)?", bare)
+    if after is None or after.group(2):
+        return None
+    run = after.group(1)
+    if not run:
+        before = re.search(
+            rf"(?:^|-)((?:\d+-)+){re.escape(family)}(?:-|$)", bare
+        )
+        run = before.group(1) if before else ""
+    version = tuple(int(part) for part in run.split("-") if part)
+    return version or None
+
+
+@dataclass(frozen=True)
+class ModelIdentity:
+    """Which underlying model an identifier names, for comparison only.
+
+    Three shapes, never mixed. A versioned Claude id carries its family
+    and version tuple. A bare alias nothing has resolved carries its
+    family and no version, and stands for every version of it, since
+    the CLI decides which one it runs. Anything else, every OpenAI id
+    and any custom one, carries only its suffix-stripped literal, so two
+    such ids can never meet through an empty version tuple.
+    """
+
+    provider: str
+    family: str | None
+    version: tuple[int, ...] | None
+    literal: str | None
+
+    def matches(self, other: ModelIdentity) -> bool:
+        if self.provider != other.provider:
+            return False
+        if self.literal is not None or other.literal is not None:
+            return self.literal == other.literal
+        if self.family != other.family:
+            return False
+        # An unresolved alias matches its whole family: that is all
+        # anything knows about it, and treating it as distinct from a
+        # version it may be running would let a failed or excluded model
+        # come back under its other name.
+        return (
+            self.version is None
+            or other.version is None
+            or self.version == other.version
+        )
+
+
+def model_identity(
+    provider: str,
+    model: str,
+    resolved: str | None = None,
+) -> ModelIdentity:
+    """The identity every comparison of two model ids goes through.
+
+    `resolved` is discovery's statement of what an alias runs now, and
+    is read first where a caller has it. No prefix rule: `claude-opus-5`
+    and `claude-opus-5-5` differ in their version tuple, and a context
+    suffix such as `[1m]` is the same model with a larger window.
+    """
+    if provider == "anthropic":
+        for name in (resolved, model):
+            if not name:
+                continue
+            bare = _bare_claude_id(name)
+            family = _claude_family(bare)
+            if family is None:
+                continue
+            version = _identity_version(bare, family)
+            if version:
+                return ModelIdentity(provider, family, version, None)
+        bare = _strip_context(model).lower()
+        if bare in CLAUDE_ALIASES:
+            return ModelIdentity(provider, bare, None, None)
+    return ModelIdentity(provider, None, None, _strip_context(model))
+
+
 def _normalise_claude_models(raw_models: Any) -> list[dict[str, Any]]:
     """Selectable Claude models, with identity retained.
 

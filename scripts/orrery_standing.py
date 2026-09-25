@@ -33,6 +33,7 @@ from orrery_runtime import (  # noqa: E402
     Role,
     RuntimeConfigError,
 )
+from orrery_model_catalogue import model_identity  # noqa: E402
 
 
 SESSION_SCOPE = "session"
@@ -309,6 +310,12 @@ def record_approval(
         "boot_id": current_boot_id() if scope == SESSION_SCOPE else None,
         "reason": re.sub(r"\s+", " ", reason).strip()[:300],
         "created_at": time.time(),
+        # Every candidate recorded here came from a ranking that compared
+        # it with the failed model by identity: through discovery's word
+        # on what an alias runs where there was one, and otherwise with
+        # the alias barring its whole family, which is stricter. See
+        # `failed_model_refusal`.
+        "identity_ranked": True,
     }
     path = _store_for_scope(scope)
     with _locked_all_stores():
@@ -401,6 +408,34 @@ def candidate_role(configured: Role, record: dict[str, Any]) -> Role:
         # A recorded approval names a first-party provider and model, so
         # the candidate must not keep the configured role's endpoint.
         endpoint=None,
+    )
+
+
+def failed_model_refusal(record: dict[str, Any]) -> str | None:
+    """Why a record's candidate is the model whose failure it answers.
+
+    A record minted under the literal ranking, before `claude-opus-5-5`
+    and `opus` were one model, can name the failed model under its other
+    id; adopting it would restart that model as its own fallback. With
+    no discovery at adoption, a failed alias is its whole family, so
+    such a record naming any version of it goes inert. A record minted
+    since was ranked against the failed model by identity, knowing what
+    the alias ran, and a sibling version it names is a deliberate
+    choice this check cannot second-guess. Returned unpunctuated, like
+    `delegate_allowance_refusal`, so each caller composes it into its
+    own sentence.
+    """
+    if record.get("identity_ranked") is True:
+        return None
+    failed = (record["failed_provider"], record["failed_model"])
+    candidate = (record["candidate_provider"], record["candidate_model"])
+    if not model_identity(*candidate).matches(model_identity(*failed)):
+        return None
+    return (
+        f"{candidate[0]}/{candidate[1]} may be the failed model "
+        f"{failed[0]}/{failed[1]} under another id: the record predates "
+        "identity ranking, so a version of a failed alias is refused "
+        "rather than trusted"
     )
 
 
