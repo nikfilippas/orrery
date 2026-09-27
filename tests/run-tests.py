@@ -10051,7 +10051,9 @@ console.log(JSON.stringify(report));
 def test_exact_version_dispatch() -> None:
     """AC2: a pinned version reaches the delegate as `--model <id>` with
     `--effort`, which a hand-typed exact id once lost as a custom model."""
-    with user_configuration(roles={"implementer": {
+    # The stubs on PATH, or a runner with no provider CLI installed, which
+    # is every CI runner, raises before the command is ever built.
+    with provider_binaries_on_path(), user_configuration(roles={"implementer": {
         "provider": "anthropic", "model": "claude-opus-5-5", "thinking": "high",
     }}), tempfile.TemporaryDirectory() as directory:
         role = runtime_module.load_role("implementer")
