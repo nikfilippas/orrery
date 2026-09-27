@@ -160,44 +160,54 @@ ROLE_LABEL = {
 }
 
 
-def resolved_models() -> dict[tuple[str, str], str]:
-    """Each configured alias against the version it currently resolves to.
+def resolved_models() -> dict[str, list[dict[str, Any]] | None]:
+    """Each provider's picker as the installed CLI states it, or None.
 
     Live discovery, because an alias moves without the manifest
     changing and a table that says `opus` tells the reader less than one
     that says which Opus. Measured at about a second against both
-    installed CLIs, inside a fifteen second hook budget, and every
-    failure degrades to the alias rather than costing the session its
-    framing.
+    installed CLIs, inside a fifteen second hook budget. A provider
+    whose CLI could not be asked maps to None, which names an alias as
+    unverified rather than by a bundled guess, and any failure at all
+    leaves every provider unverified rather than costing the session
+    its framing.
     """
     try:
         from orrery_model_catalogue import discover_catalogue
 
         discovered = discover_catalogue(load_catalogue())
     except Exception:  # noqa: BLE001 - a hook must never fail a session
-        return {}
-    found: dict[tuple[str, str], str] = {}
-    for provider, entries in discovered.providers.items():
-        for entry in entries:
-            if isinstance(entry, dict) and entry.get("id"):
-                found[(provider, entry["id"])] = (
-                    entry.get("resolved") or entry["id"]
-                )
-    return found
+        return {provider: None for provider in PROVIDERS}
+    return {
+        provider: (
+            entries
+            if discovered.sources.get(provider) == "installed CLI"
+            else None
+        )
+        for provider, entries in discovered.providers.items()
+    }
 
 
-def pretty_model(provider: str, alias: str, resolved: dict) -> str:
-    """The version a reader recognises, or the alias where none is known."""
-    api = resolved.get((provider, alias), alias)
-    if provider == "anthropic" and api.startswith("claude-"):
-        parts = api[len("claude-"):].split("-")
-        numbers = [p for p in parts[1:] if p.isdigit() and len(p) <= 2]
-        name = parts[0].capitalize()
-        return f"{name} {'.'.join(numbers)}" if numbers else name
-    match = re.fullmatch(r"gpt-([0-9.]+)-([a-z]+)", api)
-    if match:
-        return f"GPT-{match.group(1)} {match.group(2).capitalize()}"
-    return api
+def pretty_model(
+    provider: str,
+    model: str,
+    resolved: dict[str, list[dict[str, Any]] | None],
+    endpoint: Any = None,
+) -> str:
+    """The name the installed CLI gives a model, with its version.
+
+    An alias reads as the version it resolves to now, or, where the CLI
+    lists no row for it, the version it last ran as; never Orrery's
+    guess. An endpoint serves its own models, so its id is kept.
+    """
+    if endpoint:
+        return model
+    try:
+        from orrery_model_names import model_name
+
+        return model_name(provider, model, resolved.get(provider))
+    except Exception:  # noqa: BLE001 - a hook must never fail a session
+        return model
 
 
 def _column(cells: list[tuple[str, ...]]) -> list[str]:
@@ -250,7 +260,9 @@ def role_table(manifest: dict[str, Any] | None = None) -> str:
                 ROLE_SQUARE.get(s["id"], "\u2B1C"),
                 ROLE_LABEL.get(s["id"], s["id"]),
                 s["provider"],
-                pretty_model(s["provider"], s["model"], resolved),
+                pretty_model(
+                    s["provider"], s["model"], resolved, s.get("endpoint")
+                ),
                 s.get("thinking") or "-",
             )
             for s in steps
@@ -455,14 +467,29 @@ def main() -> int:
         )
         return 0
 
-    configured_label = (
-        f"{provider_label(configured.provider)} / {configured.model}"
-        + (
-            f" / thinking {configured.thinking}"
-            if configured.thinking
-            else ""
+    held: dict[str, dict[str, list[dict[str, Any]] | None]] = {}
+
+    def labelled(
+        provider: str,
+        model: str,
+        thinking: str | None = None,
+        endpoint: Any = None,
+    ) -> str:
+        # Each id with the version it means, as the roster names it.
+        # Asked only on a path that prints, and of both CLIs at once:
+        # the roster that follows reads the same discovery from the
+        # cache, so the hook's budget holds one parallel discovery and
+        # a matched session that prints nothing never starts a CLI.
+        if "resolved" not in held:
+            held["resolved"] = resolved_models()
+        named = pretty_model(provider, model, held["resolved"], endpoint)
+        if named != model:
+            model = f"{model} ({named})"
+        return (
+            f"{provider_label(provider)} / {model}"
+            + (f" / thinking {thinking}" if thinking else "")
         )
-    )
+
     active_model = payload.get("model")
     if (
         not isinstance(active_model, str)
@@ -478,6 +505,12 @@ def main() -> int:
         # The stored default only decides whether this is ordinary
         # (aligned, so nothing to act on) or drifted (actionable).
         aligned = surface_default_matches(configured, active_provider)
+        configured_label = labelled(
+            configured.provider,
+            configured.model,
+            configured.thinking,
+            configured.endpoint,
+        )
         selection_note = (
             "The model chosen in the interface, or with /model, "
             "overrides the stored default and is not visible to this "
@@ -582,6 +615,12 @@ def main() -> int:
     ):
         return 0
 
+    configured_label = labelled(
+        configured.provider,
+        configured.model,
+        configured.thinking,
+        configured.endpoint,
+    )
     excluded = set(PROVIDERS) - {active_provider}
     proposal = nearest_fallback(
         configured,
@@ -593,21 +632,17 @@ def main() -> int:
         manifest=manifest,
     )
     recommended = proposal.candidate if proposal is not None else None
-    active_label = (
-        f"{provider_label(active_provider)} / {active_model}"
-    )
+    active_label = labelled(active_provider, active_model)
     if recommended is None:
         recommendation = (
             "No potential fallback could be ranked for this provider surface."
         )
     else:
-        recommended_label = (
-            f"{provider_label(recommended.provider)} / {recommended.model}"
-            + (
-                f" / thinking {recommended.thinking}"
-                if recommended.thinking
-                else ""
-            )
+        recommended_label = labelled(
+            recommended.provider,
+            recommended.model,
+            recommended.thinking,
+            recommended.endpoint,
         )
         recommendation = (
             f"This is the nearest potential fallback ({recommended_label})."

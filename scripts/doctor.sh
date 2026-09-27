@@ -473,6 +473,10 @@ from orrery_runtime import VALIDATED_CODEX_CLI; print(VALIDATED_CODEX_CLI)" \
 fi
 
 printf '\n=== Catalogue currency ===\n'
+# Filled by the block below, which names each standing approval from
+# its own discovery for the standing section to print.
+STANDING_NAMED=0
+STANDING_LIST=""
 if CURRENCY_REPORT="$(
     python3 - "$KIT_DIR" <<'PY'
 import sys
@@ -491,6 +495,8 @@ from orrery_model_catalogue import (  # noqa: E402
     known_entry,
     visible_entries,
 )
+from orrery_model_names import model_name, sibling_divergences  # noqa: E402
+from orrery_standing import describe, list_active  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     PROVIDERS,
     RuntimeConfigError,
@@ -511,11 +517,13 @@ def emit(kind, message):
 
 
 # Diagnostics only: an install found here is reported, never dispatched.
+found_installs = {}
 for provider in sorted(PROVIDERS):
     try:
         installs = provider_installs(provider)
     except RuntimeConfigError:
         continue
+    found_installs[provider] = installs
     dispatched = next(
         (item for item in installs if item["origin"] == "PATH"), None
     )
@@ -577,6 +585,21 @@ for step in manifest.get("steps", []):
         emit("INFO", f"{role_id} is endpoint-routed; its service serves its own models")
         continue
     configured_models.setdefault(role.provider, set()).add(role.model)
+    # Which version the role runs, in the dispatched CLI's own words:
+    # an alias names none by itself, and "unverified" where that CLI
+    # could not be asked.
+    stated = live.get(role.provider)
+    emit(
+        "INFO",
+        f"{role_id}: {role.provider}/{role.model} is "
+        + model_name(
+            role.provider,
+            role.model,
+            stated[0]
+            if stated and stated[1] == "installed CLI catalogue"
+            else None,
+        ),
+    )
     if role.provider not in statuses:
         statuses[role.provider] = provider_status(role.provider)
     status = statuses[role.provider]
@@ -594,6 +617,45 @@ for step in manifest.get("steps", []):
         emit("FAIL", f"{role_id}: {level_reason}")
     elif level is Availability.READY:
         emit("PASS", f"{role_id}: {level_reason}")
+
+
+# The dispatched CLI decides what an alias means, and an editor's own
+# copy of the CLI may decide differently; sibling_divergences says where.
+for provider in sorted(PROVIDERS):
+    shared = live.get(provider)
+    if shared is None or shared[1] != "installed CLI catalogue":
+        continue
+    for kind, message in sibling_divergences(
+        provider,
+        configured_models.get(provider, set()),
+        shared[0],
+        found_installs.get(provider),
+    ):
+        emit(kind, message)
+
+
+def live_name(provider, model):
+    stated = live.get(provider)
+    return model_name(
+        provider,
+        model,
+        stated[0] if stated and stated[1] == "installed CLI catalogue" else None,
+    )
+
+
+# The standing approvals are named here, from this section's discovery,
+# and printed in their own section below: naming them there would ask
+# both CLIs a second time. Described inside the try: a record the store
+# accepts but no line can describe must cost only these lines, not the
+# whole section, and leaves the section below to report the store.
+try:
+    standing = [describe(record, live_name) for record in list_active()]
+except Exception:  # noqa: BLE001 - diagnostics must not raise
+    pass
+else:
+    emit("STANDING_READ", "")
+    for line in standing:
+        emit("STANDING", line)
 
 # The ladder orrery-sync arms comes from the bundled catalogue's
 # fallback_tier, a judgement about capability class that live discovery
@@ -713,6 +775,8 @@ PY
             WARN:*) warn "${line#WARN:}" ;;
             SKIP:*) skip "${line#SKIP:}" ;;
             FAIL:*) fail "${line#FAIL:}" ;;
+            STANDING_READ:*) STANDING_NAMED=1 ;;
+            STANDING:*) STANDING_LIST+="${line#STANDING:}"$'\n' ;;
         esac
     done <<< "$CURRENCY_REPORT"
 else
@@ -808,6 +872,7 @@ for script in \
     "$KIT_DIR/scripts/orrery-prompt-submit" \
     "$KIT_DIR/scripts/orrery_effort.py" \
     "$KIT_DIR/scripts/orrery_model_catalogue.py" \
+    "$KIT_DIR/scripts/orrery_model_names.py" \
     "$KIT_DIR/scripts/orrery_runtime.py" \
     "$KIT_DIR/scripts/orrery-review" \
     "$KIT_DIR/scripts/orrery-config" \
@@ -1075,7 +1140,8 @@ $ENDPOINT_REPORT
 EOF
 
 printf '\n=== Standing fallback approvals ===\n'
-if STANDING_LIST="$(
+# Read again, unnamed, only where the currency block could not read them.
+if [ "$STANDING_NAMED" = 1 ] || STANDING_LIST="$(
     python3 - "$KIT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -1089,6 +1155,7 @@ PY
 )"; then
     if [ -n "$STANDING_LIST" ]; then
         while IFS= read -r line; do
+            [ -n "$line" ] || continue
             warn "Standing fallback active: $line"
         done <<< "$STANDING_LIST"
         printf 'Revoke with: orrery --revoke-fallbacks\n'

@@ -33,13 +33,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from orrery_incidents import read_events  # noqa: E402
 from orrery_model_catalogue import (  # noqa: E402
     CatalogueDiscoveryError,
-    discover_claude_models,
-    discover_codex_models,
     ModelIdentity,
+    discover_models,
     known_entry,
     model_identity,
     visible_entries,
 )
+from orrery_model_names import banner_name  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     MODEL_ID,
     PROVIDERS,
@@ -463,13 +463,9 @@ def _catalogue_entries(
     ):
         return bundled, "bundled catalogue"
 
-    discoverer = (
-        discover_claude_models
-        if provider == "anthropic"
-        else discover_codex_models
-    )
     try:
-        live = discoverer(
+        live = discover_models(
+            provider,
             status.executable,
             timeout=DISCOVERY_TIMEOUT_SECONDS,
             environment=environment,
@@ -1576,9 +1572,26 @@ def _scope_phrase(scope: str, expires_at: float | None) -> str:
     return "for this run only"
 
 
+def _version_note(role: Role) -> str:
+    """Which version a proposed or configured model is, as a suffix.
+
+    An approval is bound to an exact provider and model, so the prompt
+    says which version that model is rather than leaving `opus` to be
+    guessed at. Read from what this run's ranking already discovered;
+    nothing is added where the name is the id itself.
+    """
+    try:
+        named = banner_name(role)
+    except Exception:  # noqa: BLE001 - a prompt must never fail on a name
+        return ""
+    return "" if named == role.model else f" — {named}"
+
+
 def _candidate_label(candidate: Role) -> str:
-    return f"{candidate.provider}:{candidate.model}" + (
-        f" (thinking {candidate.thinking})" if candidate.thinking else ""
+    return (
+        f"{candidate.provider}:{candidate.model}"
+        + (f" (thinking {candidate.thinking})" if candidate.thinking else "")
+        + _version_note(candidate)
     )
 
 
@@ -1630,14 +1643,16 @@ def request_fallback_decision(
     _safe_print("ORRERY FALLBACK PROPOSED", stream=stream)
     _safe_print(
         f"Configured: {provider_label(original.provider)} / {original.model}"
-        + (f" / thinking {original.thinking}" if original.thinking else ""),
+        + (f" / thinking {original.thinking}" if original.thinking else "")
+        + _version_note(original),
         stream=stream,
     )
     _safe_print(f"Reason: {proposal.reason}", stream=stream)
     _safe_print(
         f"Nearest candidate: {provider_label(candidate.provider)} / "
         f"{candidate.model}"
-        + (f" / thinking {candidate.thinking}" if candidate.thinking else ""),
+        + (f" / thinking {candidate.thinking}" if candidate.thinking else "")
+        + _version_note(candidate),
         stream=stream,
     )
     _safe_print(
@@ -1728,7 +1743,8 @@ def request_fallback_decision(
                 )
                 return ConsentDecision(Consent.REQUIRED)
             _safe_print(
-                f"Fallback approved for {proposal.approval_key} "
+                f"Fallback approved for {proposal.approval_key}"
+                f"{_version_note(candidate)} "
                 f"{_scope_phrase(scope, expires_at)}.",
                 stream=stream,
             )
@@ -1771,7 +1787,8 @@ def request_fallback_decision(
             chosen = numbered[int(answer) - 1]
         if chosen is not None:
             _safe_print(
-                f"Fallback approved for {proposal.approval_key} "
+                f"Fallback approved for {proposal.approval_key}"
+                f"{_version_note(candidate)} "
                 f"{_scope_phrase(chosen[0], chosen[1])}.",
                 stream=stream,
             )

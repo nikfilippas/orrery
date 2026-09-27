@@ -32,6 +32,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orrery_spend  # noqa: E402
+from orrery_model_names import spend_name  # noqa: E402
 
 
 COLUMNS = ("fresh_in", "cache_read", "cache_write", "output", "total")
@@ -378,6 +379,27 @@ def price_records(records: list[dict]) -> tuple[float | None, str | None]:
     return total, None
 
 
+def ran_as(record: dict) -> str:
+    """The model an attempt ran as: the one it reported, else its configured one.
+
+    Grouped by this rather than by the configured name, so two `opus`
+    runs a CLI update split between Opus 5 and Opus 5.5 are two rows.
+    """
+    from orrery_allowance import single_reported_model
+
+    named = record.get("reported_models")
+    single = (
+        single_reported_model({
+            "provider": record.get("provider"),
+            "model": record.get("model"),
+            "reported_models": ",".join(str(name) for name in named),
+        })
+        if isinstance(named, list)
+        else None
+    )
+    return single or str(record.get("model", "unknown"))
+
+
 def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
     store = root / ".orrery"
     if not (store / "ledger" / f"{task_id}.jsonl").exists():
@@ -385,7 +407,7 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
         return 2
     records, unattributed = task_attempts(store, task_id)
 
-    totals: dict[tuple[str, str, str, str], dict[str, int]] = {}
+    totals: dict[tuple[str, str, str, str, str], dict[str, int]] = {}
     unknown = 0
     reported_cost = 0.0
     have_reported = False
@@ -396,6 +418,7 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
             str(record.get("provider", "unknown")),
             str(record.get("model", "unknown")),
             str(record.get("endpoint") or ""),
+            ran_as(record),
         )
         bucket = totals.setdefault(key, new_bucket())
         bucket["events"] += 1
@@ -443,11 +466,14 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
                             "provider": provider,
                             "model": model,
                             "endpoint": endpoint or None,
+                            "ran_as": ran,
+                            "name": (
+                                ran if endpoint else spend_name(provider, ran)
+                            ),
                             **bucket,
                         }
-                        for (role, provider, model, endpoint), bucket in sorted(
-                            totals.items()
-                        )
+                        for (role, provider, model, endpoint, ran), bucket
+                        in sorted(totals.items())
                     ],
                     "provider_cost_usd": reported_cost if have_reported else None,
                     "computed_cost_usd": computed,
@@ -476,25 +502,37 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
         "it predates this accounting or never started a provider"
     )
     print()
+    # An endpoint serves its own models, which no first-party name fits.
+    # The column is as wide as its longest name, so none is cut short.
+    names = {
+        (role, provider, model, endpoint, ran): (
+            ran if endpoint else spend_name(provider, ran)
+        )
+        for role, provider, model, endpoint, ran in totals
+    }
+    width = max([len("RAN AS"), *map(len, names.values())])
     header = (
-        f"{'ROLE':13} {'PROVIDER':10} {'MODEL':22} {'FRESH IN':>10} "
-        f"{'CACHE RD':>10} {'CACHE WR':>10} {'OUTPUT':>9} {'TOTAL':>11} {'RUNS':>5}"
+        f"{'ROLE':13} {'PROVIDER':10} {'MODEL':22} {'RAN AS':{width}} "
+        f"{'FRESH IN':>10} {'CACHE RD':>10} {'CACHE WR':>10} {'OUTPUT':>9} "
+        f"{'TOTAL':>11} {'RUNS':>5}"
     )
     print(header)
     print("-" * len(header))
     grand = new_bucket()
-    for (role, provider, model, _endpoint), bucket in sorted(totals.items()):
+    for key, bucket in sorted(totals.items()):
+        role, provider, model, _endpoint, _ran = key
         for name in (*COLUMNS, "events"):
             grand[name] += bucket[name]
         print(
             f"{role[:13]:13} {provider[:10]:10} {model[:22]:22} "
+            f"{names[key]:{width}} "
             f"{bucket['fresh_in']:>10,} {bucket['cache_read']:>10,} "
             f"{bucket['cache_write']:>10,} {bucket['output']:>9,} "
             f"{bucket['total']:>11,} {bucket['events']:>5,}"
         )
     print("-" * len(header))
     print(
-        f"{'all':13} {'':10} {'':22} {grand['fresh_in']:>10,} "
+        f"{'all':13} {'':10} {'':22} {'':{width}} {grand['fresh_in']:>10,} "
         f"{grand['cache_read']:>10,} {grand['cache_write']:>10,} "
         f"{grand['output']:>9,} {grand['total']:>11,} {grand['events']:>5,}"
     )
@@ -577,7 +615,12 @@ def main() -> int:
                     "since": since.isoformat(),
                     "files": {"claude": claude_files, "codex": codex_files},
                     "usage": [
-                        {"provider": provider, "model": model, **bucket}
+                        {
+                            "provider": provider,
+                            "model": model,
+                            "name": spend_name(provider, model),
+                            **bucket,
+                        }
                         for (provider, model), bucket in sorted(totals.items())
                     ],
                     "delegated": {
@@ -585,7 +628,12 @@ def main() -> int:
                         "unknown_runs": unknown_runs,
                         "partial_runs": partial_runs,
                         "usage": [
-                            {"provider": provider or None, "model": model, **bucket}
+                            {
+                                "provider": provider or None,
+                                "model": model,
+                                "name": spend_name(provider, model),
+                                **bucket,
+                            }
                             for (provider, model), bucket in sorted(
                                 delegated.items()
                             )
@@ -629,9 +677,15 @@ def main() -> int:
 
 
 def print_table(totals: dict[tuple[str, str], dict[str, int]]) -> None:
+    # The version beside every id, so Opus 5 and Opus 5.5 read as two
+    # models rather than two ids a reader has to know apart. The column
+    # is as wide as its longest name, so none is cut short.
+    names = {key: spend_name(*key) for key in totals}
+    width = max([len("NAME"), *map(len, names.values())])
     header = (
-        f"{'PROVIDER':10} {'MODEL':26} {'FRESH IN':>12} {'CACHE RD':>12} "
-        f"{'CACHE WR':>12} {'OUTPUT':>10} {'TOTAL':>14} {'EVENTS':>7}"
+        f"{'PROVIDER':10} {'MODEL':26} {'NAME':{width}} {'FRESH IN':>12} "
+        f"{'CACHE RD':>12} {'CACHE WR':>12} {'OUTPUT':>10} {'TOTAL':>14} "
+        f"{'EVENTS':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -641,7 +695,8 @@ def print_table(totals: dict[tuple[str, str], dict[str, int]]) -> None:
         for name in (*COLUMNS, "events"):
             grand[name] += bucket[name]
         print(
-            f"{provider:10} {model[:26]:26} {bucket['fresh_in']:>12,} "
+            f"{provider:10} {model[:26]:26} "
+            f"{names[(provider, model)]:{width}} {bucket['fresh_in']:>12,} "
             f"{bucket['cache_read']:>12,} {bucket['cache_write']:>12,} "
             f"{bucket['output']:>10,} {bucket['total']:>14,} "
             f"{bucket['events']:>7,}"
@@ -649,7 +704,7 @@ def print_table(totals: dict[tuple[str, str], dict[str, int]]) -> None:
 
     print("-" * len(header))
     print(
-        f"{'all':10} {'':26} {grand['fresh_in']:>12,} "
+        f"{'all':10} {'':26} {'':{width}} {grand['fresh_in']:>12,} "
         f"{grand['cache_read']:>12,} {grand['cache_write']:>12,} "
         f"{grand['output']:>10,} {grand['total']:>14,} {grand['events']:>7,}"
     )

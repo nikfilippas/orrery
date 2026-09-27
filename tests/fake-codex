@@ -155,6 +155,10 @@ def probe_writes() -> None:
 
 def serve_catalogue() -> int:
     """Speak the app-server initialization and paginated model/list subset."""
+    # One line per discovery, as the fake Claude writes, for spawn counts.
+    if log := os.environ.get("CODEX_FAKE_DISCOVERY_LOG"):
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(os.path.realpath(sys.argv[0]) + "\n")
     pages = {
         None: (
             [

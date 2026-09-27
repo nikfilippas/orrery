@@ -68,6 +68,7 @@ from orrery_standing import (  # noqa: E402
     revoke_all,
 )
 import orrery_incidents as incident_log  # noqa: E402
+from orrery_model_names import banner_name, cached_name  # noqa: E402
 import orrery_stall  # noqa: E402
 
 TERMINAL_STATES = frozenset({"inactive", "failed"})
@@ -2040,7 +2041,8 @@ def record_standing(
         )
         return
     print(
-        f"{PROGRAM_NAME}: standing fallback recorded · {describe(record)}",
+        f"{PROGRAM_NAME}: standing fallback recorded · "
+        + describe(record, cached_name),
         file=sys.stderr,
     )
     incident_log.record(
@@ -2113,7 +2115,8 @@ def adopt_standing_approval(
     state.role = candidate
     state.is_fallback = True
     print(
-        f"{PROGRAM_NAME}: standing fallback active · {describe(record)}",
+        f"{PROGRAM_NAME}: standing fallback active · "
+        + describe(record, cached_name),
         file=sys.stderr,
     )
     incident_log.record(
@@ -2474,7 +2477,10 @@ def main(
             return 1
         if removed:
             for record in removed:
-                print(f"revoked standing fallback · {describe(record)}")
+                print(
+                    "revoked standing fallback · "
+                    + describe(record, cached_name)
+                )
         else:
             print("No standing fallback approvals.")
         return 0
@@ -2733,7 +2739,7 @@ def main(
             if state.is_fallback
             else f"↳ {display}"
         )
-        + f" · {role_config.provider} · {role_config.model}"
+        + f" · {role_config.provider} · {banner_name(role_config)}"
         + (
             f" · thinking {role_config.thinking}"
             if role_config.thinking

@@ -112,6 +112,52 @@ rebuilds the adjacent thinking selector from that model's reported levels. A
 custom model requires an explicit provider and has no inferred thinking
 selector.
 
+### Exact versions and floating aliases
+
+A role holds either an exact version or an alias, and the page offers
+both, each under the name the CLI itself gives it, with the CLI's
+description beneath, as Claude Code's own picker shows them:
+
+| Option | Stored as | Reads as |
+| --- | --- | --- |
+| an exact version | `claude-opus-5-5` | Opus 5.5 |
+| a native alias | `opus` | Opus (latest) · Opus 5.5 |
+| an alias the CLI lists no row for | `fable` | Fable (latest) · Fable 5.1, 26 Sep |
+
+An exact version is pinned: it runs that model until you change it,
+with its own thinking levels passed as `--effort`. An alias floats: the
+installed CLI decides what it means, so upgrading the CLI can move it,
+as `opus` moved from Opus 5 on Claude Code 2.1.278 to Opus 5.5 on 2.1.282. Nothing
+rewrites a stored alias; it keeps floating, and every surface says what
+it runs now. Where the CLI lists no row for a stored alias (Claude Code
+2.1.282 lists Fable only as Fable 5.1 and Fable 5), Orrery does not
+guess its version: it reads as the version a delegated run of that
+alias last reported, with the day (`26 Sep`, or the month, `Dec '25`,
+in an earlier year), or "not yet observed". A principal
+session records nothing that ties it to the alias it was started as,
+so a principal alias with no row reads "not yet observed" until a
+delegated role runs the same alias. Where the CLI could not be asked and
+nothing has been observed it reads "unverified". A name the provider
+moves with no identity to resolve, such as an OpenAI `-latest` model,
+says that it moves, "moves, no version". Every one of these fits a role
+card's model select whole.
+
+Every surface that names a model uses the same words, read from one
+discovery per run, so none of them starts a CLI more than once:
+`orrery-config --print` prints the id and its version,
+`opus (Opus (latest) · Opus 5.5)`; the session roster and the dispatch
+banner (`↳ Implementation worker · anthropic · Opus 5.5 · thinking
+high`) print the version; the doctor adds one line per role; `orrery-sync`
+names the principal and its fallback ladder; `orrery-usage` and the spend
+breakdown name each figure's version; and every fallback proposal and
+approval prompt names the version of both the configured model and the
+candidate, since an approval is bound to an exact model. A role routed
+at a custom endpoint keeps its id alone: that service serves its own
+models. The doctor also warns when an editor's own copy of the CLI (the
+VS Code extension's) resolves a configured alias to a different model
+than the CLI Orrery dispatches, naming both; `claude update` brings the
+older one level.
+
 Preview computes one unified diff of `~/.config/orrery/config.json`, the
 small file holding this machine's deviations, not of the shipped manifest.
 Apply is accepted only for the exact content previously previewed, uses an
@@ -353,11 +399,14 @@ The squares carry the configuration page's own role colours, so the two
 can be scanned against each other. The mechanic is the one compromise:
 its colour is a muted slate and the emoji set has no grey square.
 
-The model column shows the version an alias currently resolves to, from
-the same live discovery `orrery-doctor` uses, so `fable` reads as
-`Fable 5.1` and would change by itself if a provider moved the alias.
-Where discovery is unavailable the alias is shown unchanged; the table
-never fails a session to report a version.
+The model column names each role's version from the same live discovery
+`orrery-doctor` uses: an exact version as the CLI names it, `Opus 5.5`,
+and an alias with what it resolves to now, `Opus (latest) · Opus 5.5`,
+which changes by itself if the provider moves the alias. An alias the
+CLI lists no row for reads as the version a delegated run of it last
+reported, with the day, or "not yet observed", never Orrery's guess, and where discovery is unavailable and nothing
+was observed the alias is marked unverified; the table never fails a session to report a version.
+See [Exact versions and floating aliases](#exact-versions-and-floating-aliases).
 
 It is deliberately absent in two cases. An un-adopted repository is an
 ordinary single-provider session and Orrery's roles do not apply to it.
@@ -436,6 +485,23 @@ Keyed by provider rather than by model, because the measured constraint
 is account-wide: Anthropic reports one five-hour and one seven-day window
 for the whole account with no per-model breakdown, so every Anthropic
 model's spend sums into the one bucket.
+
+The breakdown inside that bucket is per exact model, so Opus 5 and Opus
+5.5 are two lines, each named by its version. A transcript records the
+model that answered, and a delegated run is filed under the one model
+of its configured family that its provider reported running, so a
+principal session and a delegated `opus` run on the same Opus 5.5 share
+one key. Claude Code also reports the small model it makes side calls
+on (Haiku beside Opus); that model is set aside when choosing the key,
+and its tokens stay in the run's figure. A versioned model the bundled
+catalogue lists only by its family alias, such as Sonnet 5 or Haiku
+4.5, is still filed under its own id: the catalogue settles which
+provider owns it, never which version it was. A delegated run that
+reported no single model of its family, or recorded no reported models
+at all, is filed under its configured name, so one window can hold
+both `anthropic/opus` and `anthropic/claude-opus-5-5`; the provider's
+total is exact either way, and only the alias line may mix versions,
+reading "version not recorded".
 
 Spend is measured from the local session logs, the Claude transcripts
 (subagent and workflow-agent transcripts included) and Codex rollout
@@ -1418,6 +1484,9 @@ The maintained artefacts are:
   approval notification.
 - `scripts/orrery_model_catalogue.py` — no-inference live model and
   thinking-capability discovery.
+- `scripts/orrery_model_names.py` — how every surface names a model: the
+  CLI's own name for an exact version, an alias with what it resolves to
+  now, and a rowless alias by what it last ran as, never a guess.
 - `scripts/orrery-review` — the `orrery-agent` runner and compatibility review
   entry point.
 - `scripts/orrery_incidents.py` and `scripts/orrery-incidents` — the

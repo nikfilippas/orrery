@@ -143,6 +143,11 @@ def catalogue_shape() -> str:
 
 def serve_catalogue() -> int:
     """Speak the initialization subset used by the Agent SDK."""
+    # One line per discovery, naming the copy asked, so a test can count
+    # how often a surface spawned each installed CLI.
+    if log := os.environ.get("CLAUDE_FAKE_DISCOVERY_LOG"):
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(os.path.realpath(sys.argv[0]) + "\n")
     for line in sys.stdin:
         try:
             message = json.loads(line)

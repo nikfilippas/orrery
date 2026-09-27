@@ -88,6 +88,19 @@ single-provider session and says so.
   dispatched, a thinking level withdrawn since a role was configured, a
   live model the offline fallback has never heard of, and a principal
   left with no automatic fallback ladder.
+- **Every model is named by its version, never guessed.** `opus` meant
+  Opus 5 on one Claude Code release and Opus 5.5 on the next. Every
+  exact version the CLI lists is its own option under the CLI's own
+  name ("Opus 5.5", with its description beneath), and a floating alias
+  says what it runs now ("Opus (latest) · Opus 5.5"). The page,
+  `orrery-config --print`, the session roster, the dispatch banner, the
+  doctor, `orrery-sync`, usage and spend reports, standing approvals
+  and every fallback prompt name models the same way; an alias the CLI
+  lists no row for reads as the version a delegated run of it last
+  reported, dated ("Fable (latest) · Fable 5.1, 26 Sep"); where nothing
+  has reported it, "not yet observed", or "unverified" where the CLI
+  could not be asked. The doctor warns when an editor's own
+  copy of the CLI resolves an alias to a different model.
 - **Nothing hidden, nothing left behind.** Every standing instruction a
   session carries is a file in this repository; delegated process trees
   are contained and cleaned; failures land in a local incident log so

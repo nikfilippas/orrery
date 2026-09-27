@@ -40,6 +40,7 @@ from orrery_model_catalogue import (  # noqa: E402
     known_entry,
     model_identity,
 )
+from orrery_model_names import model_name  # noqa: E402
 from orrery_runtime import (  # noqa: E402
     MANIFEST_PATH,
     USER_CONFIG_VERSION,
@@ -293,11 +294,35 @@ def load_catalogue() -> dict[str, list[dict[str, Any]]]:
     return ACTIVE_CATALOGUE if ACTIVE_CATALOGUE is not None else bundled_catalogue()
 
 
+def live_rows(provider: str) -> list[dict[str, Any]] | None:
+    """The installed CLI's own entries, or None where it was not asked.
+
+    A bundled entry states no resolution, so naming an alias from it
+    would have to guess; None makes the name say "unverified" instead.
+    """
+    if CATALOGUE_DISCOVERY.sources.get(provider) != "installed CLI":
+        return None
+    return load_catalogue().get(provider, [])
+
+
+def display_name(provider: str, model: str, *, observe: bool = True) -> str:
+    """What a model is called on this page and in --print."""
+    return model_name(provider, model, live_rows(provider), observe=observe)
+
+
 def model_choices(
     current_provider: str,
     current_model: str,
+    *,
+    observe: bool = True,
 ) -> list[dict[str, Any]]:
-    """Every discovered provider/model pair plus the current custom pair."""
+    """Every discovered provider/model pair plus the current custom pair.
+
+    Each carries `display`, the name its option reads as: the CLI's own
+    for an exact version, and for an alias the version it means now or
+    was last observed to run as. `observe` is off for a published
+    export, which must not carry this machine's history.
+    """
     choices: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -305,7 +330,11 @@ def model_choices(
         for entry in entries:
             identity = (provider, entry["id"])
             if identity not in seen:
-                choices.append(dict(entry))
+                choice = dict(entry)
+                choice["display"] = display_name(
+                    provider, entry["id"], observe=observe
+                )
+                choices.append(choice)
                 seen.add(identity)
 
     current = (current_provider, current_model)
@@ -332,6 +361,9 @@ def model_choices(
                 "id": current_model,
                 "label": label,
                 "label_derived": True,
+                "display": display_name(
+                    current_provider, current_model, observe=observe
+                ),
                 "description": None,
                 "alias": is_alias(current_provider, current_model),
                 "resolved": None,
@@ -348,6 +380,7 @@ def model_choices(
                 "provider": current_provider,
                 "id": current_model,
                 "label": current_model,
+                "display": current_model,
                 "thinking_levels": [],
                 "default_thinking": None,
                 "known": False,
@@ -357,7 +390,9 @@ def model_choices(
     return choices
 
 
-def step_state(step: dict[str, Any]) -> dict[str, Any]:
+def step_state(
+    step: dict[str, Any], *, observe: bool = True
+) -> dict[str, Any]:
     provider = step.get("provider")
     model = step.get("model")
     thinking = step.get("thinking")
@@ -384,7 +419,7 @@ def step_state(step: dict[str, Any]) -> dict[str, Any]:
         "selects": step.get("selects", ""),
         "endpoint": step.get("endpoint") or "",
     }
-    state["choices"] = model_choices(provider, model)
+    state["choices"] = model_choices(provider, model, observe=observe)
     return state
 
 
@@ -504,10 +539,12 @@ def endpoint_presets() -> list[dict[str, Any]]:
 
 def snapshot(
     manifest: dict[str, Any] | None = None,
+    *,
+    observe: bool = True,
 ) -> list[dict[str, Any]]:
     if manifest is None:
         manifest = effective_manifest()
-    return [step_state(step) for step in manifest["steps"]]
+    return [step_state(step, observe=observe) for step in manifest["steps"]]
 
 
 MODEL_NAME = re.compile(
@@ -1038,7 +1075,16 @@ stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   }
   .cardctl .ctl:disabled { opacity: .5; cursor: default; }
   .cardctl .ctl::placeholder { color: rgba(255,255,255,.5); }
+  /* A model is named the way Claude Code's picker names it, in a
+     proportional face, which fits a third more of a long name than the
+     monospace the other controls use. */
+  .cardctl select.ctl[data-kind="model"] {
+    font-family: system-ui, sans-serif; letter-spacing: 0;
+  }
   .cardctl select.ctl option { background: #16232d; color: #eaf1f5; }
+  /* A model's description sits under its name, as in Claude Code's own
+     picker, and cannot be chosen itself. */
+  .cardctl select.ctl option.desc { color: #8fa6b4; font-style: italic; }
   /* A pale card needs the same controls drawn in ink rather than light. */
   .cardctl.on-light .ctl {
     color: #10161a; background-color: rgba(0,0,0,.05);
@@ -1058,6 +1104,7 @@ stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
   }
   .cardctl.on-light .ctl::placeholder { color: rgba(0,0,0,.42); }
   .cardctl.on-light select.ctl option { background: #ffffff; color: #10161a; }
+  .cardctl.on-light select.ctl option.desc { color: #5b6a73; }
   /* The buttons sit beside the legend, on the drawing's clear ground. */
   .actions { display: none; }
   .actionbar {
@@ -1332,15 +1379,43 @@ function option(value, label, selected) {
   return node;
 }
 
-// A stored level the model does not list, null included, reads as "not
-// set", which leaves it unchanged: left to the browser, the first level
-// would show as chosen and a preview of any other role would write it.
-function fillLevels(select, levels, chosen) {
-  if (!levels.includes(chosen)) {
-    select.appendChild(option("", "not set", true));
+// A stored level the model does not list is shown as what it is,
+// "xhigh (not offered)", or "not set" for none, and carries no value,
+// so choosing it leaves the role's level unchanged: left to the
+// browser, the first level would show as chosen and a preview of any
+// other role would write it. `held` is that stored level where the
+// caller keeps offering it beside a level chosen on the same model.
+function fillLevels(select, levels, chosen, held) {
+  const unlisted = held !== undefined
+    ? held
+    : (levels.includes(chosen) ? undefined : chosen);
+  if (unlisted !== undefined) {
+    select.appendChild(option(
+      "",
+      unlisted ? `${unlisted} (not offered)` : "not set",
+      !levels.includes(chosen),
+    ));
   }
   for (const level of levels) {
     select.appendChild(option(level, level, level === chosen));
+  }
+}
+
+// Every model option reads as the CLI's own name, with its version,
+// and its description on a line of its own beneath it.
+function modelOptions(select, choices, current) {
+  for (const choice of choices) {
+    const item = option(
+      choice.id, choice.display || choice.label, choice.id === current,
+    );
+    if (choice.description) item.title = choice.description;
+    select.appendChild(item);
+    if (choice.description) {
+      const note = option("", `\u2003${choice.description}`, false);
+      note.disabled = true;
+      note.className = "desc";
+      select.appendChild(note);
+    }
   }
 }
 
@@ -1418,9 +1493,9 @@ function roleControls(card) {
   } else {
     // Seeded by the endpoint: a first-party endpoint is one provider, so
     // only that provider's catalogue belongs in the list.
-    for (const choice of known.filter(item => item.provider === step.provider)) {
-      model.appendChild(option(choice.id, choice.label, choice.id === step.model));
-    }
+    modelOptions(
+      model, known.filter(item => item.provider === step.provider), step.model,
+    );
   }
   model.appendChild(option("__custom__", "custom…", !listed));
   place(box, card, card.fields[1].slot, model, "ctl");
@@ -1428,6 +1503,7 @@ function roleControls(card) {
   const thinking = document.createElement("select");
   thinking.dataset.step = step.id;
   thinking.dataset.kind = "thinking";
+  thinking.dataset.model = step.model;
   const levels = preset ? [] : (chosen ? chosen.thinking_levels : []);
   if (levels.length) {
     fillLevels(thinking, levels, step.thinking);
@@ -1510,6 +1586,42 @@ function layoutRow(box, card, custom) {
     if (thinking) thinking.style.display = "block";
     if (label) label.style.opacity = "";
   }
+
+  const chosen = model.options[model.selectedIndex];
+  const text = custom || !chosen ? "" : chosen.textContent;
+  model.title = text && chosen.title ? `${text}\\n${chosen.title}` : text;
+  fitText(model, text);
+}
+
+// A name longer than its select would be cut short, and a cut version is
+// a guess, so the select's text shrinks until the whole name fits, down
+// to a floor still legible at the card's scale; the tooltip always holds
+// it in full. Measured against the width the row gave it.
+function fitText(select, text, tries = 0) {
+  select.style.fontSize = "";
+  if (!text) return;
+  if (select.isConnected === false) {
+    // Cards are built before they are placed, and a detached select has
+    // no computed style to measure with; try again once it is placed.
+    if (tries < 20) {
+      requestAnimationFrame(() => fitText(select, text, tries + 1));
+    }
+    return;
+  }
+  const style = getComputedStyle(select);
+  const room = parseFloat(select.style.width)
+    - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
+    - parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth);
+  const context = fitText.context
+    || (fitText.context = document.createElement("canvas").getContext("2d"));
+  const floor = 8.5;
+  let size = parseFloat(style.fontSize);
+  const width = at => {
+    context.font = `${style.fontWeight} ${at}px ${style.fontFamily}`;
+    return context.measureText(text).width;
+  };
+  while (size > floor && width(size) > room) size -= 0.25;
+  select.style.fontSize = `${size}px`;
 }
 
 // What a card stands for, worded for the legend rather than for a step.
@@ -1997,6 +2109,10 @@ function choiceFor(roleId, provider, model) {
 function selectThinking(select, roleId, provider, model, preferred) {
   const choice = choiceFor(roleId, provider, model);
   const levels = choice ? choice.thinking_levels : [];
+  // Which model this picker showed before: arriving on a model is not
+  // the same event as choosing a level on the one already shown.
+  const previous = select.dataset ? select.dataset.model : undefined;
+  if (select.dataset) select.dataset.model = model;
   select.replaceChildren();
   if (!levels.length) {
     const option = document.createElement("option");
@@ -2008,15 +2124,22 @@ function selectThinking(select, roleId, provider, model, preferred) {
   }
   const stored = provider === roles[roleId].provider &&
     model === roles[roleId].model;
-  const remembered = preferred || (stored ? roles[roleId].thinking : "");
-  // Back on the stored model with its unlisted level: still not set.
-  const unset = !preferred && stored && !levels.includes(remembered);
+  const storedLevel = roles[roleId].thinking;
+  // On the stored model, a stored level it does not list stays on
+  // offer. Arriving back on that model chooses it again, whatever
+  // level the other model carried, so switching away and back leaves
+  // the role untouched; a level chosen on the model itself is kept.
+  const held = stored && !levels.includes(storedLevel)
+    ? storedLevel
+    : undefined;
+  const unset = held !== undefined && (!preferred || previous !== model);
+  const remembered = preferred || (stored ? storedLevel : "");
   const chosen = unset
     ? null
     : levels.includes(remembered)
       ? remembered
       : (choice.default_thinking || levels[0]);
-  fillLevels(select, levels, chosen);
+  fillLevels(select, levels, chosen, held);
   select.disabled = false;
   return chosen;
 }
@@ -2343,7 +2466,7 @@ def render_page(token: str, demo: bool = False) -> str:
                 f"{', '.join(fallback)}."
             )
     replacements = {
-        "__STATE__": script_json(snapshot(manifest)),
+        "__STATE__": script_json(snapshot(manifest, observe=not demo)),
         "__SETTINGS__": script_json(settings_snapshot(manifest)),
         "__CHART__": script_json(manifest.get("chart", {})),
         "__ENDPOINTS__": script_json(endpoint_presets()),
@@ -2378,7 +2501,7 @@ def standing_html() -> str:
     if not records:
         return ""
     items = "".join(
-        f"<li>{html.escape(describe_standing(record))}</li>"
+        f"<li>{html.escape(describe_standing(record, display_name))}</li>"
         for record in records
     )
     return (
@@ -2412,8 +2535,22 @@ def print_state() -> int:
             )
             else "default"
         )
+        # The id is what the configuration holds and what a user types;
+        # the name beside it is which version that is. An endpoint
+        # serves its own models, which the first-party picker cannot
+        # name, so a routed role shows its id alone.
+        named = (
+            state["model"]
+            if state.get("endpoint")
+            else display_name(state["provider"], state["model"])
+        )
+        model = (
+            state["model"]
+            if named == state["model"]
+            else f"{state['model']} ({named})"
+        )
         print(f"{state['title']:24} {state['provider']:10} "
-              f"{state['model']}{thinking}   [{source}]")
+              f"{model}{thinking}   [{source}]")
     for setting in settings_snapshot(manifest):
         source = (
             "user" if f"settings.{setting['id']}" in sources else "default"
@@ -2426,7 +2563,7 @@ def print_state() -> int:
     for record in list_standing():
         print(
             f"{'Standing fallback':24} {'consent':10} "
-            f"{describe_standing(record)}"
+            f"{describe_standing(record, display_name)}"
         )
     return 0
 
@@ -2704,7 +2841,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(
                     {
                         "revoked": [
-                            describe_standing(record) for record in removed
+                            describe_standing(record, display_name)
+                            for record in removed
                         ]
                     }
                 )

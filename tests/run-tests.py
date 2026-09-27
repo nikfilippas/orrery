@@ -105,6 +105,7 @@ import orrery_allowance as allowance_module  # noqa: E402
 import orrery_effort as effort_module  # noqa: E402
 import orrery_findings as findings_module  # noqa: E402
 import orrery_incidents as incidents_module  # noqa: E402
+import orrery_model_names as names_module  # noqa: E402
 import orrery_stall as stall_module  # noqa: E402
 import orrery_standing as standing_module  # noqa: E402
 
@@ -6325,7 +6326,9 @@ def test_delegated_quota_fallback() -> None:
             "Nearest candidate: Anthropic / claude-fable-5[1m] / thinking "
             "high" in stderr
             and "Fallback approved for anthropic:claude-fable-5[1m]" in stderr
-            and "↳ Fallback reviewer · anthropic · claude-fable-5[1m] · "
+            # The banner names the version, here Orrery's label for a
+            # row the fake CLI names none for, rather than the id.
+            and "↳ Fallback reviewer · anthropic · Fable 5, 1M context · "
             "thinking high" in stderr,
             f"delegated fallback was not fully announced: {stderr}",
         )
@@ -9643,6 +9646,562 @@ console.log(JSON.stringify({ before, after, changes: changes() }));
         set(observed["changes"]) == {"reviewer"}
         and observed["changes"]["reviewer"]["model"] == "sonnet",
         f"a preview of the reviewer touched the implementer: {observed}",
+    )
+
+
+@contextlib.contextmanager
+def fake_picker(shape: str | None = None) -> Iterator[Path]:
+    """The fake CLIs on this process's own PATH, serving one picker shape.
+
+    For the surfaces that ask the installed CLI in-process: the page,
+    --print, the roster, the pre-dispatch check and the banner. Yields
+    the log each fake appends to once per discovery. Both per-run
+    caches are emptied on the way in and out, so neither another test's
+    discovery nor its observations can answer for this one.
+    """
+    names = (
+        "CLAUDE_FAKE_CATALOGUE",
+        "CLAUDE_FAKE_CATALOGUE_PATHS",
+        "CLAUDE_FAKE_DISCOVERY_LOG",
+        "CODEX_FAKE_DISCOVERY_LOG",
+        "ORRERY_MODEL_DISCOVERY",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    catalogue = sys.modules["orrery_model_catalogue"]
+    with provider_binaries_on_path() as bin_dir:
+        log = bin_dir / "discoveries.log"
+        for name in names:
+            os.environ.pop(name, None)
+        if shape is not None:
+            os.environ["CLAUDE_FAKE_CATALOGUE"] = shape
+        os.environ["CLAUDE_FAKE_DISCOVERY_LOG"] = str(log)
+        os.environ["CODEX_FAKE_DISCOVERY_LOG"] = str(log)
+        catalogue._DISCOVERED.clear()
+        names_module._OBSERVED.clear()
+        try:
+            yield log
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            catalogue._DISCOVERED.clear()
+            names_module._OBSERVED.clear()
+
+
+def discoveries(log: Path) -> dict[str, int]:
+    """How often each fake CLI was asked for its picker, by command name."""
+    counts: dict[str, int] = {}
+    if log.exists():
+        for line in log.read_text().splitlines():
+            counts[Path(line).name] = counts.get(Path(line).name, 0) + 1
+    return counts
+
+
+def utc_day(moment: float | None = None) -> str:
+    stamp = datetime.fromtimestamp(
+        time.time() if moment is None else moment, timezone.utc
+    )
+    return f"{stamp.day} {stamp:%b}"
+
+
+@test("the page names every option with its version and its description")
+def test_page_names_versions() -> None:
+    """The user's second requirement: nobody should have to guess which
+    version an option means. Every option reads as the CLI's own name,
+    an alias as the version it resolves to now, and a stored alias the
+    CLI lists no row for as the version it was last observed to run as,
+    dated, or as not yet observed; never as Orrery's guess."""
+    with standing_stores(), transcript_roots(), fake_picker("2.1.282"):
+        config = load_script(CONFIG_SCRIPT, f"kit_config_names_{time.time_ns()}")
+        config.activate_discovered_catalogue()
+        offered = offered_choices(config, "implementer", "anthropic")
+        require(
+            offered["opus"]["display"] == "Opus (latest) · Opus 5.5"
+            and offered["claude-opus-5-5"]["display"] == "Opus 5.5"
+            and offered["claude-opus-5-5"]["description"]
+            == "Most capable for ambitious work"
+            and offered["claude-opus-5"]["display"] == "Opus 5"
+            and offered["claude-fable-5-1"]["display"] == "Fable 5.1",
+            f"an option does not state its version: {offered}",
+        )
+        stored = offered_choices(config, "orchestrator", "anthropic")
+        require(
+            stored["fable"]["display"] == "Fable (latest) · not yet observed",
+            f"an unobserved alias was not said to be unobserved: "
+            f"{stored['fable']}",
+        )
+
+        # A delegated run of the alias reports what it ran as.
+        incidents_module.record(
+            "spend",
+            program="orrery-agent",
+            role=anthropic_role("implementer", "fable"),
+            outcome="completed",
+            reported_models="claude-fable-5-1",
+            fresh_in=10,
+        )
+        names_module._OBSERVED.clear()
+        stored = offered_choices(config, "orchestrator", "anthropic")
+        require(
+            stored["fable"]["display"]
+            == f"Fable (latest) · Fable 5.1, {utc_day()}",
+            f"the observed version was not stated: {stored['fable']}",
+        )
+
+    # No transcript ties a session to the alias it was started as: one
+    # `/model` to Fable 5 anywhere must not relabel the principal's
+    # alias, nor any delegate or candidate sharing it.
+    with standing_stores(), transcript_roots() as (projects, _codex), \
+            fake_picker("2.1.282"):
+        write_transcript(
+            projects / "principal.jsonl",
+            [
+                transcript_response("m1", "r1", "claude-fable-5", 40),
+                transcript_response(
+                    "m2", "r2", "claude-opus-5-5", 40, age_seconds=60
+                ),
+            ],
+        )
+        require(
+            names_module.name("anthropic", "fable")
+            == "Fable (latest) · not yet observed",
+            f"an alias was named from an unrelated transcript: "
+            f"{names_module.name('anthropic', 'fable')}",
+        )
+
+    # Every described option carries its description on a line of its
+    # own beneath it, which cannot itself be chosen.
+    node = shutil.which("node")
+    if node is None:
+        print("      (skipped: node is not installed)")
+        return
+    pieces = [
+        re.search(
+            rf"^function {name}\(.*?^}}$", config.PAGE_TEMPLATE, re.M | re.S
+        ).group(0)
+        for name in ("option", "modelOptions")
+    ]
+    choices = [
+        {"id": "opus", "display": "Opus (latest) · Opus 5.5",
+         "label": "Opus (latest)", "description": "Most capable"},
+        {"id": "claude-opus-5", "display": "Opus 5", "label": "Opus 5",
+         "description": None},
+    ]
+    script = (
+        "const document = { createElement: () => ({}) };\n"
+        + "\n".join(pieces)
+        + "\nconst select = { options: [], appendChild(node) "
+        "{ this.options.push(node); } };\n"
+        f"modelOptions(select, {json.dumps(choices)}, 'opus');\n"
+        "console.log(JSON.stringify(select.options.map(item => "
+        "[item.value, item.textContent, Boolean(item.disabled), "
+        "Boolean(item.selected)])));"
+    )
+    result = subprocess.run(
+        [node, "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=30, check=False,
+    )
+    require(result.returncode == 0, f"the harness failed: {result.stderr}")
+    rows = json.loads(result.stdout)
+    require(
+        rows == [
+            ["opus", "Opus (latest) · Opus 5.5", False, True],
+            ["", " Most capable", True, False],
+            ["claude-opus-5", "Opus 5", False, False],
+        ],
+        f"the options do not read as the picker's do: {rows}",
+    )
+
+    # A select narrower than a long name would cut it, so the select's own
+    # text shrinks until the whole name fits, never below a legible floor,
+    # and its tooltip holds the name and description in full; a model named
+    # by hand shows no chosen name. Measured with a stand-in canvas whose
+    # glyphs are 0.49 em wide, the widest average measured for these labels
+    # in the sans faces the model select may fall back to (DejaVu Sans), on
+    # every card's real slot width. Every longest form the naming code
+    # produces must fit whole at 9 px or more, so the version is never cut.
+    # Each pairs the label with the part of it that names the version.
+    now = datetime.now(timezone.utc)
+    earlier = datetime(now.year - 1, 12, 30, tzinfo=timezone.utc)
+    saved_observed = names_module.last_observed
+    try:
+        names_module.last_observed = lambda _provider, _model: (
+            "claude-sonnet-4-6", now.isoformat()
+        )
+        this_year = names_module.model_name("anthropic", "sonnet", None)
+        names_module.last_observed = lambda _provider, _model: (
+            "claude-sonnet-4-6", earlier.isoformat()
+        )
+        last_year = names_module.model_name("anthropic", "sonnet", [])
+    finally:
+        names_module.last_observed = saved_observed
+    moving = names_module.model_name(
+        "openai",
+        "daybreak-blue-latest",
+        [{"id": "daybreak-blue-latest", "label": "Daybreak Blue"}],
+    )
+    labels = [
+        (this_year, "Sonnet (latest) · Sonnet 4.6"),
+        (last_year, "Sonnet (latest) · Sonnet 4.6"),
+        (moving, "Daybreak Blue"),
+        ("Sonnet (latest) · not yet observed", "Sonnet (latest)"),
+        ("Opus 5", "Opus 5"),
+    ]
+    require(
+        this_year == f"Sonnet (latest) · Sonnet 4.6, {utc_day()}"
+        and last_year
+        == f"Sonnet (latest) · Sonnet 4.6, Dec '{earlier:%y}"
+        and moving == "Daybreak Blue · moves, no version",
+        f"a label is not worded as expected: {labels}",
+    )
+    layout = [
+        re.search(
+            rf"^function {name}\(.*?^}}$", config.PAGE_TEMPLATE, re.M | re.S
+        ).group(0)
+        for name in ("boxLeft", "boxTop", "layoutRow", "fitText")
+    ]
+    chart = read_json(KIT_DIR / "global" / "orchestration.json")["chart"]
+    script = (
+        f"const CHART = {json.dumps(chart)};\n"
+        "const S = CHART.scale || 1;\n"
+        "const document = { querySelector: () => null, createElement: () => ({\n"
+        "  getContext: () => { const c = { font: '', measureText: t => ({\n"
+        "    width: t.length * 0.49 * parseFloat(c.font.split(' ')[1]) }) };\n"
+        "    return c; } }) };\n"
+        "const getComputedStyle = node => ({ fontSize: node.style.fontSize || '11.5px',\n"
+        "  fontWeight: '500', fontFamily: 'system-ui', paddingLeft: '9px',\n"
+        "  paddingRight: '22px', borderLeftWidth: '1px', borderRightWidth: '1px' });\n"
+        + "\n".join(layout)
+        + "\nconst made = () => ({ style: {}, title: '', textContent: '' });\n"
+        "const out = [];\n"
+        "for (const card of CHART.legend.cards) {\n"
+        "  if (card.kind !== 'role') continue;\n"
+        f"  for (const [name, version] of {json.dumps(labels)}) {{\n"
+        "    const model = made(), typed = made(), thinking = made();\n"
+        "    model.options = [{ textContent: name, title: 'Most capable' },\n"
+        "      { textContent: 'custom…', title: '' }];\n"
+        "    model.selectedIndex = 0;\n"
+        "    const box = { querySelector: query =>\n"
+        "      query.includes('model') ? model : query.includes('custom') ? typed\n"
+        "      : query.includes('thinking') ? thinking : null };\n"
+        "    layoutRow(box, card, false);\n"
+        "    const size = parseFloat(model.style.fontSize);\n"
+        "    const room = parseFloat(model.style.width) - 33;\n"
+        "    const fits = text => text.length * 0.49 * size <= room;\n"
+        "    const shown = [fits(name), fits(version), size, model.title];\n"
+        "    model.selectedIndex = 1;\n"
+        "    layoutRow(box, card, true);\n"
+        "    out.push([card.target, name, ...shown, model.title]);\n"
+        "  }\n"
+        "}\n"
+        "console.log(JSON.stringify(out));"
+    )
+    result = subprocess.run(
+        [node, "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=30, check=False,
+    )
+    require(result.returncode == 0, f"the harness failed: {result.stderr}")
+    cards = json.loads(result.stdout)
+    require(
+        len(cards) == 5 * len(labels)
+        and all(
+            fits and version_fits
+            and title == f"{name}\nMost capable" and typed_title == ""
+            and 9 <= size <= 11.5
+            for _role, name, fits, version_fits, size, title, typed_title
+            in cards
+        )
+        and all(
+            size == 11.5
+            for _role, name, _fits, _version, size, _title, _typed in cards
+            if name == "Opus 5"
+        ),
+        f"a card cuts its model's name or shrinks one that fits: {cards}",
+    )
+
+
+@test("a stored level a model does not offer is shown, kept and offered again")
+def test_unlisted_level_survives_a_model_round_trip() -> None:
+    """A role holding a level its model does not list read "not set", and
+    once its model was switched away and back that option was gone, so
+    the level the other model carried was written instead. The held
+    level now reads as what it is and returns with its model."""
+    node = shutil.which("node")
+    if node is None:
+        print("      (skipped: node is not installed)")
+        return
+    config = config_on_shape("2.1.282")
+    template = config.PAGE_TEMPLATE
+    pieces = []
+    for pattern in (
+        r"^const roles = .*?;$",
+        r"^const original = Object\.fromEntries\(.*?^\);$",
+        r"^const originalSettings = .*?;$",
+        *(
+            rf"^function {name}\(.*?^}}$"
+            for name in (
+                "option", "fillLevels", "choiceFor", "selectThinking",
+                "endpointChoice", "currentEndpoint", "currentProvider",
+                "currentModel", "currentThinking", "currentSetting", "changes",
+            )
+        ),
+    ):
+        match = re.search(pattern, template, re.M | re.S)
+        require(match is not None, f"the page lacks {pattern}")
+        pieces.append(match.group(0))
+    state = [
+        {
+            "id": role_id, "provider": "anthropic", "model": model,
+            "thinking": thinking, "endpoint": "",
+            "choices": config.model_choices("anthropic", model),
+        }
+        for role_id, model, thinking in (
+            ("implementer", "claude-opus-4-6", "xhigh"),
+            ("reviewer", "claude-opus-5-5", ""),
+        )
+    ]
+    harness = """
+const STATE = __STATE__;
+const ENDPOINTS = [];
+const SETTINGS = [];
+const controls = {};
+function select(value) {
+  return {
+    options: [], disabled: false, fixed: value, dataset: {},
+    parentNode: { querySelector: () => null },
+    appendChild(node) { this.options.push(node); },
+    replaceChildren() { this.options = []; },
+    get value() {
+      if (this.fixed !== undefined) return this.fixed;
+      const chosen = this.options.filter(item => item.selected);
+      return (chosen.pop() || this.options[0] || { value: "" }).value;
+    },
+    set value(text) { this.fixed = text; },
+  };
+}
+const document = {
+  createElement: () => ({ value: "", textContent: "", selected: false }),
+  querySelector: selector => controls[selector] || null,
+};
+__PIECES__
+const key = (id, kind) => `select[data-step="${id}"][data-kind="${kind}"]`;
+const seen = picker => ({
+  value: picker.value,
+  labels: picker.options.map(item => item.textContent),
+});
+const report = {};
+for (const step of STATE) {
+  controls[key(step.id, "endpoint")] = select(step.provider);
+  const model = select(step.model);
+  controls[key(step.id, "model")] = model;
+  const thinking = select();
+  thinking.dataset.model = step.model;
+  const chosen = choiceFor(step.id, step.provider, step.model);
+  fillLevels(thinking, chosen.thinking_levels, step.thinking);
+  controls[key(step.id, "thinking")] = thinking;
+  const trip = [seen(thinking)];
+  // Away to another model, whose own default the level becomes...
+  model.value = "sonnet";
+  selectThinking(thinking, step.id, "anthropic", "sonnet", currentThinking(step.id));
+  trip.push(seen(thinking));
+  // ...and back, which must restore the role as it was stored.
+  model.value = step.model;
+  selectThinking(thinking, step.id, "anthropic", step.model, currentThinking(step.id));
+  trip.push(seen(thinking));
+  // Only this role's own entry: the role before it was left changed.
+  trip.push(Object.keys(changes()).filter(id => id === step.id));
+  // A level chosen on the stored model itself is kept, with the held
+  // one still on offer beside it.
+  thinking.fixed = "high";
+  selectThinking(thinking, step.id, "anthropic", step.model, currentThinking(step.id));
+  thinking.fixed = undefined;
+  trip.push(seen(thinking));
+  report[step.id] = trip;
+}
+console.log(JSON.stringify(report));
+"""
+    script = harness.replace("__STATE__", json.dumps(state)).replace(
+        "__PIECES__", "\n".join(pieces)
+    )
+    result = subprocess.run(
+        [node, "-e", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=30, check=False,
+    )
+    require(result.returncode == 0, f"the harness failed: {result.stderr}")
+    report = json.loads(result.stdout)
+    for role_id, held, levels in (
+        ("implementer", "xhigh (not offered)", ["low", "medium", "high", "max"]),
+        ("reviewer", "not set", ["low", "medium", "high", "xhigh", "max"]),
+    ):
+        stored, away, back, changed, chosen = report[role_id]
+        require(
+            stored == {"value": "", "labels": [held, *levels]}
+            and away["value"] != "" and held not in away["labels"]
+            and back == stored
+            and changed == []
+            and chosen == {"value": "high", "labels": [held, *levels]},
+            f"{role_id}'s held level did not survive a round trip: "
+            f"{report[role_id]}",
+        )
+
+
+@test("an exact version is dispatched with its own id and thinking level")
+def test_exact_version_dispatch() -> None:
+    """AC2: a pinned version reaches the delegate as `--model <id>` with
+    `--effort`, which a hand-typed exact id once lost as a custom model."""
+    with user_configuration(roles={"implementer": {
+        "provider": "anthropic", "model": "claude-opus-5-5", "thinking": "high",
+    }}), tempfile.TemporaryDirectory() as directory:
+        role = runtime_module.load_role("implementer")
+        command = runtime_module.delegated_command(
+            role, Path(directory) / "v.txt", Path(directory) / "s.json"
+        )
+    require(
+        command[command.index("--model") + 1] == "claude-opus-5-5"
+        and command[command.index("--effort") + 1] == "high",
+        f"the exact version was not dispatched at its level: {command}",
+    )
+
+
+@test("an alias keeps floating through an upgrade and says what it runs now")
+def test_alias_named_through_an_upgrade() -> None:
+    """AC3: `opus` stays `opus` when the CLI moves from Opus 5 to Opus 5.5,
+    previews no edit, and every surface names the version it means on
+    the CLI being dispatched, the page, --print, the roster and the
+    banner alike."""
+    role = {"provider": "anthropic", "model": "opus", "thinking": "high"}
+    for shape, version in ((None, "Opus 5"), ("2.1.282", "Opus 5.5")):
+        expected = f"Opus (latest) · {version}"
+        with standing_stores(), transcript_roots(), fake_picker(shape), \
+                user_configuration(roles={"implementer": role}):
+            stored = runtime_module.user_config_path().read_text()
+            config = load_script(
+                CONFIG_SCRIPT, f"kit_config_upgrade_{time.time_ns()}"
+            )
+            config.activate_discovered_catalogue()
+            require(
+                config.plan({"implementer": dict(role)}) == [],
+                f"the alias previewed an edit on {shape}",
+            )
+            page = offered_choices(config, "implementer", "anthropic")["opus"]
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                config.print_state()
+            roster = load_script(
+                SESSION_START_SCRIPT, f"kit_roles_upgrade_{time.time_ns()}"
+            ).role_table()
+            loaded = runtime_module.load_role("implementer")
+            fallback_module.model_status(
+                loaded, fallback_module.provider_status("anthropic")
+            )
+            banner = names_module.banner_name(loaded)
+            require(
+                runtime_module.user_config_path().read_text() == stored
+                and loaded.model == "opus",
+                f"the stored alias moved on {shape}",
+            )
+            require(
+                page["display"] == expected
+                and f"opus ({expected}) · thinking high" in printed.getvalue()
+                and expected in roster
+                and banner == expected,
+                f"a surface does not say what opus runs on {shape}: "
+                f"{page['display']!r} {printed.getvalue()!r} {roster!r} "
+                f"{banner!r}",
+            )
+
+
+@test("an alias the dispatched CLI cannot confirm is called unverified")
+def test_alias_unverified_without_discovery() -> None:
+    with standing_stores(), transcript_roots(), fake_picker("2.1.282"):
+        os.environ["ORRERY_MODEL_DISCOVERY"] = "0"
+        named = names_module.name("anthropic", "opus")
+        exact = names_module.name("anthropic", "claude-opus-5-5")
+    require(
+        named == "Opus (latest) · unverified" and exact == "Opus 5.5",
+        f"without discovery an alias was guessed or an id lost: "
+        f"{named!r} {exact!r}",
+    )
+
+
+@test("an installed sibling CLI resolving an alias differently is named")
+def test_sibling_alias_divergence() -> None:
+    """AC6: two installed copies, the dispatched one serving the older
+    picker (opus is Opus 5) and an editor's copy serving 2.1.282 (opus
+    is Opus 5.5). The doctor's verdict names both resolutions; copies
+    that agree, and a configuration holding only exact ids, say nothing.
+    Installs are stubbed because whether a copy may be executed depends
+    on where the host puts HOME, which is not what is under test."""
+    with fake_picker() as log:
+        dispatched = Path(shutil.which("claude"))
+        editor = dispatched.parent / "editor" / "claude"
+        editor.parent.mkdir()
+        shutil.copy2(dispatched, editor)
+        installs = [
+            {"path": str(dispatched), "origin": "PATH", "version": "2.1.278",
+             "refused": None},
+            {"path": str(editor), "origin": "sibling", "version": "2.1.282",
+             "refused": None},
+        ]
+        saved = runtime_module.provider_installs
+        runtime_module.provider_installs = lambda provider: installs
+        try:
+            os.environ["CLAUDE_FAKE_CATALOGUE_PATHS"] = json.dumps(
+                {str(editor): "2.1.282"}
+            )
+            ours = names_module.discover_models("anthropic", str(dispatched))
+            diverging = names_module.sibling_divergences(
+                "anthropic", {"opus", "claude-opus-5"}, ours
+            )
+            exact_only = names_module.sibling_divergences(
+                "anthropic", {"claude-opus-5"}, ours
+            )
+            spawned = sorted(log.read_text().splitlines())
+            os.environ["CLAUDE_FAKE_CATALOGUE_PATHS"] = json.dumps(
+                {str(editor): "default"}
+            )
+            sys.modules["orrery_model_catalogue"]._DISCOVERED.clear()
+            agreeing = names_module.sibling_divergences(
+                "anthropic", {"opus"}, ours
+            )
+
+            # The doctor hands over the installs it already listed, so
+            # no install's --version is asked a second time.
+            def listed_again(provider: str) -> Any:
+                raise Failure("the installs were listed a second time")
+
+            runtime_module.provider_installs = listed_again
+            os.environ["CLAUDE_FAKE_CATALOGUE_PATHS"] = json.dumps(
+                {str(editor): "2.1.282"}
+            )
+            sys.modules["orrery_model_catalogue"]._DISCOVERED.clear()
+            given = names_module.sibling_divergences(
+                "anthropic", {"opus", "claude-opus-5"}, ours, installs
+            )
+        finally:
+            runtime_module.provider_installs = saved
+    require(
+        given == diverging,
+        f"the installs handed over were not the ones used: {given}",
+    )
+    require(
+        len(diverging) == 1
+        and diverging[0][0] == "WARN"
+        and "opus runs Opus 5 (claude-opus-5)" in diverging[0][1]
+        and "Opus 5.5 (claude-opus-5-5)" in diverging[0][1]
+        and str(editor) in diverging[0][1],
+        f"the divergence was not named with both resolutions: {diverging}",
+    )
+    require(
+        exact_only == [] and agreeing == [],
+        f"a warning was raised with nothing diverging: {exact_only} {agreeing}",
+    )
+    require(
+        spawned
+        == sorted(os.path.realpath(path) for path in (dispatched, editor)),
+        f"each installed copy was not asked exactly once: {spawned}",
     )
 
 
@@ -13276,8 +13835,18 @@ def test_standing_adoption_end_to_end() -> None:
             )
             require(
                 "standing fallback active" in stderr
-                and "anthropic/fable (thinking max)" in stderr
-                and "↳ Fallback reviewer · anthropic · fable" in stderr,
+                # Named from this run's cache alone, so the line spawns
+                # nothing and says whether it could check.
+                and re.search(
+                    r"standing fallback active · reviewer: openai/\S+ -> "
+                    r"anthropic/fable \(Fable \(latest\) · "
+                    r"(?:unverified|not yet observed); thinking max\)",
+                    stderr,
+                )
+                # The fake CLI lists no `fable` row and nothing has run
+                # it yet, so the banner says so rather than guessing.
+                and "↳ Fallback reviewer · anthropic · Fable (latest) · "
+                "not yet observed" in stderr,
                 f"the standing adoption was not disclosed: {stderr}",
             )
             require(
@@ -13446,9 +14015,15 @@ def test_revoke_fallbacks_cli() -> None:
         environment = review_environment("success", standing_state=state_dir)
         revoke = start_review(environment, "--revoke-fallbacks")
         stdout, stderr = finish_review(revoke, environment)
+        # The reply names the version from this run's cache alone, and a
+        # revocation discovers nothing, so the alias says it is unchecked.
+        named = (
+            "-> anthropic/fable (Fable (latest) · unverified; thinking max)"
+        )
         require(
             revoke.returncode == 0
             and "revoked standing fallback" in stdout
+            and named in stdout
             and standing_module.list_active() == [],
             f"orrery-agent revocation failed: {stdout} {stderr}",
         )
@@ -13459,6 +14034,15 @@ def test_revoke_fallbacks_cli() -> None:
             and "No standing fallback approvals." in principal.stdout
             and "↳" not in principal.stderr,
             f"orrery revocation failed: {principal.stdout} "
+            f"{principal.stderr}",
+        )
+        seed_standing_reviewer()
+        principal = run_principal(environment, "--revoke-fallbacks")
+        require(
+            principal.returncode == 0
+            and named in principal.stdout
+            and standing_module.list_active() == [],
+            f"orrery revocation did not name the version: {principal.stdout} "
             f"{principal.stderr}",
         )
 
@@ -15264,9 +15848,104 @@ def test_doctor_lists_standing() -> None:
         )
         require(
             "WARN  Standing fallback active: reviewer:" in listed.stdout
+            and "anthropic/fable (Fable (latest) · not yet observed; "
+            "thinking max)" in listed.stdout
             and "Revoke with: orrery --revoke-fallbacks" in listed.stdout
             and "FAIL  The standing-approval store" not in listed.stdout,
             f"the standing warning is missing: {listed.stdout[-800:]}",
+        )
+
+        # Each side is named where its name differs from its id, and
+        # never where the failed role was routed at an endpoint, whose
+        # service names its own models.
+        record = {
+            "role_id": "reviewer",
+            "failed_provider": "anthropic",
+            "failed_model": "claude-opus-5",
+            "candidate_provider": "openai",
+            "candidate_model": "gpt-5.5",
+            "candidate_thinking": None,
+            "scope": "session",
+            "fingerprint": [None] * 10,
+        }
+        names = {"claude-opus-5": "Opus 5", "gpt-5.5": "gpt-5.5"}
+
+        def lookup(_provider: str, model: str) -> str:
+            return names[model]
+
+        routed = {**record, "fingerprint": [None] * 8 + ["local", "http://x"]}
+
+        def broken(_provider: str, _model: str) -> str:
+            raise RuntimeError("no catalogue")
+
+        lines = [
+            standing_module.describe(record, lookup),
+            standing_module.describe(routed, lookup),
+            standing_module.describe(record, broken),
+        ]
+        require(
+            lines == [
+                "reviewer: anthropic/claude-opus-5 (Opus 5) -> openai/gpt-5.5 "
+                "for this login session",
+                "reviewer: anthropic/claude-opus-5 -> openai/gpt-5.5 "
+                "for this login session",
+                "reviewer: anthropic/claude-opus-5 -> openai/gpt-5.5 "
+                "for this login session",
+            ],
+            f"a standing approval was named wrongly: {lines}",
+        )
+
+
+@test("a standing record no line can describe costs only its own lines")
+def test_doctor_survives_undescribable_standing() -> None:
+    """The store accepts any numeric expiry, and one beyond datetime's
+    range made describing it raise inside the catalogue-currency block,
+    which lost every per-role version line and sibling warning with it."""
+
+    def doctor(environment: dict[str, str]) -> str:
+        return subprocess.run(
+            ["bash", str(DOCTOR_SCRIPT)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+            check=False,
+        ).stdout
+
+    def currency(report: str) -> str:
+        section = report.split("=== Catalogue currency ===", 1)[-1]
+        return section.split("\n=== ", 1)[0]
+
+    with until_store_only() as state_dir:
+        environment = review_environment("success", standing_state=state_dir)
+        baseline = doctor(environment)
+        configured = runtime_module.load_role("reviewer")
+        standing_module.record_approval(
+            configured=configured,
+            candidate=runtime_module.Role(
+                id=configured.id,
+                title=configured.title,
+                provider="anthropic",
+                model="fable",
+                thinking="max",
+                access=configured.access,
+            ),
+            scope="until",
+            expires_at=1e20,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+        report = doctor(environment)
+        require(
+            len(standing_module.list_active()) == 1
+            and "=== Catalogue currency ===" in report
+            and currency(report) == currency(baseline)
+            and "Catalogue currency could not be checked" not in report
+            and "FAIL  The standing-approval store could not be read"
+            in report,
+            f"an undescribable standing record cost more than its own "
+            f"lines: {currency(baseline)!r} then {report[-1500:]}",
         )
 
 
@@ -15275,6 +15954,11 @@ def test_config_standing_revoke() -> None:
     import urllib.error
     import urllib.request
 
+    # Nobody should have to guess which version a consent names: the
+    # candidate reads as its name wherever it is described.
+    named_standing = (
+        "anthropic/fable (Fable (latest) · not yet observed; thinking max)"
+    )
     with until_store_only() as state_dir:
         seed_standing_reviewer()
         environment = review_environment("success", standing_state=state_dir)
@@ -15308,8 +15992,9 @@ def test_config_standing_revoke() -> None:
             require(
                 "Standing fallback approvals" in page
                 and 'id="revoke-standing"' in page
-                and "anthropic/fable (thinking max)" in page,
-                "the page does not show the active standing approval",
+                and named_standing in page,
+                "the page does not name the active standing approval's "
+                f"version: {re.findall(r'<li>[^<]*</li>', page)}",
             )
 
             bad = url.replace(url.split("/t/")[1].split("/")[0], "x" * 24)
@@ -15348,6 +16033,7 @@ def test_config_standing_revoke() -> None:
             )
             require(
                 len(reply.get("revoked", [])) == 1
+                and named_standing in reply["revoked"][0]
                 and standing_module.list_active() == [],
                 f"the revoke endpoint did not clear the store: {reply}",
             )
@@ -15378,7 +16064,7 @@ def test_config_standing_revoke() -> None:
         require(
             printed.returncode == 0
             and "Standing fallback" in printed.stdout
-            and "anthropic/fable" in printed.stdout,
+            and named_standing in printed.stdout,
             f"--print does not list standing approvals: {printed.stdout}",
         )
 
@@ -17655,6 +18341,377 @@ def test_d3_usage_agrees_with_the_rollup() -> None:
             == {"anthropic/claude-opus-5": 412, "anthropic/claude-fable-5-1": 88},
             f"orrery-usage and the rollup disagree: {reported} != {measured}",
         )
+
+
+@test("delegated spend is filed under the model its run reported")
+def test_spend_filed_by_reported_model() -> None:
+    """A delegated `opus` run was filed under `anthropic/opus` while a
+    principal session on the same Opus 5.5 was filed under its exact
+    id, so one model's spend sat under two keys and Opus 5 and Opus 5.5
+    were folded together. A run is now filed under the one model it
+    reported, and under its configured name only where it reported no
+    single model; orrery-usage, the rollup and the spend breakdown all
+    agree, and every report names the version (AC8)."""
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [
+                transcript_response("m1", "r1", "claude-opus-5-5", 400),
+                transcript_response("m2", "r2", "claude-opus-5", 200),
+                # The bundled catalogue lists these only by family alias;
+                # each is still filed under the version it names.
+                transcript_response("m3", "r3", "claude-sonnet-5", 300),
+                transcript_response(
+                    "m4", "r4", "claude-haiku-4-5-20251001", 60
+                ),
+            ],
+        )
+        record_spend(100, reported_models="claude-opus-5-5")
+        # A role pinned to an exact version the catalogue does not list.
+        record_spend(24, model="claude-opus-4-8")
+        # A run's own `[1m]` window is the same model, not an ambiguity.
+        record_spend(40, reported_models="claude-opus-5-5,claude-opus-5-5[1m]")
+        record_spend(20, reported_models="claude-opus-5")
+        record_spend(8, reported_models="claude-opus-5,claude-opus-5-5")
+        record_spend(4)
+        # Claude Code also reports the model it makes side calls on; a
+        # model of another family says nothing about what `opus` ran as.
+        record_spend(
+            16, reported_models="claude-haiku-4-5-20251001,claude-opus-5-5"
+        )
+        with user_configuration(allowances={}) as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+        measured: dict[str, int] = {}
+        for entry in rollup["hours"].values():
+            for key, total in entry["spend"].items():
+                measured[key] = measured.get(key, 0) + total
+        require(
+            measured == {
+                "anthropic/claude-opus-5-5": 556,
+                "anthropic/claude-opus-5": 220,
+                "anthropic/opus": 12,
+                "anthropic/claude-sonnet-5": 300,
+                "anthropic/claude-haiku-4-5-20251001": 60,
+                "anthropic/claude-opus-4-8": 24,
+            },
+            f"delegated spend was not filed by its reported model: {measured}",
+        )
+        breakdown = allowance_module.describe_models(
+            allowance_module.window_spend("anthropic", 7, rollup=rollup)["models"],
+            "anthropic",
+        )
+        require(
+            "claude-opus-5-5 556 (Opus 5.5)" in breakdown
+            and "claude-opus-5 220 (Opus 5)" in breakdown
+            and "opus 12 (Opus, version not recorded)" in breakdown
+            and "claude-sonnet-5 300 (Sonnet 5)" in breakdown
+            and "claude-haiku-4-5-20251001 60 (Haiku 4.5)" in breakdown
+            and "claude-opus-4-8 24 (Opus 4.8)" in breakdown
+            and "version not recorded" not in breakdown.replace(
+                "opus 12 (Opus, version not recorded)", ""
+            ),
+            f"the spend breakdown does not name each version: {breakdown}",
+        )
+
+        def usage(*arguments: str) -> str:
+            result = subprocess.run(
+                [sys.executable, str(USAGE_SCRIPT), "--since", "1", *arguments],
+                env=os.environ.copy(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=60, check=False,
+            )
+            require(result.returncode == 0, f"orrery-usage failed: {result.stderr}")
+            return result.stdout
+
+        report = json.loads(usage("--json"))
+        delegated = {
+            row["model"]: (row["total"], row["name"])
+            for row in report["delegated"]["usage"]
+        }
+        transcripts = {
+            row["model"]: row["name"] for row in report["usage"]
+        }
+        require(
+            delegated == {
+                "claude-opus-5-5": (156, "Opus 5.5"),
+                "claude-opus-5": (20, "Opus 5"),
+                "opus": (12, "Opus, version not recorded"),
+                "claude-opus-4-8": (24, "Opus 4.8"),
+            }
+            and transcripts
+            == {
+                "claude-opus-5-5": "Opus 5.5",
+                "claude-opus-5": "Opus 5",
+                "claude-sonnet-5": "Sonnet 5",
+                "claude-haiku-4-5-20251001": "Haiku 4.5",
+            },
+            f"orrery-usage does not tell Opus 5 from Opus 5.5: {report}",
+        )
+        table = usage()
+        require(
+            re.search(r"claude-opus-5-5\s+Opus 5\.5\s", table)
+            and re.search(r"claude-opus-5\s+Opus 5\s", table)
+            and re.search(r"opus\s+Opus, version not recorded\s", table)
+            and re.search(r"claude-sonnet-5\s+Sonnet 5\s", table)
+            and re.search(r"claude-opus-4-8\s+Opus 4\.8\s", table),
+            f"the usage table does not name the versions: {table}",
+        )
+        # A task report groups each attempt the same way.
+        usage_module = load_script(USAGE_SCRIPT, f"kit_usage_{time.time_ns()}")
+        attempt = {
+            "provider": "anthropic",
+            "model": "opus",
+            "reported_models": ["claude-haiku-4-5-20251001", "claude-opus-5-5"],
+        }
+        require(
+            usage_module.ran_as(attempt) == "claude-opus-5-5"
+            and usage_module.ran_as(
+                {**attempt, "reported_models": ["claude-haiku-4-5-20251001"]}
+            ) == "opus",
+            "a task report did not set a side-call model aside",
+        )
+
+
+def named_surfaces_environment(roles: dict[str, Any]) -> dict[str, str]:
+    """A fake-CLI environment whose user configuration holds `roles`,
+    with each fake logging its discoveries."""
+    environment = review_environment("success")
+    environment.pop("ORRERY_ROLE", None)
+    write_user_config_file(
+        Path(environment["XDG_CONFIG_HOME"]) / "orrery",
+        {"version": 1, "roles": roles},
+    )
+    return environment
+
+
+def surface_run(
+    environment: dict[str, str],
+    command: list[str],
+    **options: Any,
+) -> tuple[str, dict[str, int]]:
+    """One surface's output, and how often it asked each CLI its picker."""
+    log = Path(environment["KIT_FAKE_BIN"]) / "discoveries.log"
+    log.unlink(missing_ok=True)
+    environment["CLAUDE_FAKE_DISCOVERY_LOG"] = str(log)
+    environment["CODEX_FAKE_DISCOVERY_LOG"] = str(log)
+    result = subprocess.run(
+        command, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, timeout=300, check=False,
+        **options,
+    )
+    return result.stdout, discoveries(log)
+
+
+NAMED_ROLES = {
+    "implementer": {"provider": "anthropic", "model": "opus", "thinking": "high"},
+    "mechanic": {
+        "provider": "anthropic", "model": "claude-fable-5[1m]", "thinking": "low",
+    },
+}
+
+
+
+@test("a rollup stored under the old keys is rebuilt, not trusted")
+def test_rollup_version_rebuilds_old_keys() -> None:
+    """Version 1 filed a version the bundled catalogue names only by its
+    family under the family alias, so Sonnet 5 read as "Sonnet, version
+    not recorded". Its responses are marked seen and its sources read to
+    the end, so a kit that trusted such a file would never re-attribute
+    them within the window. Version 2 discards it whole and rebuilds from
+    the session logs: the same total, under the version's own key."""
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [transcript_response("m1", "r1", "claude-sonnet-5", 300)],
+        )
+        with user_configuration(allowances={}) as manifest:
+            allowance_module.refresh(manifest=manifest)
+            path = allowance_module.rollup_path()
+            stored = json.loads(path.read_text())
+            # Doctor it into what version 1 wrote: same sources, offsets
+            # and seen digests, the spend under the family alias.
+            stored["v"] = 1
+            for entry in stored["hours"].values():
+                spend = entry["spend"]
+                if "anthropic/claude-sonnet-5" in spend:
+                    spend["anthropic/sonnet"] = spend.pop(
+                        "anthropic/claude-sonnet-5"
+                    )
+            path.write_text(json.dumps(stored))
+            rollup = allowance_module.refresh(manifest=manifest)
+        measured: dict[str, int] = {}
+        for entry in rollup["hours"].values():
+            for key, total in entry["spend"].items():
+                measured[key] = measured.get(key, 0) + total
+        require(
+            rollup.get("v") == allowance_module.ROLLUP_VERSION
+            and measured == {"anthropic/claude-sonnet-5": 300},
+            f"a version-1 rollup was trusted rather than rebuilt: {measured}",
+        )
+
+@test("every surface names a role's version, [1m] included, asking once")
+def test_surfaces_name_versions_once() -> None:
+    """AC4 and AC11: --print, the roster, the doctor and orrery-sync name
+    the version of every role from the dispatched CLI, a `[1m]` row
+    included, and none of them asks a CLI for its picker more than
+    once in its run; orrery-usage never asks at all."""
+    environment = named_surfaces_environment(NAMED_ROLES)
+    try:
+        printed, print_asked = surface_run(
+            environment, [sys.executable, str(CONFIG_SCRIPT), "--print"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+            hook, hook_asked = surface_run(
+                environment,
+                [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+                input=json.dumps({
+                    "hook_event_name": "SessionStart", "source": "startup",
+                    "cwd": str(repository),
+                }),
+            )
+        doctor, doctor_asked = surface_run(
+            environment, ["bash", str(DOCTOR_SCRIPT)]
+        )
+        synced, sync_asked = surface_run(
+            environment, [sys.executable, str(SYNC_SCRIPT)]
+        )
+        _usage, usage_asked = surface_run(
+            environment, [sys.executable, str(USAGE_SCRIPT), "--since", "1"]
+        )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
+    roster = json.loads(hook)["hookSpecificOutput"]["additionalContext"]
+    doctor_lines = [" ".join(line.split()) for line in doctor.splitlines()]
+    for expected, where, text in (
+        ("opus (Opus (latest) · Opus 5) · thinking high", "--print", printed),
+        ("claude-fable-5[1m] (Fable 5, 1M context) · thinking low",
+         "--print", printed),
+        ("Opus (latest) · Opus 5 ", "the roster", roster),
+        ("Fable 5, 1M context ", "the roster", roster),
+        ("implementer: anthropic/opus is Opus (latest) · Opus 5",
+         "the doctor", "\n".join(doctor_lines)),
+        ("mechanic: anthropic/claude-fable-5[1m] is Fable 5, 1M context",
+         "the doctor", "\n".join(doctor_lines)),
+        ("already runs fable (Fable (latest) · not yet observed)"
+         if "already runs" in synced
+         else "surface to fable (Fable (latest) · not yet observed):",
+         "orrery-sync", synced),
+    ):
+        require(expected in text, f"{where} does not say {expected!r}: {text}")
+    for where, asked, most in (
+        ("--print", print_asked, {"claude": 1, "codex": 1}),
+        ("the roster", hook_asked, {"claude": 1, "codex": 1}),
+        ("the doctor", doctor_asked, {"claude": 1, "codex": 1}),
+        ("orrery-sync", sync_asked, {"claude": 1}),
+        ("orrery-usage", usage_asked, {}),
+    ):
+        require(
+            asked == most,
+            f"{where} asked the CLIs {asked}, not once each ({most})",
+        )
+    require(
+        "Anthropic / fable (Fable (latest) · not yet observed)" in roster,
+        f"the hook does not name the configured principal: {roster}",
+    )
+
+    # A principal routed at an endpoint runs that service's own model,
+    # which no first-party name describes, so the hook keeps its id.
+    environment = review_environment("success")
+    environment.pop("ORRERY_ROLE", None)
+    write_user_config_file(
+        Path(environment["XDG_CONFIG_HOME"]) / "orrery",
+        {
+            "version": 1,
+            "roles": {
+                "orchestrator": {
+                    "provider": "anthropic", "model": "opus",
+                    "thinking": None, "endpoint": "kimi",
+                },
+            },
+            "endpoints": {
+                "kimi": {
+                    "label": "Kimi (Moonshot AI)", "adapter": "anthropic",
+                    "base_url": "https://api.moonshot.ai/anthropic",
+                    "key_env": "MOONSHOT_API_KEY",
+                },
+            },
+        },
+    )
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = adopted_repository(directory)
+            routed, _asked = surface_run(
+                environment,
+                [sys.executable, str(SESSION_START_SCRIPT), "anthropic"],
+                input=json.dumps({
+                    "hook_event_name": "SessionStart", "source": "startup",
+                    "cwd": str(repository),
+                }),
+            )
+    finally:
+        shutil.rmtree(environment["KIT_FAKE_BIN"], ignore_errors=True)
+        remove_helper_state(environment)
+    context = json.loads(routed)["hookSpecificOutput"]["additionalContext"]
+    require(
+        "Anthropic / opus" in context
+        and "Anthropic / opus (" not in context,
+        f"an endpoint's model was named as a first-party one: {context}",
+    )
+
+
+@test("a dispatch names its version and every fallback prompt says which")
+def test_dispatch_and_fallback_prompts_name_versions() -> None:
+    """The pre-dispatch check, the banner, fallback ranking and the
+    approval prompt share one discovery, and every model they name is
+    followed by the version it is; an approval is bound to an exact
+    model and must say which (D8, AC11)."""
+    with standing_stores(), transcript_roots(), fake_picker() as log:
+        # The principal, as `orrery` supervises it: a delegate may not be
+        # substituted onto the principal's provider, which would leave
+        # ranking nothing on Anthropic to share the discovery with.
+        role = runtime_module.Role(
+            id="orchestrator", title="Principal orchestrator",
+            provider="anthropic", model="opus", thinking="high",
+            access="principal",
+        )
+        status = fallback_module.provider_status("anthropic")
+        fallback_module.model_status(role, status)
+        banner = names_module.banner_name(role)
+        proposal = fallback_module.nearest_fallback(
+            role, "fixture failure", excluded_models=[("anthropic", "opus")]
+        )
+        require(proposal is not None, "no fallback was ranked")
+        stream = io.StringIO()
+        fallback_module.request_fallback_decision(
+            proposal, approval=None, no_fallback=False,
+            program_name="fixture", stream=stream, tty_opener=lambda: None,
+        )
+        asked = discoveries(log)
+    text = stream.getvalue()
+    candidate = proposal.candidate
+    named = names_module.model_name(
+        candidate.provider, candidate.model, None
+    )
+    require(
+        banner == "Opus (latest) · Opus 5",
+        f"the banner does not name the version: {banner!r}",
+    )
+    require(
+        "Configured: Anthropic / opus / thinking high — Opus (latest) · Opus 5"
+        in text
+        and (
+            f"{candidate.model} / thinking {candidate.thinking} — "
+            in text
+            or named == candidate.model
+        )
+        and f"Candidate: {candidate.provider}:{candidate.model}" in text,
+        f"the fallback prompt does not say which version: {text}",
+    )
+    require(
+        asked.get("claude") == 1 and asked.get("codex", 0) <= 1,
+        f"one dispatch asked a CLI more than once: {asked}",
+    )
 
 
 @test("an incident log under a reused inode is read from its start")
@@ -20021,7 +21078,9 @@ def test_exact_model_identity() -> None:
         )
 
     # The allowance resolver prefers the exact entry, and a manifest step
-    # still never outranks the catalogue's owner of a model.
+    # still never outranks the catalogue's owner of a model. A version
+    # reached only through its family's alias keeps its own id: the alias
+    # settles the provider, not the version.
     saved = allowance_module.load_catalogue
     allowance_module.load_catalogue = lambda *_a, **_k: identity_catalogue(
         resolved=False
@@ -20039,11 +21098,17 @@ def test_exact_model_identity() -> None:
             "claude-opus-5": "anthropic/claude-opus-5",
             "claude-opus-5-5[1m]": "anthropic/claude-opus-5-5",
             "claude-fable-5-1": "anthropic/claude-fable-5-1",
-            "claude-fable-5": "anthropic/fable",
-            "claude-opus-4-8": "anthropic/opus",
-            "claude-3-7-sonnet-20250219": "anthropic/sonnet",
-            "us.anthropic.claude-3-5-haiku-20241022-v1:0": "anthropic/haiku",
-            "claude-3-opus-20240229": "anthropic/opus",
+            "claude-fable-5": "anthropic/claude-fable-5",
+            "claude-opus-4-8": "anthropic/claude-opus-4-8",
+            "claude-opus-4-8[1m]": "anthropic/claude-opus-4-8",
+            "claude-3-7-sonnet-20250219": (
+                "anthropic/claude-3-7-sonnet-20250219"
+            ),
+            "us.anthropic.claude-3-5-haiku-20241022-v1:0": (
+                "anthropic/us.anthropic.claude-3-5-haiku-20241022-v1:0"
+            ),
+            "claude-3-opus-20240229": "anthropic/claude-3-opus-20240229",
+            "opus": "anthropic/opus",
             "gpt-5.6-terra": "openai/gpt-5.6-terra",
             "gpt-5.6": "/gpt-5.6",
         }
@@ -20520,21 +21585,18 @@ def test_same_provider_ladder() -> None:
     # is not reused here.
     calls: list[str] = []
     saved_status = fallback_module.provider_status
-    saved_claude = fallback_module.discover_claude_models
-    saved_codex = fallback_module.discover_codex_models
+    saved_discover = fallback_module.discover_models
     try:
         fallback_module.provider_status = lambda *a, **k: calls.append("auth")
-        fallback_module.discover_claude_models = (
-            lambda *a, **k: calls.append("discover")
-        )
-        fallback_module.discover_codex_models = (
+        # Every discovery the module makes goes through the per-run
+        # cache, so this is the one entry point to watch.
+        fallback_module.discover_models = (
             lambda *a, **k: calls.append("discover")
         )
         fallback_module.same_provider_ladder(principal)
     finally:
         fallback_module.provider_status = saved_status
-        fallback_module.discover_claude_models = saved_claude
-        fallback_module.discover_codex_models = saved_codex
+        fallback_module.discover_models = saved_discover
     require(not calls, f"the ladder was not pure: {calls}")
 
     endpoint = runtime_module.Endpoint(

@@ -102,10 +102,12 @@ from orrery_runtime import (  # noqa: E402
     load_role,
     user_config_path,
 )
-from orrery_model_catalogue import model_identity  # noqa: E402
+from orrery_model_catalogue import _strip_context, model_identity  # noqa: E402
 
 
-ROLLUP_VERSION = 1
+# 2: a versioned model the catalogue lists only by its family alias is
+# filed under its own id, so hours stored under the alias are rebuilt.
+ROLLUP_VERSION = 2
 ROLLUP_NAME = "allowance.json"
 LOCK_NAME = "allowance.lock"
 
@@ -241,7 +243,9 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
     and `model_identity` is what reaches a catalogue entry from the API
     identifier a transcript records. An entry naming the exact version
     is preferred over an alias that only shares its family, so two
-    versions listed side by side each keep their own spend. Memoised
+    versions listed side by side each keep their own spend, and a
+    version reached only through its family's alias keeps its own id,
+    context suffix removed: the alias names the provider. Memoised
     because a busy window holds tens of thousands of responses and the
     catalogue is a file.
 
@@ -285,13 +289,19 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
         # The catalogue is searched in full, exact then family, before
         # any manifest step: preferring exactness across both would let
         # a step assigning a model to the wrong provider outrank the
-        # catalogue's own owner of it.
+        # catalogue's own owner of it. A family match settles only the
+        # provider: a versioned id is filed under itself, not under the
+        # alias, or Sonnet 5 would read as "Sonnet, version not
+        # recorded" merely because the bundled catalogue lists no row
+        # for that version.
         for entries in (known, assigned):
             for exact in (True, False):
                 for provider, name in entries:
                     entry = model_identity(provider, name)
                     active = model_identity(provider, model)
                     if (entry == active) if exact else entry.matches(active):
+                        if not exact and active.version is not None:
+                            return provider, _strip_context(model)
                         return provider, name
         return "", model
 
@@ -629,6 +639,14 @@ def spend_key(event: dict[str, Any], resolve: Any) -> str:
     the model is used only when it names that provider. A run routed
     at an endpoint drew on a third-party service, and is kept under an
     empty provider exactly as an uncatalogued transcript model is.
+
+    The model is the one the provider reported running, where it
+    reported exactly one of the configured model's family (a side-call
+    model of another family is set aside): a transcript records that
+    model, so a delegated `opus` run and a principal session on Opus
+    5.5 then share one key, and Opus 5 and Opus 5.5 are never folded
+    together under the alias. The configured name is used only where
+    the run reported no single model of the family.
     """
     model = event.get("model")
     if not isinstance(model, str) or not model:
@@ -636,10 +654,45 @@ def spend_key(event: dict[str, Any], resolve: Any) -> str:
     provider = event.get("provider")
     if event.get("endpoint") is not None or provider not in PROVIDERS:
         return f"/{model}"
+    model = single_reported_model(event) or model
     key = resolve(model)
     if split_key(key)[0] != provider:
         key = f"{provider}/{model}"
     return key
+
+
+def single_reported_model(event: dict[str, Any]) -> str | None:
+    """The one model a `spend` record says its run used, or None.
+
+    Where the configured model has a family, only reported models of
+    that family count: a Claude run also reports the small model its
+    CLI makes side calls on (Haiku beside Opus), which says nothing
+    about what the configured name ran as. The side calls' tokens stay
+    in the run's figure. By identity, not by name: `claude-opus-5-5`
+    and its `[1m]` window in one run are one model, named by the plain
+    id. Two models of the family in one run, or none, say nothing
+    unambiguous.
+    """
+    provider = event.get("provider")
+    reported = event.get("reported_models")
+    if not isinstance(provider, str) or not isinstance(reported, str):
+        return None
+    names = [name for name in reported.split(",") if name]
+    configured = event.get("model")
+    if isinstance(configured, str):
+        family = model_identity(provider, configured).family
+        if family is not None:
+            names = [
+                name
+                for name in names
+                if model_identity(provider, name).family == family
+            ]
+    if not names or len(
+        {model_identity(provider, name) for name in names}
+    ) != 1:
+        return None
+    plain = [name for name in names if not name.endswith("]")]
+    return (plain or names)[0]
 
 
 def _scan_codex(
@@ -910,9 +963,20 @@ def window_spend(
     return {"provider": provider, "total": total, "models": models, "since": since}
 
 
-def describe_models(models: dict[str, int]) -> str:
+def describe_models(models: dict[str, int], provider: str = "") -> str:
+    """A window's spend by model, each id followed by the version it is.
+
+    Opus 5 and Opus 5.5 are separate lines of spend, and an id alone
+    leaves a reader to know which is which.
+    """
+    from orrery_model_names import spend_name
+
+    def entry(model: str, spend: int) -> str:
+        named = spend_name(provider, model) if provider else model
+        return f"{model} {spend:,}" + (f" ({named})" if named != model else "")
+
     return ", ".join(
-        f"{model} {spend:,}"
+        entry(model, spend)
         for model, spend in sorted(
             models.items(), key=lambda item: (-item[1], item[0])
         )
@@ -944,7 +1008,7 @@ def ceiling_refusal(
     )
     if spend["total"] < allowance.tokens:
         return None
-    breakdown = describe_models(spend["models"])
+    breakdown = describe_models(spend["models"], role.provider)
     return (
         f"the {role.provider} allowance is spent: {spend['total']:,} tokens "
         f"measured over the last {allowance.window_days} day(s) against a "
@@ -1006,7 +1070,7 @@ def principal_crossing(
         spend["total"],
         allowance.tokens,
         allowance.window_days,
-        describe_models(spend["models"]),
+        describe_models(spend["models"], provider),
     )
 
 

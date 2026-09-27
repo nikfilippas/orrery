@@ -47,6 +47,7 @@ from orrery_standing import (  # noqa: E402
     revoke_all,
 )
 import orrery_incidents as incident_log  # noqa: E402
+from orrery_model_names import banner_name, cached_name  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,8 @@ def _record_standing(
         )
         return
     print(
-        f"orrery: standing fallback recorded · {describe(record)}",
+        "orrery: standing fallback recorded · "
+        + describe(record, cached_name),
         file=sys.stderr,
     )
     incident_log.record(
@@ -323,7 +325,10 @@ def main() -> int:
             return 1
         if removed:
             for record in removed:
-                print(f"revoked standing fallback · {describe(record)}")
+                print(
+                    "revoked standing fallback · "
+                    + describe(record, cached_name)
+                )
         else:
             print("No standing fallback approvals.")
         return 0
@@ -470,7 +475,8 @@ def main() -> int:
                 role = candidate
                 is_fallback = True
                 print(
-                    f"orrery: standing fallback active · {describe(record)}",
+                    "orrery: standing fallback active · "
+                    + describe(record, cached_name),
                     file=sys.stderr,
                 )
                 incident_log.record(
@@ -586,7 +592,7 @@ def main() -> int:
 
         print(
             ("↳ Fallback principal" if is_fallback else "↳ Principal orchestrator")
-            + f" · {role.provider} · {role.model}"
+            + f" · {role.provider} · {banner_name(role)}"
             + (f" · thinking {role.thinking}" if role.thinking else "")
             + (f" · via {role.endpoint.label}" if role.endpoint else ""),
             file=sys.stderr,

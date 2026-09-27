@@ -773,6 +773,91 @@ def discover_codex_models(
         _terminate(process)
 
 
+# Every surface that names a model reads the installed CLI's own
+# catalogue, and one run asks several of them: a dispatch checks the
+# model is offered, prints the version it runs as, and may rank a
+# fallback. Each is answered from one discovery per CLI, so naming a
+# model never costs a second spawn. Keyed by everything that could make
+# the answer differ, the executable's identity and the whole
+# environment included, and held only for a few minutes, because a
+# supervisor that outlives a CLI update must not name the old models.
+DISCOVERY_CACHE_SECONDS = 300.0
+_DISCOVERED: dict[
+    tuple[Any, ...], tuple[float, list[dict[str, Any]] | None, str | None]
+] = {}
+
+
+def _discovery_key(
+    provider: str, executable: str, environment: dict[str, str]
+) -> tuple[Any, ...]:
+    try:
+        details = os.stat(executable)
+        stamp: tuple[int, ...] | None = (
+            details.st_ino, details.st_mtime_ns, details.st_size
+        )
+    except OSError:
+        stamp = None
+    return (
+        provider,
+        os.path.realpath(executable),
+        stamp,
+        tuple(sorted(environment.items())),
+    )
+
+
+def discover_models(
+    provider: str,
+    executable: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    environment: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """One provider's live catalogue, discovered at most once per run.
+
+    A failure is remembered too: a CLI that timed out once would
+    otherwise cost its timeout again for every surface that asks.
+    """
+    env = dict(os.environ if environment is None else environment)
+    key = _discovery_key(provider, executable, env)
+    held = _DISCOVERED.get(key)
+    if held is not None and time.monotonic() - held[0] < DISCOVERY_CACHE_SECONDS:
+        if held[2] is not None:
+            raise CatalogueDiscoveryError(held[2])
+        return copy.deepcopy(held[1] or [])
+    discoverer = (
+        discover_claude_models if provider == "anthropic"
+        else discover_codex_models
+    )
+    try:
+        found = discoverer(executable, timeout=timeout, environment=env)
+    except (CatalogueDiscoveryError, OSError) as exc:
+        _DISCOVERED[key] = (time.monotonic(), None, str(exc))
+        raise
+    _DISCOVERED[key] = (time.monotonic(), copy.deepcopy(found), None)
+    return found
+
+
+def cached_models(
+    provider: str,
+    executable: str,
+    environment: dict[str, str] | None = None,
+) -> list[dict[str, Any]] | None:
+    """What this run already discovered for a CLI, without asking it.
+
+    None where nothing was discovered or discovery failed, which a
+    caller reports as unverified rather than spawning the CLI itself.
+    """
+    env = dict(os.environ if environment is None else environment)
+    held = _DISCOVERED.get(_discovery_key(provider, executable, env))
+    if (
+        held is None
+        or held[1] is None
+        or time.monotonic() - held[0] >= DISCOVERY_CACHE_SECONDS
+    ):
+        return None
+    return copy.deepcopy(held[1])
+
+
 def _seeded_tier(seed: dict[str, Any] | None) -> int | None:
     tier = seed.get("fallback_tier") if seed else None
     if isinstance(tier, int) and not isinstance(tier, bool) and 1 <= tier <= 3:
@@ -835,20 +920,11 @@ def discover_catalogue(
         "anthropic": shutil.which("claude", path=path),
         "openai": shutil.which("codex", path=path),
     }
-    discoverers: dict[
-        str,
-        tuple[Callable[..., list[dict[str, Any]]], str],
-    ] = {}
-    if commands["anthropic"]:
-        discoverers["anthropic"] = (
-            discover_claude_models,
-            commands["anthropic"],
-        )
-    if commands["openai"]:
-        discoverers["openai"] = (
-            discover_codex_models,
-            commands["openai"],
-        )
+    discoverers = {
+        provider: executable
+        for provider, executable in commands.items()
+        if executable
+    }
 
     warnings = [
         f"{provider}: {provider} CLI is unavailable; using bundled fallback"
@@ -858,12 +934,13 @@ def discover_catalogue(
     with ThreadPoolExecutor(max_workers=max(1, len(discoverers))) as pool:
         futures = {
             pool.submit(
-                discoverer,
+                discover_models,
+                provider,
                 executable,
                 timeout=timeout,
                 environment=env,
             ): provider
-            for provider, (discoverer, executable) in discoverers.items()
+            for provider, executable in discoverers.items()
         }
         for future in as_completed(futures):
             provider = futures[future]

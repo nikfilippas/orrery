@@ -539,19 +539,39 @@ def main() -> int:
     if stale_ladder:
         print(f"{PROGRAM}: fallbackModel: stale Orrery ladder remains armed")
 
+    def named(model: str) -> str:
+        # The version each id means, in the installed CLI's words. Not
+        # under --check, which only the doctor runs, from inside a run
+        # that has already asked the CLI once and prints none of this
+        # line; nor under --quiet, which prints nothing at all.
+        if arguments.check:
+            return model
+        from orrery_model_names import with_name
+
+        return with_name(role.provider, model)
+
     if not differences:
         if not arguments.quiet:
             print(
                 f"{PROGRAM}: {role.provider} already runs "
-                f"{role.model}"
+                f"{named(role.model)}"
                 + (f" at thinking {role.thinking}" if role.thinking else "")
-                + (f" with fallback {', '.join(ladder)}" if ladder else "")
+                + (
+                    " with fallback "
+                    + ", ".join(named(model) for model in ladder)
+                    if ladder
+                    else ""
+                )
             )
         return 1 if stale_ladder else 0
 
     verb = "would change" if arguments.check else "aligned"
     if not arguments.quiet:
-        print(f"{PROGRAM}: {verb} the {role.provider} surface:")
+        print(
+            f"{PROGRAM}: {verb} the {role.provider} surface"
+            + ("" if arguments.check else f" to {named(role.model)}")
+            + ":"
+        )
         for difference in differences:
             print(f"  {difference}")
     return 1 if arguments.check else 0

@@ -871,10 +871,20 @@ running a model. Discovery is concurrent and provider-independent: if
 one local interface is unavailable, only that provider uses the bundled
 fallback catalogue. Equivalent Claude aliases are collapsed, newly
 released models appear automatically, and every role gets the same
-deduplicated menu grouped into Anthropic and OpenAI. Selecting a known
-model rebuilds the adjacent thinking menu from that model's reported
-capabilities. A custom exact identifier remains possible and requires
-an explicit provider.
+deduplicated menu grouped into Anthropic and OpenAI. Every exact
+version the CLI lists is its own option, labelled with the CLI's own
+display name and its description beneath, and a native alias states
+the version it resolves to now ("Opus (latest) · Opus 5.5"); an alias
+the CLI lists no row for states the version a run last reported, or
+that none has. The card's select is narrower than a long name, so its
+text shrinks until the chosen name fits whole, never below a legible
+floor, and the select's tooltip holds the name and its description in
+full; every name the naming code produces is worded to fit the
+narrowest card at that floor. Selecting a known model rebuilds the adjacent thinking
+menu from that model's reported capabilities. A stored level the model
+does not offer reads as itself, "xhigh (not offered)", and is left
+untouched unless another is chosen. A custom exact identifier remains
+possible and requires an explicit provider.
 
 The diagram is the workflow, flowing left to right:
 
@@ -1077,11 +1087,27 @@ provider whose live catalogue could not be read.
 
 Discovered models also keep their identity rather than only their alias:
 the alias a manifest is written against, the exact value the picker
-offers, and the provider's own resolved identifier. An alias binds to
-the highest version of its family, so a provider listing two versions
-cannot move it by reordering its response, and a pinned exact identifier
-is never collapsed away. This is how a family moving underneath a stable
-alias, `fable` becoming `claude-fable-5-1`, is visible at all.
+offers, and the provider's own resolved identifier. A native alias row
+states what it resolves to, and the exact version behind it is offered
+beside it; where the CLI lists no alias row for a family, Orrery invents
+none, and a stored alias there is named by what it was last observed to
+run as rather than by Orrery's guess. This is how a family moving
+underneath a stable alias, `opus` becoming Opus 5.5, is visible at all.
+
+Every surface names models through one module, `orrery_model_names`,
+and one discovery per CLI per run: the discovery cache is keyed by the
+executable and the whole environment, remembers a failure as well as a
+result, and lasts a few minutes, so a pre-dispatch check, the banner
+after it and a fallback ranking share one spawn. The banner and the
+fallback prompts read only what the run already discovered and never
+start a CLI themselves; where nothing was discovered an alias reads
+as its last observation, or "unverified" where it has none. An alias is observed only from a delegated run's own
+spend record of it; the principal writes none, and no transcript names
+the alias a session was started as, so a principal alias with no row
+stays "not yet observed" rather than being named from another session.
+The doctor asks each
+installed sibling CLI once, and only when a configured role holds an
+alias, and warns where the two resolve it to different models.
 
 ## Installation
 
@@ -1177,7 +1203,10 @@ The table is `prices` in the manifest or a file named by
 classes, keyed `provider:model`, or `provider@endpoint:model` where a
 custom endpoint bills differently for the same model name. A missing
 rate or a table past its stated maximum age refuses the money question
-and says why; the token report still succeeds. Neither provider offers a
+and says why; the token report still succeeds. The key is the model as
+the role is configured: a role pinned to an exact version,
+`anthropic:claude-opus-5-5`, needs its own row, and a row for the alias
+`anthropic:opus` does not price it. Neither provider offers a
 machine-readable rate endpoint, so rates cannot be fetched: the table is
 the only route for the half that providers do not price themselves.
 
@@ -1274,6 +1303,7 @@ number on this page should be read as one.
 | `scripts/orrery_standing.py` | scoped standing-approval store with locked serialisation |
 | `scripts/orrery-session-start` | direct Claude/Codex principal-mismatch hook |
 | `scripts/orrery_model_catalogue.py` | no-inference live model and thinking-capability discovery |
+| `scripts/orrery_model_names.py` | the one way every surface names a model and its version |
 | `scripts/orrery_runtime.py` | validated role loader and static provider adapters |
 | `scripts/orrery-review` | contained generic role runner; compatibility filename |
 | `scripts/orrery_incidents.py` | best-effort incident log writer and validated reader |

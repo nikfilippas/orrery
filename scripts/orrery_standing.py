@@ -466,19 +466,57 @@ def revoke_all(
     return removed
 
 
-def describe(record: dict[str, Any]) -> str:
-    """One line naming the substitution, its scope, and its lifetime."""
+def describe(
+    record: dict[str, Any],
+    name: Callable[[str, str], str] | None = None,
+) -> str:
+    """One line naming the substitution, its scope, and its lifetime.
+
+    `name(provider, model)` says which version each side is, where the
+    caller has already asked the CLIs; a model reads as
+    "provider/model (Name)" where the two differ. A role routed at an
+    endpoint served its own model, which no first-party name describes,
+    so the failed side of such a record keeps its id.
+    """
+
+    def named(provider: str, model: str, routed: bool = False) -> str | None:
+        if name is None or routed:
+            return None
+        try:
+            label = name(provider, model)
+        except Exception:  # noqa: BLE001 - naming must never fail a line
+            return None
+        return None if label == model else label
+
+    fingerprint = record.get("fingerprint")
+    # The endpoint id is the ninth element of `_fingerprint`.
+    routed = (
+        isinstance(fingerprint, list)
+        and len(fingerprint) > 8
+        and fingerprint[8] is not None
+    )
+    failed_name = named(
+        record["failed_provider"], record["failed_model"], routed
+    )
+    failed = f"{record['failed_provider']}/{record['failed_model']}" + (
+        f" ({failed_name})" if failed_name else ""
+    )
     thinking = record.get("candidate_thinking")
+    details = [
+        item
+        for item in (
+            named(record["candidate_provider"], record["candidate_model"]),
+            f"thinking {thinking}" if thinking else None,
+        )
+        if item
+    ]
     candidate = (
         f"{record['candidate_provider']}/{record['candidate_model']}"
-        + (f" (thinking {thinking})" if thinking else "")
+        + (f" ({'; '.join(details)})" if details else "")
     )
     if record["scope"] == UNTIL_SCOPE:
         expires = datetime.fromtimestamp(record["expires_at"]).astimezone()
         lifetime = f"until {expires:%Y-%m-%d %H:%M %Z}"
     else:
         lifetime = "for this login session"
-    return (
-        f"{record['role_id']}: {record['failed_provider']}/"
-        f"{record['failed_model']} -> {candidate} {lifetime}"
-    )
+    return f"{record['role_id']}: {failed} -> {candidate} {lifetime}"
