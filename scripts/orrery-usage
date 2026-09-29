@@ -98,9 +98,17 @@ def read_claude(
 
     A response can be recorded more than once, for example when a session
     is resumed into a new transcript, so responses are deduplicated by
-    message and request identity across every file.
+    message and request identity across every file. Each is keyed by the
+    allowance ceiling's own resolver, so one model recorded as
+    `claude-haiku-4-5-20251001` and as `claude-haiku-4-5` is one row, and
+    every row is one of the ceiling's keys.
     """
+    from orrery_allowance import model_resolver, split_key
+
     seen: set[tuple[str, str]] = set()
+    # Memoised: a month of transcripts holds tens of thousands of
+    # responses and only a handful of model ids.
+    resolve = model_resolver()
     files = 0
 
     # At any depth, as the allowance rollup reads them: subagent and
@@ -151,7 +159,9 @@ def read_claude(
                 model = message.get("model")
                 if not isinstance(model, str) or not model:
                     model = "unknown"
-                bucket = totals.setdefault(("claude", model), new_bucket())
+                bucket = totals.setdefault(
+                    ("claude", split_key(resolve(model))[1]), new_bucket()
+                )
                 bucket["fresh_in"] += fresh
                 bucket["cache_read"] += cache_read
                 bucket["cache_write"] += cache_write
@@ -379,13 +389,23 @@ def price_records(records: list[dict]) -> tuple[float | None, str | None]:
     return total, None
 
 
-def ran_as(record: dict) -> str:
+def ran_as(record: dict, resolve: Any = None) -> str:
     """The model an attempt ran as: the one it reported, else its configured one.
 
     Grouped by this rather than by the configured name, so two `opus`
     runs a CLI update split between Opus 5 and Opus 5.5 are two rows.
+    Spelled as the run's spend is keyed, through the ceiling's resolver,
+    built here where the caller passes none, so attempts naming one model
+    differently, `claude-haiku-4-5-20251001` and `claude-haiku-4-5`,
+    share a row; an endpoint's model keeps its own spelling, as the
+    delegated figure keeps it.
     """
-    from orrery_allowance import single_reported_model
+    from orrery_allowance import (
+        model_resolver,
+        single_reported_model,
+        spend_key,
+        split_key,
+    )
 
     named = record.get("reported_models")
     single = (
@@ -397,15 +417,25 @@ def ran_as(record: dict) -> str:
         if isinstance(named, list)
         else None
     )
-    return single or str(record.get("model", "unknown"))
+    ran = single or str(record.get("model", "unknown"))
+    if record.get("endpoint"):
+        return ran
+    if resolve is None:
+        resolve = model_resolver()
+    return split_key(
+        spend_key({"provider": record.get("provider"), "model": ran}, resolve)
+    )[1]
 
 
 def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
+    from orrery_allowance import model_resolver
+
     store = root / ".orrery"
     if not (store / "ledger" / f"{task_id}.jsonl").exists():
         print(f"orrery-usage: no such task: {task_id}", file=sys.stderr)
         return 2
     records, unattributed = task_attempts(store, task_id)
+    resolve = model_resolver()
 
     totals: dict[tuple[str, str, str, str, str], dict[str, int]] = {}
     unknown = 0
@@ -418,7 +448,7 @@ def task_report(root: Path, task_id: str, money: bool, as_json: bool) -> int:
             str(record.get("provider", "unknown")),
             str(record.get("model", "unknown")),
             str(record.get("endpoint") or ""),
-            ran_as(record),
+            ran_as(record, resolve),
         )
         bucket = totals.setdefault(key, new_bucket())
         bucket["events"] += 1

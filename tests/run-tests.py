@@ -18404,7 +18404,7 @@ def test_spend_filed_by_reported_model() -> None:
                 "anthropic/claude-opus-5": 220,
                 "anthropic/opus": 12,
                 "anthropic/claude-sonnet-5": 300,
-                "anthropic/claude-haiku-4-5-20251001": 60,
+                "anthropic/claude-haiku-4-5": 60,
                 "anthropic/claude-opus-4-8": 24,
             },
             f"delegated spend was not filed by its reported model: {measured}",
@@ -18418,7 +18418,7 @@ def test_spend_filed_by_reported_model() -> None:
             and "claude-opus-5 220 (Opus 5)" in breakdown
             and "opus 12 (Opus, version not recorded)" in breakdown
             and "claude-sonnet-5 300 (Sonnet 5)" in breakdown
-            and "claude-haiku-4-5-20251001 60 (Haiku 4.5)" in breakdown
+            and "claude-haiku-4-5 60 (Haiku 4.5)" in breakdown
             and "claude-opus-4-8 24 (Opus 4.8)" in breakdown
             and "version not recorded" not in breakdown.replace(
                 "opus 12 (Opus, version not recorded)", ""
@@ -18455,7 +18455,7 @@ def test_spend_filed_by_reported_model() -> None:
                 "claude-opus-5-5": "Opus 5.5",
                 "claude-opus-5": "Opus 5",
                 "claude-sonnet-5": "Sonnet 5",
-                "claude-haiku-4-5-20251001": "Haiku 4.5",
+                "claude-haiku-4-5": "Haiku 4.5",
             },
             f"orrery-usage does not tell Opus 5 from Opus 5.5: {report}",
         )
@@ -18482,6 +18482,251 @@ def test_spend_filed_by_reported_model() -> None:
             ) == "opus",
             "a task report did not set a side-call model aside",
         )
+
+
+@test("every spelling of one model is filed under one key")
+def test_spend_filed_under_one_spelling() -> None:
+    """A version the catalogue lists only by its family was filed under
+    whichever spelling reported it, so `claude-haiku-4-5-20251001` sat
+    beside `claude-haiku-4-5`, and a Bedrock
+    `us.anthropic.claude-sonnet-5-v1:0` beside `claude-sonnet-5`, each
+    line named alike. Each such id is now filed under its bare form, and
+    orrery-usage's session table, its delegated table and the rollup
+    agree key for key, an inference-profile ARN included."""
+    haiku = {
+        "claude-haiku-4-5-20251001": 60,
+        "claude-haiku-4-5": 40,
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0": 20,
+        "claude-haiku-4-5@20251001": 12,
+        "claude-haiku-4-5-20251001[1m]": 8,
+    }
+    sonnet = {
+        "claude-sonnet-5": 300,
+        "us.anthropic.claude-sonnet-5-v1:0": 100,
+        "claude-sonnet-5@20260901": 48,
+        "claude-sonnet-5[1m]": 32,
+    }
+    with standing_stores(), transcript_roots() as (projects, _codex):
+        write_transcript(
+            projects / "session.jsonl",
+            [
+                transcript_response(f"m{index}", f"r{index}", model, tokens)
+                for index, (model, tokens) in enumerate(
+                    [*haiku.items(), *sonnet.items()]
+                )
+            ],
+        )
+        # Runs of each alias that reported their model in one spelling or
+        # two, and a role pinned to the dated id whose run reported nothing.
+        record_spend(100, model="haiku", reported_models="claude-haiku-4-5-20251001")
+        record_spend(24, model="claude-haiku-4-5-20251001")
+        record_spend(
+            40, model="sonnet", reported_models="us.anthropic.claude-sonnet-5-v1:0"
+        )
+        record_spend(
+            20, model="sonnet", reported_models="claude-sonnet-5,claude-sonnet-5[1m]"
+        )
+        with user_configuration(allowances={}) as manifest:
+            rollup = allowance_module.refresh(manifest=manifest)
+            resolve = allowance_module.model_resolver(manifest)
+        resolved = {model: resolve(model) for model in [*haiku, *sonnet]}
+        require(
+            {resolved[model] for model in haiku} == {"anthropic/claude-haiku-4-5"}
+            and {resolved[model] for model in sonnet}
+            == {"anthropic/claude-sonnet-5"},
+            f"a spelling resolved to a key of its own: {resolved}",
+        )
+        measured: dict[str, int] = {}
+        for entry in rollup["hours"].values():
+            for key, total in entry["spend"].items():
+                measured[key] = measured.get(key, 0) + total
+        require(
+            measured == {
+                "anthropic/claude-haiku-4-5": 264,
+                "anthropic/claude-sonnet-5": 540,
+            },
+            f"one model's spellings were filed under more than one key: {measured}",
+        )
+        breakdown = allowance_module.describe_models(
+            allowance_module.window_spend("anthropic", 7, rollup=rollup)["models"],
+            "anthropic",
+        )
+        require(
+            breakdown
+            == "claude-sonnet-5 540 (Sonnet 5), claude-haiku-4-5 264 (Haiku 4.5)",
+            f"the breakdown does not name each model once: {breakdown}",
+        )
+
+        def usage(*arguments: str) -> str:
+            result = subprocess.run(
+                [sys.executable, str(USAGE_SCRIPT), "--since", "1", *arguments],
+                env=os.environ.copy(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, timeout=60, check=False,
+            )
+            require(result.returncode == 0, f"orrery-usage failed: {result.stderr}")
+            return result.stdout
+
+        report = json.loads(usage("--json"))
+        sessions = {
+            f"anthropic/{row['model']}": (row["total"], row["name"])
+            for row in report["usage"]
+        }
+        delegated = {
+            f"{row['provider']}/{row['model']}": (row["total"], row["name"])
+            for row in report["delegated"]["usage"]
+        }
+        require(
+            len(report["usage"]) == len(sessions)
+            and sessions == {
+                "anthropic/claude-haiku-4-5": (140, "Haiku 4.5"),
+                "anthropic/claude-sonnet-5": (480, "Sonnet 5"),
+            }
+            and delegated == {
+                "anthropic/claude-haiku-4-5": (124, "Haiku 4.5"),
+                "anthropic/claude-sonnet-5": (60, "Sonnet 5"),
+            },
+            f"orrery-usage does not report each model once: {report}",
+        )
+        # Key for key: a session row's model is the ceiling's own key for
+        # it, and the two tables add up to the rollup under each key.
+        require(
+            all(resolve(key.split("/", 1)[1]) == key for key in sessions)
+            and {
+                key: sessions[key][0] + delegated[key][0] for key in measured
+            } == measured,
+            f"orrery-usage does not reconcile with the rollup: {report} {measured}",
+        )
+        table = usage()
+        for model, name in (
+            ("claude-haiku-4-5", "Haiku 4.5"), ("claude-sonnet-5", "Sonnet 5"),
+        ):
+            rows = re.findall(
+                rf"^(\S+)\s+{re.escape(model)}\s+{re.escape(name)}\s", table, re.M
+            )
+            require(
+                rows == ["claude", "anthropic"],
+                f"{model} is not one session row and one delegated row: {table}",
+            )
+        require(
+            not re.search(r"20251001|us\.anthropic|@|\[1m\]", table),
+            f"the usage table kept a reported spelling: {table}",
+        )
+    # A task report groups attempts by the same spelling, except that an
+    # endpoint's model is its own.
+    usage_module = load_script(USAGE_SCRIPT, f"kit_usage_{time.time_ns()}")
+    pinned = {"provider": "anthropic", "model": "claude-haiku-4-5-20251001"}
+    require(
+        {
+            usage_module.ran_as(pinned),
+            usage_module.ran_as(
+                {**pinned, "reported_models": ["claude-haiku-4-5-20251001"]}
+            ),
+            usage_module.ran_as({**pinned, "reported_models": ["claude-haiku-4-5"]}),
+        } == {"claude-haiku-4-5"}
+        and usage_module.ran_as({**pinned, "endpoint": "fixture-endpoint"})
+        == "claude-haiku-4-5-20251001",
+        "a task report split one model's attempts, or respelled an endpoint's model",
+    )
+    # A record whose provider the catalogue does not confirm is filed on
+    # that provider, under the same one spelling.
+    filed = {
+        allowance_module.spend_key(
+            {"provider": "anthropic", "model": model}, lambda raw: f"/{raw}"
+        )
+        for model in haiku
+    }
+    require(
+        filed == {"anthropic/claude-haiku-4-5"},
+        f"an unconfirmed record kept its spelling: {filed}",
+    )
+    # An inference-profile ARN keeps its spelling under `canonical_model`,
+    # and the ceiling files it under the key of its version's catalogue
+    # row. The session table and a task report spell it as the ceiling
+    # does, not as the ARN.
+    arn = (
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+        "us.anthropic.claude-opus-5-5-v1:0"
+    )
+    rows: dict[tuple[str, str], dict[str, int]] = {}
+    with tempfile.TemporaryDirectory() as directory:
+        write_transcript(
+            Path(directory) / "session.jsonl",
+            [transcript_response("m1", "r1", arn, 40)],
+        )
+        usage_module.read_claude(
+            Path(directory), datetime.now(timezone.utc) - timedelta(days=1), rows
+        )
+    ceiling = allowance_module.model_resolver()(arn)
+    require(
+        ceiling == "anthropic/claude-opus-5-5"
+        and set(rows) == {("claude", "claude-opus-5-5")}
+        and usage_module.ran_as({"provider": "anthropic", "model": arn})
+        == "claude-opus-5-5",
+        f"orrery-usage split a spelling the ceiling files as {ceiling}: "
+        f"{sorted(rows)}, "
+        f"{usage_module.ran_as({'provider': 'anthropic', 'model': arn})}",
+    )
+
+
+@test("a catalogue row spelled otherwise names the model's one key")
+def test_catalogue_spelling_names_one_key() -> None:
+    """An exact catalogue entry keeps its id as the key only where the
+    id is already the bare form: a dated row, or a `[1m]` row matched
+    first, would otherwise make its own spelling a second key for the
+    model. The key is still named as the catalogue names the model, but
+    never by a `[1m]` row's name, which describes the larger window."""
+    catalogue = {
+        "anthropic": [
+            {"id": "haiku", "label": "Haiku (latest)"},
+            {"id": "claude-haiku-4-5-20251001", "label": "Haiku 4.5 (fixture row)"},
+            {"id": "sonnet", "label": "Sonnet (latest)"},
+            {"id": "claude-sonnet-5[1m]", "label": "Sonnet 5 (1M context)"},
+            {"id": "claude-opus-5-5", "label": "Opus 5.5"},
+        ],
+    }
+    saved = (allowance_module.load_catalogue, names_module._bundled)
+    allowance_module.load_catalogue = lambda *_a, **_k: copy.deepcopy(catalogue)
+    names_module._bundled = lambda provider: copy.deepcopy(
+        catalogue.get(provider, [])
+    )
+    try:
+        resolve = allowance_module.model_resolver({"steps": []})
+        found = {
+            model: resolve(model)
+            for model in (
+                "claude-haiku-4-5",
+                "claude-haiku-4-5-20251001",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "claude-sonnet-5",
+                "claude-sonnet-5[1m]",
+                "claude-opus-5-5[1m]",
+            )
+        }
+        named = {
+            model: names_module.spend_name("anthropic", model)
+            for model in ("claude-haiku-4-5", "claude-sonnet-5", "claude-opus-5-5")
+        }
+    finally:
+        allowance_module.load_catalogue, names_module._bundled = saved
+    require(
+        found == {
+            "claude-haiku-4-5": "anthropic/claude-haiku-4-5",
+            "claude-haiku-4-5-20251001": "anthropic/claude-haiku-4-5",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0": "anthropic/claude-haiku-4-5",
+            "claude-sonnet-5": "anthropic/claude-sonnet-5",
+            "claude-sonnet-5[1m]": "anthropic/claude-sonnet-5",
+            "claude-opus-5-5[1m]": "anthropic/claude-opus-5-5",
+        },
+        f"a catalogue row's own spelling became a key: {found}",
+    )
+    require(
+        named == {
+            "claude-haiku-4-5": "Haiku 4.5 (fixture row)",
+            "claude-sonnet-5": "Sonnet 5",
+            "claude-opus-5-5": "Opus 5.5",
+        },
+        f"a bare key was not named as the catalogue names its model: {named}",
+    )
 
 
 def named_surfaces_environment(roles: dict[str, Any]) -> dict[str, str]:
@@ -18523,43 +18768,151 @@ NAMED_ROLES = {
 
 
 
-@test("a rollup stored under the old keys is rebuilt, not trusted")
+@test("a rollup stored under the old keys is not trusted as stored")
 def test_rollup_version_rebuilds_old_keys() -> None:
     """Version 1 filed a version the bundled catalogue names only by its
     family under the family alias, so Sonnet 5 read as "Sonnet, version
-    not recorded". Its responses are marked seen and its sources read to
-    the end, so a kit that trusted such a file would never re-attribute
-    them within the window. Version 2 discards it whole and rebuilds from
-    the session logs: the same total, under the version's own key."""
-    with standing_stores(), transcript_roots() as (projects, _codex):
-        write_transcript(
-            projects / "session.jsonl",
-            [transcript_response("m1", "r1", "claude-sonnet-5", 300)],
-        )
-        with user_configuration(allowances={}) as manifest:
-            allowance_module.refresh(manifest=manifest)
-            path = allowance_module.rollup_path()
-            stored = json.loads(path.read_text())
-            # Doctor it into what version 1 wrote: same sources, offsets
-            # and seen digests, the spend under the family alias.
-            stored["v"] = 1
-            for entry in stored["hours"].values():
-                spend = entry["spend"]
-                if "anthropic/claude-sonnet-5" in spend:
-                    spend["anthropic/sonnet"] = spend.pop(
-                        "anthropic/claude-sonnet-5"
-                    )
-            path.write_text(json.dumps(stored))
-            rollup = allowance_module.refresh(manifest=manifest)
-        measured: dict[str, int] = {}
-        for entry in rollup["hours"].values():
-            for key, total in entry["spend"].items():
-                measured[key] = measured.get(key, 0) + total
-        require(
-            rollup.get("v") == allowance_module.ROLLUP_VERSION
-            and measured == {"anthropic/claude-sonnet-5": 300},
-            f"a version-1 rollup was trusted rather than rebuilt: {measured}",
-        )
+    not recorded". Version 2 filed it under the spelling that reported
+    it, so Haiku 4.5 sat under `claude-haiku-4-5-20251001` beside
+    `claude-haiku-4-5`. Either file's responses are marked seen and its
+    sources read to the end, so a kit that trusted its keys would never
+    re-attribute them within the window. The current version discards a
+    version-1 file whole and rebuilds from the session logs, since an
+    alias key cannot say which version it held, and re-keys a version-2
+    file in place: the same total, under the model's one key."""
+    for version, reported, key, old in (
+        (1, "claude-sonnet-5", "anthropic/claude-sonnet-5", "anthropic/sonnet"),
+        (
+            2,
+            "claude-haiku-4-5-20251001",
+            "anthropic/claude-haiku-4-5",
+            "anthropic/claude-haiku-4-5-20251001",
+        ),
+        (
+            2,
+            "us.anthropic.claude-sonnet-5-v1:0",
+            "anthropic/claude-sonnet-5",
+            "anthropic/us.anthropic.claude-sonnet-5-v1:0",
+        ),
+    ):
+        with standing_stores(), transcript_roots() as (projects, _codex):
+            write_transcript(
+                projects / "session.jsonl",
+                [transcript_response("m1", "r1", reported, 300)],
+            )
+            with user_configuration(allowances={}) as manifest:
+                allowance_module.refresh(manifest=manifest)
+                path = allowance_module.rollup_path()
+                stored = json.loads(path.read_text())
+                # Doctor it into what that version wrote: same sources,
+                # offsets and seen digests, the spend under its old key.
+                stored["v"] = version
+                for entry in stored["hours"].values():
+                    spend = entry["spend"]
+                    if key in spend:
+                        spend[old] = spend.pop(key)
+                path.write_text(json.dumps(stored))
+                rollup = allowance_module.refresh(manifest=manifest)
+            measured: dict[str, int] = {}
+            for entry in rollup["hours"].values():
+                for name, total in entry["spend"].items():
+                    measured[name] = measured.get(name, 0) + total
+            require(
+                rollup.get("v") == allowance_module.ROLLUP_VERSION
+                and measured == {key: 300},
+                f"a version-{version} rollup filing {reported} under {old} "
+                f"was trusted as stored: {measured}",
+            )
+
+
+@test("a version-2 rollup is re-keyed in place, its sources kept")
+def test_rollup_version_2_rekeyed_in_place() -> None:
+    """Version 2's keys differ from the current ones only in spelling,
+    which each key alone decides, so its file is re-keyed rather than
+    discarded. Discarding it dropped its sources too: every log was
+    read again from the start, and each Codex rollout lost the baseline
+    saying how much of its running total was already counted. The
+    sources, seen digests and time survive as stored, one model's
+    spellings sum under its one key, and a key no provider owns keeps
+    its spelling, as the current version files it. An untrusted hour is
+    still skipped, and any version but 2 and the current one is still
+    discarded whole."""
+    sources = {
+        "/fixture/claude/session.jsonl": {"offset": 4096},
+        "/fixture/codex/rollout-fixture.jsonl": {
+            "offset": 2048, "counted": 150000, "model": "gpt-5.5",
+        },
+        "/fixture/state/incidents.jsonl": {
+            "offset": 512, "inode": 1234, "head": "0123456789abcdef",
+        },
+    }
+    seen = ["0123456789abcdef", "fedcba9876543210"]
+    stored = {
+        "v": 2,
+        "updated": 1790000000.5,
+        "sources": sources,
+        "hours": {
+            "497222": {
+                "spend": {
+                    "anthropic/claude-haiku-4-5-20251001": 60,
+                    "anthropic/claude-haiku-4-5": 40,
+                    "anthropic/us.anthropic.claude-haiku-4-5-20251001-v1:0": 20,
+                    "anthropic/claude-sonnet-5[1m]": 32,
+                    "anthropic/opus": 7,
+                    "openai/gpt-5.5": 900,
+                    "/claude-haiku-4-5-20251001": 5,
+                },
+                "seen": seen,
+            },
+            "497223": {
+                "spend": {
+                    "anthropic/claude-fable-5[1m]": 11,
+                    "anthropic/claude-fable-5": 4,
+                },
+                "seen": [],
+            },
+            "497224": {"spend": {"fixture/claude-haiku-4-5": 1}, "seen": []},
+        },
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "allowance.json"
+        path.write_text(json.dumps(stored))
+        rollup = allowance_module.read_rollup(path)
+        discarded: dict[Any, dict[str, Any]] = {}
+        for version in (1, 4, "2"):
+            path.write_text(json.dumps({**stored, "v": version}))
+            discarded[version] = allowance_module.read_rollup(path)
+    require(
+        rollup["v"] == allowance_module.ROLLUP_VERSION
+        and rollup["sources"] == sources
+        and rollup["updated"] == 1790000000.5,
+        f"a version-2 rollup lost its sources or its time: {rollup}",
+    )
+    require(
+        rollup["hours"] == {
+            "497222": {
+                "spend": {
+                    "anthropic/claude-haiku-4-5": 120,
+                    "anthropic/claude-sonnet-5": 32,
+                    "anthropic/opus": 7,
+                    "openai/gpt-5.5": 900,
+                    "/claude-haiku-4-5-20251001": 5,
+                },
+                "seen": seen,
+            },
+            "497223": {"spend": {"anthropic/claude-fable-5": 15}, "seen": []},
+        },
+        f"a version-2 rollup was not re-keyed under each model's one key: "
+        f"{rollup['hours']}",
+    )
+    require(
+        all(
+            found == allowance_module.empty_rollup()
+            for found in discarded.values()
+        ),
+        f"a rollup of another version was trusted: {discarded}",
+    )
+
 
 @test("every surface names a role's version, [1m] included, asking once")
 def test_surfaces_name_versions_once() -> None:
@@ -21092,7 +21445,8 @@ def test_exact_model_identity() -> None:
 
     # The allowance resolver prefers the exact entry, and a manifest step
     # still never outranks the catalogue's owner of a model. A version
-    # reached only through its family's alias keeps its own id: the alias
+    # reached only through its family's alias keeps its own id, spelled
+    # bare, without its snapshot date or cloud packaging: the alias
     # settles the provider, not the version.
     saved = allowance_module.load_catalogue
     allowance_module.load_catalogue = lambda *_a, **_k: identity_catalogue(
@@ -21114,13 +21468,11 @@ def test_exact_model_identity() -> None:
             "claude-fable-5": "anthropic/claude-fable-5",
             "claude-opus-4-8": "anthropic/claude-opus-4-8",
             "claude-opus-4-8[1m]": "anthropic/claude-opus-4-8",
-            "claude-3-7-sonnet-20250219": (
-                "anthropic/claude-3-7-sonnet-20250219"
-            ),
+            "claude-3-7-sonnet-20250219": "anthropic/claude-3-7-sonnet",
             "us.anthropic.claude-3-5-haiku-20241022-v1:0": (
-                "anthropic/us.anthropic.claude-3-5-haiku-20241022-v1:0"
+                "anthropic/claude-3-5-haiku"
             ),
-            "claude-3-opus-20240229": "anthropic/claude-3-opus-20240229",
+            "claude-3-opus-20240229": "anthropic/claude-3-opus",
             "opus": "anthropic/opus",
             "gpt-5.6-terra": "openai/gpt-5.6-terra",
             "gpt-5.6": "/gpt-5.6",

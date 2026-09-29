@@ -251,7 +251,11 @@ def spend_name(provider: str, model: str) -> str:
 
     Never from discovery: a figure is history, and what an alias means
     now says nothing about what it meant then. An exact id reads as its
-    version, whether or not the catalogue lists that version. An alias
+    version, whether or not the catalogue lists that version. A spend
+    key spells it bare, `claude-haiku-4-5`, and the catalogue may list
+    it under another spelling, dated or packaged: that entry's name is
+    still the model's, where no entry has the key's own id. Never a
+    `[1m]` entry's, whose name describes the larger window. An alias
     key holds only spend whose version is unknown: delegated runs that
     recorded no reported models, and runs that reported no single model
     of the alias's family (a side-call model of another family does not
@@ -263,6 +267,21 @@ def spend_name(provider: str, model: str) -> str:
         identity = model_identity(provider, model)
         if identity.family is not None and identity.version is None:
             return f"{identity.family.capitalize()}, version not recorded"
+        listed = _bundled(provider)
+        if (
+            identity.version is not None
+            and not model.endswith("]")
+            and not any(entry.get("id") == model for entry in listed)
+        ):
+            for entry in listed:
+                other = entry.get("id")
+                if (
+                    isinstance(other, str)
+                    and isinstance(entry.get("label"), str)
+                    and not other.endswith("]")
+                    and model_identity(provider, other) == identity
+                ):
+                    return entry["label"]
         return _label_of(provider, model, [])
     except Exception:  # noqa: BLE001 - naming must never fail a report
         return model

@@ -495,8 +495,16 @@ one key. Claude Code also reports the small model it makes side calls
 on (Haiku beside Opus); that model is set aside when choosing the key,
 and its tokens stay in the run's figure. A versioned model the bundled
 catalogue lists only by its family alias, such as Sonnet 5 or Haiku
-4.5, is still filed under its own id: the catalogue settles which
-provider owns it, never which version it was. A delegated run that
+4.5, is still filed under its own version: the catalogue settles which
+provider owns it, never which version it was. A dated, cloud-packaged
+or `[1m]` spelling of one version is the same key, its bare id:
+`claude-haiku-4-5-20251001`, `claude-haiku-4-5`, the Bedrock
+`us.anthropic.claude-haiku-4-5-20251001-v1:0`, the Vertex
+`claude-haiku-4-5@20251001` and a `[1m]` window all sum under
+`anthropic/claude-haiku-4-5`, named Haiku 4.5. An inference-profile ARN
+or a `-latest` id is not stripped that way: it shares the key only where
+the catalogue lists its version, and otherwise keeps a line of its own,
+the provider's total unchanged. A delegated run that
 reported no single model of its family, or recorded no reported models
 at all, is filed under its configured name, so one window can hold
 both `anthropic/opus` and `anthropic/claude-opus-5-5`; the provider's
@@ -512,9 +520,10 @@ incident log when each run ends, counted once per run however the log
 rotates. A run dispatched by `orrery-task` writes that record too, beside
 its task's ledger entry, so it is counted like any other. `orrery-usage`
 reports those records as a separate delegated figure, keyed as the
-ceiling keys them, so its session table and its delegated table add up
-to what the ceiling measures. A run that died before reporting its usage
-is counted from the messages it did stream, which understates its
+ceiling keys them, and keys each session-table model as the ceiling
+keys it, so its session table and its delegated table add up to what
+the ceiling measures, key for key. A run that died before reporting its
+usage is counted from the messages it did stream, which understates its
 output; one that streamed none adds nothing, and `orrery-usage` says how
 many there were. The figure is therefore a local estimate of this
 machine's spend and not the provider's billing.

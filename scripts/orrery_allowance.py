@@ -102,12 +102,15 @@ from orrery_runtime import (  # noqa: E402
     load_role,
     user_config_path,
 )
-from orrery_model_catalogue import _strip_context, model_identity  # noqa: E402
+from orrery_model_catalogue import _bare_claude_id, model_identity  # noqa: E402
 
 
 # 2: a versioned model the catalogue lists only by its family alias is
 # filed under its own id, so hours stored under the alias are rebuilt.
-ROLLUP_VERSION = 2
+# 3: a versioned Claude id is filed under its bare form. A version-2
+# file is re-keyed in place, since each old key alone decides its new
+# spelling, and its sources are kept.
+ROLLUP_VERSION = 3
 ROLLUP_NAME = "allowance.json"
 LOCK_NAME = "allowance.lock"
 
@@ -236,6 +239,26 @@ def retention_seconds(allowances: dict[str, Allowance]) -> float:
     return max(DEFAULT_RETENTION_DAYS, widest + 1) * 86400.0
 
 
+def canonical_model(provider: str, model: str) -> str:
+    """The one spelling a model's spend is filed under.
+
+    One Claude model reaches the logs under several ids: with and
+    without its snapshot date, packaged for Bedrock or Vertex, with a
+    `[1m]` window. Filed under each, one model would be several lines of
+    spend under one name, so a versioned id is filed under its bare
+    form, `claude-haiku-4-5`. An alias, an OpenAI id and a custom
+    literal already name one thing each and are kept as they are.
+
+    An inference-profile ARN or a `-latest` id is not stripped to that
+    form. The resolver files one under the key of the catalogue entry
+    for its version where there is one; otherwise it keeps a key of its
+    own, and only the breakdown shows it, the provider's total unchanged.
+    """
+    if model_identity(provider, model).version is None:
+        return model
+    return _bare_claude_id(model)
+
+
 def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
     """A memoised `raw model id -> provider/model key` lookup.
 
@@ -244,10 +267,12 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
     identifier a transcript records. An entry naming the exact version
     is preferred over an alias that only shares its family, so two
     versions listed side by side each keep their own spend, and a
-    version reached only through its family's alias keeps its own id,
-    context suffix removed: the alias names the provider. Memoised
-    because a busy window holds tens of thousands of responses and the
-    catalogue is a file.
+    version reached only through its family's alias keeps its own id:
+    the alias names the provider. Either way a versioned id is keyed by
+    `canonical_model`, so each spelling it strips shares the model's one
+    key, and an entry's own id is kept only where it is that spelling
+    already. Memoised because a busy window holds tens of thousands of
+    responses and the catalogue is a file.
 
     The manifest's own role assignments are consulted after it. A
     bundled catalogue goes stale between releases, and a role the user
@@ -301,8 +326,8 @@ def model_resolver(manifest: dict[str, Any] | None = None) -> Any:
                     active = model_identity(provider, model)
                     if (entry == active) if exact else entry.matches(active):
                         if not exact and active.version is not None:
-                            return provider, _strip_context(model)
-                        return provider, name
+                            return provider, canonical_model(provider, model)
+                        return provider, canonical_model(provider, name)
         return "", model
 
     def resolve(model: str) -> str:
@@ -428,6 +453,22 @@ def valid_hour(entry: Any) -> dict[str, Any] | None:
     }
 
 
+def _rekeyed(spend: dict[str, int]) -> dict[str, int]:
+    """A version-2 hour's spend under the keys a refresh files it by now.
+
+    Version 2 kept a versioned Claude id as it was reported, context
+    suffix removed, or as a catalogue entry spells it. Its
+    `canonical_model` spelling is the key the same spend is filed under
+    now, so the spellings of one model are summed into it.
+    """
+    kept: dict[str, int] = {}
+    for key, total in spend.items():
+        provider, model = split_key(key)
+        key = f"{provider}/{canonical_model(provider, model)}"
+        kept[key] = kept.get(key, 0) + total
+    return kept
+
+
 def read_rollup(path: Path | None = None) -> dict[str, Any]:
     """The stored rollup, or an empty one where it cannot be read.
 
@@ -435,13 +476,21 @@ def read_rollup(path: Path | None = None) -> dict[str, Any]:
     estimate consulted to decide whether to stop, so a corrupt file must
     not itself become a refusal. The next refresh rebuilds what is still
     in the session logs, which are the durable record.
+
+    A version-2 file is re-keyed rather than discarded: its keys differ
+    from the current ones only in spelling, which each key alone decides.
+    Discarding it would read every log again from the start and lose
+    what no log still holds: a deleted transcript's spend, and each Codex
+    rollout's baseline, without which growth already counted from a
+    rollout begun before the window is dropped. Any other version is
+    discarded.
     """
     target = rollup_path() if path is None else path
     try:
         stored = json.loads(target.read_text())
     except (OSError, json.JSONDecodeError):
         return empty_rollup()
-    if not isinstance(stored, dict) or stored.get("v") != ROLLUP_VERSION:
+    if not isinstance(stored, dict) or stored.get("v") not in (2, ROLLUP_VERSION):
         return empty_rollup()
     rollup = empty_rollup()
     updated = stored.get("updated")
@@ -474,6 +523,8 @@ def read_rollup(path: Path | None = None) -> dict[str, Any]:
                 continue
             validated = valid_hour(entry)
             if validated is not None:
+                if stored["v"] == 2:
+                    validated["spend"] = _rekeyed(validated["spend"])
                 rollup["hours"][name] = validated
     return rollup
 
@@ -646,7 +697,8 @@ def spend_key(event: dict[str, Any], resolve: Any) -> str:
     model, so a delegated `opus` run and a principal session on Opus
     5.5 then share one key, and Opus 5 and Opus 5.5 are never folded
     together under the alias. The configured name is used only where
-    the run reported no single model of the family.
+    the run reported no single model of the family. Either one is keyed
+    by its `canonical_model` spelling, as a transcript's model is.
     """
     model = event.get("model")
     if not isinstance(model, str) or not model:
@@ -657,7 +709,7 @@ def spend_key(event: dict[str, Any], resolve: Any) -> str:
     model = single_reported_model(event) or model
     key = resolve(model)
     if split_key(key)[0] != provider:
-        key = f"{provider}/{model}"
+        key = f"{provider}/{canonical_model(provider, model)}"
     return key
 
 
