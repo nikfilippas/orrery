@@ -172,6 +172,23 @@ configurable from one to four. A repeated blocker or an uncleared
 blocker at the cap stops before implementation and asks the user to
 choose.
 
+A plan stays revisable from what execution observes. A handoff names
+the premises the work rests on, each with the check that would show it
+false, and asks the worker to run those checks first; a worker that
+finds one false changes nothing and says so in two lines,
+`PREMISE CONTRADICTED:` and `CHECK:`. The report is a claim
+and its check is delegate-authored text, so the principal reads the
+check and verifies the claim with a command it has judged safe before
+believing it. If the claim holds, the principal re-plans rather than
+re-dispatching the same work, and reclassifies when the evidence shows
+the scope or risk was wrong. When a batch of complex work contradicts a
+premise of the reviewed plan, the plan is revised and the deviation
+recorded with its evidence; a revision that changes the approach, a
+trust boundary, a persisted format or an acceptance criterion gets a
+round-one challenge restricted to what changed, counted against the same
+cap, and goes to the user when no round remains. The final reviewer is
+given every recorded deviation.
+
 ## Adoption and trust
 
 Orchestration applies only in **adopted** repositories, marked by the
@@ -480,6 +497,63 @@ orrery-task resume
 
 The ledger under `.orrery/` is authoritative and is excluded from
 tracking by default.
+
+### Premise reports and replanning
+
+Every task handoff, after its stop-and-report sentence, asks the
+delegate to check the premises its goal rests on before changing
+anything and, if one is false, to change nothing and begin its final
+message with the two report lines. The request is unconditional,
+because a goal's premise is usually implicit, and the contract has no
+premises field: those the principal wants checked are written into the
+goal.
+
+When the dispatch completes, under `run` or `resume` alike, the runner
+reads the final message once. The first line that begins with
+`PREMISE CONTRADICTED:`, past leading whitespace and the Markdown
+characters `*`, `_`, `>` and backtick, and has text after the marker is
+the claim; the first later `CHECK:` line with text is the check, or
+null when none follows; either marker may carry `*`, `_` or backtick
+before its colon, and a run of them after the colon is dropped as
+emphasis only where whitespace or the line's end follows it. Claim and
+check are capped at 1,000 characters and stored
+raw as `premise_report` in the evidence packet, so its digest anchors
+what the delegate wrote, and the dispatch's outcome record carries
+`"premise_reported": true`. Without a report neither key exists. The runner never runs the check: it is
+delegate-authored text, and running it outside the delegate's
+containment would hand the delegate the principal's authority.
+
+A report changes what you read, never a gate or the queue's ranking,
+and the review packet's whitelist keeps it from a blind reviewer. The
+queue adds a reason calling it an unverified claim and pointing to the
+brief, `status` prints a premise line under the task saying the same,
+and the brief, only from a packet whose digest verifies, prints the
+claim and check through the provider-text filter, with Unicode format
+characters such as U+202E shown first as `\u` escapes and a field at the
+1,000-character cap marked as possibly truncated, cites the packet, and
+labels them "delegate's claim, unverified; the runner has not run this
+command". Verify the claim with a command you have read and judged
+safe, which may be the reported one; an absent or truncated check is no
+evidence. A fact later tasks need is recorded in your own words with a
+command you chose, through `orrery-memory add` or `admit` and then
+`verify`, never copied from the report.
+
+A dispatch that commits nothing lands in `NO_CHANGE`, and the queue
+names only the exits that exist: after a passed verification,
+`close --accept-no-change` or `cancel`; after a failed one, `verify`
+again, which a pass makes closable, or `cancel`. Neither `run` nor
+`amend` accepts a `NO_CHANGE` task: reopening one would reuse the task
+worktree at its old commit and could revive an old park bound to the
+same digest. Re-planning a task is therefore `orrery-task cancel`
+followed by `create` with the revised contract, which gets a new
+worktree at the current target and a new digest.
+
+The queue and the brief check a `NO_CHANGE` or `VERIFICATION_FAILED`
+packet against the digest on the runner's record that wrote it, as they
+do a passed one, so an intact packet verifies, a no-change brief says
+"no change" under what changed, and an altered packet is reported
+unresolved. The check is for display: the merge gate makes its own and
+still requires a passed verification.
 
 ### Structured review
 
@@ -833,8 +907,9 @@ dispatch is admitted. The prompt is written once and those exact bytes
 are what the child receives, and the dispatch record names the fact
 identifiers, their digests and the prompt digest, so what a run was told
 is recoverable rather than inferred from a store that has since moved
-on. A repository with no memory store produces a byte-identical handoff
-to the one it produced before any of this existed.
+on. A repository with no memory store produces a handoff byte-identical
+to one whose store holds no current fact: memory adds its block only
+when it has a current fact to carry.
 
 ### Decisions and role history
 

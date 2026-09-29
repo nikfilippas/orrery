@@ -1081,8 +1081,18 @@ needs `--allow-dirty-baseline`; retrying an altered task worktree needs
 `--accept-changed-worktree`. These flags are forwarded only with explicit
 user consent.
 
-`NO_CHANGE` is a real outcome and needs `close --accept-no-change`. Changes
-outside scope remain visible in evidence and require
+`NO_CHANGE` is a real outcome: after a passed verification
+`close --accept-no-change` accepts it, after a failed one `verify` reruns the
+criteria, and `cancel` ends it either way. `run` and `amend` refuse it, so
+re-planning a task means `cancel`, then `create` with the revised contract.
+Every task handoff asks the delegate to check the premises its goal rests on,
+so write any you want checked into the goal; a delegate that finds one false
+changes nothing and opens its final message with `PREMISE CONTRADICTED:` and
+`CHECK:` lines. The runner records them in the evidence packet and never runs
+the check, and `queue`, the brief and `status` show them as an unverified
+claim to verify with a command you have judged safe.
+
+Changes outside scope remain visible in evidence and require
 `merge --accept-out-of-scope`. If a controller dies, `resume` completes a
 receipt-backed dispatch, marks a receiptless dead dispatch interrupted, and
 leaves a live one alone. Merge refuses the wrong target branch, a dirty or

@@ -297,8 +297,12 @@ def plan_review_context(rounds: int) -> str:
     return context + (
         "If the same blocking objection survives a revision, or a blocking "
         "objection cannot be cleared within the cap, stop before implementation "
-        "and ask the user to decide. Do not iterate merely to obtain agreement "
-        "or describe an unconfirmed plan as approved."
+        "and ask the user to decide. When a batch contradicts a premise of the "
+        "plan, a revision that changes the approach, a trust boundary, a "
+        "persisted format, or an acceptance criterion gets a round-one "
+        "challenge restricted to what changed, counted against the same cap; "
+        "when no round remains, ask the user. Do not iterate merely to obtain "
+        "agreement or describe an unconfirmed plan as approved."
     )
 
 

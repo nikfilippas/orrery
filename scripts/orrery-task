@@ -8,12 +8,14 @@ import fcntl
 import json
 import os
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -133,13 +135,26 @@ def role_data(role: object) -> dict:
     }
 
 
+# The two lines a delegate opens its final message with when the goal
+# rests on something false. The runner records them and never runs the
+# check: it is delegate-authored text, and running it outside the
+# delegate's containment would hand the delegate the principal's authority.
+PREMISE_MARKER = "PREMISE CONTRADICTED:"
+CHECK_MARKER = "CHECK:"
+PREMISE_TEXT_LIMIT = 1_000
+REPORT_LINE_LEAD = re.compile(r"[\s*_`>]*")
+REPORT_MARKER_COLON = re.compile(r"[*_`]*:(?:[*_`]+(?=\s|$))?")
+
+
 def handoff(contract: dict, facts: list[dict] | None = None) -> str:
     """The assignment a delegate is given.
 
-    Facts are appended only when the caller has already selected them
-    under the control lock. Absent them the text is byte-identical to
-    what it was before memory existed, which is what makes a repository
-    with no store behave exactly as it did.
+    Every assignment asks for the premise check, unconditionally, because
+    a goal's premise is usually implicit. Facts are appended only when the
+    caller has already selected them under the control lock; absent them,
+    or given none, the text carries no memory block, which is what makes
+    a repository with no store hand over exactly what one with an empty
+    store does.
     """
     scope = contract["scope"]
     criteria = "\n".join(
@@ -149,10 +164,52 @@ def handoff(contract: dict, facts: list[dict] | None = None) -> str:
     text = (
         f"Goal:\n{contract['goal']}\n\nInclude: {scope['include']}\nExclude: {scope['exclude']}\n"
         "Changes outside the include set, or within the exclude set, will be rejected at merge.\n\n"
-        f"Acceptance criteria:\n{criteria}\n\nDo not run git commit. Stop and report instead of improvising if judgement beyond the specification is required.\n"
+        f"Acceptance criteria:\n{criteria}\n\nDo not run git commit. Stop and report instead of improvising if judgement beyond the specification is required.\n\n"
+        "Before changing anything, check the premises the goal rests on. If one is false, change nothing and begin your final message with these two lines:\n"
+        f"{PREMISE_MARKER} <what is false>\n{CHECK_MARKER} <a command that shows it>\n"
     )
     block = orrery_memory.facts_block(facts or [])
     return f"{text}\n{block}\n" if block else text
+
+
+def report_field(line: str, marker: str) -> str:
+    """What follows `marker` on one report line, capped, or "" if nothing.
+
+    A model indents, quotes and emphasises freely. So the marker's words,
+    case-sensitive, may be preceded by any run of whitespace and the
+    Markdown characters `*`, `_`, backtick and `>`, and followed by any
+    run of `*`, `_` and backtick before the colon, as in `**CHECK**:`.
+    A run of those three directly after the colon is the marker's closing
+    emphasis, as in `**CHECK:**`, and is dropped only when whitespace or
+    the end of the line follows it, so CHECK:`cmd` keeps its backtick.
+    What remains is stripped of surrounding whitespace and capped at
+    PREMISE_TEXT_LIMIT characters.
+    """
+    bare = line[REPORT_LINE_LEAD.match(line).end():]
+    words = marker.removesuffix(":")
+    colon = REPORT_MARKER_COLON.match(bare, len(words)) if bare.startswith(words) else None
+    if colon is None:
+        return ""
+    return bare[colon.end():].strip()[:PREMISE_TEXT_LIMIT]
+
+
+def premise_report(message: str) -> dict | None:
+    """The first contradicted-premise report in a final message, or None.
+
+    The claim is the first marker line with something after it; the check
+    is the first such `CHECK:` line after the claim, or None. Both are
+    kept raw, so the evidence packet's digest anchors what the delegate
+    wrote, and every place they reach a terminal renders them inert.
+    """
+    lines = message.splitlines()
+    for index, line in enumerate(lines):
+        if claim := report_field(line, PREMISE_MARKER):
+            check = next(
+                (text for later in lines[index + 1:] if (text := report_field(later, CHECK_MARKER))),
+                None,
+            )
+            return {"claim": claim, "check": check}
+    return None
 
 
 def process_start_time(pid: int) -> int | None:
@@ -576,12 +633,21 @@ def complete_dispatch(
     else:
         commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
         next_state = "IMPLEMENTED" if commit != base else "NO_CHANGE"
+    # Read once, before the outcome is recorded, so a dispatch that
+    # `resume` completes records a report exactly as `run` would have.
+    worker_claim = (attempt / "result.txt").read_text()
+    report = premise_report(worker_claim)
     with control_lock(root) as locked:
         state = current(locked, task_id)[1]
         record = {"from": state, "to": next_state, "actor": "runner", "contract_digest": digest, "spend": spend}
         if next_state == "IMPLEMENTED":
             record["commit"] = commit
-        implemented = next((entry for entry in reversed(current(locked, task_id)[0]) if entry.get("commit") == commit), None)
+        if report:
+            record["premise_reported"] = True
+        # This dispatch's records only: a retry that changed nothing is
+        # still at the previous dispatch's commit, and that dispatch's
+        # outcome is not this one's.
+        implemented = next((entry for entry in reversed(current_dispatch_slice(current(locked, task_id)[0])[0]) if entry.get("commit") == commit), None)
         if next_state != "IMPLEMENTED" or implemented is None:
             append_record(locked, task_id, record)
     receipt = json.loads((attempt / "receipt.json").read_text())
@@ -599,7 +665,7 @@ def complete_dispatch(
         diff = {"files": files, "stat": git(worktree, "diff", "--stat", f"{base}..{commit}").stdout, "patch": rel(root, patch), "out_of_scope_algo": OUT_OF_SCOPE_ALGO}
     else:
         out = []
-    packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": attempt_entries(attempt, receipt), "diff": diff, "out_of_scope": out, "usage": spend, "worker_claim": (attempt / "result.txt").read_text()}
+    packet = {"v": 1, "task_id": task_id, "dispatch_seq": sequence, "contract_digest": digest, "role": role_data(role), "gate": gate, "base_head": base, "commit": commit, "no_change": next_state == "NO_CHANGE", "attempts": attempt_entries(attempt, receipt), "diff": diff, "out_of_scope": out, "usage": spend, "worker_claim": worker_claim, **({"premise_report": report} if report else {})}
     return verify(root, store, task_id, contract, sequence, worktree, base, commit, packet, next_state == "NO_CHANGE")
 
 
@@ -3049,22 +3115,31 @@ def current_dispatch_slice(records: list[dict]) -> tuple[list[dict], int | None]
 def verify_latest_evidence(root: Path, records: list[dict]) -> tuple[bool, str | None]:
     """Whether the task's latest evidence packet still matches its digest.
 
-    The same check the merge gate makes, so the queue and brief never
-    present a packet whose bytes no longer match what verification
-    recorded. Returns (ok, evidence_path); ok is True when no packet is
-    referenced yet, because there is then nothing to mistrust.
+    For display only, so the queue and brief never present a packet whose
+    bytes no longer match what the runner recorded. The digest is the one
+    on the newest record naming that same packet and carrying
+    `evidence_sha256`, whatever its state: a NO_CHANGE or
+    VERIFICATION_FAILED packet is checked as a passed one is, and a later
+    record naming the packet without a digest, such as MERGED, defers to
+    the record that has one. The merge gate does not call this; it makes
+    its own check and still requires VERIFICATION_PASSED. Returns (ok,
+    evidence_path); ok is True when no packet is referenced yet, because
+    there is then nothing to mistrust.
     """
     evidence = next((r.get("evidence") for r in reversed(records) if r.get("evidence")), None)
     if not evidence:
         return True, None
-    verified = next((r for r in reversed(records) if r.get("to") == "VERIFICATION_PASSED"), None)
-    if not verified or verified.get("evidence") != evidence:
+    recorded = next(
+        (r for r in reversed(records) if r.get("evidence") == evidence and r.get("evidence_sha256")),
+        None,
+    )
+    if recorded is None:
         return False, evidence
     try:
         actual = evidence_digest(root, evidence)
     except OSError:
         return False, evidence
-    return verified.get("evidence_sha256") == actual, evidence
+    return recorded["evidence_sha256"] == actual, evidence
 
 
 def queue_situation(root: Path, store: Path, task_id: str) -> dict | None:
@@ -3147,13 +3222,27 @@ def queue_situation(root: Path, store: Path, task_id: str) -> dict | None:
         "REVIEW_BLOCKED": "review blocked; resolve or rework",
         "VERIFICATION_FAILED": "verification failed; rework or cancel",
         "DISPATCH_FAILED": "dispatch failed; retry or cancel",
-        "NO_CHANGE": "the delegate changed nothing; close or re-dispatch",
+        # Neither `run` nor `amend` accepts a NO_CHANGE task, so the line
+        # names only the exits that exist, split by the test `close` makes.
+        "NO_CHANGE": (
+            "the delegate changed nothing; close with --accept-no-change, or cancel"
+            if records[-1].get("reason") == "verification-passed"
+            else "the delegate changed nothing and verification failed; "
+            "verify again, or cancel and create a revised task"
+        ),
         "IN_REVIEW": "awaiting review; run `orrery-task review`",
         "REVIEW_PASSED": "review passed; ready for merge",
         "AWAITING_MERGE": "awaiting the merge decision",
         "INTERRUPTED": "interrupted; resume or investigate",
         "READY": "stopped by a ceiling; amend the budget or override",
     }.get(state, state))
+    # Read from the ledger, never the packet, and never part of the key:
+    # a report changes what the principal reads, not where the task ranks.
+    if any(r.get("premise_reported") for r in slice_records):
+        reasons.append(
+            "the delegate reports a contradicted premise (unverified claim); "
+            "read the brief, and re-plan as a new task if it holds"
+        )
     if not evidence_ok:
         reasons.append("evidence unverified: its packet does not match the recorded digest")
 
@@ -3268,6 +3357,25 @@ def base_comparison(base_evidence: dict, packet: dict, criteria: list[str]) -> l
     return rows
 
 
+def premise_field(name: str, text: str) -> str:
+    """One field of a premise report as the brief prints it.
+
+    The provider-text filter keeps Unicode format characters, which can be
+    invisible, as U+200B is, or reorder what follows them, as U+202E does,
+    so each is first shown as a visible `\\uXXXX` escape, or `\\UXXXXXXXX`
+    above the Basic Multilingual Plane. A field whose stored length is the
+    parser's cap may have been cut there, and says so.
+    """
+    shown = "".join(
+        (f"\\u{ord(ch):04x}" if ord(ch) <= 0xFFFF else f"\\U{ord(ch):08x}")
+        if unicodedata.category(ch) == "Cf"
+        else ch
+        for ch in text
+    )
+    cut = f" (possibly truncated at {PREMISE_TEXT_LIMIT:,} characters)" if len(text) == PREMISE_TEXT_LIMIT else ""
+    return f"    {name}{cut}: {orrery_findings.sanitise_provider_text(shown)}"
+
+
 def queue_brief(root: Path, store: Path, task_id: str) -> int:
     """One task's evidence summary, every element citing its artefact.
 
@@ -3330,6 +3438,8 @@ def queue_brief(root: Path, store: Path, task_id: str) -> int:
             print(f"      {entry.get('status', '?'):3} {inert(str(entry.get('path', '?')))}")
         if packet["diff"].get("out_of_scope_algo") != OUT_OF_SCOPE_ALGO:
             print("      (packet predates the shared out-of-scope computation; recomputed below)")
+    elif packet and packet.get("no_change"):
+        print(f"    no change [from {evidence}]")
     else:
         print("    not recorded" if evidence_ok else "    packet unavailable (digest mismatch)")
 
@@ -3340,6 +3450,17 @@ def queue_brief(root: Path, store: Path, task_id: str) -> int:
         out = out_of_scope_paths(root, base, commit, contract["scope"])
         shown = ", ".join(inert(path) for path in out) if out else "none"
         print(f"    out of scope, recomputed authoritatively: {shown}")
+
+    # Only from a packet whose digest verified, so an altered packet shows
+    # no premise text at all. Both fields are the delegate's own words and
+    # the check is shown, never run.
+    report = (packet or {}).get("premise_report")
+    if isinstance(report, dict):
+        check = report.get("check")
+        print("\n  premise report")
+        print(f"    delegate's claim, unverified; the runner has not run this command [from {evidence}]")
+        print(premise_field("claim", str(report.get("claim", ""))))
+        print(premise_field("check", check) if isinstance(check, str) else "    check: none given")
 
     print("\n  verification")
     if packet and packet.get("verification"):
@@ -3621,6 +3742,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(
                             f"  waiver: {task_id} declares high risk and "
                             "declines independent review"
+                        )
+                    if any(r.get("premise_reported") for r in current_dispatch_slice(records)[0]):
+                        print(
+                            "  premise: the delegate reports a contradicted premise "
+                            f"(unverified); see `orrery-task queue {task_id}`"
                         )
                 active = active_dispatches(store)
                 cap = concurrency_cap(root)

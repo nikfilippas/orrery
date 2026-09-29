@@ -162,6 +162,8 @@ match was not verified.
 An explicit role handoff overrides that default. A non-principal session:
 
 - performs only its bounded assignment,
+- stops and reports, rather than works around, a premise of its assignment
+  that proves false,
 - obeys the access mode in the handoff,
 - does not delegate or spawn another agent,
 - does not re-enter the orchestration workflow, and
@@ -205,7 +207,10 @@ Make a concise plan. Delegate the bounded implementation to
 `orrery-agent --role implementer`. Inspect the actual diff, correct
 small integration issues, and run relevant tests, lint, types, and builds.
 Request a fresh final review when meaningful logic or regression risk warrants
-it.
+it. When a worker reports a contradicted premise, read its check and verify
+the claim with a command you have judged safe before believing it; if it
+holds, re-plan rather than re-dispatch the same task, and reclassify when the
+evidence shows the scope or risk was wrong.
 
 The principal plans, inspects every diff, runs verification and owns the
 outcome; it does not write the implementation itself. That is not a
@@ -227,7 +232,13 @@ every batch and its real diff, run the complete relevant verification suite,
 and use a fresh final-review session. The standard route's rule on not
 writing the implementation applies here too, and more strongly: a batch
 the principal wrote is a batch no independent context ever read. Verify every finding before changing
-code, then rerun affected checks.
+code, then rerun affected checks. When a batch's evidence contradicts a
+premise of the reviewed plan, stop and revise the plan, recording the
+deviation and its evidence. A revision that changes the approach, a trust
+boundary, a persisted format, or an acceptance criterion gets a round-one
+challenge restricted to what changed, counted against the same round cap, and
+goes to the user when no round remains. Give the final reviewer every recorded
+deviation.
 
 ##### Bounded plan review
 
@@ -269,6 +280,8 @@ final reviewer.
 When delegating:
 
 - include the task, constraints, acceptance criteria, and relevant paths;
+- state the premises the plan rests on, each with the check that would show
+  it false, and ask the worker to run those checks first;
 - pass only the task-specific delta, not instructions the CLI discovers;
 - keep implementation and review contexts separate;
 - point to repository files instead of pasting large files;
