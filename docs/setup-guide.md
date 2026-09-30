@@ -1363,7 +1363,9 @@ touches either surface, smoke it by hand:
 provider CLI installed elsewhere than the one Orrery dispatches, a
 configured thinking level the installed CLI no longer offers for that
 model, a live model the bundled fallback has never heard of, and a
-principal that has no automatic fallback ladder.
+principal that has no automatic fallback ladder. The first is also said
+on the configuration page itself, since that is where a missing model
+is noticed.
 
 The first matters more than it looks. Each provider serves its model
 catalogue per client version, so an out-of-date CLI is told about fewer
@@ -1435,7 +1437,7 @@ The maintained artefacts are:
 - `docs/technical-overview.md` — the full technical account behind the
   README: positioning and terminology, roles and budgets, containment,
   runtime commands, the task control plane, fallback consent, caching,
-  verification, and the benchmark programme. The README stays the short
+  verification, and why no performance claim is made. The README stays the short
   overview; deep sections live here rather than growing it.
 - `scripts/orrery_stall.py` — stdlib-only provider event signatures and
   conservative trajectory stall rules used by the review wrapper.

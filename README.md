@@ -43,6 +43,11 @@ single-provider session and says so.
   implementer may answer one but never close it, and a task cannot merge
   while a blocking finding is unresolved, including after rework and a
   later clean review.
+- **Workers stop on a false premise.** Every handoff names the premises
+  its plan rests on, each with the check that would show it false. The
+  worker runs those checks first and reports a contradicted premise
+  rather than working around it; the principal verifies the report and
+  revises the plan instead of sending the same task out again.
 - **Parallel work, integrated on evidence.** Independent tasks run in
   isolated worktrees and merge only through a gate that re-runs the union
   of the acceptance checks of the tasks integrating together, so tasks in
@@ -53,7 +58,9 @@ single-provider session and says so.
 - **Enforced containment, not promised containment.** Read-only roles
   run inside a service unit whose workspace mapping is enforced by the
   kernel and probed before every run; where the guarantee cannot be
-  established the run is refused, with one named escape hatch.
+  established the run is refused, with one named escape hatch. It
+  governs what a delegate can write, not everything a deliberately
+  hostile one could reach, and the setup guide states what remains.
 - **Authority that never escalates.** A delegate holds exactly the
   toolset and access mode its role grants, denied by default and
   enforced outside the model, and a delegate cannot delegate: the
@@ -77,15 +84,15 @@ single-provider session and says so.
   parks the stopped work instead and re-dispatches it when the
   provider's stated limit resets, offline, under a spend ceiling, with
   the merge gate still yours.
-- **New models arrive on their own, and the doctor says when they have
-  not.** The configuration page lists what the installed CLIs actually
-  offer, discovered afresh on every run, so a newly shipped model is
-  selectable without editing anything. Each provider serves that
-  catalogue *per client version*, so a stale binary is told about fewer
-  models however often it refreshes, which is how a flagship release
-  goes unnoticed while everything looks healthy. `orrery-doctor`
-  therefore reports a newer CLI installed elsewhere than the one being
-  dispatched, a thinking level withdrawn since a role was configured, a
+- **New models arrive on their own.** The configuration page lists what
+  the installed CLIs actually offer, discovered afresh every time it
+  opens, so a newly shipped model is selectable as soon as its CLI is
+  updated, without editing anything. Each provider serves that catalogue
+  *per client version*, so a stale binary is told about fewer models
+  however often it refreshes; when a newer copy of a CLI is installed
+  elsewhere, such as an editor extension that updates itself, the page
+  names it and the command that brings Orrery's level. `orrery-doctor`
+  also reports a thinking level withdrawn since a role was configured, a
   live model the offline fallback has never heard of, and a principal
   left with no automatic fallback ladder.
 - **Every model is named by its version, never guessed.** `opus` meant
@@ -110,7 +117,7 @@ single-provider session and says so.
 
 <p align="center">
   <img src="flowchart.svg" width="100%"
-       alt="How a request flows: classify once, then one of five routes - read-only investigation, the principal implementing directly, a mechanical worker, an implementation worker, or a bounded plan-review loop. Worker edits are inspected as a real diff, verified, and where warranted put through a fresh final review before completion.">
+       alt="How a request flows: classify once, then one of five routes - read-only investigation, the principal implementing directly, a mechanical worker, an implementation worker, or a bounded plan-review loop. Worker edits are inspected as a real diff; a contradicted premise sends the work back to the plan, and otherwise it is verified and, where warranted, put through a fresh final review before completion.">
 </p>
 
 | Class | Typical request | Route |
@@ -188,7 +195,7 @@ provider has crossed its allowance.
 
 Órrery advertises no speed multipliers and no token-saving
 percentages. What it claims is what its test suite enforces: a
-deterministic 400-plus-test regression suite that spends no model
+deterministic 550-plus-test regression suite that spends no model
 credits, lint and suite on CI for every push, a doctor that validates
 the installation, kernel-level probes before every read-only delegated
 run, non-escalating delegation (a role's toolset is closed and denied
@@ -196,9 +203,9 @@ by default, and a delegate that is asked to orchestrate stands down),
 honest degradation messages where a guarantee cannot hold, local
 token-usage and incident accounting (`orrery-usage`, `orrery-incidents`),
 and a memory whose every fact carries the command that re-checks it
-(`orrery-memory`). Performance and cost effects are the subject of a
-dedicated with/without benchmark programme, published with unfavourable
-numbers included; see the technical overview.
+(`orrery-memory`). It makes no claim about speed, cost or quality: a
+with/without benchmark was built to test such a claim and retired
+unrun, because none is made. The technical overview says why.
 
 ## Learn more
 
@@ -206,8 +213,8 @@ numbers included; see the technical overview.
   in detail: positioning and terminology, including a dated
   nearest-neighbour comparison with the other harnesses in the field,
   roles and budgets, containment, runtime commands, the task control
-  plane, fallback and consent, caching, verification, and the
-  benchmark programme.
+  plane, fallback and consent, caching, verification, and why no
+  performance claim is made.
 - **[Setup guide](docs/setup-guide.md)**: operation and maintenance.
 - **[Configuration page demo](https://nikfilippas.github.io/orrery/config-demo.html)**.
 

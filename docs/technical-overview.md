@@ -1335,31 +1335,18 @@ every push and pull request.
 
 The test suite proves the tool's code behaves; it cannot prove the tool
 helps. That second question needs a with/without measurement, and the
-category's record there is poor (see the evidence problem above). The
-Orchestration Delta Benchmark is Órrery's answer, currently a
-specification and self-tested reference harness, with the first live
-runs pending:
+category's record there is poor (see the evidence problem above).
 
-- **Paired arms.** The same pinned model and CLI run the same tasks in
-  an unadopted workspace (baseline) and an adopted one (treatment);
-  headline numbers are per-task deltas with confidence intervals, never
-  lone percentages.
-- **Metered truth.** Tokens and cost are read from the CLI's structured
-  output and cross-checked at an API-side meter; a tool's self-reported
-  savings are never used. The four token classes (input, output, cache
-  write, cache read) are priced separately from a pinned table.
-- **Beyond pass/fail.** Hidden dual test sets score outcomes; static
-  and structural deltas score quality; seeded-defect review tasks score
-  the review pipeline; probes score process discipline (leftover
-  processes, out-of-workspace writes, secret leakage, honeypot pushes,
-  instruction fidelity); repeated runs score reliability as pass^k.
-- **The unwelcome answer is allowed.** The standing policy costs
-  context on every session; the benchmark measures whether the quality
-  delta pays for that overhead, and the resulting card is published
-  either way.
-
-Until those cards exist, Órrery makes no speed or cost claims, and no
-number on this page should be read as one.
+Órrery makes no speed, cost or quality claim, so there is nothing for a
+benchmark to test. One was built in case there would be: the
+Orchestration Delta Benchmark, a specification and self-tested reference
+harness with paired arms at a pinned model and CLI, tokens metered by
+class and cross-checked at an API-side meter, hidden dual test sets,
+seeded-defect review tasks, process probes and pass^k reliability. With
+no claim to test, it was retired on 29 September 2026 without a live
+run. A claim of that kind would need such a measurement first, published
+whatever it showed; until then no number on this page should be read as
+one.
 
 ## Repository layout
 
