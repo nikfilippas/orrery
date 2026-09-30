@@ -1116,7 +1116,9 @@ orrery-pickup park T-3 --priority 1   # inside the adopted repository
 orrery-pickup list
 orrery-pickup run                     # what the timer fires; also manual
 orrery-pickup revoke --all
-``` A park is an operator command
+```
+
+A park is an operator command
 that binds the task to its sealed contract digest, its full role
 fingerprint, and a repository-instance nonce written into the control
 store; the executor re-derives all three at fire time and refuses any

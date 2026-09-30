@@ -21348,6 +21348,14 @@ def test_incidents_cli() -> None:
 def test_doctor_incidents() -> None:
     with until_store_only() as state_dir:
         environment = review_environment("success", standing_state=state_dir)
+        # A delegated run's spend record is accounting, not an incident:
+        # a store holding only that must still read as quiet.
+        incidents_module._warned = False
+        incidents_module.record(
+            "spend",
+            program="orrery-agent",
+            detail="routine accounting",
+        )
         quiet = subprocess.run(
             ["bash", str(DOCTOR_SCRIPT)],
             env=environment,

@@ -1274,7 +1274,11 @@ sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
 from orrery_incidents import read_events
 
 since = datetime.now(timezone.utc) - timedelta(days=7)
-events = read_events(since=since)
+# Every delegated run writes one `spend` record as accounting, not as an
+# incident; counted here it would keep this warning on for good.
+events = [
+    event for event in read_events(since=since) if event.get("kind") != "spend"
+]
 if events:
     kinds: dict[str, int] = {}
     for event in events:
