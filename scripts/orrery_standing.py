@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -80,7 +81,8 @@ def until_store_path() -> Path:
 
 
 def session_scope_available() -> bool:
-    return session_store_path() is not None
+    path = session_store_path()
+    return path is not None and not _skipped(path)
 
 
 def available_scopes(reset_time: datetime | None) -> list[str]:
@@ -88,7 +90,7 @@ def available_scopes(reset_time: datetime | None) -> list[str]:
     scopes = [RUN_SCOPE]
     if session_scope_available():
         scopes.append(SESSION_SCOPE)
-    if reset_time is not None:
+    if reset_time is not None and not _skipped(until_store_path()):
         scopes.append(UNTIL_SCOPE)
     return scopes
 
@@ -108,9 +110,9 @@ def parse_approval_scope(value: str) -> tuple[str, float | None]:
     if value == SESSION_SCOPE:
         if not session_scope_available():
             raise RuntimeConfigError(
-                "--approval-scope session requires a login-session runtime "
-                "directory (XDG_RUNTIME_DIR); use run, or set a standing "
-                "until approval at the interactive menu"
+                "--approval-scope session requires a usable login-session "
+                "runtime directory (XDG_RUNTIME_DIR); use run, or set a "
+                "standing until approval at the interactive menu"
             )
         return SESSION_SCOPE, None
     if value == UNTIL_SCOPE:
@@ -156,18 +158,104 @@ def _fingerprint(role: Role) -> list[str | None]:
     ]
 
 
+# Each skipped store is announced once per process, not once per consult.
+_announced_skips: set[tuple[str, str]] = set()
+
+
+def _file_problem(details: os.stat_result) -> str | None:
+    """Why a store or lock file cannot be trusted, from its own metadata."""
+    if stat.S_ISLNK(details.st_mode):
+        return "symlinked"
+    if not stat.S_ISREG(details.st_mode):
+        return "non-regular"
+    if details.st_uid != os.getuid():
+        return "foreign-owned"
+    if details.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return "group- or world-writable"
+    return None
+
+
+def _insecure_reason(path: Path) -> str | None:
+    """Why the store at `path` sits in an insecure location, or None.
+
+    Insecure means a symlink anywhere on the way to the store's
+    directory, or a store or lock that is a symlink, not a regular file,
+    another user's, or group- or world-writable. Ancestors are judged for
+    symlinks alone, not for owner or mode, so a runtime directory under
+    /tmp stays usable. This check and the opens after it are separate
+    calls, so it is hardening rather than a race-free boundary; the
+    no-follow opens and the check on the open store hold for the final
+    component.
+    """
+    directory = path.parent.absolute()
+    current = Path(directory.anchor)
+    try:
+        for part in directory.parts[1:]:
+            current /= part
+            try:
+                mode = os.lstat(current).st_mode
+            except FileNotFoundError:
+                # Nothing exists below a missing component; the first
+                # write creates it fresh.
+                return None
+            if stat.S_ISLNK(mode):
+                return f"symlinked path component {current}"
+        # The cross-store lock lives beside the until store only.
+        for name in (path.name, LOCK_NAME, GLOBAL_LOCK_NAME):
+            try:
+                details = os.lstat(directory / name)
+            except FileNotFoundError:
+                continue
+            problem = _file_problem(details)
+            if problem is not None:
+                return f"{problem} {directory / name}"
+    except OSError as exc:
+        return f"its location could not be inspected: {exc}"
+    return None
+
+
+def _announce_skip(path: Path, reason: str) -> None:
+    if (str(path), reason) in _announced_skips:
+        return
+    _announced_skips.add((str(path), reason))
+    print(
+        f"orrery: skipping the standing-approval store at {path} "
+        f"({reason}); it is treated as empty and never written.",
+        file=sys.stderr,
+    )
+
+
+def _skipped(path: Path) -> bool:
+    """Whether to leave the store at `path` alone, saying so once.
+
+    An insecure store degrades as a broken one does: it is treated as
+    empty, never honoured and never written, and the launch or dispatch
+    that consulted it carries on without it.
+    """
+    reason = _insecure_reason(path)
+    if reason is None:
+        return False
+    _announce_skip(path, reason)
+    return True
+
+
 @contextlib.contextmanager
 def _locked_store(path: Path) -> Iterator[None]:
     """Hold the sibling lock for a whole read-modify-replace.
 
     The lock file is created once and never replaced, so every writer
     serialises on the same inode; replacing the data file while the lock
-    is held cannot lose a concurrent writer's view.
+    is held cannot lose a concurrent writer's view. Callers check the
+    location first; the lock is still opened without following a
+    symlink, so one swapped in since fails the open rather than creating
+    or locking whatever it names.
     """
     directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
-    descriptor = os.open(directory / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = os.open(
+        directory / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600
+    )
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -177,20 +265,37 @@ def _locked_store(path: Path) -> Iterator[None]:
 
 
 def _read_records(path: Path) -> list[dict[str, Any]]:
+    """The store's valid records; an absent store has none.
+
+    Opened without following a symlink or blocking on a FIFO, then
+    checked on the open descriptor, so the file parsed is the file
+    checked. A store that exists but cannot be read that way raises
+    OSError rather than reading as empty, so no caller rewrites it.
+    """
     try:
-        data = json.loads(path.read_text())
-    except OSError:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
         return []
-    except json.JSONDecodeError:
+    with os.fdopen(descriptor, "rb") as handle:
+        problem = _file_problem(os.fstat(handle.fileno()))
+        if problem is not None:
+            raise OSError(f"refusing {problem} standing-approval store {path}")
+        raw = handle.read()
+    try:
+        data = json.loads(raw)
+        approvals = data.get("approvals") if isinstance(data, dict) else None
+        if not isinstance(approvals, list):
+            return []
+        validated = [_valid_record(entry) for entry in approvals]
+    except (ValueError, RecursionError):
+        # Undecodable bytes, malformed JSON, and nesting too deep to
+        # parse: none may raise out of a consult that never needed the
+        # store to exist.
         print(
             f"orrery: ignoring an unreadable standing-approval store: {path}",
             file=sys.stderr,
         )
         return []
-    approvals = data.get("approvals") if isinstance(data, dict) else None
-    if not isinstance(approvals, list):
-        return []
-    validated = (_valid_record(entry) for entry in approvals)
     return [record for record in validated if record is not None]
 
 
@@ -200,12 +305,17 @@ def _valid_record(entry: Any) -> dict[str, Any] | None:
     fingerprint = entry.get("fingerprint")
     thinking = entry.get("candidate_thinking")
     expires_at = entry.get("expires_at")
+    # Each membership test is guarded by a type check first: an unhashable
+    # value hand-edited into a field would otherwise raise, not fail.
     if not (
         isinstance(entry.get("role_id"), str)
+        and isinstance(entry.get("failed_provider"), str)
         and entry.get("failed_provider") in PROVIDERS
         and isinstance(entry.get("failed_model"), str)
         and MODEL_ID.fullmatch(entry.get("failed_model", ""))
+        and isinstance(entry.get("failure_scope"), str)
         and entry.get("failure_scope") in _FAILURE_SCOPES
+        and isinstance(entry.get("candidate_provider"), str)
         and entry.get("candidate_provider") in PROVIDERS
         and isinstance(entry.get("candidate_model"), str)
         and MODEL_ID.fullmatch(entry.get("candidate_model", ""))
@@ -214,6 +324,7 @@ def _valid_record(entry: Any) -> dict[str, Any] | None:
             or isinstance(thinking, str)
             and THINKING_LEVEL.fullmatch(thinking)
         )
+        and isinstance(entry.get("scope"), str)
         and entry.get("scope") in {SESSION_SCOPE, UNTIL_SCOPE}
         and (
             expires_at is None
@@ -287,7 +398,11 @@ def record_approval(
     failure_scope: str,
     _test_hook: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Persist one standing approval, replacing any older one for the role."""
+    """Persist one standing approval, replacing any older one for the role.
+
+    A store in an insecure location is declined, with the reason, rather
+    than written.
+    """
     if scope == UNTIL_SCOPE and expires_at is None:
         raise RuntimeConfigError(
             "an until-scope approval requires its reset time"
@@ -318,6 +433,11 @@ def record_approval(
         "identity_ranked": True,
     }
     path = _store_for_scope(scope)
+    problem = _insecure_reason(path)
+    if problem is not None:
+        raise RuntimeConfigError(
+            f"the standing-approval store at {path} is skipped: {problem}"
+        )
     with _locked_all_stores():
         with _locked_store(path):
             records = _read_records(path)
@@ -342,11 +462,24 @@ def _candidate_paths() -> list[Path]:
 
 @contextlib.contextmanager
 def _locked_all_stores() -> Iterator[None]:
-    """Serialise approval writes with a whole cross-store revocation."""
-    directory = until_store_path().parent
+    """Serialise approval writes with a whole cross-store revocation.
+
+    The lock lives beside the until store. A skipped until store is never
+    written, which leaves the session store alone behind its own lock, so
+    nothing is opened in a location that failed the check.
+    """
+    path = until_store_path()
+    if _skipped(path):
+        yield
+        return
+    directory = path.parent
     directory.mkdir(parents=True, exist_ok=True)
     os.chmod(directory, 0o700)
-    descriptor = os.open(directory / GLOBAL_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = os.open(
+        directory / GLOBAL_LOCK_NAME,
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+        0o600,
+    )
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -366,6 +499,8 @@ def match(configured: Role) -> dict[str, Any] | None:
     """
     now = time.time()
     for path in _candidate_paths():
+        if _skipped(path):
+            continue
         found: dict[str, Any] | None = None
         try:
             with _locked_store(path):
@@ -444,25 +579,94 @@ def list_active(now: float | None = None) -> list[dict[str, Any]]:
     moment = time.time() if now is None else now
     active: list[dict[str, Any]] = []
     for path in _candidate_paths():
-        for record in _read_records(path):
+        if _skipped(path):
+            continue
+        try:
+            records = _read_records(path)
+        except OSError as exc:
+            _announce_skip(path, str(exc))
+            continue
+        for record in records:
             if not _expired(record, moment):
                 active.append(record)
     return active
 
 
+class RevocationIncomplete(OSError):
+    """A revocation that left at least one store uncleared.
+
+    Raised only once every candidate store has been attempted, carrying
+    the records that were removed and each store left behind with its
+    reason.
+    """
+
+    def __init__(
+        self,
+        removed: list[dict[str, Any]],
+        failures: list[tuple[Path, str]],
+    ) -> None:
+        super().__init__(
+            "; ".join(
+                f"the standing-approval store at {path} was not cleared "
+                f"({reason})"
+                for path, reason in failures
+            )
+        )
+        self.removed = removed
+        self.failures = failures
+
+
+def _data_present(path: Path) -> bool:
+    """Whether a store's data file is at `path`, counting unknown as yes."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        # A location that cannot be inspected may still hold approvals.
+        pass
+    return True
+
+
 def revoke_all(
     _test_hook: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
+    """Clear every candidate store, each independently of the others.
+
+    A store whose data file could not be cleared, because the store is
+    skipped or could not be locked, read or rewritten, is collected with
+    its reason rather than stopping the rest, and `RevocationIncomplete`
+    then reports all of them with the records that were removed. A store
+    with no data file holds nothing to clear.
+    """
     removed: list[dict[str, Any]] = []
-    with _locked_all_stores():
+    failures: list[tuple[Path, str]] = []
+    with contextlib.ExitStack() as stack:
+        with contextlib.suppress(OSError):
+            # Each store is still cleared under its own lock without
+            # this one, so an approval written meanwhile is either
+            # revoked or kept whole.
+            stack.enter_context(_locked_all_stores())
         for path in _candidate_paths():
-            with _locked_store(path):
-                records = _read_records(path)
-                if _test_hook is not None:
-                    _test_hook()
-                if records:
-                    removed.extend(records)
-                    _write_records(path, [])
+            reason = _insecure_reason(path)
+            if reason is not None:
+                _announce_skip(path, reason)
+                if _data_present(path):
+                    failures.append((path, f"skipped: {reason}"))
+                continue
+            try:
+                with _locked_store(path):
+                    records = _read_records(path)
+                    if _test_hook is not None:
+                        _test_hook()
+                    if records:
+                        _write_records(path, [])
+                        removed.extend(records)
+            except OSError as exc:
+                if _data_present(path):
+                    failures.append((path, str(exc)))
+    if failures:
+        raise RevocationIncomplete(removed, failures)
     return removed
 
 

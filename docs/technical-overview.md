@@ -1222,12 +1222,14 @@ private prompt, settings, log, and result state.
 
 Accepted residual: delegate confinement closes what a hostile
 repository can write, not what it can read. With the provider CLI
-sandbox disabled and no hook-suppression flag, repository hooks running
-inside a delegate can read the provider credentials that `HOME` and
-`CODEX_HOME` expose and exfiltrate them over an unconfined network.
-Closing it needs upstream hook suppression or unit-level egress
-control, both currently unavailable. Delegate confinement is not
-complete while this remains.
+sandbox disabled and no hook suppression applied, repository hooks
+running inside a delegate can read the provider credentials that `HOME`
+and `CODEX_HOME` expose and exfiltrate them over an unconfined network.
+Current CLIs do provide hook controls (Claude Code's `disableAllHooks`
+setting, Codex's hook trust), but Orrery does not yet apply them to
+delegates. Closing it needs those applied, or unit-level egress control,
+which is currently unavailable. Delegate confinement is not complete
+while this remains.
 
 Pre-existing user processes and data are never guessed about or
 removed. Codex-principal sessions still follow the same cleanup policy

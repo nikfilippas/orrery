@@ -38,6 +38,7 @@ from orrery_runtime import (  # noqa: E402
 )
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
+    RevocationIncomplete,
     candidate_role,
     describe,
     failed_model_refusal,
@@ -314,8 +315,11 @@ def main() -> int:
         return 2
 
     if invocation.revoke:
+        failures: list[tuple[Path, str]] = []
         try:
             removed = revoke_all()
+        except RevocationIncomplete as exc:
+            removed, failures = exc.removed, exc.failures
         except OSError as exc:
             print(
                 "orrery: the standing-approval store could not be "
@@ -323,13 +327,22 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        if removed:
-            for record in removed:
-                print(
-                    "revoked standing fallback · "
-                    + describe(record, cached_name)
-                )
-        else:
+        for record in removed:
+            print(
+                "revoked standing fallback · "
+                + describe(record, cached_name)
+            )
+        # A store left uncleared may still hold approvals, so the
+        # revocation fails rather than reporting that there are none.
+        for path, reason in failures:
+            print(
+                f"orrery: the standing-approval store at {path} was not "
+                f"cleared ({reason}).",
+                file=sys.stderr,
+            )
+        if failures:
+            return 1
+        if not removed:
             print("No standing fallback approvals.")
         return 0
 

@@ -13,6 +13,7 @@ import ast
 import contextlib
 import copy
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -13397,6 +13398,10 @@ def test_standing_corruption_and_revoke() -> None:
         until_store = state_dir / "orrery" / "standing.json"
         until_store.parent.mkdir(parents=True)
         until_store.write_text("{not json")
+        # The mode every write gives the store: under a permissive umask
+        # a plain write is group-writable, which is skipped as insecure
+        # before the corruption this exercises is ever read.
+        until_store.chmod(0o600)
         errors = io.StringIO()
         with contextlib.redirect_stderr(errors):
             require(
@@ -13536,6 +13541,385 @@ def test_standing_lock_interleaving() -> None:
         require(
             final == [] and len(revoked[0]) == 1,
             "the revoked store was resurrected or the record was lost",
+        )
+
+
+def tree_snapshot(path: Path) -> dict[str, tuple[int, bytes]] | None:
+    """Every mode and byte at or under `path`, or None where nothing is."""
+    if not os.path.lexists(path):
+        return None
+    entries = [path, *sorted(path.rglob("*"))] if path.is_dir() else [path]
+    return {
+        str(entry.relative_to(path)): (
+            entry.lstat().st_mode,
+            entry.read_bytes() if entry.is_file() else b"",
+        )
+        for entry in entries
+    }
+
+
+@test("an insecure standing store is skipped with one warning and never written")
+def test_standing_insecure_store_skipped() -> None:
+    configured = runtime_module.load_role("reviewer")
+    candidate = standing_candidate(configured)
+
+    def record(scope: str) -> None:
+        standing_module.record_approval(
+            configured=configured,
+            candidate=candidate,
+            scope=scope,
+            expires_at=time.time() + 3600 if scope == "until" else None,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+
+    for scope, planted in (
+        ("until", "store"),
+        ("until", "lock"),
+        ("until", "cross-store lock"),
+        ("until", "component"),
+        ("session", "component"),
+    ):
+        label = f"{scope} {planted}"
+        other = "session" if scope == "until" else "until"
+        with standing_stores() as (runtime_dir, state_dir):
+            base = state_dir if scope == "until" else runtime_dir
+            directory = base / "orrery"
+            record(scope)
+            require(
+                standing_module.match(configured) is not None,
+                f"{label}: a trusted store did not round-trip",
+            )
+            # Each plant leaves the live approval readable, behind the
+            # link or beside it, so honouring it would be observable.
+            if planted == "store":
+                link, target = directory / "standing.json", base / "elsewhere.json"
+                link.rename(target)
+            elif planted.endswith("lock"):
+                # Dangling, so a lock opened through it would create it.
+                name = "standing.lock" if planted == "lock" else "standing-all.lock"
+                link, target = directory / name, base / "lock-target"
+                link.unlink()
+            else:
+                link, target = directory, base / "elsewhere"
+                link.rename(target)
+                # Absent, so a cross-store lock opened through the link
+                # would appear in the target.
+                (target / "standing-all.lock").unlink(missing_ok=True)
+            link.symlink_to(target)
+            before = tree_snapshot(target)
+
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                matched = standing_module.match(configured)
+                active = standing_module.list_active()
+                state = review_module.DelegationState(
+                    configured=configured, role=configured
+                )
+                adopted = review_module.adopt_standing_approval(state)
+                try:
+                    record(scope)
+                except runtime_module.RuntimeConfigError as exc:
+                    refusal = str(exc)
+                else:
+                    refusal = ""
+                record(other)
+                try:
+                    revoked = standing_module.revoke_all()
+                except standing_module.RevocationIncomplete as exc:
+                    revoked, uncleared = exc.removed, exc.failures
+                else:
+                    uncleared = []
+                session_usable = standing_module.session_scope_available()
+                offered = standing_module.available_scopes(
+                    datetime.now(timezone.utc) + timedelta(hours=1)
+                )
+            text = errors.getvalue()
+            require(
+                matched is None
+                and active == []
+                and adopted is None
+                and state.role is configured
+                and not state.is_fallback,
+                f"{label}: a skipped store was honoured: {matched} {active}",
+            )
+            require(
+                "is skipped: symlinked" in refusal,
+                f"{label}: a write to a skipped store was not declined: "
+                f"{refusal!r}",
+            )
+            require(
+                [entry["scope"] for entry in revoked] == [other],
+                f"{label}: revocation reached the skipped store or missed "
+                f"the other one: {revoked}",
+            )
+            # It still holds the hidden approval, so revocation reports it
+            # as not cleared rather than passing over it.
+            require(
+                [path for path, _reason in uncleared]
+                == [directory / "standing.json"]
+                and uncleared[0][1].startswith("skipped: symlinked"),
+                f"{label}: the skipped store was not reported as uncleared: "
+                f"{uncleared}",
+            )
+            require(
+                session_usable is (scope != "session"),
+                f"{label}: the session scope reported {session_usable}",
+            )
+            require(
+                offered
+                == (["run", "session"] if scope == "until" else ["run", "until"]),
+                f"{label}: a skipped store's scope was offered: {offered}",
+            )
+            require(
+                text.count("skipping the standing-approval store") == 1
+                and "symlinked" in text
+                and "unusable" not in text,
+                f"{label}: the skip was not announced exactly once, by the "
+                f"location check: {text!r}",
+            )
+            require(
+                link.is_symlink() and tree_snapshot(target) == before,
+                f"{label}: something was written through the link",
+            )
+            if scope == "session":
+                try:
+                    standing_module.parse_approval_scope("session")
+                except runtime_module.RuntimeConfigError:
+                    pass
+                else:
+                    raise Failure(
+                        "the session scope parsed over a skipped session store"
+                    )
+
+            # Taking the plant away restores the store it hid, untouched.
+            link.unlink()
+            if not planted.endswith("lock"):
+                target.rename(link)
+            found = standing_module.match(configured)
+            require(
+                found is not None and found["scope"] == scope,
+                f"{label}: the restored store did not round-trip: {found}",
+            )
+
+
+@test("a standing store swapped after its check is refused at the open")
+def test_standing_no_follow_opens() -> None:
+    configured = runtime_module.load_role("reviewer")
+
+    def record() -> None:
+        standing_module.record_approval(
+            configured=configured,
+            candidate=standing_candidate(configured),
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+
+    saved_check = standing_module._insecure_reason
+    with standing_stores() as (_runtime_dir, state_dir):
+        os.environ.pop("XDG_RUNTIME_DIR")
+        record()
+        directory = state_dir / "orrery"
+        store = directory / "standing.json"
+        try:
+            # As if every plant below landed between the location check
+            # and the open that follows it.
+            standing_module._insecure_reason = lambda _path: None
+
+            live = state_dir / "live.json"
+            store.rename(live)
+            store.symlink_to(live)
+            before = live.read_bytes()
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                matched = standing_module.match(configured)
+                active = standing_module.list_active()
+            require(
+                matched is None
+                and active == []
+                and "unusable" in errors.getvalue(),
+                f"a symlinked store was read through: {matched} {active} "
+                f"{errors.getvalue()!r}",
+            )
+            require(
+                store.is_symlink() and live.read_bytes() == before,
+                "the symlinked store was written through",
+            )
+            store.unlink()
+            live.rename(store)
+
+            for name in ("standing.lock", "standing-all.lock"):
+                lock = directory / name
+                target = state_dir / f"{name}.target"
+                lock.unlink()
+                lock.symlink_to(target)
+                try:
+                    record()
+                except OSError as exc:
+                    refused = exc.errno == errno.ELOOP
+                else:
+                    refused = False
+                require(
+                    refused and not os.path.lexists(target),
+                    f"a symlinked {name} was opened through",
+                )
+                lock.unlink()
+
+            # Refused on the open descriptor, which no swap can outrun.
+            store.chmod(0o660)
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                matched = standing_module.match(configured)
+            require(
+                matched is None and "group- or world-writable" in errors.getvalue(),
+                f"a group-writable store was honoured: {errors.getvalue()!r}",
+            )
+            store.chmod(0o600)
+            require(
+                standing_module.match(configured) is not None,
+                "the store did not round-trip once it was private again",
+            )
+
+            # A FIFO must be refused, not waited on: the consult sits in
+            # front of every launch and dispatch.
+            fifo = state_dir / "fifo"
+            os.mkfifo(fifo)
+            outcome: list[str] = []
+
+            def read_fifo() -> None:
+                try:
+                    standing_module._read_records(fifo)
+                except OSError as exc:
+                    outcome.append(str(exc))
+                else:
+                    outcome.append("read")
+
+            reader = threading.Thread(target=read_fifo, daemon=True)
+            reader.start()
+            reader.join(timeout=5)
+            if reader.is_alive():
+                with contextlib.suppress(OSError):
+                    os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+                reader.join(timeout=5)
+                raise Failure("reading a FIFO store blocked")
+            require(
+                outcome and "non-regular" in outcome[0],
+                f"a FIFO store was not refused: {outcome}",
+            )
+        finally:
+            standing_module._insecure_reason = saved_check
+
+    # Another user's file cannot be made without privilege, so its
+    # verdict is read from constructed metadata.
+    foreign = os.stat_result(
+        (stat.S_IFREG | 0o600, 0, 0, 1, os.getuid() + 1, 0, 0, 0, 0, 0)
+    )
+    require(
+        standing_module._file_problem(foreign) == "foreign-owned",
+        "a foreign-owned store file was trusted",
+    )
+
+
+@test("a hand-edited standing store that cannot be validated reads as empty")
+def test_standing_store_odd_values() -> None:
+    configured = runtime_module.load_role("reviewer")
+    with standing_stores() as (_runtime_dir, state_dir):
+        os.environ.pop("XDG_RUNTIME_DIR")
+        standing_module.record_approval(
+            configured=configured,
+            candidate=standing_candidate(configured),
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit reached",
+            failure_scope="provider",
+        )
+        store = state_dir / "orrery" / "standing.json"
+        original = store.read_text()
+        live = json.loads(original)["approvals"][0]
+        # Each field is tested for membership in a set, where an
+        # unhashable value would raise rather than fail validation.
+        cases = {
+            f"list-valued {field}": json.dumps(
+                {"version": 1, "approvals": [{**live, field: [live[field]]}]}
+            )
+            for field in (
+                "failed_provider",
+                "failure_scope",
+                "candidate_provider",
+                "scope",
+            )
+        }
+        # Deeper than any interpreter's JSON parser will recurse.
+        depth = 1_000_000
+        cases["deeply nested"] = (
+            '{"version": 1, "approvals": ' + "[" * depth + "]" * depth + "}"
+        )
+        for label, text in cases.items():
+            # Rewritten in place, so the store keeps its private mode.
+            store.write_text(text)
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                try:
+                    matched = standing_module.match(configured)
+                    active = standing_module.list_active()
+                except Exception as exc:  # noqa: BLE001 - any escape fails
+                    raise Failure(
+                        f"{label}: a consult raised {type(exc).__name__}: {exc}"
+                    ) from exc
+            require(
+                matched is None and active == [],
+                f"{label}: the store did not read as empty: {matched} {active}",
+            )
+            if label == "deeply nested":
+                require(
+                    "ignoring an unreadable standing-approval store"
+                    in errors.getvalue(),
+                    f"{label}: the store was not reported as unreadable: "
+                    f"{errors.getvalue()!r}",
+                )
+        store.write_text(original)
+        require(
+            standing_module.match(configured) is not None,
+            "the untouched record did not round-trip",
+        )
+
+
+@test("a runtime directory under /tmp keeps the session store usable")
+def test_standing_session_store_under_tmp() -> None:
+    configured = runtime_module.load_role("reviewer")
+    saved_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    with until_store_only(), tempfile.TemporaryDirectory(dir="/tmp") as runtime:
+        os.environ["XDG_RUNTIME_DIR"] = runtime
+        try:
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                usable = standing_module.session_scope_available()
+                parsed = standing_module.parse_approval_scope("session")
+                standing_module.record_approval(
+                    configured=configured,
+                    candidate=standing_candidate(configured),
+                    scope="session",
+                    expires_at=None,
+                    reason="usage limit reached",
+                    failure_scope="provider",
+                )
+                found = standing_module.match(configured)
+        finally:
+            if saved_runtime is None:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = saved_runtime
+        require(
+            usable
+            and parsed == ("session", None)
+            and found is not None
+            and found["scope"] == "session"
+            and (Path(runtime) / "orrery" / "standing.json").is_file()
+            and not errors.getvalue(),
+            f"a session store under /tmp was not usable: {found} "
+            f"{errors.getvalue()!r}",
         )
 
 
@@ -13936,6 +14320,152 @@ def test_no_fallback_ignores_standing() -> None:
         )
 
 
+def plant_store_link(state_dir: Path) -> tuple[Path, Path]:
+    """Hide a live until store behind a symlink; return (link, target)."""
+    store = state_dir / "orrery" / "standing.json"
+    target = state_dir / "elsewhere.json"
+    store.rename(target)
+    store.symlink_to(target)
+    return store, target
+
+
+@test("an insecure standing store never steers or stops a principal launch")
+def test_standing_insecure_store_principal() -> None:
+    with until_store_only() as state_dir, tempfile.TemporaryDirectory() as directory:
+        principal = runtime_module.load_role("orchestrator")
+        standing_module.record_approval(
+            configured=principal,
+            candidate=dataclasses.replace(principal, model="opus"),
+            scope="until",
+            expires_at=time.time() + 3600,
+            reason="usage limit reached",
+            failure_scope="model",
+        )
+        claude_arguments = Path(directory) / "claude-args"
+
+        def launch() -> tuple[subprocess.CompletedProcess[str], str | None]:
+            """One principal launch and the model it started."""
+            claude_arguments.unlink(missing_ok=True)
+            environment = review_environment("success", standing_state=state_dir)
+            environment["CLAUDE_FAKE_ARGS"] = str(claude_arguments)
+            result = run_principal(environment)
+            arguments = (
+                claude_arguments.read_text().splitlines()
+                if claude_arguments.exists()
+                else []
+            )
+            if "--model" not in arguments:
+                return result, None
+            return result, arguments[arguments.index("--model") + 1]
+
+        trusted, model = launch()
+        require(
+            trusted.returncode == 0
+            and "standing fallback active" in trusted.stderr
+            and model == "opus",
+            f"the fixture approval was not adopted from a trusted store: "
+            f"{trusted.returncode} {model} {trusted.stderr}",
+        )
+
+        link, target = plant_store_link(state_dir)
+        before = target.read_bytes()
+        planted, model = launch()
+        require(
+            planted.returncode == 0
+            and "skipping the standing-approval store" in planted.stderr
+            and "standing fallback active" not in planted.stderr
+            and model == principal.model,
+            f"a symlinked store steered or stopped the launch: "
+            f"{planted.returncode} {model} {planted.stderr}",
+        )
+        require(
+            link.is_symlink() and target.read_bytes() == before,
+            "the launch wrote through the symlinked store",
+        )
+
+
+@test("an insecure standing store never steers or stops a dispatch")
+def test_standing_insecure_store_dispatch() -> None:
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository:
+        seed_standing_reviewer()
+
+        def dispatch() -> tuple[subprocess.Popen[str], str, str]:
+            """One reviewer dispatch against the seeded until store."""
+            environment = review_environment("success", standing_state=state_dir)
+            environment["ORRERY_ALLOW_UNCONFINED"] = "1"
+            process = start_review(
+                environment, "--timeout", "60", "--", "prompt", cwd=repository
+            )
+            stdout, stderr = finish_review(process, environment)
+            return process, stdout, stderr
+
+        # The control: from the trusted store the recorded candidate runs,
+        # so the configured reviewer running below is the skip.
+        process, stdout, stderr = dispatch()
+        require(
+            process.returncode == 0
+            and "fake Claude verdict" in stdout
+            and "standing fallback active" in stderr,
+            f"the fixture approval was not adopted from a trusted store: "
+            f"{process.returncode} {stderr}",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+        link, target = plant_store_link(state_dir)
+        before = target.read_bytes()
+        process, stdout, stderr = dispatch()
+        require(
+            process.returncode == 0 and "# PASS" in stdout,
+            f"the configured reviewer did not run: {process.returncode} "
+            f"{stderr}",
+        )
+        require(
+            "skipping the standing-approval store" in stderr
+            and "standing fallback active" not in stderr,
+            f"the symlinked store was not skipped with a warning: {stderr}",
+        )
+        require(
+            link.is_symlink() and target.read_bytes() == before,
+            "the dispatch wrote through the symlinked store",
+        )
+        assert_no_review_residue(f"orrery-review-{process.pid}-")
+
+
+@test("a session approval under a /tmp runtime directory still dispatches")
+def test_standing_tmp_runtime_dispatch() -> None:
+    saved_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    with until_store_only() as state_dir, d1_repository(
+        OPENAI_PRINCIPAL
+    ) as repository, tempfile.TemporaryDirectory(dir="/tmp") as runtime:
+        os.environ["XDG_RUNTIME_DIR"] = runtime
+        try:
+            seed_standing_reviewer(scope="session")
+        finally:
+            if saved_runtime is None:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = saved_runtime
+        # A process group rather than a unit: the systemd user bus is
+        # found through XDG_RUNTIME_DIR, which this run moves.
+        environment = fallback_environment("success")
+        environment["XDG_STATE_HOME"] = str(state_dir)
+        environment["XDG_RUNTIME_DIR"] = runtime
+        process = start_review(
+            environment, "--timeout", "60", "--", "prompt", cwd=repository
+        )
+        stdout, stderr = finish_review(process, environment)
+        require(
+            process.returncode == 0
+            and "fake Claude verdict" in stdout
+            and "standing fallback active" in stderr
+            and "skipping the standing-approval store" not in stderr,
+            f"a session approval under /tmp did not dispatch: "
+            f"{process.returncode} {stderr}",
+        )
+
+
 @test("a non-interactive until approval is refused, not recorded")
 def test_until_scope_refused_noninteractive() -> None:
     with until_store_only() as state_dir, d1_repository(
@@ -14066,6 +14596,108 @@ def test_revoke_fallbacks_cli() -> None:
             combined.returncode == 2
             and "stands alone" in combined.stderr,
             "--revoke-fallbacks combined with other flags was accepted",
+        )
+
+
+def revoke_with(program: str, state_dir: Path) -> tuple[int, str, str]:
+    """One `--revoke-fallbacks` run of `program`: (status, stdout, stderr)."""
+    environment = review_environment("success", standing_state=state_dir)
+    if program == "orrery":
+        result = run_principal(environment, "--revoke-fallbacks")
+        return result.returncode, result.stdout, result.stderr
+    process = start_review(environment, "--revoke-fallbacks")
+    stdout, stderr = finish_review(process, environment)
+    return process.returncode, stdout, stderr
+
+
+@test("revocation reports a skipped store it could not clear and fails")
+def test_revoke_reports_skipped_store() -> None:
+    for program in ("orrery", "orrery-agent"):
+        # Alone, the skipped store once let the reply say there were no
+        # approvals; beside a cleared one, it once let the reply succeed.
+        for with_session in (False, True):
+            label = f"{program}, session record {with_session}"
+            with standing_stores() as (runtime_dir, state_dir):
+                if with_session:
+                    seed_standing_reviewer(scope="session")
+                seed_standing_reviewer()
+                link, target = plant_store_link(state_dir)
+                before = target.read_bytes()
+                status, stdout, stderr = revoke_with(program, state_dir)
+                require(
+                    status == 1
+                    and f"the standing-approval store at {link} was not "
+                    f"cleared (skipped: symlinked {link})." in stderr
+                    and "No standing fallback approvals." not in stdout,
+                    f"{label}: the skipped store was not reported as "
+                    f"uncleared: {status} {stdout!r} {stderr!r}",
+                )
+                session_store = runtime_dir / "orrery" / "standing.json"
+                require(
+                    ("revoked standing fallback" in stdout) is with_session
+                    and (
+                        not with_session
+                        or read_json(session_store)["approvals"] == []
+                    ),
+                    f"{label}: the session store was not revoked beside the "
+                    f"skipped one: {stdout!r}",
+                )
+                require(
+                    link.is_symlink() and target.read_bytes() == before,
+                    f"{label}: revocation wrote through the skipped store",
+                )
+
+
+@test("an unopenable session store does not stop the until store's revocation")
+def test_revoke_past_unopenable_store() -> None:
+    with standing_stores() as (runtime_dir, state_dir):
+        seed_standing_reviewer(scope="session")
+        session_store = runtime_dir / "orrery" / "standing.json"
+        until_store = state_dir / "orrery" / "standing.json"
+        denied = f"[Errno {errno.EACCES}]"
+        # Private and regular, so it is not skipped; only its open fails.
+        session_store.chmod(0)
+        try:
+            for program in ("in-process", "orrery", "orrery-agent"):
+                seed_standing_reviewer()
+                if program == "in-process":
+                    try:
+                        standing_module.revoke_all()
+                    except standing_module.RevocationIncomplete as exc:
+                        removed, uncleared = exc.removed, exc.failures
+                    else:
+                        raise Failure(
+                            "an unopenable session store was taken as cleared"
+                        )
+                    require(
+                        [entry["scope"] for entry in removed] == ["until"]
+                        and [path for path, _reason in uncleared]
+                        == [session_store]
+                        and uncleared[0][1].startswith(denied),
+                        f"the until store was not cleared past the session "
+                        f"store, or the failure was not named: {removed} "
+                        f"{uncleared}",
+                    )
+                else:
+                    status, stdout, stderr = revoke_with(program, state_dir)
+                    require(
+                        status == 1
+                        and "revoked standing fallback" in stdout
+                        and "No standing fallback approvals." not in stdout
+                        and f"the standing-approval store at {session_store} "
+                        f"was not cleared ({denied}" in stderr,
+                        f"{program}: the unopenable session store was not "
+                        f"reported: {status} {stdout!r} {stderr!r}",
+                    )
+                require(
+                    read_json(until_store)["approvals"] == [],
+                    f"{program}: the until store was not cleared",
+                )
+        finally:
+            session_store.chmod(0o600)
+        require(
+            len(read_json(session_store)["approvals"]) == 1,
+            "the unopenable session store was changed",
         )
 
 
@@ -24866,6 +25498,19 @@ def test_pickup_store_strictness() -> None:
             f"a malformed store was not refused intact: {malformed.stderr}",
         )
 
+        # Bytes that are not text at all fail decoding before parsing,
+        # and get the same named refusal rather than a traceback.
+        undecodable_bytes = b"\x80\xfe not json\n"
+        store_file.write_bytes(undecodable_bytes)
+        undecodable = run_pickup(root, "list", environment=environment)
+        require(
+            undecodable.returncode == 2
+            and "malformed" in undecodable.stderr
+            and store_file.read_bytes() == undecodable_bytes,
+            f"an undecodable store was not refused intact: "
+            f"{undecodable.stderr}",
+        )
+
         store_file.unlink()
         target = state / "orrery" / "elsewhere.json"
         target.write_bytes(original)
@@ -24901,6 +25546,223 @@ def test_pickup_store_strictness() -> None:
             json.loads(store_file.read_text())["records"] == [],
             "the expired record survived in the store",
         )
+
+
+@test("the pickup store's opens refuse a symlink swapped in after its check")
+def test_pickup_store_no_follow() -> None:
+    module = load_script(PICKUP_SCRIPT, "kit_pickup_no_follow")
+    validate = module._secure_paths
+    saved_state = os.environ.get("XDG_STATE_HOME")
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "state"
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            entry = {
+                "repo": directory,
+                "task_id": "T-1",
+                "contract_digest": "0" * 64,
+                "priority": 1,
+                "parked_at": time.time(),
+                "reset_at": time.time() + 3600,
+                "re_parked": False,
+                "instance": {"nonce_sha256": "1" * 64, "lineage_sha256": "2" * 64},
+                "role_fingerprint": ["v4", "openai", "gpt-5.6-sol"],
+                "claimed_by": None,
+            }
+            with module.store_transaction() as payload:
+                payload["records"].append(entry)
+            with module.store_transaction() as payload:
+                require(
+                    payload["records"] == [entry],
+                    f"a legitimate pickup record did not round-trip: "
+                    f"{payload['records']}",
+                )
+            data = state / "orrery" / "pickup.json"
+            lock = state / "orrery" / "pickup.lock"
+            original = data.read_bytes()
+
+            def restore_data() -> None:
+                data.unlink()
+                descriptor = os.open(
+                    data, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(original)
+
+            for victim, dangling in ((data, False), (data, True), (lock, True)):
+                label = f"{victim.name} ({'dangling' if dangling else 'live'} link)"
+                target = state / f"{victim.name}.target"
+                if not dangling:
+                    target.write_bytes(original)
+                before = tree_snapshot(target)
+
+                def swapped(
+                    create: bool, victim: Path = victim, target: Path = target
+                ) -> tuple[Path, Path]:
+                    # The real check passes, and the swap lands after it.
+                    paths = validate(create)
+                    victim.unlink()
+                    victim.symlink_to(target)
+                    return paths
+
+                module._secure_paths = swapped
+                try:
+                    with module.store_transaction() as payload:
+                        payload["records"] = []
+                except runtime_module.RuntimeConfigError as exc:
+                    cause = exc.__cause__
+                else:
+                    cause = None
+                finally:
+                    module._secure_paths = validate
+                require(
+                    isinstance(cause, OSError) and cause.errno == errno.ELOOP,
+                    f"{label}: the swapped-in link was not refused at the "
+                    f"open: {cause!r}",
+                )
+                require(
+                    victim.is_symlink() and tree_snapshot(target) == before,
+                    f"{label}: the transaction went through the link",
+                )
+                if victim == data:
+                    restore_data()
+                else:
+                    victim.unlink()
+                target.unlink(missing_ok=True)
+
+            # The doctor's read-only view refuses the same swap rather
+            # than reporting that nothing is parked.
+            def dangling_data(create: bool) -> tuple[Path, Path]:
+                paths = validate(create)
+                data.unlink()
+                data.symlink_to(state / "absent")
+                return paths
+
+            module._secure_paths = dangling_data
+            try:
+                info, warnings = module.describe()
+            finally:
+                module._secure_paths = validate
+            require(
+                info == []
+                and len(warnings) == 1
+                and f"[Errno {errno.ELOOP}]" in warnings[0],
+                f"the doctor read a swapped-in link as empty: {info} {warnings}",
+            )
+            restore_data()
+
+            with module.store_transaction() as payload:
+                require(
+                    payload["records"] == [entry],
+                    "the store did not round-trip after the refusals",
+                )
+        finally:
+            if saved_state is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved_state
+
+
+@test("the pickup store refuses a FIFO or insecure file swapped in after its check")
+def test_pickup_store_open_descriptor() -> None:
+    module = load_script(PICKUP_SCRIPT, "kit_pickup_open_descriptor")
+    validate = module._secure_paths
+    saved_state = os.environ.get("XDG_STATE_HOME")
+    with tempfile.TemporaryDirectory() as directory:
+        state = Path(directory) / "state"
+        os.environ["XDG_STATE_HOME"] = str(state)
+        try:
+            with module.store_transaction() as payload:
+                payload["records"] = []
+            data = state / "orrery" / "pickup.json"
+            original = data.read_bytes()
+
+            def private_copy() -> None:
+                descriptor = os.open(
+                    data, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(original)
+
+            def writable_copy() -> None:
+                private_copy()
+                data.chmod(0o620)
+
+            # A directory opens, but is refused as the file object is made,
+            # before the descriptor check sees it.
+            for label, plant, refusal in (
+                (
+                    "FIFO",
+                    lambda: os.mkfifo(data, 0o600),
+                    f"refusing non-regular pickup store {data}",
+                ),
+                (
+                    "directory",
+                    lambda: data.mkdir(mode=0o700),
+                    f"the pickup store is unreadable: [Errno {errno.EISDIR}]",
+                ),
+                (
+                    "group-writable file",
+                    writable_copy,
+                    f"refusing group- or world-writable pickup store {data}",
+                ),
+            ):
+
+                def swapped(
+                    create: bool, plant: Callable[[], None] = plant
+                ) -> tuple[Path, Path]:
+                    # The real check passes, and the swap lands after it.
+                    paths = validate(create)
+                    data.unlink()
+                    plant()
+                    return paths
+
+                outcome: list[str] = []
+
+                def transact() -> None:
+                    try:
+                        with module.store_transaction() as payload:
+                            payload["records"] = []
+                    except runtime_module.RuntimeConfigError as exc:
+                        outcome.append(str(exc))
+                    else:
+                        outcome.append("read")
+
+                module._secure_paths = swapped
+                try:
+                    # A FIFO must be refused, not waited on: the executor
+                    # reads this store unattended.
+                    worker = threading.Thread(target=transact, daemon=True)
+                    worker.start()
+                    worker.join(timeout=5)
+                    if worker.is_alive():
+                        with contextlib.suppress(OSError):
+                            os.close(os.open(data, os.O_WRONLY | os.O_NONBLOCK))
+                        worker.join(timeout=5)
+                        raise Failure(f"{label}: opening the swapped store blocked")
+                finally:
+                    module._secure_paths = validate
+                require(
+                    len(outcome) == 1 and outcome[0].startswith(refusal),
+                    f"{label}: the swapped store was not refused once opened: "
+                    f"{outcome}",
+                )
+                if data.is_dir():
+                    data.rmdir()
+                else:
+                    data.unlink()
+                private_copy()
+
+            with module.store_transaction() as payload:
+                require(
+                    payload["records"] == [],
+                    "the store did not round-trip after the refusals",
+                )
+        finally:
+            if saved_state is None:
+                os.environ.pop("XDG_STATE_HOME", None)
+            else:
+                os.environ["XDG_STATE_HOME"] = saved_state
 
 
 @test("an endpoint-routed role cannot be parked")

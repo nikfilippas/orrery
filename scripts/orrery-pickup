@@ -38,7 +38,7 @@ from orrery_ledger import (  # noqa: E402
     read_ledger,
 )
 from orrery_runtime import RuntimeConfigError, load_role  # noqa: E402
-from orrery_standing import _fingerprint  # noqa: E402
+from orrery_standing import _file_problem, _fingerprint  # noqa: E402
 from orrery_verify import (  # noqa: E402
     systemctl_path,
     systemd_run_path,
@@ -225,8 +225,18 @@ def _valid_record(entry: Any) -> dict[str, Any]:
 
 def load_store(data: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(data.read_bytes())
-    except json.JSONDecodeError as exc:
+        # No-follow and non-blocking, then judged on the open descriptor
+        # as the standing store is: a store swapped for a symlink, a FIFO
+        # or another insecure file after `_secure_paths` checked it is
+        # refused rather than read through or waited on.
+        descriptor = os.open(data, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as handle:
+            problem = _file_problem(os.fstat(handle.fileno()))
+            if problem is not None:
+                raise RuntimeConfigError(f"refusing {problem} pickup store {data}")
+            payload = json.loads(handle.read())
+    except ValueError as exc:
+        # Undecodable bytes as well as malformed JSON.
         raise RuntimeConfigError(
             f"the pickup store is malformed ({exc}); nothing was read as "
             f"empty. Inspect or remove {data}"
@@ -291,10 +301,17 @@ def store_transaction() -> Iterator[dict[str, Any]]:
     transaction, releases, and settles under another.
     """
     data, lock = _secure_paths(create=True)
-    descriptor = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        # No-follow, as in `load_store`: a lock swapped for a symlink
+        # after the check is refused, never created through.
+        descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise RuntimeConfigError(f"the pickup store lock is unusable: {exc}") from exc
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        payload = load_store(data) if data.exists() else empty_store()
+        # lexists, so a dangling symlink reaches the no-follow open and
+        # is refused there instead of reading as an empty store.
+        payload = load_store(data) if os.path.lexists(data) else empty_store()
         drop_expired(payload, time.time())
         yield payload
         save_store(data, payload)
@@ -773,7 +790,7 @@ def describe(now: float | None = None) -> tuple[list[str], list[str]]:
     moment = time.time() if now is None else now
     try:
         data, _lock = _secure_paths(create=False)
-        payload = load_store(data) if data.exists() else empty_store()
+        payload = load_store(data) if os.path.lexists(data) else empty_store()
     except RuntimeConfigError as exc:
         return [], [str(exc)]
     info: list[str] = []

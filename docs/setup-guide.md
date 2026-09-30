@@ -784,12 +784,21 @@ use. Session-scope records live under
 `$XDG_RUNTIME_DIR/orrery/standing.json` and die with the login session and
 at a 24-hour cap regardless of the boot id;
 until-scope records live under `${XDG_STATE_HOME:-~/.local/state}/orrery/
-standing.json` and expire at their recorded time. Standing approvals are
+standing.json` and expire at their recorded time. A store with a symlink on
+its path, or whose file or lock is a symlink, not a regular file, another
+user's, or group- or world-writable, is skipped with a warning printed once
+per process, so once on each launch or dispatch that consults it: it reads
+as empty, is never honoured or written, and a skipped store makes its scope
+unavailable. This store and the pickup store open their data and lock files
+without following symlinks. Standing approvals are
 listed by `orrery-doctor` and on the configuration page, are removed by
 `orrery --revoke-fallbacks` (or the page's revoke control), are skipped
 when the role's configured identity changes, and are always overridden by
 `--no-fallback`, an explicit `--approve-fallback`, and the
-changed-workspace inspection rule.
+changed-workspace inspection rule. A revocation clears every store it can;
+a skipped or unreadable store holding approvals is reported, not cleared,
+and the revocation fails: the command exits non-zero and the page shows
+the error.
 
 Direct Claude, Codex CLI, and Codex IDE sessions do not pass through the
 launcher. Their SessionStart hook compares the active provider/model with the
@@ -874,10 +883,12 @@ confused-delegate model the confinement is built for:
   as does a new higher-priority `AGENTS.override.md`. The code-execution
   channels that exist are closed; instruction injection is the residual.
   Closing it entirely needs an isolated provider home.
-- The no-delegation guard reads the kernel cgroup, which a delegate can
-  hide only by creating a cgroup namespace where the host permits
-  unprivileged namespaces; the provider's own sandbox needs namespaces, so
-  they are not blanket-restricted.
+- The no-delegation guard is best-effort, not a boundary. It refuses a
+  process whose cgroup names a delegate unit or that carries the
+  `ORRERY_ROLE` marker, but a delegate can hide the cgroup inside a cgroup
+  namespace where the host permits unprivileged namespaces (the provider's
+  own sandbox needs them, so they are not blanket-restricted), unset the
+  marker, or start a provider CLI directly.
 - The standing-approval and control stores, and this machine's user
   configuration, are trusted because they sit under `ProtectHome`. Do not
   set `XDG_STATE_HOME`, `XDG_RUNTIME_DIR` or `XDG_CONFIG_HOME` under a
@@ -1177,11 +1188,13 @@ rather than to the hook.
 
 Accepted residual: delegate confinement closes what a hostile repository can
 write, not what it can read. With the provider CLI sandbox disabled and no
-hook-suppression flag, repository hooks running inside a delegate can read the
-provider credentials that `HOME` and `CODEX_HOME` expose and exfiltrate them
-over an unconfined network. Closing it needs upstream hook suppression or
-unit-level egress control, both currently unavailable. Delegate confinement is
-not complete while this remains.
+hook suppression applied, repository hooks running inside a delegate can read
+the provider credentials that `HOME` and `CODEX_HOME` expose and exfiltrate
+them over an unconfined network. Current CLIs do provide hook controls (Claude
+Code's `disableAllHooks` setting, Codex's hook trust), but Orrery does not yet
+apply them to delegates. Closing it needs those applied, or unit-level egress
+control, which is currently unavailable. Delegate confinement is not complete
+while this remains.
 
 ## Provider exhaustion and failures
 

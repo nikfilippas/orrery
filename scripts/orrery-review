@@ -59,6 +59,7 @@ from orrery_verify import systemctl_path, systemd_run_path  # noqa: E402
 import orrery_spend  # noqa: E402
 from orrery_standing import (  # noqa: E402
     RUN_SCOPE,
+    RevocationIncomplete,
     candidate_role,
     describe,
     failed_model_refusal,
@@ -999,8 +1000,10 @@ def delegate_unit_in_cgroup(cgroup_text: str) -> str | None:
 
     A process cannot leave its own cgroup without privilege, so a delegate
     unit in this process's cgroup is a kernel-backed statement that the
-    caller is itself a delegate. Unlike the ORRERY_ROLE environment marker,
-    it cannot be unset from inside the delegate.
+    caller is itself a delegate. Unlike the ORRERY_ROLE environment marker
+    it cannot be unset, but it can be hidden: a process in a new cgroup
+    namespace reads its cgroup as that namespace's root, which names no
+    unit.
     """
     match = DELEGATE_UNIT.search(cgroup_text)
     return match.group(0) if match else None
@@ -1022,11 +1025,12 @@ def _self_cgroup_text() -> str:
 def nesting_refusal() -> str | None:
     """Why this process may not start a delegated run, or None if it may.
 
-    A delegate cannot delegate. The cgroup ancestor is the enforceable
-    signal wherever confinement is active; the ORRERY_ROLE env marker is a
-    secondary signal that also covers the unconfined path, where there is
-    no cgroup boundary and the guard is necessarily best-effort (that path
-    already announces that it is unconfined).
+    Best-effort, not a boundary. It refuses a process whose cgroup names a
+    delegate unit, or that carries the ORRERY_ROLE env marker, which also
+    covers the unconfined path where there is no unit. A delegate can hide
+    the first inside a new cgroup namespace, where the host permits
+    unprivileged ones, and unset the second, and nothing here stops it
+    starting a provider CLI directly.
     """
     unit = delegate_unit_in_cgroup(_self_cgroup_text())
     if unit is not None:
@@ -2453,9 +2457,9 @@ def main(
         print(usage(), file=sys.stderr, end="")
         return 2
 
-    # A delegate cannot delegate. Enforced here in code rather than only
-    # by the role handoff prompt, and by the kernel cgroup boundary rather
-    # than only the unsettable-from-inside environment marker.
+    # A delegate cannot delegate. Checked here in code as well as by the
+    # role handoff prompt, best-effort rather than as a boundary: see
+    # `nesting_refusal`.
     refusal = nesting_refusal()
     if refusal is not None:
         print(
@@ -2466,8 +2470,11 @@ def main(
         return NESTING_REFUSED
 
     if invocation.revoke:
+        failures: list[tuple[Path, str]] = []
         try:
             removed = revoke_all()
+        except RevocationIncomplete as exc:
+            removed, failures = exc.removed, exc.failures
         except OSError as exc:
             print(
                 f"{PROGRAM_NAME}: the standing-approval store could not be "
@@ -2475,13 +2482,22 @@ def main(
                 file=sys.stderr,
             )
             return 1
-        if removed:
-            for record in removed:
-                print(
-                    "revoked standing fallback · "
-                    + describe(record, cached_name)
-                )
-        else:
+        for record in removed:
+            print(
+                "revoked standing fallback · "
+                + describe(record, cached_name)
+            )
+        # A store left uncleared may still hold approvals, so the
+        # revocation fails rather than reporting that there are none.
+        for path, reason in failures:
+            print(
+                f"{PROGRAM_NAME}: the standing-approval store at {path} was "
+                f"not cleared ({reason}).",
+                file=sys.stderr,
+            )
+        if failures:
+            return 1
+        if not removed:
             print("No standing fallback approvals.")
         return 0
 
