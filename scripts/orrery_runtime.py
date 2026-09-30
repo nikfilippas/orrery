@@ -1560,7 +1560,11 @@ def provider_installs(provider: str) -> list[dict[str, Any]]:
             found.append({"path": path, "origin": origin, "version": "",
                           "refused": f"writable parent {writable}"})
             continue
-        if details.st_uid != os.getuid():
+        # Root's own install is trusted as well as the user's: npm puts a
+        # system-wide CLI there, no other account can rewrite it past the
+        # parent and mode checks either side, and it is often the very
+        # binary Orrery dispatches.
+        if details.st_uid not in (os.getuid(), 0):
             found.append({"path": path, "origin": origin, "version": "",
                           "refused": "foreign-owned"})
             continue

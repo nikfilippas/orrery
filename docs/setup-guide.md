@@ -106,7 +106,11 @@ idle timeout. It is generated from:
 
 The two local catalogues are read concurrently without running a model.
 Failure is isolated per provider, equivalent Claude aliases are deduplicated,
-and future picker-visible models appear automatically. Every role sees the
+and future picker-visible models appear automatically: update the CLI and
+reopen the page. A provider lists a new model only to a recent enough CLI,
+and the menus come from the one Orrery runs, so when a newer copy is
+installed elsewhere, such as an editor extension that updates itself, the
+page names it and the command that brings Orrery's level. Every role sees the
 same Anthropic and OpenAI groups. A known model determines its provider and
 rebuilds the adjacent thinking selector from that model's reported levels. A
 custom model requires an explicit provider and has no inferred thinking

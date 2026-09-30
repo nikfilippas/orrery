@@ -49,6 +49,7 @@ from orrery_runtime import (  # noqa: E402
     load_endpoint,
     load_manifest,
     load_user_config,
+    newer_sibling,
     tunable_differences,
     user_config_path,
     user_config_text,
@@ -287,6 +288,61 @@ def activate_discovered_catalogue() -> None:
     fallback = bundled_catalogue()
     CATALOGUE_DISCOVERY = discover_catalogue(fallback)
     ACTIVE_CATALOGUE = _parse_catalogue(CATALOGUE_DISCOVERY.providers)
+
+
+# Each provider's CLI installed elsewhere that is newer than the one Orrery
+# runs, found once per process beside discovery.
+NEWER_CLIS: dict[str, dict[str, Any]] = {}
+
+
+def discovery_enabled() -> bool:
+    """Whether live discovery runs, by the same switch discovery reads."""
+    switch = os.environ.get("ORRERY_MODEL_DISCOVERY", "").strip().lower()
+    return switch not in {"0", "false", "no", "off"}
+
+
+def detect_newer_clis() -> dict[str, dict[str, Any]]:
+    """Each provider's newer CLI copy installed elsewhere, if any.
+
+    A provider lists a new model only to a recent enough client, so a
+    newer copy elsewhere, such as an editor extension's that updates
+    itself, can know models these menus cannot offer. It is reported and
+    never used: running a different binary would change what Orrery
+    dispatches without anyone asking. A failed check reports nothing.
+    """
+    found: dict[str, dict[str, Any]] = {}
+    for provider in PROVIDERS:
+        try:
+            pair = newer_sibling(provider)
+        except Exception:  # noqa: BLE001 - a diagnostic must not stop the page
+            continue
+        if pair is not None:
+            found[provider] = pair
+    return found
+
+
+def newer_cli_notes(found: dict[str, dict[str, Any]]) -> list[str]:
+    """One sentence per newer CLI copy, saying how to bring Orrery's level."""
+    notes = []
+    for provider, pair in found.items():
+        sibling, dispatched = pair["sibling"], pair["dispatched"]
+        name = "Claude Code" if provider == "anthropic" else "Codex"
+        where = (
+            "in a VS Code extension"
+            if "/.vscode" in sibling["path"]
+            else f"at {sibling['path']}"
+        )
+        remedy = (
+            "run claude update"
+            if provider == "anthropic"
+            else "update the Codex CLI on your PATH"
+        )
+        notes.append(
+            f"{name} {sibling['version']} is also installed {where}, newer "
+            f"than the {dispatched['version']} Orrery runs, so models it "
+            f"adds are missing here until you {remedy}."
+        )
+    return notes
 
 
 def load_catalogue() -> dict[str, list[dict[str, Any]]]:
@@ -2465,6 +2521,9 @@ def render_page(token: str, demo: bool = False) -> str:
                 "Live model discovery is using the bundled fallback for "
                 f"{', '.join(fallback)}."
             )
+        # Said where a model is chosen, because nobody opens the doctor
+        # to ask why a new model is missing from these menus.
+        catalogue_note = " ".join([catalogue_note, *newer_cli_notes(NEWER_CLIS)])
     replacements = {
         "__STATE__": script_json(snapshot(manifest, observe=not demo)),
         "__SETTINGS__": script_json(settings_snapshot(manifest)),
@@ -2939,9 +2998,23 @@ def main() -> int:
             # Ahead of discovery, which spawns both provider CLIs to
             # build model menus a migration has no use for.
             return import_configuration(arguments.import_path)
+        # Beside discovery rather than after it: each check asks an
+        # install for its version, and together they set how long the
+        # page takes to open.
+        checker = None
+        if discovery_enabled():
+            checker = threading.Thread(
+                target=lambda: NEWER_CLIS.update(detect_newer_clis()),
+                daemon=True,
+            )
+            checker.start()
         activate_discovered_catalogue()
+        if checker is not None:
+            checker.join()
         for warning in CATALOGUE_DISCOVERY.warnings:
             print(f"Model discovery: {warning}", file=sys.stderr, flush=True)
+        for note in newer_cli_notes(NEWER_CLIS):
+            print(f"Model discovery: {note}", file=sys.stderr, flush=True)
         if arguments.print_state:
             return print_state()
         if arguments.export:

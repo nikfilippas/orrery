@@ -5453,6 +5453,28 @@ def test_sibling_inspection_is_safe() -> None:
                 entries[os.path.realpath(newer)]["refused"] == "foreign-owned",
                 "a foreign-owned install was executed",
             )
+
+            # Root's own install is a system one that no other account can
+            # rewrite, which is how npm installs a CLI system-wide; it is the
+            # binary Orrery would dispatch, so it is asked, not refused.
+            def root_owned(path, *arguments, **keywords):
+                details = real_stat(path, *arguments, **keywords)
+                if str(path) == os.path.realpath(newer):
+                    doctored = list(details)
+                    doctored[stat.ST_UID] = 0
+                    return os.stat_result(doctored)
+                return details
+
+            runtime_module.os.stat = root_owned
+            entries = {
+                entry["path"]: entry
+                for entry in runtime_module.provider_installs("anthropic")
+            }
+            require(
+                entries[os.path.realpath(newer)]["refused"] == ""
+                and entries[os.path.realpath(newer)]["version"] == "2.1.200",
+                f"a root-owned install was refused: {entries[os.path.realpath(newer)]}",
+            )
     finally:
         runtime_module.os.stat = saved_stat
         runtime_module.SIBLING_VERSION_TIMEOUT_SECONDS = saved_timeout
@@ -21392,6 +21414,76 @@ def test_doctor_incidents() -> None:
             and "Review with: orrery-incidents" in listed.stdout
             and "FAIL  The incident log" not in listed.stdout,
             f"the incident warning is missing: {listed.stdout[-800:]}",
+        )
+
+
+@test("the configuration page names a newer CLI installed elsewhere")
+def test_config_names_newer_cli() -> None:
+    """A model is chosen on the page, not in the doctor, so the page is
+    where a newer copy of the CLI, one that may list models these menus
+    cannot, has to be named, together with how to bring Orrery's level.
+    """
+    import urllib.request
+
+    def page_and_log(home: Path) -> tuple[str, str]:
+        environment = dict(os.environ)
+        environment.update({
+            "HOME": str(home),
+            # The stub first, and no real provider CLI behind it.
+            "PATH": f"{home / 'bin'}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_STATE_HOME": str(home / ".state"),
+        })
+        environment.pop("ORRERY_MODEL_DISCOVERY", None)
+        process = subprocess.Popen(
+            [sys.executable, str(KIT_DIR / "scripts" / "orrery-config"),
+             "--port", "0", "--timeout", "60", "--no-browser"],
+            env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True,
+        )
+        try:
+            log, url, deadline = [], None, time.monotonic() + 30
+            while time.monotonic() < deadline:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                if line.startswith("CONFIG_URL="):
+                    url = line.split("=", 1)[1].strip()
+                    break
+                log.append(line)
+            require(bool(url), f"the server never announced its URL: {log}")
+            return urllib.request.urlopen(url, timeout=10).read().decode(), "".join(log)
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=10)
+
+    notice = "Claude Code 2.1.200 is also installed in a VS Code extension"
+    with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
+        home = Path(directory)
+        write_stub_cli(home / "bin" / "claude", "2.1.100 (Claude Code)")
+        page, log = page_and_log(home)
+        require(
+            "is also installed" not in page and "is also installed" not in log,
+            "a notice appeared with no other CLI installed",
+        )
+        write_stub_cli(
+            home / ".vscode" / "extensions"
+            / "anthropic.claude-code-2.1.200-linux-x64"
+            / "resources" / "native-binary" / "claude",
+            "2.1.200 (Claude Code)",
+        )
+        page, log = page_and_log(home)
+        require(
+            f"{notice}, newer than the 2.1.100 Orrery runs" in page
+            and "until you run claude update" in page,
+            "the page did not name the newer CLI and its remedy",
+        )
+        require(
+            f"Model discovery: {notice}" in log,
+            f"the terminal did not name the newer CLI: {log}",
         )
 
 
